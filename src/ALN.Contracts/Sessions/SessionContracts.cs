@@ -9,12 +9,14 @@ public sealed record SessionSpec(
     string ModelProfileId,
     string Objective,
     string SystemPrompt,
-    string FormatVersion);
+    string FormatVersion,
+    IReadOnlyList<ModelToolDefinition>? Tools = null);
 
 /// <summary>Persisted state. Phase is intentionally transient and is not stored here.</summary>
 public sealed record SessionState(
     SessionStatus Status,
     int StepNumber,
+    long Revision,
     bool Locked,
     SessionUsage Usage,
     int SchemaVersion);
@@ -50,6 +52,11 @@ public sealed record SessionTurnResult(
     ModelUsage Usage,
     bool DuplicateActivation = false);
 
+public interface ISessionToolExecutor
+{
+    ValueTask<Result<string>> ExecuteAsync(string sessionId, Guid activationId, ModelToolCall call, CancellationToken cancellationToken);
+}
+
 public interface ISessionManager
 {
     /// <summary>Run one serialized model step and commit its completed turn to the session journal.</summary>
@@ -58,6 +65,7 @@ public interface ISessionManager
         SessionSpec spec,
         Guid activationId,
         string userInput,
+        ISessionToolExecutor? toolExecutor,
         CancellationToken cancellationToken);
 
     Result<SessionState> GetState(string sessionId);

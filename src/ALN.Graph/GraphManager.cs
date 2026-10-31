@@ -247,11 +247,16 @@ public sealed class GraphManager : IGraphRuntime
             if (envelope.Adapter != current.Source || envelope.EventId != current.EventId)
                 await DenyAsync(ScriptCapabilities.SessionRun, "Adapter payload does not match routed event.", cancellationToken).ConfigureAwait(false);
             var spec = Parse<SessionSpec>(sessionSpecJson);
+            if (spec.Tools?.Any(tool => tool.Name != "send_message") == true)
+                return JsonSerializer.Serialize(new { ok = false, error = new { message = "Unknown Session tool binding." } }, JsonOptions);
+            if (spec.Tools?.Any(tool => tool.Name == "send_message") == true &&
+                !mount.Package.Manifest.Capabilities.Contains(ScriptCapabilities.SelfAdapterSend, StringComparer.Ordinal))
+                await DenyAsync(ScriptCapabilities.SelfAdapterSend, "send_message requires self.adapter.send.", cancellationToken).ConfigureAwait(false);
             var identity = $"{current.Source}\n{envelope.PlatformConversationId}";
             var sessionId = "s-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
                 mount.Target, ScriptCapabilities.SessionRun, "allowed", sessionId), cancellationToken).ConfigureAwait(false);
-            var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, userInput, cancellationToken).ConfigureAwait(false);
+            var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, userInput, this, cancellationToken).ConfigureAwait(false);
             if (!result.Ok || result.Value is null)
             {
                 await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
@@ -261,6 +266,43 @@ public sealed class GraphManager : IGraphRuntime
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
                 mount.Target, ScriptCapabilities.SessionRun, "completed", sessionId), cancellationToken).ConfigureAwait(false);
             return JsonSerializer.Serialize(new { ok = true, result = result.Value }, JsonOptions);
+        }
+
+        public async ValueTask<Result<string>> ExecuteAsync(string sessionId, Guid activationId, ModelToolCall call,
+            CancellationToken cancellationToken)
+        {
+            if (call.Name != "send_message")
+                return Result<string>.Failure(new(ErrorCode.Denied, $"Session tool binding is not available: {call.Name}"));
+            try { await RequireCapabilityAsync(ScriptCapabilities.SelfAdapterSend, cancellationToken).ConfigureAwait(false); }
+            catch (UnauthorizedAccessException ex)
+            { return Result<string>.Failure(new(ErrorCode.Denied, ex.Message)); }
+            if (current.Name != EventNames.AdapterEnvelope || current.Source != mount.Target)
+                return Result<string>.Failure(new(ErrorCode.Denied, "Session send_message requires the source Adapter event."));
+
+            AdapterEnvelope envelope;
+            SessionSendArguments arguments;
+            try
+            {
+                envelope = Parse<AdapterEnvelope>(current.PayloadJson);
+                arguments = Parse<SessionSendArguments>(call.ArgumentsJson);
+            }
+            catch (Exception ex) when (ex is JsonException or ArgumentException)
+            { return Result<string>.Failure(new(ErrorCode.Invalid, "Session tool arguments are invalid.", ex.Message)); }
+            if (envelope.Adapter != current.Source || envelope.EventId != current.EventId || string.IsNullOrWhiteSpace(arguments.Text))
+                return Result<string>.Failure(new(ErrorCode.Invalid, "Session send_message requires non-empty text for the bound conversation."));
+
+            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                mount.Target, "session.tool.send_message", "allowed", call.Id), cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var result = await SendAsync(current.EventId, current.Source,
+                    new OutboundMessage(envelope.PlatformConversationId, arguments.Text, envelope.PlatformMessageId), cancellationToken)
+                    .ConfigureAwait(false);
+                return Result<string>.Success(result);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            { return Result<string>.Failure(new(ErrorCode.Unavailable, "Session send_message failed.", ex.Message)); }
         }
 
         public async Task<string> CompleteModelAsync(string profileId, string requestJson, CancellationToken cancellationToken)
@@ -391,6 +433,7 @@ public sealed class GraphManager : IGraphRuntime
         }
 
         private static T Parse<T>(string json) => JsonSerializer.Deserialize<T>(json, JsonOptions) ?? throw new ArgumentException("Script API received invalid JSON.");
+        private sealed record SessionSendArguments(string Text);
     }
 }
 

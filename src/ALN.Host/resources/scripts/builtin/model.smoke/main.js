@@ -8,8 +8,18 @@ async function onEvent(event, ctx) {
     const spec = {
       modelProfileId: "default",
       objective: "Respond helpfully to messages in this conversation.",
-      systemPrompt: "You are ALN, a helpful assistant. Answer clearly and concisely.",
-      formatVersion: "1"
+      systemPrompt: "You are ALN, a helpful assistant. Answer clearly and concisely. Use send_message when the user asks you to send a message to this conversation.",
+      formatVersion: "1",
+      tools: [{
+        name: "send_message",
+        description: "Send a text message to the current conversation.",
+        parametersJson: JSON.stringify({
+          type: "object",
+          properties: { text: { type: "string", description: "Message text to send." } },
+          required: ["text"],
+          additionalProperties: false
+        })
+      }]
     };
     const raw = await ctx.session.run(spec, prompt);
     const response = JSON.parse(raw);

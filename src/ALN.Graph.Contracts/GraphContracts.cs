@@ -1,4 +1,5 @@
 using ALN.Contracts;
+using ALN.Contracts.Sessions;
 
 namespace ALN.Graph.Contracts;
 
@@ -37,7 +38,7 @@ public interface IScriptExecutor
         IScriptApi api, CancellationToken cancellationToken);
 }
 
-public interface IScriptApi
+public interface IScriptApi : ISessionToolExecutor
 {
     Task<string> RunSessionAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken);
     Task<string> CompleteModelAsync(string profileId, string requestJson, CancellationToken cancellationToken);
