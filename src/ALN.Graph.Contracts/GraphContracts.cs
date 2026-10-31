@@ -42,6 +42,7 @@ public interface IScriptApi
     Task<string> SendSelfAsync(string outboundMessageJson, CancellationToken cancellationToken);
     Task<string> AcceptIntoChannelAsync(CancellationToken cancellationToken);
     Task<string> ReplyThroughChannelAsync(string outboundMessageJson, CancellationToken cancellationToken);
+    Task<string> PollSelfAsync(CancellationToken cancellationToken);
 }
 
 public interface IGraphScriptCatalog
@@ -57,10 +58,12 @@ public static class ScriptEvents
 {
     public const string AdapterEnvelope = "adapter.envelope";
     public const string ChannelMessageAccepted = "channel.message.accepted";
+    public const string ClockPulse = "clock.pulse";
 }
 public static class ScriptCapabilities
 {
     public const string SelfAdapterSend = "self.adapter.send";
     public const string ChannelAccept = "channel.accept";
     public const string ChannelReply = "channel.bound-send";
+    public const string SelfAdapterPoll = "self.adapter.poll";
 }

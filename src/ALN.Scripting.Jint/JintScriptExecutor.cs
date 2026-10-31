@@ -37,18 +37,23 @@ public sealed class JintScriptExecutor(IExecutionJournal journal) : IScriptExecu
         {
             var engine = BuildEngine(package, cancellationToken);
             engine.SetValue("__eventJson", routedEvent.PayloadJson);
+            engine.SetValue("__eventNameJson", JsonSerializer.Serialize(routedEvent.Name));
             engine.SetValue("__sendSelf", new Func<string, Task<string>>(json => api.SendSelfAsync(json, cancellationToken)));
+            engine.SetValue("__pollSelf", new Func<Task<string>>(() => api.PollSelfAsync(cancellationToken)));
             engine.SetValue("__channelAccept", new Func<Task<string>>(() => api.AcceptIntoChannelAsync(cancellationToken)));
             engine.SetValue("__channelReply", new Func<string, Task<string>>(json => api.ReplyThroughChannelAsync(json, cancellationToken)));
             var source = $$"""
                 (async function() {
                   const event = JSON.parse(__eventJson);
+                  const eventName = JSON.parse(__eventNameJson);
                   const sendSelf = __sendSelf;
+                  const pollSelf = __pollSelf;
                   const acceptChannel = __channelAccept;
                   const replyChannel = __channelReply;
                   const ctx = Object.freeze({
-                    self: Object.freeze({ adapter: Object.freeze({ send: (message) => sendSelf(JSON.stringify(message)) }) }),
-                    channel: Object.freeze({ accept: () => acceptChannel(), reply: (message) => replyChannel(JSON.stringify(message)) })
+                    self: Object.freeze({ adapter: Object.freeze({ send: (message) => sendSelf(JSON.stringify(message)), poll: () => pollSelf() }) }),
+                    channel: Object.freeze({ accept: () => acceptChannel(), reply: (message) => replyChannel(JSON.stringify(message)) }),
+                    eventName
                   });
                   {{package.Source}}
                   const handler = {{package.Manifest.EntryPoint}};

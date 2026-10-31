@@ -1,0 +1,15 @@
+{
+  "id": "aln.bundled.runtime",
+  "version": "1.0.0",
+  "entryAssembly": "ALN.BundledModules.dll",
+  "entryType": "ALN.BundledModules.DefaultModulesPlugin",
+  "provides": [
+    {
+      "typeId": "channel.logical",
+      "parentTypeId": "channel",
+      "isAbstract": false
+    }
+  ],
+  "dependencies": [],
+  "reloadPolicy": "none"
+}

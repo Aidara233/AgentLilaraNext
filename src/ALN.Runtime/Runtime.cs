@@ -19,27 +19,87 @@ public sealed class ExecutionJournal : IExecutionJournal
 
 public sealed record AdapterTypeDefinition(string Id, string? ParentId, bool IsAbstract);
 
-public sealed class AdapterTypeCatalog : IModuleTypeCatalog
+public sealed class AdapterTypeCatalog : IModuleTypeRegistry
 {
     private readonly Dictionary<string, AdapterTypeDefinition> _types = new(StringComparer.Ordinal)
     {
         ["adapter"] = new("adapter", null, true),
-        ["adapter.file"] = new("adapter.file", "adapter", false)
+        ["channel"] = new("channel", null, true),
+        ["clock"] = new("clock", null, true),
+        ["graph"] = new("graph", null, true)
     };
-    public bool TryGet(string id, out AdapterTypeDefinition definition) => _types.TryGetValue(id, out definition!);
-    public bool IsKnownAbstract(string typeId) => _types.TryGetValue(typeId, out var type) && type.IsAbstract;
-    public bool IsConcrete(string id) => _types.TryGetValue(id, out var type) && !type.IsAbstract;
+    private readonly Dictionary<string, HashSet<string>> _ownedTypes = new(StringComparer.Ordinal);
+    private readonly object _gate = new();
+
+    public bool TryGet(string id, out AdapterTypeDefinition definition)
+    { lock (_gate) return _types.TryGetValue(id, out definition!); }
+    public bool IsKnownAbstract(string typeId)
+    { lock (_gate) return _types.TryGetValue(typeId, out var type) && type.IsAbstract; }
+    public bool IsConcrete(string id)
+    { lock (_gate) return _types.TryGetValue(id, out var type) && !type.IsAbstract; }
     public bool IsAssignableTo(string concreteTypeId, string abstractTypeId)
     {
-        var current = concreteTypeId;
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        while (_types.TryGetValue(current, out var definition) && seen.Add(current))
+        lock (_gate)
         {
-            if (StringComparer.Ordinal.Equals(current, abstractTypeId)) return true;
-            if (definition.ParentId is null) return false;
-            current = definition.ParentId;
+            var current = concreteTypeId;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            while (_types.TryGetValue(current, out var definition) && seen.Add(current))
+            {
+                if (StringComparer.Ordinal.Equals(current, abstractTypeId)) return true;
+                if (definition.ParentId is null) return false;
+                current = definition.ParentId;
+            }
+            return false;
         }
-        return false;
+    }
+
+    public Result RegisterPackageTypes(string packageId, IReadOnlyList<ModuleTypeProvision> types)
+    {
+        if (string.IsNullOrWhiteSpace(packageId) || types is null || types.Any(t => t is null || string.IsNullOrWhiteSpace(t.TypeId)))
+            return Result.Failure(new(ErrorCode.Invalid, "Module type registration is incomplete."));
+        lock (_gate)
+        {
+            if (_ownedTypes.ContainsKey(packageId))
+                return Result.Failure(new(ErrorCode.Conflict, $"Package types are already registered: {packageId}"));
+            if (types.Select(t => t.TypeId).Distinct(StringComparer.Ordinal).Count() != types.Count ||
+                types.Any(t => _types.ContainsKey(t.TypeId)))
+                return Result.Failure(new(ErrorCode.Conflict, "Module type id is already registered."));
+
+            var candidate = new Dictionary<string, AdapterTypeDefinition>(_types, StringComparer.Ordinal);
+            foreach (var type in types) candidate.Add(type.TypeId, new(type.TypeId, type.ParentTypeId, type.IsAbstract));
+            foreach (var type in types)
+            {
+                if (type.ParentTypeId is not null && !candidate.ContainsKey(type.ParentTypeId))
+                    return Result.Failure(new(ErrorCode.Invalid, $"Parent module type is not registered: {type.ParentTypeId}"));
+                var seen = new HashSet<string>(StringComparer.Ordinal);
+                var current = type.TypeId;
+                while (candidate.TryGetValue(current, out var definition))
+                {
+                    if (!seen.Add(current)) return Result.Failure(new(ErrorCode.Invalid, $"Module type inheritance cycle at {current}."));
+                    if (definition.ParentId is null) break;
+                    current = definition.ParentId;
+                }
+            }
+
+            foreach (var type in types) _types.Add(type.TypeId, new(type.TypeId, type.ParentTypeId, type.IsAbstract));
+            _ownedTypes.Add(packageId, types.Select(t => t.TypeId).ToHashSet(StringComparer.Ordinal));
+            return Result.Success();
+        }
+    }
+
+    public Result RemovePackageTypes(string packageId)
+    {
+        lock (_gate)
+        {
+            if (!_ownedTypes.TryGetValue(packageId, out var owned)) return Result.Success();
+            var dependents = _types.Values.Where(t => t.ParentId is not null && owned.Contains(t.ParentId) && !owned.Contains(t.Id))
+                .Select(t => t.Id).ToArray();
+            if (dependents.Length > 0)
+                return Result.Failure(new(ErrorCode.Conflict, $"Module types still have registered children: {string.Join(", ", dependents)}"));
+            foreach (var id in owned) _types.Remove(id);
+            _ownedTypes.Remove(packageId);
+            return Result.Success();
+        }
     }
 }
 
@@ -48,14 +108,21 @@ public sealed class AdapterManager : IAdapterManager
     private readonly Dictionary<Address, IChatAdapter> _adapters = new();
     private readonly IModuleTypeCatalog _types;
     private readonly IInstanceBindings _bindings;
+    private readonly IAdapterFactoryRegistry? _factories;
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
 
-    public AdapterManager(IModuleTypeCatalog types, IInstanceBindings bindings)
+    public AdapterManager(IModuleTypeCatalog types, IInstanceBindings bindings, IAdapterFactoryRegistry? factories = null)
     {
         _types = types;
         _bindings = bindings;
+        _factories = factories;
     }
+
+    public ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, CancellationToken cancellationToken) =>
+        _factories is null
+            ? ValueTask.FromResult(Result<IChatAdapter>.Failure(new(ErrorCode.Unavailable, "No Adapter factory registry is configured.")))
+            : CreateCoreAsync(spec, s => _factories.Create(s.Address.TypeId, s), cancellationToken);
     public Result<IChatAdapter> Get(Address address)
     {
         lock (_gate)
@@ -66,7 +133,15 @@ public sealed class AdapterManager : IAdapterManager
     {
         lock (_gate) return _adapters.Values.Select(a => new AdapterInfo(a.Address, a.Descriptor, a.State)).ToArray();
     }
-    public async ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, Func<AdapterSpec, IChatAdapter> factory, CancellationToken cancellationToken)
+    public ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, Func<AdapterSpec, IChatAdapter> factory, CancellationToken cancellationToken) =>
+        CreateCoreAsync(spec, s =>
+        {
+            try { return Result<IChatAdapter>.Success(factory(s)); }
+            catch (Exception ex) { return Result<IChatAdapter>.Failure(new(ErrorCode.Internal, "Adapter factory failed.", ex.Message)); }
+        }, cancellationToken);
+
+    private async ValueTask<Result<IChatAdapter>> CreateCoreAsync(AdapterSpec spec,
+        Func<AdapterSpec, Result<IChatAdapter>> factory, CancellationToken cancellationToken)
     {
         if (spec.Address.Module != "adapter" || spec.Address.Kind is null || spec.Address.Instance is null || !_types.IsConcrete(spec.Address.TypeId))
             return Result<IChatAdapter>.Failure(new(ErrorCode.Invalid, "Only registered concrete Adapter types with an instance id can be created."));
@@ -79,7 +154,9 @@ public sealed class AdapterManager : IAdapterManager
                 if (_adapters.Values.Any(a => a.Descriptor.PlatformId == spec.Descriptor.PlatformId && a.Descriptor.AccountId == spec.Descriptor.AccountId))
                     return Result<IChatAdapter>.Failure(new(ErrorCode.Conflict, "Platform/account is already registered."));
             }
-            var adapter = factory(spec);
+            var created = factory(spec);
+            if (!created.Ok || created.Value is null) return Result<IChatAdapter>.Failure(created.Error ?? new(ErrorCode.Internal, "Adapter factory failed."));
+            var adapter = created.Value;
             if (adapter.Address != spec.Address || adapter.Descriptor != spec.Descriptor)
                 return Result<IChatAdapter>.Failure(new(ErrorCode.Invalid, "Factory output does not match its AdapterSpec."));
             lock (_gate) _adapters.Add(spec.Address, adapter);
@@ -121,6 +198,69 @@ public sealed class AdapterManager : IAdapterManager
         }
         finally { _lifecycle.Release(); }
     }
+    public async ValueTask<Result<IReadOnlyList<AdapterInfo>>> SnapshotByTypeAsync(string concreteTypeId, CancellationToken cancellationToken)
+    {
+        await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try { return Result<IReadOnlyList<AdapterInfo>>.Success(List().Where(a => a.Address.TypeId == concreteTypeId).ToArray()); }
+        finally { _lifecycle.Release(); }
+    }
+
+    public async ValueTask<Result> DestroyByTypeAsync(string concreteTypeId, CancellationToken cancellationToken)
+    {
+        await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var addresses = List().Where(a => a.Address.TypeId == concreteTypeId).Select(a => a.Address).ToArray();
+            foreach (var address in addresses)
+            {
+                var found = Get(address);
+                if (!found.Ok || found.Value is null) continue;
+                var detached = await _bindings.DetachAsync(address, cancellationToken).ConfigureAwait(false);
+                if (!detached.Ok) return detached;
+                try
+                {
+                    var stopped = await found.Value.StopAsync(cancellationToken).ConfigureAwait(false);
+                    if (!stopped.Ok)
+                    {
+                        await _bindings.AttachAsync(address, CancellationToken.None).ConfigureAwait(false);
+                        return stopped;
+                    }
+                    lock (_gate) _adapters.Remove(address);
+                }
+                catch
+                {
+                    await _bindings.AttachAsync(address, CancellationToken.None).ConfigureAwait(false);
+                    throw;
+                }
+            }
+            return Result.Success();
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) { return Result.Failure(new(ErrorCode.Internal, "Adapter type destruction failed.", ex.Message)); }
+        finally { _lifecycle.Release(); }
+    }
+
+    public async ValueTask<Result> ForceDestroyByTypeAsync(string concreteTypeId, CancellationToken cancellationToken)
+    {
+        await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var addresses = List().Where(a => a.Address.TypeId == concreteTypeId).Select(a => a.Address).ToArray();
+            foreach (var address in addresses)
+            {
+                var detached = _bindings is IForceInstanceBindings forceBindings
+                    ? await forceBindings.ForceDetachAsync(address, cancellationToken).ConfigureAwait(false)
+                    : await _bindings.DetachAsync(address, cancellationToken).ConfigureAwait(false);
+                if (!detached.Ok) return detached;
+                lock (_gate) _adapters.Remove(address);
+            }
+            return Result.Success();
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) { return Result.Failure(new(ErrorCode.Internal, "Forced Adapter disconnection failed.", ex.Message)); }
+        finally { _lifecycle.Release(); }
+    }
+
     public async ValueTask<Result> DestroyAsync(Address address, CancellationToken cancellationToken)
     {
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -128,12 +268,24 @@ public sealed class AdapterManager : IAdapterManager
         {
             var found = Get(address);
             if (!found.Ok || found.Value is null) return Result.Failure(found.Error!);
-            var stopped = await found.Value.StopAsync(cancellationToken).ConfigureAwait(false);
-            if (!stopped.Ok) return stopped;
             var detached = await _bindings.DetachAsync(address, cancellationToken).ConfigureAwait(false);
             if (!detached.Ok) return detached;
-            lock (_gate) _adapters.Remove(address);
-            return Result.Success();
+            try
+            {
+                var stopped = await found.Value.StopAsync(cancellationToken).ConfigureAwait(false);
+                if (!stopped.Ok)
+                {
+                    await _bindings.AttachAsync(address, CancellationToken.None).ConfigureAwait(false);
+                    return stopped;
+                }
+                lock (_gate) _adapters.Remove(address);
+                return Result.Success();
+            }
+            catch
+            {
+                await _bindings.AttachAsync(address, CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex) { return Result.Failure(new(ErrorCode.Internal, "Adapter destruction failed.", ex.Message)); }
@@ -152,14 +304,13 @@ public sealed class EventQueue : IEventSink
     }
     public ValueTask<Result> PublishAsync(RoutedEvent routedEvent, CancellationToken cancellationToken)
     {
-        if (routedEvent is null || string.IsNullOrWhiteSpace(routedEvent.Name) || !routedEvent.Source.IsInstance || string.IsNullOrWhiteSpace(routedEvent.PayloadJson))
+        cancellationToken.ThrowIfCancellationRequested();
+        if (routedEvent is null || string.IsNullOrWhiteSpace(routedEvent.Name) || !routedEvent.Source.IsInstance ||
+            string.IsNullOrWhiteSpace(routedEvent.PayloadJson) || routedEvent.Target is { IsInstance: false })
             return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, "Invalid routed event.")));
-        return EnqueueCoreAsync(routedEvent, cancellationToken);
-    }
-    private async ValueTask<Result> EnqueueCoreAsync(RoutedEvent routedEvent, CancellationToken ct)
-    {
-        try { await _queue.Writer.WriteAsync(routedEvent, ct).ConfigureAwait(false); return Result.Success(); }
-        catch (ChannelClosedException ex) { return Result.Failure(new(ErrorCode.Unavailable, "Event queue is closed.", ex.Message)); }
+        if (!_queue.Writer.TryWrite(routedEvent))
+            return ValueTask.FromResult(Result.Failure(new(ErrorCode.Unavailable, "Event queue is full or closed.", Retryable: true)));
+        return ValueTask.FromResult(Result.Success());
     }
     public IAsyncEnumerable<RoutedEvent> ReadAllAsync(CancellationToken ct) => _queue.Reader.ReadAllAsync(ct);
     public void Complete() => _queue.Writer.TryComplete();

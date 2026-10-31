@@ -32,7 +32,7 @@ public sealed record SendResult(bool Sent, string AttemptId, string? Detail = nu
 public sealed record AdapterInfo(Address Address, AdapterDescriptor Descriptor, AdapterState State);
 public sealed record AdapterSpec(Address Address, AdapterDescriptor Descriptor);
 
-public sealed record RoutedEvent(string Name, Address Source, Guid EventId, string PayloadJson);
+public sealed record RoutedEvent(string Name, Address Source, Guid EventId, string PayloadJson, Address? Target = null);
 public interface IEventSink
 {
     // Acceptance into a bounded queue, NOT durable processing acknowledgment.
@@ -51,6 +51,20 @@ public interface IChatAdapter : IInboundAdapter, IOutboundAdapter
     ValueTask<Result> StartAsync(CancellationToken cancellationToken);
     ValueTask<Result> StopAsync(CancellationToken cancellationToken);
 }
+public interface IAdapterFactory
+{
+    string TypeId { get; }
+    IChatAdapter Create(AdapterSpec spec);
+}
+
+public interface IAdapterFactoryRegistry : IModulePackageResourceRegistry
+{
+    Result Register(string packageId, IAdapterFactory factory);
+    Result BeginDrain(string packageId);
+    Result Resume(string packageId);
+    Result<IChatAdapter> Create(string typeId, AdapterSpec spec);
+}
+
 public interface IModuleTypeCatalog
 {
     bool IsKnownAbstract(string typeId);
@@ -61,7 +75,11 @@ public interface IAdapterManager
 {
     Result<IChatAdapter> Get(Address address);
     IReadOnlyList<AdapterInfo> List();
+    ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, CancellationToken cancellationToken);
     ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, Func<AdapterSpec, IChatAdapter> factory, CancellationToken cancellationToken);
+    ValueTask<Result<IReadOnlyList<AdapterInfo>>> SnapshotByTypeAsync(string concreteTypeId, CancellationToken cancellationToken);
+    ValueTask<Result> DestroyByTypeAsync(string concreteTypeId, CancellationToken cancellationToken);
+    ValueTask<Result> ForceDestroyByTypeAsync(string concreteTypeId, CancellationToken cancellationToken);
     ValueTask<Result> StartAsync(Address address, CancellationToken cancellationToken);
     ValueTask<Result> StopAsync(Address address, CancellationToken cancellationToken);
     ValueTask<Result> DestroyAsync(Address address, CancellationToken cancellationToken);
@@ -70,6 +88,14 @@ public interface IInstanceBindings
 {
     ValueTask<Result> AttachAsync(Address target, CancellationToken cancellationToken);
     ValueTask<Result> DetachAsync(Address target, CancellationToken cancellationToken);
+}
+public interface IForceInstanceBindings : IInstanceBindings
+{
+    ValueTask<Result> ForceDetachAsync(Address target, CancellationToken cancellationToken);
+}
+public interface IInstanceBindingsProxy : IForceInstanceBindings
+{
+    void Bind(IInstanceBindings inner);
 }
 
 // File IO is supplied by the host. Adapters cannot choose arbitrary OS paths.

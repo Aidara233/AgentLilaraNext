@@ -1,7 +1,9 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/ALN.Adapter.File/ALN.Adapter.File.csproj" />
+    <Project Path="src/ALN.BundledModules/ALN.BundledModules.csproj" />
     <Project Path="src/ALN.Channel/ALN.Channel.csproj" />
+    <Project Path="src/ALN.Clock/ALN.Clock.csproj" />
     <Project Path="src/ALN.Contracts/ALN.Contracts.csproj" />
     <Project Path="src/ALN.Graph.Contracts/ALN.Graph.Contracts.csproj" />
     <Project Path="src/ALN.Graph/ALN.Graph.csproj" />

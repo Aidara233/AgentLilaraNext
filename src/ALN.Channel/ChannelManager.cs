@@ -108,11 +108,25 @@ public sealed class ChannelManager : IChannelManager
             lock (_gate)
             {
                 if (!_channels.TryGetValue(address, out channel!)) return Result.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
-                channel.Running = false;
+                channel.Draining = true;
             }
-            var detached = await _bindings.DetachAsync(address, cancellationToken).ConfigureAwait(false);
-            if (!detached.Ok) return detached;
-            lock (_gate) _channels.Remove(address);
+            Result detached;
+            try { detached = await _bindings.DetachAsync(address, cancellationToken).ConfigureAwait(false); }
+            catch
+            {
+                lock (_gate) channel.Draining = false;
+                throw;
+            }
+            if (!detached.Ok)
+            {
+                lock (_gate) channel.Draining = false;
+                return detached;
+            }
+            lock (_gate)
+            {
+                channel.Running = false;
+                _channels.Remove(address);
+            }
             return Result.Success();
         }
         catch (OperationCanceledException) { throw; }
@@ -124,7 +138,7 @@ public sealed class ChannelManager : IChannelManager
     {
         ChannelInstance[] matched;
         lock (_gate)
-            matched = _channels.Values.Where(c => c.Running && c.Bindings.Any(b =>
+            matched = _channels.Values.Where(c => c.Running && !c.Draining && c.Bindings.Any(b =>
                 b.Adapter == envelope.Adapter && b.PlatformConversationId == envelope.PlatformConversationId)).ToArray();
         var accepted = 0;
         foreach (var channel in matched)
@@ -150,14 +164,7 @@ public sealed class ChannelManager : IChannelManager
         public string Name { get; } = spec.Name;
         public IReadOnlyList<ChannelBinding> Bindings { get; } = Array.AsReadOnly(spec.Bindings.ToArray());
         public bool Running { get; set; }
+        public bool Draining { get; set; }
         public ChannelInfo ToInfo() => new(Address, Name, Bindings, Running);
     }
-}
-
-public sealed class ChannelTypeCatalog(IModuleTypeCatalog inner) : IModuleTypeCatalog
-{
-    public bool IsKnownAbstract(string typeId) => typeId == "channel" || inner.IsKnownAbstract(typeId);
-    public bool IsConcrete(string typeId) => typeId == "channel.logical" || inner.IsConcrete(typeId);
-    public bool IsAssignableTo(string concreteTypeId, string abstractTypeId) =>
-        concreteTypeId == "channel.logical" && abstractTypeId == "channel" || inner.IsAssignableTo(concreteTypeId, abstractTypeId);
 }

@@ -10,21 +10,25 @@ namespace ALN.Graph;
 public sealed class GraphManager : IGraphRuntime
 {
     private static readonly HashSet<string> AllowedCapabilities = new(StringComparer.Ordinal)
-    { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelReply };
+    { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelReply };
     private readonly IAdapterManager _adapters;
     private readonly IChannelManager _channels;
+    private readonly IClockManager _clock;
     private readonly IModuleTypeCatalog _types;
     private readonly IScriptExecutor _executor;
     private readonly IAuditSink _audit;
     private readonly Dictionary<string, ScriptPackage> _packages = new(StringComparer.Ordinal);
     private readonly List<MountedScript> _mounted = new();
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly HashSet<Address> _drainingTargets = new();
+    private readonly Dictionary<Address, int> _activeDispatches = new();
+    private readonly Dictionary<Address, TaskCompletionSource> _dispatchDrained = new();
     private bool _loaded;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    public GraphManager(IAdapterManager adapters, IChannelManager channels, IModuleTypeCatalog types,
+    public GraphManager(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IModuleTypeCatalog types,
         IScriptExecutor executor, IAuditSink audit)
-    { _adapters = adapters; _channels = channels; _types = types; _executor = executor; _audit = audit; }
+    { _adapters = adapters; _channels = channels; _clock = clock; _types = types; _executor = executor; _audit = audit; }
 
     public IReadOnlyList<MountedScript> Mounted
     { get { _gate.Wait(); try { return _mounted.ToArray(); } finally { _gate.Release(); } } }
@@ -38,7 +42,7 @@ public sealed class GraphManager : IGraphRuntime
             var m = package.Manifest;
             if (string.IsNullOrWhiteSpace(m.Id) || !candidate.TryAdd(m.Id, package) || m.Version < 1 ||
                 string.IsNullOrWhiteSpace(m.TargetType) || !_types.IsKnownAbstract(m.TargetType) || m.Events is null || m.Events.Length == 0 ||
-                m.Events.Any(e => e is not (EventNames.AdapterEnvelope or EventNames.ChannelMessageAccepted)) || string.IsNullOrWhiteSpace(m.EntryPoint) ||
+                m.Events.Any(e => e is not (EventNames.AdapterEnvelope or EventNames.ChannelMessageAccepted or EventNames.ClockPulse)) || string.IsNullOrWhiteSpace(m.EntryPoint) ||
                 m.MaxStatements is < 1 or > 1_000_000 || m.TimeoutMilliseconds is < 1 or > 60_000 ||
                 m.MemoryLimitBytes is < 1_048_576 or > 268_435_456)
                 return Result.Failure(new(ErrorCode.Invalid, $"Invalid script manifest: {m.Id}"));
@@ -78,6 +82,7 @@ public sealed class GraphManager : IGraphRuntime
             if (!_loaded) return Result.Failure(new(ErrorCode.Unavailable, "Graph scripts are not loaded."));
             if (!_types.IsConcrete(target.TypeId)) return Result.Failure(new(ErrorCode.Invalid, "Mount target must be a concrete module instance."));
             if (!TargetExists(target)) return Result.Failure(new(ErrorCode.Invalid, $"Mount target not found: {target}"));
+            _drainingTargets.Remove(target);
             foreach (var package in _packages.Values.Where(p => p.Manifest.Mount == MountMode.Default && IsCompatible(p.Manifest.TargetType, target)))
                 if (!_mounted.Any(m => m.Package.Manifest.Id == package.Manifest.Id && m.Target == target)) _mounted.Add(new(package, target));
             return Result.Success();
@@ -86,7 +91,55 @@ public sealed class GraphManager : IGraphRuntime
     }
 
     public async ValueTask<Result> DetachAsync(Address target, CancellationToken cancellationToken)
-    { await _gate.WaitAsync(cancellationToken).ConfigureAwait(false); try { _mounted.RemoveAll(m => m.Target == target); return Result.Success(); } finally { _gate.Release(); } }
+    {
+        Task? drained = null;
+        List<MountedScript> removed;
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            _drainingTargets.Add(target);
+            removed = _mounted.Where(m => m.Target == target).ToList();
+            _mounted.RemoveAll(m => m.Target == target);
+            if (_activeDispatches.TryGetValue(target, out var active) && active > 0)
+            {
+                if (!_dispatchDrained.TryGetValue(target, out var completion))
+                    _dispatchDrained.Add(target, completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+                drained = completion.Task;
+            }
+        }
+        finally { _gate.Release(); }
+
+        if (drained is not null)
+        {
+            try { await drained.WaitAsync(cancellationToken).ConfigureAwait(false); }
+            catch
+            {
+                await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+                try
+                {
+                    _drainingTargets.Remove(target);
+                    foreach (var mount in removed)
+                        if (!_mounted.Any(existing => existing.Package.Manifest.Id == mount.Package.Manifest.Id && existing.Target == target))
+                            _mounted.Add(mount);
+                }
+                finally { _gate.Release(); }
+                throw;
+            }
+        }
+        return Result.Success();
+    }
+
+    public async ValueTask<Result> ForceDetachAsync(Address target, CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            _drainingTargets.Add(target);
+            _mounted.RemoveAll(m => m.Target == target);
+            return Result.Success();
+        }
+        finally { _gate.Release(); }
+    }
 
     public async ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken cancellationToken)
     {
@@ -95,6 +148,7 @@ public sealed class GraphManager : IGraphRuntime
         {
             if (!_packages.TryGetValue(scriptId, out var package)) return Result.Failure(new(ErrorCode.Invalid, $"Script not found: {scriptId}"));
             if (package.Manifest.Mount != MountMode.Manual) return Result.Failure(new(ErrorCode.Denied, "Default scripts are mounted by instance lifecycle."));
+            if (_drainingTargets.Contains(target)) return Result.Failure(new(ErrorCode.Unavailable, "Manual mount target is draining.", Retryable: true));
             if (!IsCompatible(package.Manifest.TargetType, target) || !TargetExists(target)) return Result.Failure(new(ErrorCode.Invalid, "Manual mount target is absent or incompatible."));
             if (_mounted.Any(m => m.Package.Manifest.Id == scriptId && m.Target == target)) return Result.Failure(new(ErrorCode.Conflict, "Script is already mounted."));
             _mounted.Add(new(package, target)); return Result.Success();
@@ -115,27 +169,68 @@ public sealed class GraphManager : IGraphRuntime
 
     public async ValueTask<Result> DispatchAsync(RoutedEvent routedEvent, CancellationToken cancellationToken)
     {
-        MountedScript[] handlers;
-        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try { handlers = _mounted.Where(m => m.Target == routedEvent.Source && m.Package.Manifest.Events.Contains(routedEvent.Name, StringComparer.Ordinal)).OrderBy(m => m.Package.Manifest.Id, StringComparer.Ordinal).ToArray(); }
-        finally { _gate.Release(); }
-        Error? firstFailure = null;
-        foreach (var mount in handlers)
+        var target = routedEvent.Target ?? routedEvent.Source;
+        ClockPulse? clockPulse = null;
+        if (routedEvent.Name == EventNames.ClockPulse && routedEvent.Source == _clock.Address && routedEvent.Target is not null)
         {
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            deadline.CancelAfter(TimeSpan.FromMilliseconds(mount.Package.Manifest.TimeoutMilliseconds));
-            var api = new ScriptApi(_adapters, _channels, _audit, mount, routedEvent, deadline.Token);
-            var result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
-            if (!result.Ok) firstFailure ??= result.Error;
+            try { clockPulse = JsonSerializer.Deserialize<ClockPulse>(routedEvent.PayloadJson, JsonOptions); }
+            catch (JsonException) { }
         }
-        return firstFailure is null ? Result.Success() : Result.Failure(firstFailure);
+        var dispatchEntered = false;
+        try
+        {
+            MountedScript[] handlers;
+            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (_drainingTargets.Contains(target))
+                    return Result.Failure(new(ErrorCode.Unavailable, $"Graph target is draining: {target}", Retryable: true));
+                _activeDispatches[target] = _activeDispatches.GetValueOrDefault(target) + 1;
+                dispatchEntered = true;
+                handlers = _mounted.Where(m => m.Target == target && m.Package.Manifest.Events.Contains(routedEvent.Name, StringComparer.Ordinal)).OrderBy(m => m.Package.Manifest.Id, StringComparer.Ordinal).ToArray();
+            }
+            finally { _gate.Release(); }
+            Error? firstFailure = null;
+            foreach (var mount in handlers)
+            {
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                deadline.CancelAfter(TimeSpan.FromMilliseconds(mount.Package.Manifest.TimeoutMilliseconds));
+                var api = new ScriptApi(_adapters, _channels, _clock, _audit, mount, routedEvent, deadline.Token);
+                var result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
+                if (!result.Ok) firstFailure ??= result.Error;
+            }
+            return firstFailure is null ? Result.Success() : Result.Failure(firstFailure);
+        }
+        finally
+        {
+            if (dispatchEntered) await EndDispatchAsync(target).ConfigureAwait(false);
+            if (clockPulse is not null && routedEvent.Target is { } clockTarget)
+                await _clock.AcknowledgeAsync(clockPulse.SubscriptionId, clockTarget, routedEvent.EventId, CancellationToken.None).ConfigureAwait(false);
+        }
+    }
+
+    private async ValueTask EndDispatchAsync(Address target)
+    {
+        await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            if (!_activeDispatches.TryGetValue(target, out var active)) return;
+            if (active > 1)
+            {
+                _activeDispatches[target] = active - 1;
+                return;
+            }
+            _activeDispatches.Remove(target);
+            if (_dispatchDrained.Remove(target, out var completion)) completion.TrySetResult();
+        }
+        finally { _gate.Release(); }
     }
 
     private bool IsCompatible(string targetType, Address target) => _types.IsAssignableTo(target.TypeId, targetType);
     private bool TargetExists(Address target) => target.Module switch
     { "adapter" => _adapters.Get(target).Ok, "channel" => _channels.Get(target).Ok, _ => false };
 
-    private sealed class ScriptApi(IAdapterManager adapters, IChannelManager channels, IAuditSink audit,
+    private sealed class ScriptApi(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IAuditSink audit,
         MountedScript mount, RoutedEvent current, CancellationToken ct) : IScriptApi
     {
         public async Task<string> SendSelfAsync(string json, CancellationToken cancellationToken)
@@ -177,6 +272,24 @@ public sealed class GraphManager : IGraphRuntime
                 message.PlatformConversationId != binding.PlatformConversationId)
                 await DenyAsync(ScriptCapabilities.ChannelReply, "Reply destination differs from Channel binding.", cancellationToken).ConfigureAwait(false);
             return await SendAsync(current.EventId, binding.Adapter, message, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task<string> PollSelfAsync(CancellationToken cancellationToken)
+        {
+            await RequireCapabilityAsync(ScriptCapabilities.SelfAdapterPoll, cancellationToken).ConfigureAwait(false);
+            if (current.Name != EventNames.ClockPulse || current.Source != clock.Address || current.Target != mount.Target)
+                await DenyAsync(ScriptCapabilities.SelfAdapterPoll, "Clock pulse is not addressed to this Adapter.", cancellationToken).ConfigureAwait(false);
+            var pulse = Parse<ClockPulse>(current.PayloadJson);
+            if (!clock.IsRegistered(pulse.SubscriptionId, mount.Target))
+                return JsonSerializer.Serialize(new { polled = false, stale = true }, JsonOptions);
+            var found = adapters.Get(mount.Target);
+            if (!found.Ok || found.Value is not IPollingAdapter poller)
+                throw new InvalidOperationException("Mounted Adapter does not expose a polling endpoint.");
+            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                mount.Target, ScriptCapabilities.SelfAdapterPoll, "allowed"), cancellationToken).ConfigureAwait(false);
+            var polled = await poller.PollOnceAsync(cancellationToken).ConfigureAwait(false);
+            if (!polled.Ok) throw new InvalidOperationException(polled.Error?.Message ?? "Adapter poll failed.");
+            return JsonSerializer.Serialize(new { polled = true, accepted = polled.Value }, JsonOptions);
         }
 
         private async ValueTask RequireCapabilityAsync(string capability, CancellationToken cancellationToken)

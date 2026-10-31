@@ -18,6 +18,7 @@ public sealed class GraphIntegrationTests : IDisposable
     private readonly AdapterTypeCatalog _adapterTypes = new();
     private readonly IModuleTypeCatalog _types;
     private readonly EventQueue _events = new(32);
+    private readonly ALN.Clock.ClockSource _clock;
     private readonly GraphBindingProxy _bindings = new();
     private readonly AdapterManager _adapters;
     private readonly ChannelManager _channels;
@@ -28,15 +29,19 @@ public sealed class GraphIntegrationTests : IDisposable
 
     public GraphIntegrationTests()
     {
-        Directory.CreateDirectory(_root);
+        _events = new(32);
+        _clock = new ALN.Clock.ClockSource(_events);
+        _bindings = new();
         _audit = new JsonlAuditSink(Path.Combine(_root, "audit", "test.jsonl"));
-        _types = new ChannelTypeCatalog(_adapterTypes);
+        Assert.True(_adapterTypes.RegisterPackageTypes("test.adapter.file", [new("adapter.file", "adapter")]).Ok);
+        Assert.True(_adapterTypes.RegisterPackageTypes("test.channel", [new("channel.logical", "channel")]).Ok);
+        _types = _adapterTypes;
         _adapters = new AdapterManager(_types, _bindings);
         _channels = new ChannelManager(_adapters, _events, _bindings);
-        _graph = new GraphManager(_adapters, _channels, _types, new JintScriptExecutor(_journal), _audit);
+        _graph = new GraphManager(_adapters, _channels, _clock, _types, new JintScriptExecutor(_journal), _audit);
         _bindings.Bind(_graph);
         _mailbox = new FileMailbox(Path.Combine(_root, "adapters", "test-1"));
-        _adapter = new FileAdapter(new(_adapterAddress, new("file", "test-account", AdapterDirection.Both)), _mailbox, _events);
+        _adapter = new FileAdapter(new(_adapterAddress, new("file", "test-account", AdapterDirection.Both)), _mailbox, _events, _clock);
     }
 
     public void Dispose()
@@ -58,7 +63,8 @@ public sealed class GraphIntegrationTests : IDisposable
 
         await WriteInputAsync("chat-1", "one");
         await WriteInputAsync("chat-2", "two");
-        Assert.Equal(2, (await _adapter.PollOnceAsync()).Value);
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DispatchOneAsync();
         await DispatchOneAsync();
         await DispatchOneAsync();
         await DispatchOneAsync();
@@ -69,7 +75,7 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.Equal("one", ReadOutbound(outOne).Text);
         Assert.Equal("two", ReadOutbound(outTwo).Text);
         Assert.Equal(2, _channels.List().Count);
-        Assert.Equal(4, _journal.Snapshot().Count(r => r.Succeeded));
+        Assert.Equal(5, _journal.Snapshot().Count(r => r.Succeeded));
     }
 
     [Fact]
@@ -82,10 +88,11 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.False(duplicate.Ok);
         await _adapters.StartAsync(_adapterAddress, default);
         await WriteInputAsync("chat-3", "nobody owns this room");
-        Assert.Equal(1, (await _adapter.PollOnceAsync()).Value);
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DispatchOneAsync();
         await DispatchOneAsync();
         Assert.Empty(Directory.GetFiles(Path.Combine(_mailbox.Root, "outbox"), "*.json", SearchOption.AllDirectories));
-        Assert.Single(_journal.Snapshot());
+        Assert.Equal(2, _journal.Snapshot().Count);
     }
 
     [Fact]
@@ -98,7 +105,8 @@ public sealed class GraphIntegrationTests : IDisposable
         await AddChannelAsync(new("channel", "logical", "chat-1"), "chat-1");
         await _adapters.StartAsync(_adapterAddress, default);
         await WriteInputAsync("chat-1", "restricted");
-        await _adapter.PollOnceAsync();
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DispatchOneAsync();
         await DispatchOneAsync();
         var replyResult = await DispatchOneResultAsync();
         Assert.False(replyResult.Ok);
@@ -135,6 +143,9 @@ public sealed class GraphIntegrationTests : IDisposable
             JsonSerializer.Serialize(new { text, messageId = Guid.NewGuid().ToString("N") }));
     }
 
+    private async Task<Result<int>> PulseAdapterAsync() =>
+        await _clock.PulseDueAsync(DateTimeOffset.UtcNow.AddSeconds(1), default);
+
     private async Task DispatchOneAsync()
     {
         var result = await DispatchOneResultAsync();
@@ -149,9 +160,9 @@ public sealed class GraphIntegrationTests : IDisposable
     }
 
     private ScriptPackage AdapterIntake() => new(
-        new("adapter.channel-intake", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
-            [ScriptCapabilities.ChannelAccept], TrustDomain.Builtin),
-        "async function onEvent(event, ctx) { await ctx.channel.accept(); }");
+        new("adapter.channel-intake", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope, EventNames.ClockPulse], "onEvent",
+            [ScriptCapabilities.ChannelAccept, ScriptCapabilities.SelfAdapterPoll], TrustDomain.Builtin),
+        "async function onEvent(event, ctx) { if (ctx.eventName === 'clock.pulse') { await ctx.self.adapter.poll(); return; } await ctx.channel.accept(); }");
 
     private ScriptPackage ChannelReply() => new(
         new("channel.bound-reply", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",

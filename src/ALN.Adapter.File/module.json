@@ -1,0 +1,21 @@
+{
+  "id": "aln.adapter.file",
+  "version": "1.0.0",
+  "entryAssembly": "ALN.Adapter.File.dll",
+  "entryType": "ALN.Adapter.File.FileAdapterModule",
+  "provides": [
+    {
+      "typeId": "adapter.file",
+      "parentTypeId": "adapter",
+      "isAbstract": false
+    }
+  ],
+  "dependencies": [
+    {
+      "id": "aln.bundled.runtime",
+      "versionRange": "*",
+      "optional": false
+    }
+  ],
+  "reloadPolicy": "replace"
+}

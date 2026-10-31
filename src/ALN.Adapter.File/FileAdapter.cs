@@ -17,7 +17,7 @@ public abstract class AdapterBase : IChatAdapter
     public AdapterDescriptor Descriptor { get; }
     public AdapterState State => (AdapterState)Volatile.Read(ref _state);
 
-    public ValueTask<Result> StartAsync(CancellationToken cancellationToken)
+    public virtual ValueTask<Result> StartAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         while (true)
@@ -32,7 +32,7 @@ public abstract class AdapterBase : IChatAdapter
         }
     }
 
-    public ValueTask<Result> StopAsync(CancellationToken cancellationToken)
+    public virtual ValueTask<Result> StopAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         while (true)
@@ -51,23 +51,67 @@ public abstract class AdapterBase : IChatAdapter
     public abstract ValueTask<Result<SendResult>> SendAsync(OutboundMessage message, CancellationToken cancellationToken);
 }
 
-public sealed class FileAdapter : AdapterBase
+public sealed class FileAdapter : AdapterBase, IPollingAdapter
 {
     private readonly IFileMailbox _mailbox;
     private readonly IEventSink _sink;
+    private readonly IClockManager _clock;
+    private readonly SemaphoreSlim _pollGate = new(1, 1);
+    private Guid? _clockSubscriptionId;
 
-    public FileAdapter(AdapterSpec spec, IFileMailbox mailbox, IEventSink sink)
+    public FileAdapter(AdapterSpec spec, IFileMailbox mailbox, IEventSink sink, IClockManager clock)
         : base(spec.Address, spec.Descriptor)
     {
         _mailbox = mailbox ?? throw new ArgumentNullException(nameof(mailbox));
         _sink = sink ?? throw new ArgumentNullException(nameof(sink));
+        _clock = clock ?? throw new ArgumentNullException(nameof(clock));
+    }
+
+    public TimeSpan PollInterval { get; set; } = TimeSpan.FromMilliseconds(200);
+
+    public override async ValueTask<Result> StartAsync(CancellationToken cancellationToken)
+    {
+        var started = await base.StartAsync(cancellationToken).ConfigureAwait(false);
+        if (!started.Ok) return started;
+        if (_clockSubscriptionId.HasValue) return Result.Success();
+        var registration = await _clock.RegisterAsync(Address, PollInterval, cancellationToken).ConfigureAwait(false);
+        if (!registration.Ok)
+        {
+            await base.StopAsync(CancellationToken.None).ConfigureAwait(false);
+            return Result.Failure(registration.Error ?? new(ErrorCode.Internal, "Clock registration failed."));
+        }
+        _clockSubscriptionId = registration.Value;
+        return Result.Success();
+    }
+
+    public override async ValueTask<Result> StopAsync(CancellationToken cancellationToken)
+    {
+        if (_clockSubscriptionId is { } subscriptionId)
+        {
+            var unregistered = await _clock.UnregisterAsync(subscriptionId, Address, cancellationToken).ConfigureAwait(false);
+            if (!unregistered.Ok) return unregistered;
+            _clockSubscriptionId = null;
+        }
+        await _pollGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try { return await base.StopAsync(cancellationToken).ConfigureAwait(false); }
+        finally { _pollGate.Release(); }
     }
 
     public async ValueTask<Result<int>> PollOnceAsync(CancellationToken cancellationToken = default)
     {
         if (!IsRunning)
             return Result<int>.Failure(new(ErrorCode.Unavailable, "FileAdapter is not running."));
+        await _pollGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!IsRunning) return Result<int>.Failure(new(ErrorCode.Unavailable, "FileAdapter is not running."));
+            return await PollCoreAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally { _pollGate.Release(); }
+    }
 
+    private async ValueTask<Result<int>> PollCoreAsync(CancellationToken cancellationToken)
+    {
         IReadOnlyList<MailboxInput> inputs;
         try { inputs = await _mailbox.ReadPendingAsync(cancellationToken).ConfigureAwait(false); }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }

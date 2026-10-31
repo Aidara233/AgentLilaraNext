@@ -21,7 +21,10 @@
 | **能力 + 审计** | **界**（唯一碰 OS 的地方） | host（极小） | 改版本 |
 
 ```
-平台/文件夹 ⇄ Adapter ──adapter.envelope──▶ RoutedEvent 队列 ──▶ Graph intake 脚本
+ClockSource ──clock.pulse──▶ RoutedEvent 队列 ──target=Adapter──▶ Graph poll script ──▶ FileAdapter.PollOnce
+                                                                         │ adapter.envelope
+                                                                         ▼
+平台/文件夹 ⇄ Adapter ──adapter.envelope──▶ Graph intake 脚本
                                                                        │ ctx.channel.accept()
                                                                        ▼
                                                               ChannelManager 按绑定认领
@@ -32,7 +35,10 @@
                                                                        ▼
                                                      原 Adapter + 原 conversationId
 
-Host ──创建──▶ 全局唯一 Managers ──持有──▶ 各自模块实例
+Host / 核心装载器 ──装载──▶ 固定发布扩展与可插拔 DLL
+Runtime 核心 ──持有──▶ AdapterManager、事件队列、包注册表与卸载协调器
+固定发布扩展 ──提供──▶ ChannelManager、ClockSource、Graph/Jint
+可插拔包 ──提供──▶ Adapter 类型/工厂；由包清单声明依赖与卸载参与者
 ```
 
 **唯一的自我检验**：一条消息是否只能由它的 Adapter/conversation binding 认领；Channel 事件回送时，是否只能回到这条 binding？

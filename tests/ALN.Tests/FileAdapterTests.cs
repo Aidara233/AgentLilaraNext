@@ -135,7 +135,7 @@ public sealed class FileAdapterTests : IDisposable
     }
 
     private static FileAdapter NewAdapter(IFileMailbox mailbox, IEventSink sink) =>
-        new(new AdapterSpec(new Address("adapter", "file", "test"), new("file", "account", AdapterDirection.Both)), mailbox, sink);
+        new(new AdapterSpec(new Address("adapter", "file", "test"), new("file", "account", AdapterDirection.Both)), mailbox, sink, new ALN.Clock.ClockSource(sink));
 
     private sealed class RecordingSink(Result result) : IEventSink
     {
