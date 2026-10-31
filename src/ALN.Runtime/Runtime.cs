@@ -26,7 +26,8 @@ public sealed class AdapterTypeCatalog : IModuleTypeRegistry
         ["adapter"] = new("adapter", null, true),
         ["channel"] = new("channel", null, true),
         ["clock"] = new("clock", null, true),
-        ["graph"] = new("graph", null, true)
+        ["graph"] = new("graph", null, true),
+        ["model"] = new("model", null, true)
     };
     private readonly Dictionary<string, HashSet<string>> _ownedTypes = new(StringComparer.Ordinal);
     private readonly object _gate = new();

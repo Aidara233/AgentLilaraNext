@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ALN.Contracts;
+using ALN.Contracts.Models;
 using ALN.Graph.Contracts;
 
 namespace ALN.Graph;
@@ -10,13 +11,14 @@ namespace ALN.Graph;
 public sealed class GraphManager : IGraphRuntime
 {
     private static readonly HashSet<string> AllowedCapabilities = new(StringComparer.Ordinal)
-    { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelReply };
+    { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelReply, ScriptCapabilities.ModelComplete };
     private readonly IAdapterManager _adapters;
     private readonly IChannelManager _channels;
     private readonly IClockManager _clock;
     private readonly IModuleTypeCatalog _types;
     private readonly IScriptExecutor _executor;
     private readonly IAuditSink _audit;
+    private readonly IModelManager? _models;
     private readonly Dictionary<string, ScriptPackage> _packages = new(StringComparer.Ordinal);
     private readonly List<MountedScript> _mounted = new();
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -27,8 +29,8 @@ public sealed class GraphManager : IGraphRuntime
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     public GraphManager(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IModuleTypeCatalog types,
-        IScriptExecutor executor, IAuditSink audit)
-    { _adapters = adapters; _channels = channels; _clock = clock; _types = types; _executor = executor; _audit = audit; }
+        IScriptExecutor executor, IAuditSink audit, IModelManager? models = null)
+    { _adapters = adapters; _channels = channels; _clock = clock; _types = types; _executor = executor; _audit = audit; _models = models; }
 
     public IReadOnlyList<MountedScript> Mounted
     { get { _gate.Wait(); try { return _mounted.ToArray(); } finally { _gate.Release(); } } }
@@ -195,7 +197,7 @@ public sealed class GraphManager : IGraphRuntime
             {
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 deadline.CancelAfter(TimeSpan.FromMilliseconds(mount.Package.Manifest.TimeoutMilliseconds));
-                var api = new ScriptApi(_adapters, _channels, _clock, _audit, mount, routedEvent, deadline.Token);
+                var api = new ScriptApi(_adapters, _channels, _clock, _audit, _models, mount, routedEvent, deadline.Token);
                 var result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
                 if (!result.Ok) firstFailure ??= result.Error;
             }
@@ -231,8 +233,52 @@ public sealed class GraphManager : IGraphRuntime
     { "adapter" => _adapters.Get(target).Ok, "channel" => _channels.Get(target).Ok, _ => false };
 
     private sealed class ScriptApi(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IAuditSink audit,
-        MountedScript mount, RoutedEvent current, CancellationToken ct) : IScriptApi
+        IModelManager? models, MountedScript mount, RoutedEvent current, CancellationToken ct) : IScriptApi
     {
+        public async Task<string> CompleteModelAsync(string profileId, string requestJson, CancellationToken cancellationToken)
+        {
+            await RequireCapabilityAsync(ScriptCapabilities.ModelComplete, cancellationToken).ConfigureAwait(false);
+            if (models is null) throw new InvalidOperationException("Model manager is unavailable.");
+            var request = Parse<ModelRequest>(requestJson);
+            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                mount.Target, ScriptCapabilities.ModelComplete, "allowed", profileId), cancellationToken).ConfigureAwait(false);
+            var started = await models.CompleteAsync(profileId, request, cancellationToken).ConfigureAwait(false);
+            if (!started.Ok || started.Value is null)
+            {
+                await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                    mount.Target, ScriptCapabilities.ModelComplete, "failed", started.Error?.Message), cancellationToken).ConfigureAwait(false);
+                return JsonSerializer.Serialize(new { ok = false, error = started.Error, events = Array.Empty<object>() }, JsonOptions);
+            }
+
+            var events = new List<object>();
+            var terminalCount = 0;
+            var successful = true;
+            await foreach (var modelEvent in started.Value.WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
+                switch (modelEvent)
+                {
+                    case ThinkingDelta thinking: events.Add(new { type = "thinkingDelta", text = thinking.Text }); break;
+                    case TextDelta text: events.Add(new { type = "textDelta", text = text.Text }); break;
+                    case ToolCallDelta tool: events.Add(new { type = "toolCallDelta", tool.Index, tool.CallId, tool.Name, tool.ArgumentsJsonFragment }); break;
+                    case ModelCompleted completed:
+                        terminalCount++;
+                        events.Add(new { type = "completed", completed.Reason, completed.Usage, completed.ProviderResponseId });
+                        break;
+                    case ModelFailed failed:
+                        terminalCount++;
+                        successful = false;
+                        events.Add(new { type = "failed", error = failed.Error });
+                        break;
+                    default: throw new InvalidOperationException("Model provider emitted an unknown event type.");
+                }
+                if (terminalCount > 1) throw new InvalidOperationException("Model provider emitted more than one terminal event.");
+            }
+            if (terminalCount != 1) throw new InvalidOperationException("Model provider stream ended without exactly one terminal event.");
+            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                mount.Target, ScriptCapabilities.ModelComplete, successful ? "completed" : "failed", profileId), cancellationToken).ConfigureAwait(false);
+            return JsonSerializer.Serialize(new { ok = successful, events }, JsonOptions);
+        }
+
         public async Task<string> SendSelfAsync(string json, CancellationToken cancellationToken)
         {
             await RequireCapabilityAsync(ScriptCapabilities.SelfAdapterSend, cancellationToken).ConfigureAwait(false);

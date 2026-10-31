@@ -1,0 +1,13 @@
+{
+  "id": "model.smoke",
+  "version": 1,
+  "targetType": "adapter",
+  "mount": "default",
+  "events": ["adapter.envelope"],
+  "entryPoint": "onEvent",
+  "capabilities": ["model.complete", "self.adapter.send"],
+  "trustDomain": "builtin",
+  "maxStatements": 10000,
+  "timeoutMilliseconds": 60000,
+  "memoryLimitBytes": 16777216
+}

@@ -1,0 +1,16 @@
+{
+  "id": "aln.model.openai-chat",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "entryAssembly": "ALN.Model.OpenAIChat.dll",
+  "entryType": "ALN.Model.OpenAIChat.OpenAiChatModule",
+  "provides": [
+    {
+      "typeId": "model.openai-chat",
+      "parentTypeId": "model",
+      "isAbstract": false
+    }
+  ],
+  "dependencies": [],
+  "reloadPolicy": "replace"
+}

@@ -1,6 +1,7 @@
 using ALN.Channel;
 using ALN.Clock;
 using ALN.Contracts;
+using ALN.Contracts.Models;
 using ALN.Graph;
 using ALN.Graph.Contracts;
 using ALN.Scripting.Jint;
@@ -34,11 +35,12 @@ public sealed class DefaultModulesPlugin : IModulePlugin
             var journal = HostService<IExecutionJournal>(context);
             var audit = HostService<IAuditSink>(context);
             var paths = HostService<ModuleHostPaths>(context);
+            var models = HostService<IModelManager>(context);
 
             var clock = new ClockSource(events);
             var channels = new ChannelManager(adapters, events, bindings);
             var executor = new JintScriptExecutor(journal);
-            var graph = new GraphManager(adapters, channels, clock, types, executor, audit);
+            var graph = new GraphManager(adapters, channels, clock, types, executor, audit, models);
             if (bindings is IInstanceBindingsProxy proxy) proxy.Bind(graph);
 
             foreach (var (id, service) in new (string, object)[]
