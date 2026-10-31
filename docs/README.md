@@ -3,7 +3,7 @@
 > 这套文档是**设计**（该是什么样），不是**现状**（今天做到哪）。
 > 现状文档出现时，必须写 `最后更新：<commit>` 且运行代码仍为零时不许新建（`X-12`）。
 >
-> ALN 起点：`E:\Workspace\AgentLilaraNext`（无 Git 仓库）。
+> ALN 工作区：`E:\Workspace\AgentLilaraNext`。
 
 ---
 
@@ -21,17 +21,21 @@
 | **能力 + 审计** | **界**（唯一碰 OS 的地方） | host（极小） | 改版本 |
 
 ```
-平台 ⇄ Adapter ──event──▶ 单一 Driver 队列 ──▶ GraphManager 按挂载关系调度 Jint 脚本
-                                                   ├─ 条件 / 顺序 / 循环由脚本表达
-                                                   ├─ Manager facade 查询允许范围内的实例
-                                                   └─ 授权端口调用回到统一 Runtime
-                                                        ├─ Channel / Store / Model / Tool
-                                                        └─ 来源 Adapter 的 send
+平台/文件夹 ⇄ Adapter ──adapter.envelope──▶ RoutedEvent 队列 ──▶ Graph intake 脚本
+                                                                       │ ctx.channel.accept()
+                                                                       ▼
+                                                              ChannelManager 按绑定认领
+                                                                       │ channel.message.accepted
+                                                                       ▼
+                                                               Graph reply 脚本
+                                                                       │ ctx.channel.reply()
+                                                                       ▼
+                                                     原 Adapter + 原 conversationId
 
-Host ──创建──▶ 全局唯一 Managers ──持有──▶ 各自的模块实例
+Host ──创建──▶ 全局唯一 Managers ──持有──▶ 各自模块实例
 ```
 
-**唯一的自我检验**：脚本能否清楚说明事件如何处理、会调用哪些宿主能力；运行记录能否还原一次执行及其副作用？
+**唯一的自我检验**：一条消息是否只能由它的 Adapter/conversation binding 认领；Channel 事件回送时，是否只能回到这条 binding？
 
 ---
 
@@ -40,7 +44,7 @@ Host ──创建──▶ 全局唯一 Managers ──持有──▶ 各自的
 1. **模块实例的生命周期归其 Manager 所有**；模块实例不持有兄弟实例引用。
 2. **跨模块动作经统一 Runtime/Graph 能力入口**；脚本不能绕过端口解析、授权、取消与记录。
 3. **Jint 脚本是主要编排形式**：可表达条件与流程控制，调用范围由 Host 注入的接口和能力声明决定。
-4. **Manager 全局唯一且类型化**：各自持有本模块实例并提供查询；脚本通过受控 facade 查询，不拿任意 CLR 对象。
+4. **Manager 全局唯一且类型化**：各自持有本模块实例并提供查询；脚本只拿目标实例与事件绑定的受限 facade，不拿任意 CLR 对象或全局目录。
 5. **挂载目标声明抽象类型**；抽象不可实例化，具体子类继承父类型的可挂载关系。
 6. **默认挂载随实例生命周期自动建立/撤销**；启动时先加载与挂载，再开放 Adapter 入站。
 7. **程序与可变 DataRoot 分离**；所有模块收到同一解析后的根路径，不各自读取进程环境。
@@ -67,7 +71,7 @@ Host ──创建──▶ 全局唯一 Managers ──持有──▶ 各自的
 | [`10-接口契约.md`](10-接口契约.md) | **每个模块暴露什么**：三层 × 四类成员的接口形状、不变量、反向判据 | 草稿（逐模块推进：store / model / tool / logic / session / channel / adapter / graph / 后勤） |
 | [`11-上下文拼接.md`](11-上下文拼接.md) | **请求怎么拼**：四个类型的形状、九个收集点时序、合并排序、渲染纯函数、浮动放法、提示词写法约束 | 草稿（新章） |
 | [`12-工程最小闭环.md`](12-工程最小闭环.md) | **从哪段工程闭环开始**：Adapter + Graph 垂直切片、单线程 async 执行约束、启动/停机边界 | 早期工程路线草案，现由 13 细化 |
-| [`13-脚本编排与工程实施蓝图.md`](13-脚本编排与工程实施蓝图.md) | **如何把 Adapter + Jint Graph 落到 .NET 10 工程**：Manager、脚本契约、独立 DataRoot、项目树、生命周期与验收 | 工程实施蓝图草案 |
+| [`13-脚本编排与工程实施蓝图.md`](13-脚本编排与工程实施蓝图.md) | **Adapter + Channel 回环如何落到 .NET 10**：Manager、Jint 脚本、按群聊 DataRoot 子目录、双向挂载生命周期与多群验收 | 工程实施蓝图草案 |
 
 ---
 

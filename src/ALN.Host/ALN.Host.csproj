@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <ProjectReference Include="..\ALN.Contracts\ALN.Contracts.csproj" />
+    <ProjectReference Include="..\ALN.Channel\ALN.Channel.csproj" />
     <ProjectReference Include="..\ALN.Runtime\ALN.Runtime.csproj" />
     <ProjectReference Include="..\ALN.Graph.Contracts\ALN.Graph.Contracts.csproj" />
     <ProjectReference Include="..\ALN.Graph\ALN.Graph.csproj" />

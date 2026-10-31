@@ -1,0 +1,13 @@
+{
+  "id": "adapter.channel-intake",
+  "version": 1,
+  "targetType": "adapter",
+  "mount": "default",
+  "events": ["adapter.envelope"],
+  "entryPoint": "onEvent",
+  "capabilities": ["channel.accept"],
+  "trustDomain": "builtin",
+  "maxStatements": 10000,
+  "timeoutMilliseconds": 1000,
+  "memoryLimitBytes": 16777216
+}

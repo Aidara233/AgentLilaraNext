@@ -89,13 +89,15 @@ public sealed class FileAdapter : AdapterBase
                 }
                 else
                 {
-                    var conversation = root.TryGetProperty("platformConversationId", out var c) && c.ValueKind == JsonValueKind.String ? c.GetString() : null;
+                    var declaredConversation = root.TryGetProperty("platformConversationId", out var c) && c.ValueKind == JsonValueKind.String ? c.GetString() : null;
+                    var conversation = input.ConversationId;
                     var text = root.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String ? t.GetString() : null;
                     var messageId = root.TryGetProperty("messageId", out var m) && m.ValueKind == JsonValueKind.String ? m.GetString() : null;
-                    if (string.IsNullOrWhiteSpace(conversation)) validationError = "platformConversationId must be non-empty.";
+                    if (!string.IsNullOrWhiteSpace(declaredConversation) && !StringComparer.Ordinal.Equals(declaredConversation, conversation))
+                        validationError = "JSON conversation id must match its inbox directory.";
                     if (validationError is null && string.IsNullOrWhiteSpace(text)) validationError = "text must be non-empty and a string.";
                     if (validationError is null)
-                        envelope = new(Address, Descriptor.PlatformId, conversation!, messageId, text!, DateTimeOffset.UtcNow);
+                        envelope = new(Address, Descriptor.PlatformId, conversation, messageId, text!, DateTimeOffset.UtcNow);
                 }
             }
             catch (JsonException ex) { validationError = $"Invalid JSON: {ex.Message}"; }
@@ -105,7 +107,7 @@ public sealed class FileAdapter : AdapterBase
                 try
                 {
                     if (!IsRunning) return Result<int>.Failure(new(ErrorCode.Unavailable, "FileAdapter is not running."));
-                    await _mailbox.CompleteAsync(input.Token, false, validationError, cancellationToken).ConfigureAwait(false);
+                    await _mailbox.CompleteAsync(input.ConversationId, input.Token, false, validationError, cancellationToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
                 catch (Exception ex) { return Result<int>.Failure(new(ErrorCode.Internal, "Unable to record rejected input.", ex.Message, true)); }
@@ -113,12 +115,16 @@ public sealed class FileAdapter : AdapterBase
             }
 
             Result published;
-            try { published = await _sink.PublishAsync(envelope!, cancellationToken).ConfigureAwait(false); }
+            try
+            {
+                var payload = JsonSerializer.Serialize(envelope, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+                published = await _sink.PublishAsync(new RoutedEvent(EventNames.AdapterEnvelope, Address, envelope!.EventId, payload), cancellationToken).ConfigureAwait(false);
+            }
             catch (Exception ex) { return Result<int>.Failure(new(ErrorCode.Internal, "Event publication failed.", ex.Message, true)); }
             if (!published.Ok) continue;
             try
             {
-                await _mailbox.CompleteAsync(input.Token, true, null, cancellationToken).ConfigureAwait(false);
+                await _mailbox.CompleteAsync(input.ConversationId, input.Token, true, null, cancellationToken).ConfigureAwait(false);
                 accepted++;
             }
             catch (Exception ex) { return Result<int>.Failure(new(ErrorCode.Internal, "Unable to complete mailbox input.", ex.Message, true)); }

@@ -1,4 +1,3 @@
-using System.Text.Json.Nodes;
 using ALN.Contracts;
 
 namespace ALN.Graph.Contracts;
@@ -28,19 +27,21 @@ public interface IGraphRuntime : IInstanceBindings
     ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken cancellationToken);
     ValueTask<Result> UnmountAsync(string scriptId, Address target, CancellationToken cancellationToken);
     IReadOnlyList<MountedScript> Mounted { get; }
-    ValueTask<Result> DispatchAsync(string eventName, AdapterEnvelope envelope, CancellationToken cancellationToken);
+    ValueTask<Result> DispatchAsync(RoutedEvent routedEvent, CancellationToken cancellationToken);
 }
 
 public interface IScriptExecutor
 {
     ValueTask<Result> ValidateAsync(ScriptPackage package, CancellationToken cancellationToken);
-    ValueTask<Result> ExecuteAsync(ScriptPackage package, Address target, string eventName,
-        AdapterEnvelope envelope, IAdapterScriptApi adapter, CancellationToken cancellationToken);
+    ValueTask<Result> ExecuteAsync(ScriptPackage package, Address target, RoutedEvent routedEvent,
+        IScriptApi api, CancellationToken cancellationToken);
 }
 
-public interface IAdapterScriptApi
+public interface IScriptApi
 {
-    Task<string> SendAsync(string outboundMessageJson, CancellationToken cancellationToken);
+    Task<string> SendSelfAsync(string outboundMessageJson, CancellationToken cancellationToken);
+    Task<string> AcceptIntoChannelAsync(CancellationToken cancellationToken);
+    Task<string> ReplyThroughChannelAsync(string outboundMessageJson, CancellationToken cancellationToken);
 }
 
 public interface IGraphScriptCatalog
@@ -48,7 +49,6 @@ public interface IGraphScriptCatalog
     ValueTask<Result<IReadOnlyList<ScriptPackage>>> LoadAsync(CancellationToken cancellationToken);
 }
 
-public sealed record ScriptContext(Address Target, IAdapterScriptApi Adapter);
 public sealed record ScriptFileManifest(
     string Id, int Version, string TargetType, MountMode Mount, string[] Events,
     string EntryPoint, string[] Capabilities, TrustDomain TrustDomain,
@@ -56,8 +56,11 @@ public sealed record ScriptFileManifest(
 public static class ScriptEvents
 {
     public const string AdapterEnvelope = "adapter.envelope";
+    public const string ChannelMessageAccepted = "channel.message.accepted";
 }
 public static class ScriptCapabilities
 {
     public const string SelfAdapterSend = "self.adapter.send";
+    public const string ChannelAccept = "channel.accept";
+    public const string ChannelReply = "channel.bound-send";
 }

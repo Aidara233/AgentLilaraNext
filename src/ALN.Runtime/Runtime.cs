@@ -143,33 +143,33 @@ public sealed class AdapterManager : IAdapterManager
 
 public sealed class EventQueue : IEventSink
 {
-    private readonly Channel<AdapterEnvelope> _queue;
+    private readonly Channel<RoutedEvent> _queue;
     public EventQueue(int capacity = 256)
     {
         if (capacity < 1) throw new ArgumentOutOfRangeException(nameof(capacity));
-        _queue = Channel.CreateBounded<AdapterEnvelope>(new BoundedChannelOptions(capacity)
+        _queue = Channel.CreateBounded<RoutedEvent>(new BoundedChannelOptions(capacity)
         { FullMode = BoundedChannelFullMode.Wait, SingleReader = true, SingleWriter = false });
     }
-    public ValueTask<Result> PublishAsync(AdapterEnvelope envelope, CancellationToken cancellationToken)
+    public ValueTask<Result> PublishAsync(RoutedEvent routedEvent, CancellationToken cancellationToken)
     {
-        if (envelope is null || !envelope.Adapter.IsInstance || string.IsNullOrWhiteSpace(envelope.PlatformConversationId))
-            return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, "Invalid Adapter envelope.")));
-        return EnqueueCoreAsync(envelope, cancellationToken);
+        if (routedEvent is null || string.IsNullOrWhiteSpace(routedEvent.Name) || !routedEvent.Source.IsInstance || string.IsNullOrWhiteSpace(routedEvent.PayloadJson))
+            return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, "Invalid routed event.")));
+        return EnqueueCoreAsync(routedEvent, cancellationToken);
     }
-    private async ValueTask<Result> EnqueueCoreAsync(AdapterEnvelope envelope, CancellationToken ct)
+    private async ValueTask<Result> EnqueueCoreAsync(RoutedEvent routedEvent, CancellationToken ct)
     {
-        try { await _queue.Writer.WriteAsync(envelope, ct).ConfigureAwait(false); return Result.Success(); }
+        try { await _queue.Writer.WriteAsync(routedEvent, ct).ConfigureAwait(false); return Result.Success(); }
         catch (ChannelClosedException ex) { return Result.Failure(new(ErrorCode.Unavailable, "Event queue is closed.", ex.Message)); }
     }
-    public IAsyncEnumerable<AdapterEnvelope> ReadAllAsync(CancellationToken ct) => _queue.Reader.ReadAllAsync(ct);
+    public IAsyncEnumerable<RoutedEvent> ReadAllAsync(CancellationToken ct) => _queue.Reader.ReadAllAsync(ct);
     public void Complete() => _queue.Writer.TryComplete();
 }
 
-public sealed class EventPump(EventQueue queue, Func<AdapterEnvelope, CancellationToken, ValueTask<Result>> dispatch)
+public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationToken, ValueTask<Result>> dispatch)
 {
     public async Task RunAsync(CancellationToken cancellationToken)
     {
-        await foreach (var envelope in queue.ReadAllAsync(cancellationToken).ConfigureAwait(false))
-            await dispatch(envelope, cancellationToken).ConfigureAwait(false);
+        await foreach (var routedEvent in queue.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            await dispatch(routedEvent, cancellationToken).ConfigureAwait(false);
     }
 }

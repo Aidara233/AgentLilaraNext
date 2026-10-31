@@ -32,10 +32,11 @@ public sealed record SendResult(bool Sent, string AttemptId, string? Detail = nu
 public sealed record AdapterInfo(Address Address, AdapterDescriptor Descriptor, AdapterState State);
 public sealed record AdapterSpec(Address Address, AdapterDescriptor Descriptor);
 
+public sealed record RoutedEvent(string Name, Address Source, Guid EventId, string PayloadJson);
 public interface IEventSink
 {
     // Acceptance into a bounded queue, NOT durable processing acknowledgment.
-    ValueTask<Result> PublishAsync(AdapterEnvelope envelope, CancellationToken cancellationToken);
+    ValueTask<Result> PublishAsync(RoutedEvent routedEvent, CancellationToken cancellationToken);
 }
 public interface IInboundAdapter { }
 public interface IOutboundAdapter
@@ -72,10 +73,11 @@ public interface IInstanceBindings
 }
 
 // File IO is supplied by the host. Adapters cannot choose arbitrary OS paths.
-public sealed record MailboxInput(string Token, string Json);
+public sealed record MailboxInput(string ConversationId, string Token, string Json);
 public interface IFileMailbox
 {
+    ValueTask<IReadOnlyList<string>> GetConversationIdsAsync(CancellationToken cancellationToken);
     ValueTask<IReadOnlyList<MailboxInput>> ReadPendingAsync(CancellationToken cancellationToken);
-    ValueTask CompleteAsync(string token, bool accepted, string? error, CancellationToken cancellationToken);
+    ValueTask CompleteAsync(string conversationId, string token, bool accepted, string? error, CancellationToken cancellationToken);
     ValueTask<string> WriteOutputAsync(OutboundMessage message, CancellationToken cancellationToken);
 }

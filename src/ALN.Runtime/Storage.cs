@@ -52,6 +52,26 @@ public sealed class FileMailbox : IFileMailbox
 
     public string Root => _root;
 
+    public async ValueTask<IReadOnlyList<string>> GetConversationIdsAsync(CancellationToken cancellationToken)
+    {
+        await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            SafeFileSystem.VerifyDirectory(_root);
+            SafeFileSystem.VerifyDirectory(_inbox);
+            var conversations = Directory.EnumerateDirectories(_inbox, "*", SearchOption.TopDirectoryOnly)
+                .OrderBy(Path.GetFileName, StringComparer.Ordinal).ToArray();
+            foreach (var directory in conversations)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                ValidateConversationId(Path.GetFileName(directory));
+                SafeFileSystem.VerifyDirectory(directory);
+            }
+            return conversations.Select(directory => Path.GetFileName(directory)!).ToArray();
+        }
+        finally { _ioLock.Release(); }
+    }
+
     public async ValueTask<IReadOnlyList<MailboxInput>> ReadPendingAsync(CancellationToken cancellationToken)
     {
         await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -59,51 +79,60 @@ public sealed class FileMailbox : IFileMailbox
         {
             SafeFileSystem.VerifyDirectory(_root);
             SafeFileSystem.VerifyDirectory(_inbox);
-            var paths = Directory.EnumerateFiles(_inbox, "*" + ReadySuffix, SearchOption.TopDirectoryOnly)
-                .OrderBy(Path.GetFileName, StringComparer.Ordinal)
-                .Take(BatchSize)
-                .ToArray();
-            var inputs = new List<MailboxInput>(paths.Length);
-            foreach (var path in paths)
+            var paths = new List<(string ConversationId, string Directory, string Path)>();
+            foreach (var conversationDirectory in Directory.EnumerateDirectories(_inbox, "*", SearchOption.TopDirectoryOnly).Order(StringComparer.Ordinal))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var fileName = Path.GetFileName(path);
+                var conversationId = Path.GetFileName(conversationDirectory);
+                ValidateConversationId(conversationId);
+                SafeFileSystem.VerifyDirectory(conversationDirectory);
+                foreach (var path in Directory.EnumerateFiles(conversationDirectory, "*" + ReadySuffix, SearchOption.TopDirectoryOnly))
+                    paths.Add((conversationId, conversationDirectory, path));
+            }
+            var batch = paths.OrderBy(p => p.ConversationId, StringComparer.Ordinal)
+                .ThenBy(p => Path.GetFileName(p.Path), StringComparer.Ordinal).Take(BatchSize).ToArray();
+            var inputs = new List<MailboxInput>(batch.Length);
+            foreach (var item in batch)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var fileName = Path.GetFileName(item.Path);
                 var token = fileName[..^ReadySuffix.Length];
-                if (!IsValidToken(token))
-                    throw new IOException($"Invalid mailbox input token: {fileName}");
-                SafeFileSystem.VerifyFile(path, _inbox);
-                var bytes = await ReadAtMostAsync(path, MaxInputBytes + 1, cancellationToken).ConfigureAwait(false);
+                ValidateToken(token);
+                SafeFileSystem.VerifyFile(item.Path, item.Directory);
+                var bytes = await ReadAtMostAsync(item.Path, MaxInputBytes + 1, cancellationToken).ConfigureAwait(false);
                 string json;
-                if (bytes.Length > MaxInputBytes)
-                    json = "null"; // The adapter rejects this and records the oversized file in rejected/.
+                if (bytes.Length > MaxInputBytes) json = "null";
                 else
                 {
                     try { json = StrictUtf8.GetString(bytes); }
                     catch (DecoderFallbackException) { json = "null"; }
                 }
-                inputs.Add(new MailboxInput(token, json));
+                inputs.Add(new(item.ConversationId, token, json));
             }
             return inputs;
         }
         finally { _ioLock.Release(); }
     }
 
-    public async ValueTask CompleteAsync(string token, bool accepted, string? error, CancellationToken cancellationToken)
+    public async ValueTask CompleteAsync(string conversationId, string token, bool accepted, string? error, CancellationToken cancellationToken)
     {
+        ValidateConversationId(conversationId);
         ValidateToken(token);
         await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             SafeFileSystem.VerifyDirectory(_root);
-            SafeFileSystem.VerifyDirectory(_inbox);
-            var source = Path.Combine(_inbox, token + ReadySuffix);
-            var destinationDirectory = accepted ? _processed : _rejected;
-            SafeFileSystem.VerifyDirectory(destinationDirectory);
-            SafeFileSystem.VerifyFile(source, _inbox);
+            var sourceDirectory = Path.Combine(_inbox, conversationId);
+            SafeFileSystem.VerifyDirectory(sourceDirectory);
+            var source = Path.Combine(sourceDirectory, token + ReadySuffix);
+            var destinationRoot = accepted ? _processed : _rejected;
+            SafeFileSystem.EnsureDirectory(destinationRoot);
+            var destinationDirectory = Path.Combine(destinationRoot, conversationId);
+            SafeFileSystem.EnsureDirectory(destinationDirectory);
+            SafeFileSystem.VerifyFile(source, sourceDirectory);
             var destination = Path.Combine(destinationDirectory, token + ".json");
             SafeFileSystem.VerifyNewFilePath(destination, destinationDirectory);
             cancellationToken.ThrowIfCancellationRequested();
-            // File.Move without overwrite leaves both records intact if a destination already exists.
             System.IO.File.Move(source, destination);
         }
         finally { _ioLock.Release(); }
@@ -112,19 +141,21 @@ public sealed class FileMailbox : IFileMailbox
     public async ValueTask<string> WriteOutputAsync(OutboundMessage message, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(message);
-        if (string.IsNullOrWhiteSpace(message.PlatformConversationId) || string.IsNullOrWhiteSpace(message.Text))
-            throw new ArgumentException("Outbound conversation and text must be non-empty.", nameof(message));
+        ValidateConversationId(message.PlatformConversationId);
+        if (string.IsNullOrWhiteSpace(message.Text))
+            throw new ArgumentException("Outbound text must be non-empty.", nameof(message));
 
         await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             SafeFileSystem.VerifyDirectory(_root);
-            SafeFileSystem.VerifyDirectory(_outbox);
+            var conversationDirectory = Path.Combine(_outbox, message.PlatformConversationId);
+            SafeFileSystem.EnsureDirectory(conversationDirectory);
             var attemptId = Guid.NewGuid().ToString("N");
-            var destination = Path.Combine(_outbox, attemptId + ".json");
-            var temporary = Path.Combine(_outbox, "." + attemptId + ".tmp");
-            SafeFileSystem.VerifyNewFilePath(temporary, _outbox);
-            SafeFileSystem.VerifyNewFilePath(destination, _outbox);
+            var destination = Path.Combine(conversationDirectory, attemptId + ".json");
+            var temporary = Path.Combine(conversationDirectory, "." + attemptId + ".tmp");
+            SafeFileSystem.VerifyNewFilePath(temporary, conversationDirectory);
+            SafeFileSystem.VerifyNewFilePath(destination, conversationDirectory);
             var json = JsonSerializer.SerializeToUtf8Bytes(message);
             try
             {
@@ -135,17 +166,16 @@ public sealed class FileMailbox : IFileMailbox
                     await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
                 }
                 cancellationToken.ThrowIfCancellationRequested();
-                SafeFileSystem.VerifyFile(temporary, _outbox);
-                SafeFileSystem.VerifyNewFilePath(destination, _outbox);
+                SafeFileSystem.VerifyFile(temporary, conversationDirectory);
+                SafeFileSystem.VerifyNewFilePath(destination, conversationDirectory);
                 System.IO.File.Move(temporary, destination);
                 return attemptId;
             }
             catch
             {
-                // Only remove this invocation's private temporary file; never remove user data.
                 if (System.IO.File.Exists(temporary))
                 {
-                    SafeFileSystem.VerifyFile(temporary, _outbox);
+                    SafeFileSystem.VerifyFile(temporary, conversationDirectory);
                     System.IO.File.Delete(temporary);
                 }
                 throw;
@@ -168,6 +198,12 @@ public sealed class FileMailbox : IFileMailbox
             count += read;
         }
         return count == buffer.Length ? buffer : buffer[..count];
+    }
+
+    private static void ValidateConversationId(string conversationId)
+    {
+        if (conversationId is null || !IsValidToken(conversationId))
+            throw new ArgumentException("Conversation ids must be 1–128 ASCII letters, digits, '-' or '_'.", nameof(conversationId));
     }
 
     private static bool IsValidToken(string token) =>

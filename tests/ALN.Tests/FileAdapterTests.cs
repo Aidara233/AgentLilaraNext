@@ -13,39 +13,44 @@ public sealed class FileAdapterTests : IDisposable
     public void Dispose() => Directory.Delete(_directory, recursive: true);
 
     [Fact]
-    public async Task Poll_publishes_valid_input_and_moves_it_after_acceptance()
+    public async Task Conversation_folders_route_input_and_output_independently()
     {
         var mailbox = new FileMailbox(Path.Combine(_directory, "adapters", "instance-1"));
-        await File.WriteAllTextAsync(Path.Combine(mailbox.Root, "inbox", "a.ready.json"),
-            "{\"platformConversationId\":\"chat-1\",\"text\":\"hello\",\"messageId\":\"m-1\"}");
+        var roomOne = Inbox(mailbox, "chat-1");
+        var roomTwo = Inbox(mailbox, "chat-2");
+        await File.WriteAllTextAsync(Path.Combine(roomOne, "a.ready.json"), "{\"text\":\"hello\",\"messageId\":\"m-1\"}");
+        await File.WriteAllTextAsync(Path.Combine(roomTwo, "b.ready.json"), "{\"text\":\"world\",\"messageId\":\"m-2\"}");
         var sink = new RecordingSink(Result.Success());
         var adapter = NewAdapter(mailbox, sink);
         Assert.True((await adapter.StartAsync(default)).Ok);
         var polled = await adapter.PollOnceAsync();
         Assert.True(polled.Ok);
-        Assert.Equal(1, polled.Value);
-        var envelope = Assert.Single(sink.Events);
-        Assert.Equal(adapter.Address, envelope.Adapter);
-        Assert.Equal("chat-1", envelope.PlatformConversationId);
-        Assert.Equal("hello", envelope.Text);
-        Assert.True(File.Exists(Path.Combine(mailbox.Root, "processed", "a.json")));
-        Assert.False(File.Exists(Path.Combine(mailbox.Root, "inbox", "a.ready.json")));
+        Assert.Equal(2, polled.Value);
+        var routed = sink.Events.Select(e => JsonSerializer.Deserialize<AdapterEnvelope>(e.PayloadJson, new JsonSerializerOptions(JsonSerializerDefaults.Web))!).ToArray();
+        Assert.Equal(new[] { "chat-1", "chat-2" }, routed.Select(e => e.PlatformConversationId).ToArray());
+        Assert.True(File.Exists(Path.Combine(mailbox.Root, "processed", "chat-1", "a.json")));
+        Assert.True(File.Exists(Path.Combine(mailbox.Root, "processed", "chat-2", "b.json")));
+
+        var sent = await adapter.SendAsync(new("chat-2", "reply"), default);
+        Assert.True(sent.Ok);
+        Assert.True(File.Exists(Path.Combine(mailbox.Root, "outbox", "chat-2", sent.Value!.AttemptId + ".json")));
+        Assert.False(Directory.Exists(Path.Combine(mailbox.Root, "outbox", "chat-1")));
     }
 
     [Fact]
     public async Task Invalid_json_is_rejected_and_publish_failure_remains_pending()
     {
         var mailbox = new FileMailbox(Path.Combine(_directory, "instance"));
-        var inbox = Path.Combine(mailbox.Root, "inbox");
+        var inbox = Inbox(mailbox, "room");
         await File.WriteAllTextAsync(Path.Combine(inbox, "bad.ready.json"), "{");
-        await File.WriteAllTextAsync(Path.Combine(inbox, "retry.ready.json"), "{\"platformConversationId\":\"c\",\"text\":\"t\"}");
+        await File.WriteAllTextAsync(Path.Combine(inbox, "retry.ready.json"), "{\"text\":\"t\"}");
         var sink = new RecordingSink(Result.Failure(new(ErrorCode.Unavailable, "full", Retryable: true)));
         var adapter = NewAdapter(mailbox, sink);
         await adapter.StartAsync(default);
         var result = await adapter.PollOnceAsync();
         Assert.True(result.Ok);
         Assert.Equal(0, result.Value);
-        Assert.True(File.Exists(Path.Combine(mailbox.Root, "rejected", "bad.json")));
+        Assert.True(File.Exists(Path.Combine(mailbox.Root, "rejected", "room", "bad.json")));
         Assert.True(File.Exists(Path.Combine(inbox, "retry.ready.json")));
     }
 
@@ -53,7 +58,7 @@ public sealed class FileAdapterTests : IDisposable
     public async Task Non_object_and_oversized_inputs_are_rejected_without_crashing_poller()
     {
         var mailbox = new FileMailbox(Path.Combine(_directory, "shape"));
-        var inbox = Path.Combine(mailbox.Root, "inbox");
+        var inbox = Inbox(mailbox, "room");
         await File.WriteAllTextAsync(Path.Combine(inbox, "array.ready.json"), "[]");
         await File.WriteAllTextAsync(Path.Combine(inbox, "null.ready.json"), "null");
         await File.WriteAllTextAsync(Path.Combine(inbox, "large.ready.json"), new string('x', 70 * 1024));
@@ -62,7 +67,19 @@ public sealed class FileAdapterTests : IDisposable
         var result = await adapter.PollOnceAsync();
         Assert.True(result.Ok, result.Error?.Message);
         Assert.Equal(0, result.Value);
-        Assert.Equal(3, Directory.GetFiles(Path.Combine(mailbox.Root, "rejected"), "*.json").Length);
+        Assert.Equal(3, Directory.GetFiles(Path.Combine(mailbox.Root, "rejected", "room"), "*.json").Length);
+    }
+
+    [Fact]
+    public async Task Input_and_output_reject_unsafe_conversation_directory_names()
+    {
+        var mailbox = new FileMailbox(Path.Combine(_directory, "unsafe"));
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await mailbox.WriteOutputAsync(new("../outside", "no"), default));
+        var inbox = Path.Combine(mailbox.Root, "inbox", "..outside");
+        Directory.CreateDirectory(inbox);
+        await File.WriteAllTextAsync(Path.Combine(inbox, "x.ready.json"), "{}");
+        await Assert.ThrowsAsync<ArgumentException>(async () => await mailbox.ReadPendingAsync(default));
     }
 
     [Fact]
@@ -75,8 +92,9 @@ public sealed class FileAdapterTests : IDisposable
         var sent = await adapter.SendAsync(new("c", "hello"), default);
         Assert.True(sent.Ok);
         Assert.True(sent.Value!.Sent);
-        Assert.True(File.Exists(Path.Combine(mailbox.Root, "outbox", sent.Value.AttemptId + ".json")));
-        using (var output = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(mailbox.Root, "outbox", sent.Value.AttemptId + ".json"))))
+        var path = Path.Combine(mailbox.Root, "outbox", "c", sent.Value.AttemptId + ".json");
+        Assert.True(File.Exists(path));
+        using (var output = JsonDocument.Parse(await File.ReadAllTextAsync(path)))
             Assert.Equal("hello", output.RootElement.GetProperty("Text").GetString());
         await adapter.StopAsync(default);
         Assert.False((await adapter.SendAsync(new("c", "after"), default)).Ok);
@@ -88,8 +106,8 @@ public sealed class FileAdapterTests : IDisposable
     {
         var mailbox = new FileMailbox(Path.Combine(_directory, "instance"));
         await Assert.ThrowsAsync<ArgumentException>(async () =>
-            await mailbox.CompleteAsync("../outside", true, null, default));
-        var inbox = Path.Combine(mailbox.Root, "inbox");
+            await mailbox.CompleteAsync("room", "../outside", true, null, default));
+        var inbox = Inbox(mailbox, "room");
         for (var i = 0; i < 70; i++)
             await File.WriteAllTextAsync(Path.Combine(inbox, $"{i:D3}.ready.json"), "{}");
         Assert.Equal(64, (await mailbox.ReadPendingAsync(default)).Count);
@@ -109,15 +127,22 @@ public sealed class FileAdapterTests : IDisposable
         finally { Environment.CurrentDirectory = current; }
     }
 
+    private static string Inbox(FileMailbox mailbox, string conversationId)
+    {
+        var path = Path.Combine(mailbox.Root, "inbox", conversationId);
+        Directory.CreateDirectory(path);
+        return path;
+    }
+
     private static FileAdapter NewAdapter(IFileMailbox mailbox, IEventSink sink) =>
         new(new AdapterSpec(new Address("adapter", "file", "test"), new("file", "account", AdapterDirection.Both)), mailbox, sink);
 
     private sealed class RecordingSink(Result result) : IEventSink
     {
-        public List<AdapterEnvelope> Events { get; } = [];
-        public ValueTask<Result> PublishAsync(AdapterEnvelope envelope, CancellationToken cancellationToken)
+        public List<RoutedEvent> Events { get; } = [];
+        public ValueTask<Result> PublishAsync(RoutedEvent routedEvent, CancellationToken cancellationToken)
         {
-            Events.Add(envelope);
+            Events.Add(routedEvent);
             return ValueTask.FromResult(result);
         }
     }
