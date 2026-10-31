@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ALN.Adapter.File/ALN.Adapter.File.csproj" />
+    <Project Path="src/ALN.Contracts/ALN.Contracts.csproj" />
+    <Project Path="src/ALN.Graph.Contracts/ALN.Graph.Contracts.csproj" />
+    <Project Path="src/ALN.Graph/ALN.Graph.csproj" />
+    <Project Path="src/ALN.Host/ALN.Host.csproj" />
+    <Project Path="src/ALN.Runtime/ALN.Runtime.csproj" />
+    <Project Path="src/ALN.Scripting.Jint/ALN.Scripting.Jint.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ALN.Tests/ALN.Tests.csproj" />
+  </Folder>
+</Solution>

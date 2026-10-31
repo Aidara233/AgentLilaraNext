@@ -1,0 +1,81 @@
+namespace ALN.Contracts;
+
+public readonly record struct Address(string Module, string? Kind = null, string? Instance = null)
+{
+    public string TypeId => Kind is null ? Module : $"{Module}.{Kind}";
+    public override string ToString() => Instance is null ? TypeId : $"{TypeId}#{Instance}";
+    public bool IsInstance => !string.IsNullOrWhiteSpace(Module) && !string.IsNullOrWhiteSpace(Kind) && !string.IsNullOrWhiteSpace(Instance);
+}
+public enum ErrorCode { Invalid, Conflict, Unavailable, Timeout, Denied, Internal }
+public sealed record Error(ErrorCode Code, string Message, string? Detail = null, bool Retryable = false);
+public readonly record struct Result(bool Ok, Error? Error = null)
+{
+    public static Result Success() => new(true);
+    public static Result Failure(Error error) => new(false, error);
+}
+public readonly record struct Result<T>(T? Value, Error? Error)
+{
+    public bool Ok => Error is null && Value is not null;
+    public static Result<T> Success(T value) => new(value, null);
+    public static Result<T> Failure(Error error) => new(default, error);
+}
+public enum AdapterDirection { Inbound, Outbound, Both }
+public enum AdapterState { Created, Running, Stopped, Faulted, Destroyed }
+public sealed record AdapterDescriptor(string PlatformId, string AccountId, AdapterDirection Direction);
+public sealed record AdapterEnvelope(Address Adapter, string PlatformId, string PlatformConversationId,
+    string? PlatformMessageId, string Text, DateTimeOffset At)
+{
+    public Guid EventId { get; init; } = Guid.NewGuid();
+}
+public sealed record OutboundMessage(string PlatformConversationId, string Text, string? ReplyTo = null);
+public sealed record SendResult(bool Sent, string AttemptId, string? Detail = null);
+public sealed record AdapterInfo(Address Address, AdapterDescriptor Descriptor, AdapterState State);
+public sealed record AdapterSpec(Address Address, AdapterDescriptor Descriptor);
+
+public interface IEventSink
+{
+    // Acceptance into a bounded queue, NOT durable processing acknowledgment.
+    ValueTask<Result> PublishAsync(AdapterEnvelope envelope, CancellationToken cancellationToken);
+}
+public interface IInboundAdapter { }
+public interface IOutboundAdapter
+{
+    ValueTask<Result<SendResult>> SendAsync(OutboundMessage message, CancellationToken cancellationToken);
+}
+public interface IChatAdapter : IInboundAdapter, IOutboundAdapter
+{
+    Address Address { get; }
+    AdapterDescriptor Descriptor { get; }
+    AdapterState State { get; }
+    ValueTask<Result> StartAsync(CancellationToken cancellationToken);
+    ValueTask<Result> StopAsync(CancellationToken cancellationToken);
+}
+public interface IModuleTypeCatalog
+{
+    bool IsKnownAbstract(string typeId);
+    bool IsConcrete(string typeId);
+    bool IsAssignableTo(string concreteTypeId, string abstractTypeId);
+}
+public interface IAdapterManager
+{
+    Result<IChatAdapter> Get(Address address);
+    IReadOnlyList<AdapterInfo> List();
+    ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, Func<AdapterSpec, IChatAdapter> factory, CancellationToken cancellationToken);
+    ValueTask<Result> StartAsync(Address address, CancellationToken cancellationToken);
+    ValueTask<Result> StopAsync(Address address, CancellationToken cancellationToken);
+    ValueTask<Result> DestroyAsync(Address address, CancellationToken cancellationToken);
+}
+public interface IInstanceBindings
+{
+    ValueTask<Result> AttachAsync(Address target, CancellationToken cancellationToken);
+    ValueTask<Result> DetachAsync(Address target, CancellationToken cancellationToken);
+}
+
+// File IO is supplied by the host. Adapters cannot choose arbitrary OS paths.
+public sealed record MailboxInput(string Token, string Json);
+public interface IFileMailbox
+{
+    ValueTask<IReadOnlyList<MailboxInput>> ReadPendingAsync(CancellationToken cancellationToken);
+    ValueTask CompleteAsync(string token, bool accepted, string? error, CancellationToken cancellationToken);
+    ValueTask<string> WriteOutputAsync(OutboundMessage message, CancellationToken cancellationToken);
+}

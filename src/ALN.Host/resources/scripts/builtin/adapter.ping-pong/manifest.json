@@ -1,0 +1,13 @@
+{
+  "id": "adapter.ping-pong",
+  "version": 1,
+  "targetType": "adapter",
+  "mount": "default",
+  "events": ["adapter.envelope"],
+  "entryPoint": "onEvent",
+  "capabilities": ["self.adapter.send"],
+  "trustDomain": "builtin",
+  "maxStatements": 10000,
+  "timeoutMilliseconds": 1000,
+  "memoryLimitBytes": 16777216
+}

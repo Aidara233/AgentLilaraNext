@@ -1,0 +1,124 @@
+using System.Text.Json;
+using ALN.Adapter.File;
+using ALN.Contracts;
+using ALN.Runtime.Hosting;
+
+namespace ALN.Tests;
+
+public sealed class FileAdapterTests : IDisposable
+{
+    private readonly string _directory = Path.Combine(Path.GetTempPath(), "aln-tests-" + Guid.NewGuid().ToString("N"));
+
+    public FileAdapterTests() => Directory.CreateDirectory(_directory);
+    public void Dispose() => Directory.Delete(_directory, recursive: true);
+
+    [Fact]
+    public async Task Poll_publishes_valid_input_and_moves_it_after_acceptance()
+    {
+        var mailbox = new FileMailbox(Path.Combine(_directory, "adapters", "instance-1"));
+        await File.WriteAllTextAsync(Path.Combine(mailbox.Root, "inbox", "a.ready.json"),
+            "{\"platformConversationId\":\"chat-1\",\"text\":\"hello\",\"messageId\":\"m-1\"}");
+        var sink = new RecordingSink(Result.Success());
+        var adapter = NewAdapter(mailbox, sink);
+        Assert.True((await adapter.StartAsync(default)).Ok);
+        var polled = await adapter.PollOnceAsync();
+        Assert.True(polled.Ok);
+        Assert.Equal(1, polled.Value);
+        var envelope = Assert.Single(sink.Events);
+        Assert.Equal(adapter.Address, envelope.Adapter);
+        Assert.Equal("chat-1", envelope.PlatformConversationId);
+        Assert.Equal("hello", envelope.Text);
+        Assert.True(File.Exists(Path.Combine(mailbox.Root, "processed", "a.json")));
+        Assert.False(File.Exists(Path.Combine(mailbox.Root, "inbox", "a.ready.json")));
+    }
+
+    [Fact]
+    public async Task Invalid_json_is_rejected_and_publish_failure_remains_pending()
+    {
+        var mailbox = new FileMailbox(Path.Combine(_directory, "instance"));
+        var inbox = Path.Combine(mailbox.Root, "inbox");
+        await File.WriteAllTextAsync(Path.Combine(inbox, "bad.ready.json"), "{");
+        await File.WriteAllTextAsync(Path.Combine(inbox, "retry.ready.json"), "{\"platformConversationId\":\"c\",\"text\":\"t\"}");
+        var sink = new RecordingSink(Result.Failure(new(ErrorCode.Unavailable, "full", Retryable: true)));
+        var adapter = NewAdapter(mailbox, sink);
+        await adapter.StartAsync(default);
+        var result = await adapter.PollOnceAsync();
+        Assert.True(result.Ok);
+        Assert.Equal(0, result.Value);
+        Assert.True(File.Exists(Path.Combine(mailbox.Root, "rejected", "bad.json")));
+        Assert.True(File.Exists(Path.Combine(inbox, "retry.ready.json")));
+    }
+
+    [Fact]
+    public async Task Non_object_and_oversized_inputs_are_rejected_without_crashing_poller()
+    {
+        var mailbox = new FileMailbox(Path.Combine(_directory, "shape"));
+        var inbox = Path.Combine(mailbox.Root, "inbox");
+        await File.WriteAllTextAsync(Path.Combine(inbox, "array.ready.json"), "[]");
+        await File.WriteAllTextAsync(Path.Combine(inbox, "null.ready.json"), "null");
+        await File.WriteAllTextAsync(Path.Combine(inbox, "large.ready.json"), new string('x', 70 * 1024));
+        var adapter = NewAdapter(mailbox, new RecordingSink(Result.Success()));
+        await adapter.StartAsync(default);
+        var result = await adapter.PollOnceAsync();
+        Assert.True(result.Ok, result.Error?.Message);
+        Assert.Equal(0, result.Value);
+        Assert.Equal(3, Directory.GetFiles(Path.Combine(mailbox.Root, "rejected"), "*.json").Length);
+    }
+
+    [Fact]
+    public async Task Send_writes_real_attempt_and_stop_disables_io()
+    {
+        var mailbox = new FileMailbox(Path.Combine(_directory, "instance"));
+        var adapter = NewAdapter(mailbox, new RecordingSink(Result.Success()));
+        Assert.False((await adapter.SendAsync(new("c", "before"), default)).Ok);
+        await adapter.StartAsync(default);
+        var sent = await adapter.SendAsync(new("c", "hello"), default);
+        Assert.True(sent.Ok);
+        Assert.True(sent.Value!.Sent);
+        Assert.True(File.Exists(Path.Combine(mailbox.Root, "outbox", sent.Value.AttemptId + ".json")));
+        using (var output = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(mailbox.Root, "outbox", sent.Value.AttemptId + ".json"))))
+            Assert.Equal("hello", output.RootElement.GetProperty("Text").GetString());
+        await adapter.StopAsync(default);
+        Assert.False((await adapter.SendAsync(new("c", "after"), default)).Ok);
+        Assert.False((await adapter.PollOnceAsync()).Ok);
+    }
+
+    [Fact]
+    public async Task Mailbox_rejects_path_tokens_and_limits_pending_batch()
+    {
+        var mailbox = new FileMailbox(Path.Combine(_directory, "instance"));
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await mailbox.CompleteAsync("../outside", true, null, default));
+        var inbox = Path.Combine(mailbox.Root, "inbox");
+        for (var i = 0; i < 70; i++)
+            await File.WriteAllTextAsync(Path.Combine(inbox, $"{i:D3}.ready.json"), "{}");
+        Assert.Equal(64, (await mailbox.ReadPendingAsync(default)).Count);
+    }
+
+    [Fact]
+    public void Data_directory_resolves_relative_path_from_current_directory()
+    {
+        var current = Environment.CurrentDirectory;
+        try
+        {
+            Environment.CurrentDirectory = _directory;
+            var data = DataDirectory.Open("relative-data");
+            Assert.Equal(Path.Combine(_directory, "relative-data"), data.Root);
+            Assert.True(Directory.Exists(data.Root));
+        }
+        finally { Environment.CurrentDirectory = current; }
+    }
+
+    private static FileAdapter NewAdapter(IFileMailbox mailbox, IEventSink sink) =>
+        new(new AdapterSpec(new Address("adapter", "file", "test"), new("file", "account", AdapterDirection.Both)), mailbox, sink);
+
+    private sealed class RecordingSink(Result result) : IEventSink
+    {
+        public List<AdapterEnvelope> Events { get; } = [];
+        public ValueTask<Result> PublishAsync(AdapterEnvelope envelope, CancellationToken cancellationToken)
+        {
+            Events.Add(envelope);
+            return ValueTask.FromResult(result);
+        }
+    }
+}
