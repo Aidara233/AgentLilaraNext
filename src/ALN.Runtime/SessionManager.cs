@@ -15,6 +15,7 @@ public sealed class SessionManager : ISessionManager
     private const long MaxStoredHistoryBytes = 64 * 1024 * 1024;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _root;
+    private readonly string _legacyRoot;
     private readonly IModelManager _models;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
 
@@ -22,7 +23,8 @@ public sealed class SessionManager : ISessionManager
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         ArgumentNullException.ThrowIfNull(models);
-        _root = Path.GetFullPath(Path.Combine(dataRoot, "chat"));
+        _root = Path.GetFullPath(dataRoot);
+        _legacyRoot = Path.Combine(_root, "chat");
         _models = models;
     }
 
@@ -59,7 +61,7 @@ public sealed class SessionManager : ISessionManager
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var directory = Path.Combine(_root, sessionId);
+            var directory = ResolveSessionDirectory(sessionId);
             Directory.CreateDirectory(directory);
             var session = await LoadOrCreateAsync(directory, spec, cancellationToken).ConfigureAwait(false);
             if (!session.Ok || session.Value is null) return Result<SessionTurnResult>.Failure(session.Error!);
@@ -219,7 +221,9 @@ public sealed class SessionManager : ISessionManager
     {
         if (!IsValidSessionId(sessionId))
             return Result<SessionState>.Failure(new(ErrorCode.Invalid, "Session id is invalid."));
-        var statePath = Path.Combine(_root, sessionId, "state.json");
+        string statePath;
+        try { statePath = Path.Combine(ResolveSessionDirectory(sessionId), "state.json"); }
+        catch (IOException ex) { return Result<SessionState>.Failure(new(ErrorCode.Conflict, "Session data exists in both old and new locations.", ex.Message)); }
         if (!File.Exists(statePath))
             return Result<SessionState>.Failure(new(ErrorCode.Invalid, $"Session not found: {sessionId}"));
         try
@@ -424,6 +428,21 @@ public sealed class SessionManager : ISessionManager
 
     private static ModelMessage ToModelMessage(SessionHistoryEntry entry) =>
         new(entry.Role, entry.Content, entry.ToolCalls, entry.ToolCallId);
+
+    private string ResolveSessionDirectory(string sessionId)
+    {
+        var current = Path.Combine(_root, sessionId);
+        var legacy = Path.Combine(_legacyRoot, sessionId);
+        var currentExists = Directory.Exists(current);
+        var legacyExists = Directory.Exists(legacy);
+        if (currentExists && legacyExists) throw new IOException("Session data exists in both old and new locations.");
+        if (currentExists || !legacyExists) return current;
+        Directory.CreateDirectory(_root);
+        Directory.Move(legacy, current);
+        if (Directory.Exists(_legacyRoot) && !Directory.EnumerateFileSystemEntries(_legacyRoot).Any())
+            Directory.Delete(_legacyRoot);
+        return current;
+    }
 
     private static bool IsValidSessionId(string value) => value is { Length: > 0 and <= 128 } && value.All(c =>
         c is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9' or '-' or '_');
