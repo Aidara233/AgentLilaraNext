@@ -39,6 +39,7 @@ public interface IScriptExecutor
 
 public interface IScriptApi
 {
+    Task<string> RunSessionAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken);
     Task<string> CompleteModelAsync(string profileId, string requestJson, CancellationToken cancellationToken);
     Task<string> SendSelfAsync(string outboundMessageJson, CancellationToken cancellationToken);
     Task<string> AcceptIntoChannelAsync(CancellationToken cancellationToken);
@@ -63,6 +64,7 @@ public static class ScriptEvents
 }
 public static class ScriptCapabilities
 {
+    public const string SessionRun = "session.run";
     public const string ModelComplete = "model.complete";
     public const string SelfAdapterSend = "self.adapter.send";
     public const string ChannelAccept = "channel.accept";

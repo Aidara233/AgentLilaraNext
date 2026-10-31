@@ -1,6 +1,28 @@
 async function onEvent(event, ctx) {
-  if (ctx.eventName !== "adapter.envelope" || !event.text.startsWith("/model ")) return;
+  if (ctx.eventName !== "adapter.envelope") return;
 
+  if (event.text.startsWith("/agent ")) {
+    const prompt = event.text.slice("/agent ".length).trim();
+    if (prompt.length === 0) return;
+
+    const spec = {
+      modelProfileId: "default",
+      objective: "Respond helpfully to messages in this conversation.",
+      systemPrompt: "You are ALN, a helpful assistant. Answer clearly and concisely.",
+      formatVersion: "1"
+    };
+    const raw = await ctx.session.run(spec, prompt);
+    const response = JSON.parse(raw);
+    const text = response.ok ? response.result.text : `Session failed: ${response.error?.message || "unknown error"}`;
+    await ctx.self.adapter.send({
+      platformConversationId: event.platformConversationId,
+      text: text || "The model returned no text.",
+      replyTo: event.platformMessageId
+    });
+    return;
+  }
+
+  if (!event.text.startsWith("/model ")) return;
   const prompt = event.text.slice("/model ".length).trim();
   if (prompt.length === 0) return;
 

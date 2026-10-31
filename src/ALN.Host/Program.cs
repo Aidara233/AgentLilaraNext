@@ -1,6 +1,7 @@
 using System.Text.Json;
 using ALN.Contracts;
 using ALN.Contracts.Models;
+using ALN.Contracts.Sessions;
 using ALN.Graph.Contracts;
 using ALN.Runtime;
 using ALN.Runtime.Hosting;
@@ -27,11 +28,13 @@ var bindings = new InstanceBindingsProxy();
 var adapterFactories = new AdapterFactoryRegistry();
 var adapters = new AdapterManager(adapterTypes, bindings, adapterFactories);
 var modelManager = new ModelManager();
+var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager);
 var reloadState = new ModuleReloadStateStore();
 var hostServices = new HostServiceProvider(
     (typeof(IAdapterManager), adapters),
     (typeof(IAdapterFactoryRegistry), adapterFactories),
     (typeof(IModelManager), modelManager),
+    (typeof(ISessionManager), sessions),
     (typeof(IFileMailbox), mailbox),
     (typeof(IEventSink), queue),
     (typeof(IModuleTypeCatalog), adapterTypes),

@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using ALN.Contracts;
 using ALN.Contracts.Models;
+using ALN.Contracts.Sessions;
 using ALN.Graph.Contracts;
 
 namespace ALN.Graph;
@@ -11,7 +12,7 @@ namespace ALN.Graph;
 public sealed class GraphManager : IGraphRuntime
 {
     private static readonly HashSet<string> AllowedCapabilities = new(StringComparer.Ordinal)
-    { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelReply, ScriptCapabilities.ModelComplete };
+    { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelReply, ScriptCapabilities.ModelComplete, ScriptCapabilities.SessionRun };
     private readonly IAdapterManager _adapters;
     private readonly IChannelManager _channels;
     private readonly IClockManager _clock;
@@ -19,6 +20,7 @@ public sealed class GraphManager : IGraphRuntime
     private readonly IScriptExecutor _executor;
     private readonly IAuditSink _audit;
     private readonly IModelManager? _models;
+    private readonly ISessionManager? _sessions;
     private readonly Dictionary<string, ScriptPackage> _packages = new(StringComparer.Ordinal);
     private readonly List<MountedScript> _mounted = new();
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -29,8 +31,8 @@ public sealed class GraphManager : IGraphRuntime
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     public GraphManager(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IModuleTypeCatalog types,
-        IScriptExecutor executor, IAuditSink audit, IModelManager? models = null)
-    { _adapters = adapters; _channels = channels; _clock = clock; _types = types; _executor = executor; _audit = audit; _models = models; }
+        IScriptExecutor executor, IAuditSink audit, IModelManager? models = null, ISessionManager? sessions = null)
+    { _adapters = adapters; _channels = channels; _clock = clock; _types = types; _executor = executor; _audit = audit; _models = models; _sessions = sessions; }
 
     public IReadOnlyList<MountedScript> Mounted
     { get { _gate.Wait(); try { return _mounted.ToArray(); } finally { _gate.Release(); } } }
@@ -197,7 +199,7 @@ public sealed class GraphManager : IGraphRuntime
             {
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 deadline.CancelAfter(TimeSpan.FromMilliseconds(mount.Package.Manifest.TimeoutMilliseconds));
-                var api = new ScriptApi(_adapters, _channels, _clock, _audit, _models, mount, routedEvent, deadline.Token);
+                var api = new ScriptApi(_adapters, _channels, _clock, _audit, _models, _sessions, mount, routedEvent, deadline.Token);
                 var result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
                 if (!result.Ok) firstFailure ??= result.Error;
             }
@@ -233,8 +235,34 @@ public sealed class GraphManager : IGraphRuntime
     { "adapter" => _adapters.Get(target).Ok, "channel" => _channels.Get(target).Ok, _ => false };
 
     private sealed class ScriptApi(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IAuditSink audit,
-        IModelManager? models, MountedScript mount, RoutedEvent current, CancellationToken ct) : IScriptApi
+        IModelManager? models, ISessionManager? sessions, MountedScript mount, RoutedEvent current, CancellationToken ct) : IScriptApi
     {
+        public async Task<string> RunSessionAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken)
+        {
+            await RequireCapabilityAsync(ScriptCapabilities.SessionRun, cancellationToken).ConfigureAwait(false);
+            if (sessions is null) throw new InvalidOperationException("Session manager is unavailable.");
+            if (current.Name != EventNames.AdapterEnvelope || current.Source != mount.Target)
+                await DenyAsync(ScriptCapabilities.SessionRun, "Not the source Adapter event.", cancellationToken).ConfigureAwait(false);
+            var envelope = Parse<AdapterEnvelope>(current.PayloadJson);
+            if (envelope.Adapter != current.Source || envelope.EventId != current.EventId)
+                await DenyAsync(ScriptCapabilities.SessionRun, "Adapter payload does not match routed event.", cancellationToken).ConfigureAwait(false);
+            var spec = Parse<SessionSpec>(sessionSpecJson);
+            var identity = $"{current.Source}\n{envelope.PlatformConversationId}";
+            var sessionId = "s-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
+            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                mount.Target, ScriptCapabilities.SessionRun, "allowed", sessionId), cancellationToken).ConfigureAwait(false);
+            var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, userInput, cancellationToken).ConfigureAwait(false);
+            if (!result.Ok || result.Value is null)
+            {
+                await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                    mount.Target, ScriptCapabilities.SessionRun, "failed", result.Error?.Message), cancellationToken).ConfigureAwait(false);
+                return JsonSerializer.Serialize(new { ok = false, error = result.Error }, JsonOptions);
+            }
+            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                mount.Target, ScriptCapabilities.SessionRun, "completed", sessionId), cancellationToken).ConfigureAwait(false);
+            return JsonSerializer.Serialize(new { ok = true, result = result.Value }, JsonOptions);
+        }
+
         public async Task<string> CompleteModelAsync(string profileId, string requestJson, CancellationToken cancellationToken)
         {
             await RequireCapabilityAsync(ScriptCapabilities.ModelComplete, cancellationToken).ConfigureAwait(false);

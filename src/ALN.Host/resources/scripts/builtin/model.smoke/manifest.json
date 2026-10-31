@@ -5,7 +5,7 @@
   "mount": "default",
   "events": ["adapter.envelope"],
   "entryPoint": "onEvent",
-  "capabilities": ["model.complete", "self.adapter.send"],
+  "capabilities": ["model.complete", "session.run", "self.adapter.send"],
   "trustDomain": "builtin",
   "maxStatements": 10000,
   "timeoutMilliseconds": 60000,

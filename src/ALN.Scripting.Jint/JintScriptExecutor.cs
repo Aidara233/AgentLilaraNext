@@ -38,6 +38,7 @@ public sealed class JintScriptExecutor(IExecutionJournal journal) : IScriptExecu
             var engine = BuildEngine(package, cancellationToken);
             engine.SetValue("__eventJson", routedEvent.PayloadJson);
             engine.SetValue("__eventNameJson", JsonSerializer.Serialize(routedEvent.Name));
+            engine.SetValue("__sessionRun", new Func<string, string, Task<string>>((specJson, input) => api.RunSessionAsync(specJson, input, cancellationToken)));
             engine.SetValue("__modelComplete", new Func<string, string, Task<string>>((profileId, json) => api.CompleteModelAsync(profileId, json, cancellationToken)));
             engine.SetValue("__sendSelf", new Func<string, Task<string>>(json => api.SendSelfAsync(json, cancellationToken)));
             engine.SetValue("__pollSelf", new Func<Task<string>>(() => api.PollSelfAsync(cancellationToken)));
@@ -47,12 +48,14 @@ public sealed class JintScriptExecutor(IExecutionJournal journal) : IScriptExecu
                 (async function() {
                   const event = JSON.parse(__eventJson);
                   const eventName = JSON.parse(__eventNameJson);
+                  const runSession = (spec, input) => __sessionRun(JSON.stringify(spec), input);
                   const completeModel = (profileId, request) => __modelComplete(profileId, JSON.stringify(request));
                   const sendSelf = __sendSelf;
                   const pollSelf = __pollSelf;
                   const acceptChannel = __channelAccept;
                   const replyChannel = __channelReply;
                   const ctx = Object.freeze({
+                    session: Object.freeze({ run: (spec, input) => runSession(spec, input) }),
                     model: Object.freeze({ complete: (profileId, request) => completeModel(profileId, request) }),
                     self: Object.freeze({ adapter: Object.freeze({ send: (message) => sendSelf(JSON.stringify(message)), poll: () => pollSelf() }) }),
                     channel: Object.freeze({ accept: () => acceptChannel(), reply: (message) => replyChannel(JSON.stringify(message)) }),
