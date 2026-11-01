@@ -296,9 +296,11 @@ public sealed class EventQueue : IEventSink
         if (routedEvent is null || string.IsNullOrWhiteSpace(routedEvent.Name) || !routedEvent.Source.IsInstance ||
             string.IsNullOrWhiteSpace(routedEvent.PayloadJson) || routedEvent.Target is { IsInstance: false })
             return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, "Invalid routed event.")));
-        if (!_queue.Writer.TryWrite(routedEvent.EnqueuedAt is null
-                ? routedEvent with { EnqueuedAt = DateTimeOffset.UtcNow }
-                : routedEvent))
+        if (!_queue.Writer.TryWrite(routedEvent with
+            {
+                EnqueuedAt = routedEvent.EnqueuedAt ?? DateTimeOffset.UtcNow,
+                CauseSignalId = routedEvent.CauseSignalId ?? SignalScope.CurrentId
+            }))
             return ValueTask.FromResult(Result.Failure(new(ErrorCode.Unavailable, "Event queue is full or closed.", Retryable: true)));
         return ValueTask.FromResult(Result.Success());
     }
@@ -317,7 +319,8 @@ public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationTo
             signalLog.Write(new()
             {
                 Id = intakeId,
-                ParentId = SignalScope.CurrentId,
+                // If a handler emitted this event, the intake is a branch of that handler, not a new root.
+                ParentId = routedEvent.CauseSignalId ?? SignalScope.CurrentId,
                 Group = "queue",
                 Name = routedEvent.Name,
                 StepId = routedEvent.EventId,

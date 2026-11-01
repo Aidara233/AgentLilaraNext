@@ -36,6 +36,13 @@ public sealed record RoutedEvent(string Name, Address Source, Guid EventId, stri
 {
     /// <summary>Set by the event queue on acceptance; lets the log measure queue backlog.</summary>
     public DateTimeOffset? EnqueuedAt { get; init; }
+
+    /// <summary>
+    /// Record that emitted this event, captured from the ambient signal scope at publish time.
+    /// Without it an event published inside a handler becomes an unrelated second root instead of
+    /// a branch of the handler that caused it.
+    /// </summary>
+    public Guid? CauseSignalId { get; init; }
 }
 public interface IEventSink
 {

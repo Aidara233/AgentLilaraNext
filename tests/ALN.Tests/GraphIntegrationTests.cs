@@ -148,11 +148,13 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.True(dispatched.Ok, dispatched.Error?.Detail ?? dispatched.Error?.Message);
 
         var records = _signals.Snapshot();
-        var edge = Assert.Single(records, r => r.Group == "dispatch");
-        Assert.Equal(envelope.EventId, edge.StepId);
-        Assert.Null(edge.ParentId);
-        Assert.Contains(records, r => r.Group == "module" && r.ParentId == edge.Id);
-        Assert.Contains(records, r => r.Group == "capability" && r.ParentId == edge.Id);
+        var root = Assert.Single(SignalTree.Build(records));
+        Assert.Equal("event", root.Record.Group);
+        var edge = Assert.Single(root.Children);
+        Assert.Equal("dispatch", edge.Record.Group);
+        Assert.Equal(envelope.EventId, edge.Record.StepId);
+        Assert.Contains(edge.Children, c => c.Record.Group == "module");
+        Assert.Contains(edge.Children, c => c.Record.Group == "capability");
         // One tree: every non-root record points at a record that is also in the log.
         var ids = records.Select(r => r.Id).ToHashSet();
         Assert.All(records.Where(r => r.ParentId is not null), r => Assert.Contains(r.ParentId!.Value, ids));
@@ -179,6 +181,57 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.Equal(201, moduleRecords.Length);
         Assert.Single(moduleRecords, r => r.Outcome == "truncated");
         Assert.Equal(200, moduleRecords.Count(r => r.Outcome == "error"));
+    }
+
+    [Fact]
+    public async Task Fan_out_to_several_handlers_is_a_branch_not_several_roots()
+    {
+        // Two scripts mounted on the same adapter and event: one event, two lanes.
+        var first = new ScriptPackage(
+            new("adapter.fan-a", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent", [],
+                TrustDomain.Builtin),
+            "async function onEvent(event, ctx) { ctx.log.info('a'); }");
+        var second = new ScriptPackage(
+            new("adapter.fan-b", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent", [],
+                TrustDomain.Builtin),
+            "async function onEvent(event, ctx) { ctx.log.warn('b'); }");
+        Assert.True((await _graph.LoadAsync([first, second], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        await _adapters.StartAsync(_adapterAddress, default);
+
+        var envelope = new AdapterEnvelope(_adapterAddress, "file", "chat-1", "m-1", "hello", DateTimeOffset.UtcNow);
+        var dispatched = await _graph.DispatchAsync(new(EventNames.AdapterEnvelope, _adapterAddress, envelope.EventId,
+            JsonSerializer.Serialize(envelope, new JsonSerializerOptions(JsonSerializerDefaults.Web))), default);
+        Assert.True(dispatched.Ok, dispatched.Error?.Detail ?? dispatched.Error?.Message);
+
+        var roots = SignalTree.Build(_signals.Snapshot());
+        var fanOut = Assert.Single(roots);
+        Assert.True(fanOut.Forks);
+        Assert.Equal(2, fanOut.Children.Count);
+        // Each lane keeps its own note: the fork is not flattened into one line.
+        Assert.Equal(["a"], fanOut.Children[0].Children.Select(c => c.Record.Detail!["message"]));
+        Assert.Equal(["b"], fanOut.Children[1].Children.Select(c => c.Record.Detail!["message"]));
+    }
+
+    [Fact]
+    public async Task Event_emitted_inside_a_handler_appears_as_a_branch_of_that_handler()
+    {
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), ChannelReply()], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        await AddChannelAsync(new("channel", "logical", "chat-1"), "chat-1");
+        await _adapters.StartAsync(_adapterAddress, default);
+        await WriteInputAsync("chat-1", "one");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+
+        // Drain both queued events: the clock pulse (poll) and the adapter envelope (accept).
+        await DispatchOneAsync();
+        await DispatchOneAsync();
+
+        var intake = Assert.Single(SignalTree.Build(_signals.Snapshot()), n => n.Record.Mechanism == "event" &&
+            n.Record.Name == EventNames.AdapterEnvelope);
+        var intakeHandler = Assert.Single(intake.Children, c => c.Record.Mechanism == "emit");
+        Assert.Contains(intakeHandler.Children, c => c.Record.Mechanism == "call" &&
+            c.Record.Name == ScriptCapabilities.ChannelAccept);
     }
 
     private async Task AddChannelAsync(Address address, string conversation)

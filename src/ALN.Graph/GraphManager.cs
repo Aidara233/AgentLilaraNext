@@ -182,6 +182,28 @@ public sealed class GraphManager : IGraphRuntime
             catch (JsonException) { }
         }
         var dispatchEntered = false;
+        // Fan-out needs one common parent, otherwise N handlers of the same event look like N
+        // unrelated lines. Inside a pump the intake record already is that parent; a direct
+        // DispatchAsync caller gets an explicit event record instead.
+        var ambient = SignalScope.CurrentId;
+        var eventRecordId = ambient ?? Guid.NewGuid();
+        IDisposable? eventScope = null;
+        if (ambient is null)
+        {
+            _signalLog.Write(new()
+            {
+                Id = eventRecordId,
+                ParentId = null,
+                Group = "event",
+                Name = routedEvent.Name,
+                StepId = routedEvent.EventId,
+                From = routedEvent.Source.ToString(),
+                To = routedEvent.Target?.ToString() ?? "",
+                Mechanism = "event",
+                Outcome = "ok"
+            });
+            eventScope = SignalScope.Enter(eventRecordId, routedEvent.EventId);
+        }
         try
         {
             MountedScript[] handlers;
@@ -240,6 +262,7 @@ public sealed class GraphManager : IGraphRuntime
         }
         finally
         {
+            eventScope?.Dispose();
             if (dispatchEntered) await EndDispatchAsync(target).ConfigureAwait(false);
             if (clockPulse is not null && routedEvent.Target is { } clockTarget)
                 await _clock.AcknowledgeAsync(clockPulse.SubscriptionId, clockTarget, routedEvent.EventId, CancellationToken.None).ConfigureAwait(false);
