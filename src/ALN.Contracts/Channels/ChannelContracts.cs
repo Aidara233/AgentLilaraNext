@@ -1,13 +1,16 @@
 namespace ALN.Contracts;
 
 public sealed record ChannelBinding(Address Adapter, string PlatformConversationId);
-public sealed record ChannelSpec(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings);
-public sealed record ChannelInfo(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, bool Running);
+public sealed record ChannelSpec(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, int? MaxMessages = null);
+public sealed record ChannelInfo(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, bool Running,
+    int? MaxMessages = null);
 public sealed record ChannelMessage(Guid MessageId, Address Channel, ChannelBinding Binding,
     string? PlatformMessageId, string Text, DateTimeOffset At, string? Sender = null, bool MentionsSelf = false);
 
 /// <summary>Messages accepted for one Channel that a Session has not consumed yet.</summary>
-public sealed record ChannelDelta(Address Channel, IReadOnlyList<StoredMessage> Messages)
+/// <param name="Messages">At most the Channel's window; the newest ones.</param>
+/// <param name="Omitted">How many older messages were dropped from this hand-out to fit the window.</param>
+public sealed record ChannelDelta(Address Channel, IReadOnlyList<StoredMessage> Messages, int Omitted = 0)
 {
     public bool IsEmpty => Messages.Count == 0;
 }
@@ -26,7 +29,9 @@ public sealed record ChannelDelta(Address Channel, IReadOnlyList<StoredMessage> 
 /// </summary>
 public interface IChannelDeltaSource
 {
-    ValueTask<Result<ChannelDelta>> TakeDeltaAsync(Address channel, CancellationToken cancellationToken);
+    /// <param name="maxMessages">Window for this hand-out; null means "no window". Older messages beyond it
+    /// are consumed but reported as omitted, never re-delivered later.</param>
+    ValueTask<Result<ChannelDelta>> TakeDeltaAsync(Address channel, int? maxMessages, CancellationToken cancellationToken);
 }
 
 public interface IChannelManager

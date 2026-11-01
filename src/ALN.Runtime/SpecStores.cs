@@ -242,7 +242,8 @@ public sealed class FileChannelSpecStore(string root) : IChannelSpecStore
     public ValueTask<Result> SaveAsync(ChannelSpec spec, CancellationToken cancellationToken) =>
         SpecTree.WriteAsync(root, FileName, spec.Address, new ChannelSpecDocument(
             spec.Address.ToString(), spec.Name,
-            spec.Bindings.Select(b => new ChannelBindingDocument(b.Adapter.ToString(), b.PlatformConversationId)).ToArray()),
+            spec.Bindings.Select(b => new ChannelBindingDocument(b.Adapter.ToString(), b.PlatformConversationId)).ToArray(),
+            spec.MaxMessages),
             JsonOptions, cancellationToken);
 
     public ValueTask<Result> DeleteAsync(Address address, CancellationToken cancellationToken) =>
@@ -266,11 +267,12 @@ public sealed class FileChannelSpecStore(string root) : IChannelSpecStore
                         $"Stored Channel binding address is invalid: {binding.Adapter} ({entry.Path})"));
                 bindings.Add(new ChannelBinding(adapter, binding.PlatformConversationId));
             }
-            specs.Add(new ChannelSpec(address.Value!, entry.Document.Name, bindings));
+            specs.Add(new ChannelSpec(address.Value!, entry.Document.Name, bindings, entry.Document.MaxMessages));
         }
         return Result<IReadOnlyList<ChannelSpec>>.Success(specs);
     }
 
     public sealed record ChannelBindingDocument(string Adapter, string PlatformConversationId);
-    public sealed record ChannelSpecDocument(string Address, string Name, ChannelBindingDocument[]? Bindings);
+    public sealed record ChannelSpecDocument(string Address, string Name, ChannelBindingDocument[]? Bindings,
+        int? MaxMessages = null);
 }

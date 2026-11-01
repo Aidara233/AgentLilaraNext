@@ -23,6 +23,23 @@ public interface IMessageStore
     ValueTask<Result<IReadOnlyList<StoredMessage>>> ReadAsync(Address owner, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// Small durable state that belongs to whoever produced it: a cursor, a rate-limit window, a last-seen
+/// marker. Modules and host components ask for it through host services instead of inventing paths —
+/// the host owns where the data root is, the caller owns only a scope name and a key, so nothing can
+/// wander outside the data root and backups stay a single directory.
+///
+/// Values are JSON text: the store does not know what they mean, and a reader that cannot parse one
+/// gets to decide whether that is a reset or a failure.
+/// </summary>
+public interface IStateStore
+{
+    /// <summary>Null when the key was never written.</summary>
+    ValueTask<Result<string?>> ReadAsync(string scope, string key, CancellationToken cancellationToken);
+    ValueTask<Result> WriteAsync(string scope, string key, string json, CancellationToken cancellationToken);
+    ValueTask<Result> DeleteAsync(string scope, string key, CancellationToken cancellationToken);
+}
+
 /// <summary>Adapter specs survive restarts; the mailbox directory is data, not configuration.</summary>
 public interface IAdapterSpecStore
 {

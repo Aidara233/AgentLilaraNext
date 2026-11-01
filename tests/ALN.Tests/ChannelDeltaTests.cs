@@ -25,7 +25,8 @@ public sealed class ChannelDeltaTests : IDisposable
     private (FileMessageStore Store, FileChannelDeltaSource Delta) Create()
     {
         var store = new FileMessageStore(Path.Combine(_root, "messages"));
-        return (store, new FileChannelDeltaSource(store, Path.Combine(_root, "messages")));
+        var state = new FileStateStore(Path.Combine(_root, "state"));
+        return (store, new FileChannelDeltaSource(store, state));
     }
 
     private static StoredMessage Message(string id, string text) =>
@@ -38,18 +39,18 @@ public sealed class ChannelDeltaTests : IDisposable
         Assert.True((await store.AppendAsync(Message("m1", "first"), default)).Ok);
         Assert.True((await store.AppendAsync(Message("m2", "second"), default)).Ok);
 
-        var first = await delta.TakeDeltaAsync(Channel, default);
-        Assert.True(first.Ok, first.Error?.Message);
+        var first = await delta.TakeDeltaAsync(Channel, null, default);
+        Assert.True(first.Ok, first.Error?.Detail ?? first.Error?.Message);
         Assert.Equal(["first", "second"], first.Value!.Messages.Select(m => m.Text));
 
         // Nothing new since: an empty delta is a normal answer, not a failure.
-        var second = await delta.TakeDeltaAsync(Channel, default);
+        var second = await delta.TakeDeltaAsync(Channel, null, default);
         Assert.True(second.Ok);
         Assert.True(second.Value!.IsEmpty);
 
         // A message that arrives later belongs to the next hand-out only.
         Assert.True((await store.AppendAsync(Message("m3", "third"), default)).Ok);
-        var third = await delta.TakeDeltaAsync(Channel, default);
+        var third = await delta.TakeDeltaAsync(Channel, null, default);
         Assert.Equal(["third"], third.Value!.Messages.Select(m => m.Text));
     }
 
@@ -58,11 +59,11 @@ public sealed class ChannelDeltaTests : IDisposable
     {
         var (store, delta) = Create();
         Assert.True((await store.AppendAsync(Message("m1", "before restart"), default)).Ok);
-        Assert.Equal(1, (await delta.TakeDeltaAsync(Channel, default)).Value!.Messages.Count);
+        Assert.Equal(1, (await delta.TakeDeltaAsync(Channel, null, default)).Value!.Messages.Count);
 
         // A fresh instance on the same root is what a restart looks like.
-        var restarted = new FileChannelDeltaSource(store, Path.Combine(_root, "messages"));
-        var afterRestart = await restarted.TakeDeltaAsync(Channel, default);
+        var restarted = new FileChannelDeltaSource(store, new FileStateStore(Path.Combine(_root, "state")));
+        var afterRestart = await restarted.TakeDeltaAsync(Channel, null, default);
         Assert.True(afterRestart.Ok);
         Assert.True(afterRestart.Value!.IsEmpty);
     }
@@ -72,12 +73,13 @@ public sealed class ChannelDeltaTests : IDisposable
     {
         var (store, delta) = Create();
         Assert.True((await store.AppendAsync(Message("m1", "hello"), default)).Ok);
-        Assert.Equal(1, (await delta.TakeDeltaAsync(Channel, default)).Value!.Messages.Count);
+        Assert.Equal(1, (await delta.TakeDeltaAsync(Channel, null, default)).Value!.Messages.Count);
 
         // Replaying is visible and the Session timeline deduplicates by message id; skipping would silently
         // lose what people said, which is worse.
-        await File.WriteAllTextAsync(Path.Combine(_root, "messages", "my-group", "cursor.json"), "{ not json");
-        var replayed = await delta.TakeDeltaAsync(Channel, default);
+        var cursorPath = Path.Combine(_root, "state", "channel.delta", "my-group.json");
+        await File.WriteAllTextAsync(cursorPath, "{ not json");
+        var replayed = await delta.TakeDeltaAsync(Channel, null, default);
         Assert.True(replayed.Ok);
         Assert.Equal(["hello"], replayed.Value!.Messages.Select(m => m.Text));
     }
@@ -88,7 +90,7 @@ public sealed class ChannelDeltaTests : IDisposable
         var (store, delta) = Create();
         Assert.True((await store.AppendAsync(Message("m1", "在吗"), default)).Ok);
         var contributors = new RoundContextContributorRegistry();
-        Assert.True(contributors.Register(new ChannelDeltaContributor(delta)).Ok);
+        Assert.True(contributors.Register(new ChannelDeltaContributor(delta, new StubChannels(maxMessages: null))).Ok);
         var model = new ScriptedModel();
         var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
         var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
@@ -111,6 +113,51 @@ public sealed class ChannelDeltaTests : IDisposable
             null, default);
         Assert.True(again.Ok, again.Error?.Detail ?? again.Error?.Message);
         Assert.Equal(2, model.Requests.Count);
+    }
+
+    [Fact]
+    public async Task A_window_caps_what_one_turn_carries_and_reports_the_rest_as_omitted()
+    {
+        var (store, delta) = Create();
+        for (var index = 1; index <= 5; index++)
+            Assert.True((await store.AppendAsync(Message($"m{index}", $"msg {index}"), default)).Ok);
+
+        var windowed = await delta.TakeDeltaAsync(Channel, maxMessages: 2, default);
+        Assert.True(windowed.Ok, windowed.Error?.Message);
+        // The newest two survive; the older three are gone from this turn but not from the conversation.
+        Assert.Equal(["msg 4", "msg 5"], windowed.Value!.Messages.Select(m => m.Text));
+        Assert.Equal(3, windowed.Value.Omitted);
+
+        // Elided messages are consumed, not deferred: otherwise the same head would be re-elided forever.
+        var next = await delta.TakeDeltaAsync(Channel, maxMessages: 2, default);
+        Assert.True(next.Ok);
+        Assert.True(next.Value!.IsEmpty);
+        Assert.Equal(0, next.Value.Omitted);
+    }
+
+    [Fact]
+    public async Task A_non_positive_window_is_rejected_rather_than_treated_as_unlimited()
+    {
+        var (_, delta) = Create();
+        var zero = await delta.TakeDeltaAsync(Channel, maxMessages: 0, default);
+        Assert.False(zero.Ok);
+        Assert.Equal(ErrorCode.Invalid, zero.Error!.Code);
+    }
+
+    private sealed class StubChannels(int? maxMessages) : IChannelManager
+    {
+        public Result<ChannelInfo> Get(Address address) => Result<ChannelInfo>.Success(
+            new ChannelInfo(address, "test", [new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456")], true, maxMessages));
+
+        public IReadOnlyList<ChannelInfo> List() => [];
+        public bool IsBound(Address channel, Address adapter, string platformConversationId) => true;
+        public Result<ChannelInfo> FindBound(Address adapter, string platformConversationId) =>
+            Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "none"));
+        public ValueTask<Result<ChannelInfo>> CreateAsync(ChannelSpec spec, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public ValueTask<Result> StartAsync(Address address, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> StopAsync(Address address, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> DestroyAsync(Address channel, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result<int>> AcceptAsync(AdapterEnvelope envelope, CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 
     private sealed class ScriptedModel : IModelManager

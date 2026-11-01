@@ -50,6 +50,10 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "Channel address must be channel.conversation#<id>."));
         if (string.IsNullOrWhiteSpace(spec.Name) || spec.Bindings is null || spec.Bindings.Count == 0)
             return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "Channel requires a name and at least one Adapter binding."));
+        // A window bounds what one turn may carry; zero and negatives are not "no window", they are a bug in
+        // the config, and silently treating them as unlimited is how a typo becomes a huge prompt.
+        if (spec.MaxMessages is <= 0)
+            return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, $"Channel maxMessages must be positive: {spec.MaxMessages}"));
         if (spec.Bindings.Any(b => !b.Adapter.IsInstance || !IsValidConversationId(b.PlatformConversationId)))
             return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "Channel binding contains an invalid Adapter address or conversation id."));
         if (spec.Bindings.Distinct().Count() != spec.Bindings.Count)
@@ -242,8 +246,9 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         public Address Address { get; } = spec.Address;
         public string Name { get; } = spec.Name;
         public IReadOnlyList<ChannelBinding> Bindings { get; } = Array.AsReadOnly(spec.Bindings.ToArray());
+        public int? MaxMessages { get; } = spec.MaxMessages;
         public bool Running { get; set; }
         public bool Draining { get; set; }
-        public ChannelInfo ToInfo() => new(Address, Name, Bindings, Running);
+        public ChannelInfo ToInfo() => new(Address, Name, Bindings, Running, MaxMessages);
     }
 }

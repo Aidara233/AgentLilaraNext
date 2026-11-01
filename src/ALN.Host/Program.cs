@@ -41,10 +41,9 @@ if (!timeContributor.Ok) { Console.Error.WriteLine(timeContributor.Error?.Messag
 var channelContributor = roundContextContributors.Register(new ChannelInfoContributor());
 if (!channelContributor.Ok) { Console.Error.WriteLine(channelContributor.Error?.Message); return 1; }
 // The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
-// moment it assembles the request, so activation itself can stay a signal with no payload.
-var channelDelta = new FileChannelDeltaSource(messageStore, Path.Combine(data.Root, "messages"));
-var deltaContributor = roundContextContributors.Register(new ChannelDeltaContributor(channelDelta));
-if (!deltaContributor.Ok) { Console.Error.WriteLine(deltaContributor.Error?.Message); return 1; }
+// moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
+// component state, so it goes through the state store rather than a path the host invents.
+var stateStore = new FileStateStore(Path.Combine(data.Root, "state"));
 var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, roundContextContributors, signalLog);
 var reloadState = new ModuleReloadStateStore();
 var hostServices = new HostServiceProvider(
@@ -56,6 +55,7 @@ var hostServices = new HostServiceProvider(
     (typeof(IFileMailbox), mailbox),
     (typeof(IEventSink), new RecordingEventSink(queue, messageStore)),
     (typeof(IMessageStore), messageStore),
+    (typeof(IStateStore), stateStore),
     (typeof(IChannelSpecStore), channelSpecs),
     (typeof(IAdapterSpecStore), adapterSpecs),
     (typeof(IModuleTypeCatalog), adapterTypes),
@@ -100,6 +100,9 @@ if (!graphResult.Ok || graphResult.Value is null || !channelResult.Ok || channel
 }
 var graph = graphResult.Value;
 var channels = channelResult.Value;
+var channelDelta = new FileChannelDeltaSource(messageStore, stateStore);
+var deltaContributor = roundContextContributors.Register(new ChannelDeltaContributor(channelDelta, channels));
+if (!deltaContributor.Ok) { Console.Error.WriteLine(deltaContributor.Error?.Message); return 1; }
 var clock = clockResult.Value;
 // The manager owns adapter startup; it only needs the heartbeat wired before the signal arrives.
 adapters.UseHeartbeat(new RecordingEventSink(queue, messageStore), clock, TimeSpan.FromSeconds(1));

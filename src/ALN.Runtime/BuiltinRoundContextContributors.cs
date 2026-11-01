@@ -39,8 +39,12 @@ public sealed class TimeContextContributor(TimeProvider? timeProvider = null) : 
 /// An empty delta is normal, not an error: a signal can arrive for reasons that have nothing to do with
 /// channels (a timer, a script), and the Session decides whether a turn with no new messages is worth
 /// running.
+///
+/// The Channel's window is applied here — the oldest messages beyond it are replaced by one line saying
+/// how many were dropped. A model that is told "and there were 40 more before this" can ask about them;
+/// a model that is silently handed the tail of a conversation cannot even tell that it is missing context.
 /// </summary>
-public sealed class ChannelDeltaContributor(IChannelDeltaSource source) : IRoundContextContributor
+public sealed class ChannelDeltaContributor(IChannelDeltaSource source, IChannelManager channels) : IRoundContextContributor
 {
     public const string ContributorId = "channel.delta";
 
@@ -50,11 +54,20 @@ public sealed class ChannelDeltaContributor(IChannelDeltaSource source) : IRound
         IRoundContextWriter roundContext, CancellationToken cancellationToken)
     {
         if (request.Channel is not { } channel) return;
-        var delta = await source.TakeDeltaAsync(channel, cancellationToken).ConfigureAwait(false);
+        var window = channels.Get(channel) is { Ok: true, Value: { } info } ? info.MaxMessages : null;
+        var delta = await source.TakeDeltaAsync(channel, window, cancellationToken).ConfigureAwait(false);
         // A failed pull fails the round: silently sending the model a context that is missing what people
         // just said is worse than not answering this time.
         if (!delta.Ok) throw new InvalidOperationException(delta.Error!.Message);
-        foreach (var message in delta.Value!.Messages)
+
+        var value = delta.Value!;
+        if (value.Omitted > 0)
+            timeline.Add(new SessionTimelineContribution(
+                $"omitted-{value.Messages[0].Id}",
+                "system",
+                $"省略更早的 {value.Omitted} 条消息（频道窗口上限）。",
+                value.Messages[0].At));
+        foreach (var message in value.Messages)
             timeline.Add(new SessionTimelineContribution(message.Id, message.Sender, message.Text, message.At));
     }
 }

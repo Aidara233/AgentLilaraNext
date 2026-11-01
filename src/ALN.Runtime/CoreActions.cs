@@ -73,6 +73,7 @@ public static class CoreActions
                         address = c.Address.ToString(),
                         name = c.Name,
                         running = c.Running,
+                        maxMessages = c.MaxMessages,
                         bindings = c.Bindings.Select(b => new
                         {
                             adapter = b.Adapter.ToString(),
