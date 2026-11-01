@@ -272,8 +272,57 @@ public sealed class StateContinuityTests : IDisposable
         await node.DrainAsync();
 
         Assert.Single(node.OutboxTexts("chat-1"));
-        var history = await node.Messages.ReadAsync(ChatOne, default);
-        Assert.Single(history.Value!);
+        var history = (await node.Messages.ReadAsync(ChatOne, default)).Value!;
+        var inbound = Assert.Single(history, message => message.Direction == MessageDirection.Inbound);
+        Assert.Equal("platform-1", inbound.PlatformMessageId);
+        // ... and exactly one reply, pointing at what it answers. That row is what makes "already answered"
+        // a question with an answer.
+        var outbound = Assert.Single(history, message => message.Direction == MessageDirection.Outbound);
+        Assert.Equal(inbound.Id, outbound.ReplyTo);
+    }
+
+    [Fact]
+    public async Task A_message_that_was_answered_is_not_answered_again_when_its_marker_survives()
+    {
+        string answeredMessageId;
+        using (var first = new Node(_root))
+        {
+            await first.StartAsync([Intake(), Echo("channel.responder", "only once")]);
+            await first.AddChannelAsync("chat-1");
+            Assert.True((await first.Graph.AddRuleAsync(new("channel.responder", MountScope.ForType("channel.conversation")), default)).Ok);
+
+            await first.SayAsync("chat-1", "你在吗", messageId: "platform-2");
+            await first.DrainAsync();
+            Assert.Equal(["only once"], first.OutboxTexts("chat-1"));
+
+            var history = (await first.Messages.ReadAsync(ChatOne, default)).Value!;
+            answeredMessageId = Assert.Single(history, message => message.Direction == MessageDirection.Outbound).ReplyTo!;
+            // The reply went out, then the process died before the marker was cleared: exactly the window this
+            // whole mechanism exists for.
+            var marker = new
+            {
+                messageId = answeredMessageId,
+                platformMessageId = "platform-2",
+                adapter = "adapter.file#file-1",
+                conversation = "chat-1",
+                text = "你在吗",
+                at = DateTimeOffset.UtcNow,
+                sender = (string?)null
+            };
+            var seeded = await first.Storage.PutAsync(ChannelManager.PendingScope, ChatOne, answeredMessageId,
+                System.Text.Json.JsonSerializer.Serialize(marker, new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web)),
+                null, default);
+            Assert.True(seeded.Ok, seeded.Error?.Message);
+        }
+
+        using var second = new Node(_root);
+        await second.StartAsync([Intake(), Echo("channel.responder", "only once")]);
+        Assert.Contains(second.Report.Snapshot(), note => note.Component == "channels" && note.Summary.Contains("already answered"));
+        await second.DrainAsync();
+
+        // No second reply, and the stale marker is gone.
+        Assert.Single(second.OutboxTexts("chat-1"));
+        Assert.Empty((await second.Storage.ListAsync(ChannelManager.PendingScope, ChatOne, default)).Value!);
     }
 
     [Fact]

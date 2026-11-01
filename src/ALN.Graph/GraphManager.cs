@@ -740,7 +740,7 @@ public sealed class GraphManager : IGraphRuntime
                 mount.Target, "session.tool.send_message", "allowed", call.Id), cancellationToken).ConfigureAwait(false);
             try
             {
-                var result = await SendAsync(current.EventId, binding.Adapter,
+                var result = await SendAsync(current.EventId, channelMessage.Channel, binding.Adapter,
                     new OutboundMessage(binding.PlatformConversationId, arguments.Text, channelMessage.PlatformMessageId), cancellationToken)
                     .ConfigureAwait(false);
                 return Result<string>.Success(result);
@@ -809,7 +809,7 @@ public sealed class GraphManager : IGraphRuntime
             var message = Parse<OutboundMessage>(json);
             if (envelope.Adapter != current.Source || message.PlatformConversationId != envelope.PlatformConversationId)
                 await DenyAsync(ScriptCapabilities.SelfAdapterSend, "Reply destination differs from source conversation.", cancellationToken).ConfigureAwait(false);
-            return await SendAsync(envelope.EventId, current.Source, message, cancellationToken).ConfigureAwait(false);
+            return await SendAsync(envelope.EventId, null, current.Source, message, cancellationToken).ConfigureAwait(false);
         }
 
         public Task<string> RouteIntoChannelAsync(string json, CancellationToken cancellationToken) =>
@@ -897,7 +897,7 @@ public sealed class GraphManager : IGraphRuntime
             if (routed.Channel != current.Source || !channels.IsBound(current.Source, binding.Adapter, binding.PlatformConversationId) ||
                 message.PlatformConversationId != binding.PlatformConversationId)
                 await DenyAsync(ScriptCapabilities.ChannelReply, "Reply destination differs from Channel binding.", cancellationToken).ConfigureAwait(false);
-            return await SendAsync(current.EventId, binding.Adapter, message, cancellationToken).ConfigureAwait(false);
+            return await SendAsync(current.EventId, routed.Channel, binding.Adapter, message, cancellationToken).ConfigureAwait(false);
         }
 
         public Task<string> PollSelfAsync(CancellationToken cancellationToken) =>
@@ -1081,7 +1081,7 @@ public sealed class GraphManager : IGraphRuntime
             throw new UnauthorizedAccessException(detail);
         }
 
-        private async Task<string> SendAsync(Guid eventId, Address adapter, OutboundMessage message, CancellationToken cancellationToken)
+        private async Task<string> SendAsync(Guid eventId, Address? channel, Address adapter, OutboundMessage message, CancellationToken cancellationToken)
         {
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, eventId, mount.Package.Manifest.Id, adapter, "adapter.send", "allowed", message.PlatformConversationId), cancellationToken).ConfigureAwait(false);
             ct.ThrowIfCancellationRequested();
@@ -1089,6 +1089,23 @@ public sealed class GraphManager : IGraphRuntime
             if (!found.Ok || found.Value is null) throw new InvalidOperationException("Bound Adapter is unavailable.");
             var result = await found.Value.SendAsync(message, cancellationToken).ConfigureAwait(false);
             if (!result.Ok || result.Value is null) throw new InvalidOperationException(result.Error?.Message ?? "Adapter send failed.");
+            if (channel is { } answeredChannel)
+            {
+                // Written down after the send, never before: the reply is already out, so a failed row costs at
+                // most one duplicate on a later replay, while a row without a reply would cost a silence.
+                var recorded = await channels.RecordReplyAsync(answeredChannel, eventId, message.PlatformConversationId, message.Text, cancellationToken)
+                    .ConfigureAwait(false);
+                if (!recorded.Ok)
+                    signalLog.Write(new()
+                    {
+                        Group = "graph", Name = "channel.reply.record", StepId = eventId, From = answeredChannel.ToString(),
+                        Mechanism = "channel", Outcome = "failed", Level = SignalLevel.Warn,
+                        Detail = new Dictionary<string, string>
+                        {
+                            ["message"] = recorded.Error?.Message ?? string.Empty
+                        }
+                    });
+            }
             return JsonSerializer.Serialize(result.Value, JsonOptions);
         }
 

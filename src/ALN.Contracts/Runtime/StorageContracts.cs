@@ -14,7 +14,12 @@ public sealed record StoredMessage(
     string? Sender,
     string Text,
     DateTimeOffset At,
-    MessageDirection Direction = MessageDirection.Inbound);
+    MessageDirection Direction = MessageDirection.Inbound,
+    /// <summary>
+    /// For an outbound row: which inbound message it answers. This is what makes "has this message been
+    /// answered?" a question with an answer, and therefore what keeps a replayed round from replying twice.
+    /// </summary>
+    string? ReplyTo = null);
 
 /// <summary>Per-owner message history, append-only.</summary>
 public interface IMessageStore
@@ -25,6 +30,9 @@ public interface IMessageStore
     /// </summary>
     ValueTask<Result> AppendAsync(StoredMessage message, CancellationToken cancellationToken);
     ValueTask<Result<IReadOnlyList<StoredMessage>>> ReadAsync(Address owner, CancellationToken cancellationToken);
+
+    /// <summary>True when this owner already has an outbound message answering <paramref name="answeredMessageId"/>.</summary>
+    ValueTask<Result<bool>> HasReplyAsync(Address owner, string answeredMessageId, CancellationToken cancellationToken);
 }
 
 /// <summary>

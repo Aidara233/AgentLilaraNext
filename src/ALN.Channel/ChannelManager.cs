@@ -258,7 +258,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                 if (_messages is not null)
                 {
                     // The channel keeps its own history; the mailbox folder is transport, not storage.
-                    var recorded = await _messages.AppendAsync(new StoredMessage(envelope.EventId.ToString("N"),
+                    var recorded = await _messages.AppendAsync(new StoredMessage(envelope.EventId.ToString("D"),
                         channel.Address, envelope.PlatformConversationId, envelope.PlatformMessageId,
                         envelope.Sender, envelope.Text, envelope.At), token).ConfigureAwait(false);
                     if (recorded.Error?.Code == ErrorCode.Conflict)
@@ -285,6 +285,20 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         return Result<int>.Success(accepted);
     }
 
+    public async ValueTask<Result> RecordReplyAsync(Address channel, Guid answeredMessageId, string platformConversationId,
+        string text, CancellationToken cancellationToken)
+    {
+        if (_messages is null) return Result.Success();
+        var instance = Get(channel);
+        if (!instance.Ok || instance.Value is null)
+            return Result.Failure(new(ErrorCode.Invalid, $"Channel not found: {channel}"));
+        // One row per reply, pointing at the message it answers. That row is what makes "already answered"
+        // answerable, which is what keeps a replayed round from replying a second time.
+        return await _messages.AppendAsync(new StoredMessage(Guid.NewGuid().ToString("N"), channel, platformConversationId,
+            null, null, text, DateTimeOffset.UtcNow, MessageDirection.Outbound, answeredMessageId.ToString("D")),
+            cancellationToken).ConfigureAwait(false);
+    }
+
     public async ValueTask<Result> CompleteAcceptAsync(Address channel, Guid messageId, CancellationToken cancellationToken)
     {
         // Removing a marker that is not there is the normal case for a message that never became pending
@@ -296,6 +310,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     public async ValueTask<Result<int>> ReplayPendingAsync(CancellationToken cancellationToken)
     {
         var replayed = 0;
+        var alreadyAnswered = 0;
         foreach (var channel in List())
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -312,6 +327,19 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                 var binding = channel.Bindings.FirstOrDefault(candidate =>
                     candidate.Adapter.ToString() == entry.Adapter && candidate.PlatformConversationId == entry.Conversation);
                 if (binding is null) continue;   // the binding changed under it; leave the marker alone
+                // Answered already? Then only the marker survived the crash, and clearing it is the whole job.
+                // This is the last window closed: a reply that went out can no longer be sent twice.
+                if (_messages is not null)
+                {
+                    var answered = await _messages.HasReplyAsync(channel.Address, eventId.ToString("D"), cancellationToken).ConfigureAwait(false);
+                    if (answered.Error is { } answerError) return Result<int>.Failure(answerError);
+                    if (answered.Value)
+                    {
+                        await CompleteAcceptAsync(channel.Address, eventId, cancellationToken).ConfigureAwait(false);
+                        alreadyAnswered++;
+                        continue;
+                    }
+                }
                 var message = new ChannelMessage(eventId, channel.Address, binding, entry.PlatformMessageId,
                     entry.Text, entry.At, entry.Sender);
                 // The same event id, so the original round and this one are the same round as far as any
@@ -323,6 +351,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             }
         }
         if (replayed > 0) _report.Note("channels", $"{replayed} accepted message(s) replayed: they were never finished");
+        if (alreadyAnswered > 0) _report.Note("channels", $"{alreadyAnswered} message(s) were already answered; only their marker was left behind");
         return Result<int>.Success(replayed);
     }
 

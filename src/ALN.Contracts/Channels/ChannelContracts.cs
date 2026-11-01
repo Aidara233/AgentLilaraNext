@@ -130,6 +130,14 @@ public interface IChannelManager
     ValueTask<Result<int>> AcceptAsync(AdapterEnvelope envelope, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Records a reply the Channel actually sent, as an outbound row pointing at the message it answers.
+    /// Best effort by design: a reply that went out is a fact, and failing to write it down must not turn
+    /// into a second reply attempt.
+    /// </summary>
+    ValueTask<Result> RecordReplyAsync(Address channel, Guid answeredMessageId, string platformConversationId,
+        string text, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Clears the "accepted but not finished" marker for one message. Called once the event round for that
     /// message is over; until then a restart will replay it.
     /// </summary>

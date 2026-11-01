@@ -18,7 +18,7 @@ namespace ALN.Storage.Sqlite;
 /// </summary>
 public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomicWork, IEntryStore, IDisposable
 {
-    private const int SchemaVersion = 1;
+    private const int SchemaVersion = 2;
     private const int SqliteConstraint = 19;
     private const int SqliteBusy = 5;
     private const int SqliteLocked = 6;
@@ -49,6 +49,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
         Execute("PRAGMA synchronous=NORMAL;");
         Execute("PRAGMA busy_timeout=5000;");
         CreateSchema();
+        Migrate();
     }
 
     public string Path { get; }
@@ -108,8 +109,8 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             if (!message.Owner.IsInstance)
                 return Result.Failure(new(ErrorCode.Invalid, $"Message owner is not a valid instance address: {message.Owner}"));
             using var command = Command(
-                "INSERT INTO message(id, owner, conversation, platform_message_id, sender, text, at, direction) " +
-                "VALUES($id, $owner, $conversation, $platform, $sender, $text, $at, $direction);");
+                "INSERT INTO message(id, owner, conversation, platform_message_id, sender, text, at, direction, reply_to) " +
+                "VALUES($id, $owner, $conversation, $platform, $sender, $text, $at, $direction, $replyTo);");
             command.Parameters.AddWithValue("$id", message.Id);
             command.Parameters.AddWithValue("$owner", message.Owner.ToString());
             command.Parameters.AddWithValue("$conversation", message.PlatformConversationId);
@@ -118,6 +119,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             command.Parameters.AddWithValue("$text", message.Text);
             command.Parameters.AddWithValue("$at", Timestamp(message.At));
             command.Parameters.AddWithValue("$direction", (int)message.Direction);
+            command.Parameters.AddWithValue("$replyTo", (object?)message.ReplyTo ?? DBNull.Value);
             try
             {
                 command.ExecuteNonQuery();
@@ -139,7 +141,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             if (!owner.IsInstance)
                 return Result<IReadOnlyList<StoredMessage>>.Failure(new(ErrorCode.Invalid, $"Not an instance address: {owner}"));
             using var command = Command(
-                "SELECT id, conversation, platform_message_id, sender, text, at, direction FROM message " +
+                "SELECT id, conversation, platform_message_id, sender, text, at, direction, reply_to FROM message " +
                 "WHERE owner=$owner ORDER BY at, id;");
             command.Parameters.AddWithValue("$owner", owner.ToString());
             var messages = new List<StoredMessage>();
@@ -154,7 +156,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                     reader.IsDBNull(3) ? null : reader.GetString(3),
                     reader.GetString(4),
                     DateTimeOffset.Parse(reader.GetString(5), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-                    (MessageDirection)reader.GetInt32(6)));
+                    (MessageDirection)reader.GetInt32(6), reader.IsDBNull(7) ? null : reader.GetString(7)));
             }
             return Result<IReadOnlyList<StoredMessage>>.Success(messages);
         });
@@ -194,12 +196,24 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
         finally { _gate.Release(); }
     }
 
+    /// <summary>True when this owner already recorded a reply to that inbound message.</summary>
+    public ValueTask<Result<bool>> HasReplyAsync(Address owner, string answeredMessageId, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<bool>.Failure, "Replies could not be read.", () =>
+        {
+            using var command = Command(
+                "SELECT 1 FROM message WHERE owner=$owner AND reply_to=$replyTo AND direction=$outbound LIMIT 1;");
+            command.Parameters.AddWithValue("$owner", owner.ToString());
+            command.Parameters.AddWithValue("$replyTo", answeredMessageId);
+            command.Parameters.AddWithValue("$outbound", (int)MessageDirection.Outbound);
+            return Result<bool>.Success(command.ExecuteScalar() is not null);
+        });
+
     /// <summary>A page of history, newest last. Used by the WebUI; the delta contributor reads in bulk.</summary>
     public ValueTask<Result<IReadOnlyList<StoredMessage>>> ReadRecentAsync(Address owner, int limit, CancellationToken cancellationToken) =>
         RunAsync(cancellationToken, Result<IReadOnlyList<StoredMessage>>.Failure, "Message history could not be read.", () =>
         {
             using var command = Command(
-                "SELECT id, conversation, platform_message_id, sender, text, at, direction FROM message " +
+                "SELECT id, conversation, platform_message_id, sender, text, at, direction, reply_to FROM message " +
                 "WHERE owner=$owner ORDER BY at DESC, id DESC LIMIT $limit;");
             command.Parameters.AddWithValue("$owner", owner.ToString());
             command.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 5000));
@@ -213,7 +227,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                     reader.IsDBNull(3) ? null : reader.GetString(3),
                     reader.GetString(4),
                     DateTimeOffset.Parse(reader.GetString(5), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-                    (MessageDirection)reader.GetInt32(6)));
+                    (MessageDirection)reader.GetInt32(6), reader.IsDBNull(7) ? null : reader.GetString(7)));
             }
             messages.Reverse();
             return Result<IReadOnlyList<StoredMessage>>.Success(messages);
@@ -409,6 +423,24 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
         }
     }
 
+    /// <summary>
+    /// Brings an older file up to the current shape. Development-stage rule: add columns in place rather than
+    /// asking anybody to throw their history away.
+    /// </summary>
+    private void Migrate()
+    {
+        using var version = _connection.CreateCommand();
+        version.CommandText = "PRAGMA user_version;";
+        var current = Convert.ToInt32(version.ExecuteScalar(), CultureInfo.InvariantCulture);
+        if (current >= SchemaVersion) return;
+        if (current < 2)
+        {
+            try { Execute("ALTER TABLE message ADD COLUMN reply_to TEXT NULL;"); }
+            catch (SqliteException ex) when (ex.Message.Contains("duplicate column", StringComparison.OrdinalIgnoreCase)) { }
+        }
+        Execute($"PRAGMA user_version = {SchemaVersion};");
+    }
+
     private SqliteCommand Command(string sql)
     {
         var command = _connection.CreateCommand();
@@ -443,7 +475,8 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                 sender TEXT NULL,
                 text TEXT NOT NULL,
                 at TEXT NOT NULL,
-                direction INTEGER NOT NULL DEFAULT 0);
+                direction INTEGER NOT NULL DEFAULT 0,
+                reply_to TEXT NULL);
 
             CREATE INDEX IF NOT EXISTS message_owner_at ON message(owner, at);
             -- One platform message is one row per owner: the transport handing it over twice is not news.
@@ -468,8 +501,6 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                 action TEXT NOT NULL,
                 outcome TEXT NOT NULL,
                 detail TEXT NULL);
-
-            PRAGMA user_version = {SchemaVersion};
             """;
         command.ExecuteNonQuery();
     }

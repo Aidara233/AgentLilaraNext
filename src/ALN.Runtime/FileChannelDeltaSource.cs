@@ -31,19 +31,19 @@ public sealed class FileChannelDeltaSource(IMessageStore messages, IStateStore s
 
         var read = await messages.ReadAsync(channel, cancellationToken).ConfigureAwait(false);
         if (read.Error is { } readError) return Result<ChannelDelta>.Failure(readError);
-        var all = read.Value ?? [];
+        var all = (read.Value ?? []).Where(message => message.Direction == MessageDirection.Inbound).ToArray();
 
         var key = channel.Instance!;
         var consumed = await ReadCursorAsync(key, cancellationToken).ConfigureAwait(false);
         if (consumed.Error is { } cursorError) return Result<ChannelDelta>.Failure(cursorError);
-        var already = Math.Min(consumed.Value, all.Count);
+        var already = Math.Min(consumed.Value, all.Length);
 
         var pending = all.Skip(already).ToArray();
         if (pending.Length == 0) return Result<ChannelDelta>.Success(new(channel, [], 0));
 
         // Consume everything first, then decide how much of it is shown. Consuming only what is shown
         // would leave the elided head to be re-elided (and re-counted) on every later activation.
-        var advanced = await WriteCursorAsync(key, all.Count, cancellationToken).ConfigureAwait(false);
+        var advanced = await WriteCursorAsync(key, all.Length, cancellationToken).ConfigureAwait(false);
         if (advanced.Error is { } writeError) return Result<ChannelDelta>.Failure(writeError);
 
         if (maxMessages is { } window && pending.Length > window)
