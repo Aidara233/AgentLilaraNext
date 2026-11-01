@@ -137,11 +137,12 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter
                     var conversation = input.ConversationId;
                     var text = root.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String ? t.GetString() : null;
                     var messageId = root.TryGetProperty("messageId", out var m) && m.ValueKind == JsonValueKind.String ? m.GetString() : null;
+                    var sender = root.TryGetProperty("sender", out var s) && s.ValueKind == JsonValueKind.String ? s.GetString() : null;
                     if (!string.IsNullOrWhiteSpace(declaredConversation) && !StringComparer.Ordinal.Equals(declaredConversation, conversation))
                         validationError = "JSON conversation id must match its inbox directory.";
                     if (validationError is null && string.IsNullOrWhiteSpace(text)) validationError = "text must be non-empty and a string.";
                     if (validationError is null)
-                        envelope = new(Address, Descriptor.PlatformId, conversation, messageId, text!, DateTimeOffset.UtcNow);
+                        envelope = new(Address, Descriptor.PlatformId, conversation, messageId, text!, DateTimeOffset.UtcNow, sender);
                 }
             }
             catch (JsonException ex) { validationError = $"Invalid JSON: {ex.Message}"; }

@@ -241,22 +241,26 @@ public sealed class GraphManager : IGraphRuntime
         {
             await RequireCapabilityAsync(ScriptCapabilities.SessionRun, cancellationToken).ConfigureAwait(false);
             if (sessions is null) throw new InvalidOperationException("Session manager is unavailable.");
-            if (current.Name != EventNames.AdapterEnvelope || current.Source != mount.Target)
-                await DenyAsync(ScriptCapabilities.SessionRun, "Not the source Adapter event.", cancellationToken).ConfigureAwait(false);
-            var envelope = Parse<AdapterEnvelope>(current.PayloadJson);
-            if (envelope.Adapter != current.Source || envelope.EventId != current.EventId)
-                await DenyAsync(ScriptCapabilities.SessionRun, "Adapter payload does not match routed event.", cancellationToken).ConfigureAwait(false);
+            if (current.Name != EventNames.ChannelMessageAccepted || current.Source != mount.Target)
+                await DenyAsync(ScriptCapabilities.SessionRun, "Not the source Channel message event.", cancellationToken).ConfigureAwait(false);
+            var channelMessage = Parse<ChannelMessage>(current.PayloadJson);
+            if (channelMessage.Channel != current.Source || channelMessage.MessageId != current.EventId ||
+                !channels.IsBound(current.Source, channelMessage.Binding.Adapter, channelMessage.Binding.PlatformConversationId) ||
+                !StringComparer.Ordinal.Equals(channelMessage.Text, userInput))
+                await DenyAsync(ScriptCapabilities.SessionRun, "Channel message does not match routed event.", cancellationToken).ConfigureAwait(false);
             var spec = Parse<SessionSpec>(sessionSpecJson);
             if (spec.Tools?.Any(tool => tool.Name != "send_message") == true)
                 return JsonSerializer.Serialize(new { ok = false, error = new { message = "Unknown Session tool binding." } }, JsonOptions);
             if (spec.Tools?.Any(tool => tool.Name == "send_message") == true &&
-                !mount.Package.Manifest.Capabilities.Contains(ScriptCapabilities.SelfAdapterSend, StringComparer.Ordinal))
-                await DenyAsync(ScriptCapabilities.SelfAdapterSend, "send_message requires self.adapter.send.", cancellationToken).ConfigureAwait(false);
-            var identity = $"{current.Source}\n{envelope.PlatformConversationId}";
+                !mount.Package.Manifest.Capabilities.Contains(ScriptCapabilities.ChannelReply, StringComparer.Ordinal))
+                await DenyAsync(ScriptCapabilities.ChannelReply, "send_message requires channel.bound-send.", cancellationToken).ConfigureAwait(false);
+            var identity = $"{current.Source}\n{channelMessage.Channel}";
             var sessionId = "s-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
                 mount.Target, ScriptCapabilities.SessionRun, "allowed", sessionId), cancellationToken).ConfigureAwait(false);
-            var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, userInput, this, cancellationToken).ConfigureAwait(false);
+            var input = new SessionTurnInput([new SessionChannelMessage(channelMessage.MessageId.ToString("N"), "user",
+                channelMessage.Sender, channelMessage.Text, channelMessage.At)]);
+            var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, input, this, cancellationToken).ConfigureAwait(false);
             if (!result.Ok || result.Value is null)
             {
                 await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
@@ -273,30 +277,32 @@ public sealed class GraphManager : IGraphRuntime
         {
             if (call.Name != "send_message")
                 return Result<string>.Failure(new(ErrorCode.Denied, $"Session tool binding is not available: {call.Name}"));
-            try { await RequireCapabilityAsync(ScriptCapabilities.SelfAdapterSend, cancellationToken).ConfigureAwait(false); }
+            try { await RequireCapabilityAsync(ScriptCapabilities.ChannelReply, cancellationToken).ConfigureAwait(false); }
             catch (UnauthorizedAccessException ex)
             { return Result<string>.Failure(new(ErrorCode.Denied, ex.Message)); }
-            if (current.Name != EventNames.AdapterEnvelope || current.Source != mount.Target)
-                return Result<string>.Failure(new(ErrorCode.Denied, "Session send_message requires the source Adapter event."));
+            if (current.Name != EventNames.ChannelMessageAccepted || current.Source != mount.Target)
+                return Result<string>.Failure(new(ErrorCode.Denied, "Session send_message requires the source Channel message event."));
 
-            AdapterEnvelope envelope;
+            ChannelMessage channelMessage;
             SessionSendArguments arguments;
             try
             {
-                envelope = Parse<AdapterEnvelope>(current.PayloadJson);
+                channelMessage = Parse<ChannelMessage>(current.PayloadJson);
                 arguments = Parse<SessionSendArguments>(call.ArgumentsJson);
             }
             catch (Exception ex) when (ex is JsonException or ArgumentException)
             { return Result<string>.Failure(new(ErrorCode.Invalid, "Session tool arguments are invalid.", ex.Message)); }
-            if (envelope.Adapter != current.Source || envelope.EventId != current.EventId || string.IsNullOrWhiteSpace(arguments.Text))
-                return Result<string>.Failure(new(ErrorCode.Invalid, "Session send_message requires non-empty text for the bound conversation."));
+            var binding = channelMessage.Binding;
+            if (channelMessage.Channel != current.Source || channelMessage.MessageId != current.EventId ||
+                !channels.IsBound(current.Source, binding.Adapter, binding.PlatformConversationId) || string.IsNullOrWhiteSpace(arguments.Text))
+                return Result<string>.Failure(new(ErrorCode.Invalid, "Session send_message requires non-empty text for the bound Channel."));
 
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
                 mount.Target, "session.tool.send_message", "allowed", call.Id), cancellationToken).ConfigureAwait(false);
             try
             {
-                var result = await SendAsync(current.EventId, current.Source,
-                    new OutboundMessage(envelope.PlatformConversationId, arguments.Text, envelope.PlatformMessageId), cancellationToken)
+                var result = await SendAsync(current.EventId, binding.Adapter,
+                    new OutboundMessage(binding.PlatformConversationId, arguments.Text, channelMessage.PlatformMessageId), cancellationToken)
                     .ConfigureAwait(false);
                 return Result<string>.Success(result);
             }

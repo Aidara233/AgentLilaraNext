@@ -17,19 +17,21 @@ public sealed class SessionManager : ISessionManager
     private readonly string _root;
     private readonly string _legacyRoot;
     private readonly IModelManager _models;
+    private readonly IRoundContextContributorRegistry _roundContextContributors;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
 
-    public SessionManager(string dataRoot, IModelManager models)
+    public SessionManager(string dataRoot, IModelManager models, IRoundContextContributorRegistry? roundContextContributors = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         ArgumentNullException.ThrowIfNull(models);
         _root = Path.GetFullPath(dataRoot);
         _legacyRoot = Path.Combine(_root, "chat");
         _models = models;
+        _roundContextContributors = roundContextContributors ?? new RoundContextContributorRegistry();
     }
 
     public async ValueTask<Result<SessionTurnResult>> RunTurnAsync(
-        string sessionId, SessionSpec spec, Guid activationId, string userInput,
+        string sessionId, SessionSpec spec, Guid activationId, SessionTurnInput input,
         ISessionToolExecutor? toolExecutor, CancellationToken cancellationToken)
     {
         if (!IsValidSessionId(sessionId))
@@ -52,8 +54,10 @@ public sealed class SessionManager : ISessionManager
         }
         catch (JsonException ex)
         { return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Session tool schema is invalid JSON.", ex.Message)); }
-        if (activationId == Guid.Empty || string.IsNullOrWhiteSpace(userInput))
-            return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Activation id and user input are required."));
+        if (activationId == Guid.Empty || input?.Messages is not { Count: > 0 } channelMessages ||
+            channelMessages.Any(m => string.IsNullOrWhiteSpace(m.Id) || string.IsNullOrWhiteSpace(m.Source) || m.Content is null) ||
+            channelMessages.Select(m => m.Id).Distinct(StringComparer.Ordinal).Count() != channelMessages.Count)
+            return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Activation id and unique channel messages are required."));
         if (spec.Tools is { Count: > 0 } && toolExecutor is null)
             return Result<SessionTurnResult>.Failure(new(ErrorCode.Unavailable, "Session tools are declared but no tool executor is available."));
 
@@ -89,18 +93,41 @@ public sealed class SessionManager : ISessionManager
             var activationUser = activationEntries.FirstOrDefault(e => e.Role == "user");
             if (activationEntries.Length > 0 && activationUser is null)
                 return Result<SessionTurnResult>.Failure(new(ErrorCode.Conflict, "Session activation is incomplete and cannot be resumed safely."));
-            if (activationUser is not null && !StringComparer.Ordinal.Equals(activationUser.Content, userInput))
-                return Result<SessionTurnResult>.Failure(new(ErrorCode.Conflict, "Activation id was reused with different input."));
+            if (activationUser is not null && !SameChannelMessages(activationUser.ChannelMessages, input.Messages))
+                return Result<SessionTurnResult>.Failure(new(ErrorCode.Conflict, "Activation id was reused with different channel messages."));
+
+            var state = session.Value.State;
+            if (activationUser is null)
+            {
+                activationUser = new SessionHistoryEntry($"{activation}:user", activation, state.StepNumber + 1,
+                    "user", null, DateTimeOffset.UtcNow, ChannelMessages: input.Messages);
+                var timelineState = state with { Revision = state.Revision + 1 };
+                var timelineCommit = await CommitTurnAsync(directory,
+                    new SessionPendingCommit(timelineState, [activationUser]), cancellationToken).ConfigureAwait(false);
+                if (!timelineCommit.Ok) return Result<SessionTurnResult>.Failure(timelineCommit.Error!);
+                state = timelineState;
+                history = history.Append(activationUser).ToArray();
+            }
 
             var messages = new List<ModelMessage>
             {
                 new("system", session.Value.Spec.SystemPrompt),
                 new("user", session.Value.Spec.Objective)
             };
-            messages.AddRange(history.Select(ToModelMessage));
-            var state = session.Value.State;
-            var userEntryPending = activationUser is null;
-            if (userEntryPending) messages.Add(new ModelMessage("user", userInput));
+            messages.AddRange(history.Where(entry => entry.ChannelMessages is null).Select(ToModelMessage));
+            var collected = await CollectRoundContextAsync(
+                new RoundContextRequest(sessionId, activationId, state.StepNumber + 1), cancellationToken).ConfigureAwait(false);
+            if (!collected.Ok || collected.Value is null) return Result<SessionTurnResult>.Failure(collected.Error!);
+
+            var persistedTimeline = await PersistTimelineContributionsAsync(directory, activation, state, history,
+                collected.Value.Timeline, cancellationToken).ConfigureAwait(false);
+            if (!persistedTimeline.Ok || persistedTimeline.Value is null)
+                return Result<SessionTurnResult>.Failure(persistedTimeline.Error!);
+            state = persistedTimeline.Value.State;
+            history = persistedTimeline.Value.History;
+
+            var channelTimeline = CollectChannelTimeline(history);
+            messages.Add(new ModelMessage("user", RenderChannelContext(channelTimeline, collected.Value.RoundContext)));
             var turnUsage = new ModelUsage(0, 0);
             var executedCalls = new List<ModelToolCall>();
             var finalText = "";
@@ -159,12 +186,13 @@ public sealed class SessionManager : ISessionManager
                 var revision = state.Revision + 1;
                 var now = DateTimeOffset.UtcNow;
                 var assistantStopReason = completedCalls.Length > 0 ? StopReason.ToolUse : stopReason ?? StopReason.EndTurn;
+                IReadOnlyList<SessionChannelMessage>? assistantChannelMessage = completedCalls.Length == 0
+                    ? [new SessionChannelMessage($"{activation}:assistant:{stepNumber}", "assistant", "ALN", text.ToString(), now)]
+                    : null;
                 var assistantEntry = new SessionHistoryEntry($"{activation}:assistant:{stepNumber}", activation, stepNumber,
-                    "assistant", text.ToString(), now, completedCalls, Usage: completedUsage, StopReason: assistantStopReason);
-                var modelEntries = new List<SessionHistoryEntry>();
-                if (userEntryPending)
-                    modelEntries.Add(new($"{activation}:user", activation, stepNumber, "user", userInput, now));
-                modelEntries.Add(assistantEntry);
+                    "assistant", text.ToString(), now, completedCalls, Usage: completedUsage, StopReason: assistantStopReason,
+                    ChannelMessages: assistantChannelMessage);
+                var modelEntries = new List<SessionHistoryEntry> { assistantEntry };
                 var modelState = state with
                 {
                     Status = SessionStatus.Dormant,
@@ -176,7 +204,6 @@ public sealed class SessionManager : ISessionManager
                     .ConfigureAwait(false);
                 if (!modelCommit.Ok) return Result<SessionTurnResult>.Failure(modelCommit.Error!);
                 state = modelState;
-                userEntryPending = false;
                 messages.Add(new ModelMessage("assistant", text.ToString(), completedCalls.Length > 0 ? completedCalls : null));
                 executedCalls.AddRange(completedCalls);
 
@@ -426,8 +453,204 @@ public sealed class SessionManager : ISessionManager
         (left.CacheReadTokens ?? 0) + (right.CacheReadTokens ?? 0),
         (left.CacheWriteTokens ?? 0) + (right.CacheWriteTokens ?? 0));
 
+    private async ValueTask<Result<PersistedTimeline>> PersistTimelineContributionsAsync(string directory, string activation,
+        SessionState state, IReadOnlyList<SessionHistoryEntry> history, IReadOnlyList<CollectedTimelineMessage> contributions,
+        CancellationToken cancellationToken)
+    {
+        var existing = CollectChannelTimeline(history);
+        var byKey = existing.ToDictionary(message => TimelineKey(message.Source, message.Id), StringComparer.Ordinal);
+        var additions = new List<SessionHistoryEntry>();
+        foreach (var item in contributions)
+        {
+            var message = new SessionChannelMessage(item.Id, item.Source, item.Sender, item.Content, item.At);
+            var key = TimelineKey(message.Source, message.Id);
+            if (byKey.TryGetValue(key, out var prior))
+            {
+                if (prior != message)
+                    return Result<PersistedTimeline>.Failure(new(ErrorCode.Conflict,
+                        $"Timeline message id was reused with different content: {item.Source}/{item.Id}"));
+                continue;
+            }
+            byKey.Add(key, message);
+            var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key))).ToLowerInvariant();
+            additions.Add(new SessionHistoryEntry($"{activation}:timeline:{digest}", activation, state.StepNumber + 1,
+                "user", null, item.At, ChannelMessages: [message]));
+        }
+        if (additions.Count == 0)
+            return Result<PersistedTimeline>.Success(new(state, history));
+
+        var nextState = state with { Revision = state.Revision + 1 };
+        var committed = await CommitTurnAsync(directory, new SessionPendingCommit(nextState, additions), cancellationToken)
+            .ConfigureAwait(false);
+        if (!committed.Ok) return Result<PersistedTimeline>.Failure(committed.Error!);
+        return Result<PersistedTimeline>.Success(new(nextState, history.Concat(additions).ToArray()));
+    }
+
+    private static string TimelineKey(string source, string id) => $"{source}\n{id}";
+
+    private static IReadOnlyList<SessionChannelMessage> CollectChannelTimeline(IReadOnlyList<SessionHistoryEntry> history)
+    {
+        var messages = new List<SessionChannelMessage>();
+        var byKey = new Dictionary<string, SessionChannelMessage>(StringComparer.Ordinal);
+        foreach (var message in history.SelectMany(entry => entry.ChannelMessages ?? []))
+        {
+            var key = TimelineKey(message.Source, message.Id);
+            if (!byKey.TryAdd(key, message))
+            {
+                if (byKey[key] != message)
+                    throw new InvalidOperationException($"Channel timeline message id was reused with different content: {message.Source}/{message.Id}");
+                continue;
+            }
+            messages.Add(message);
+        }
+        return messages;
+    }
+
     private static ModelMessage ToModelMessage(SessionHistoryEntry entry) =>
         new(entry.Role, entry.Content, entry.ToolCalls, entry.ToolCallId);
+
+    private async ValueTask<Result<CollectedRoundContextSnapshot>> CollectRoundContextAsync(
+        RoundContextRequest request, CancellationToken cancellationToken)
+    {
+        var contributors = _roundContextContributors.Snapshot();
+        try
+        {
+            var results = await Task.WhenAll(contributors.Select(async contributor =>
+            {
+                if (string.IsNullOrWhiteSpace(contributor.Id))
+                    throw new InvalidOperationException("Round context contributor id is required.");
+                var timelineWriter = new TimelineWriter(contributor.Id);
+                var roundWriter = new ContributionWriter(contributor.Id);
+                await contributor.ContributeAsync(request, timelineWriter, roundWriter, cancellationToken).ConfigureAwait(false);
+                return (Timeline: timelineWriter.Seal(), Round: roundWriter.Seal());
+            })).ConfigureAwait(false);
+            var roundContext = results.SelectMany(result => result.Round)
+                .OrderBy(item => item.Order)
+                .ThenBy(item => item.Source, StringComparer.Ordinal)
+                .ThenBy(item => item.Id, StringComparer.Ordinal)
+                .ToArray();
+            var timeline = results.SelectMany(result => result.Timeline)
+                .OrderBy(item => item.At)
+                .ThenBy(item => item.Source, StringComparer.Ordinal)
+                .ThenBy(item => item.Id, StringComparer.Ordinal)
+                .ToArray();
+            return Result<CollectedRoundContextSnapshot>.Success(new(roundContext, timeline));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            return Result<CollectedRoundContextSnapshot>.Failure(
+                new(ErrorCode.Unavailable, "Round context collection failed.", ex.Message));
+        }
+    }
+
+    private static string RenderChannelContext(IReadOnlyList<SessionChannelMessage> messages,
+        IReadOnlyList<CollectedRoundContext> floating)
+    {
+        var builder = new StringBuilder("<channel_context>\n");
+        if (floating.Count > 0)
+        {
+            builder.AppendLine("<floating_context>");
+            foreach (var item in floating)
+                builder.Append("<section name=\"").Append(EscapeXmlAttribute(item.Section))
+                    .Append("\" source=\"").Append(EscapeXmlAttribute(item.Source))
+                    .Append("\" id=\"").Append(EscapeXmlAttribute(item.Id)).AppendLine("\">")
+                    .AppendLine(EscapeXmlText(item.Content)).AppendLine("</section>");
+            builder.AppendLine("</floating_context>");
+        }
+        builder.AppendLine("<channel_messages>");
+        foreach (var message in messages)
+        {
+            builder.Append("<message id=\"").Append(EscapeXmlAttribute(message.Id))
+                .Append("\" source=\"").Append(EscapeXmlAttribute(message.Source)).Append('"');
+            if (!string.IsNullOrEmpty(message.Sender))
+                builder.Append(" sender=\"").Append(EscapeXmlAttribute(message.Sender)).Append('"');
+            builder.Append(" at=\"").Append(message.At.ToString("O", System.Globalization.CultureInfo.InvariantCulture)).AppendLine("\">")
+                .AppendLine(EscapeXmlText(message.Content)).AppendLine("</message>");
+        }
+        return builder.AppendLine("</channel_messages>").Append("</channel_context>").ToString();
+    }
+
+    private static bool SameChannelMessages(IReadOnlyList<SessionChannelMessage>? left,
+        IReadOnlyList<SessionChannelMessage> right) => left is not null && left.SequenceEqual(right);
+
+    private static string EscapeXmlText(string value) => value.Replace("&", "&amp;", StringComparison.Ordinal)
+        .Replace("<", "&lt;", StringComparison.Ordinal).Replace(">", "&gt;", StringComparison.Ordinal);
+
+    private static string EscapeXmlAttribute(string value) => EscapeXmlText(value)
+        .Replace("\"", "&quot;", StringComparison.Ordinal).Replace("'", "&apos;", StringComparison.Ordinal);
+
+    private sealed record CollectedRoundContext(string Source, string Id, string Section, string Content, int Order);
+    private sealed record CollectedTimelineMessage(string Source, string Id, string? Sender, string Content, DateTimeOffset At);
+    private sealed record CollectedRoundContextSnapshot(
+        IReadOnlyList<CollectedRoundContext> RoundContext,
+        IReadOnlyList<CollectedTimelineMessage> Timeline);
+    private sealed record PersistedTimeline(SessionState State, IReadOnlyList<SessionHistoryEntry> History);
+
+    private sealed class TimelineWriter(string source) : ISessionTimelineWriter
+    {
+        private readonly object _gate = new();
+        private readonly List<CollectedTimelineMessage> _items = [];
+        private bool _sealed;
+
+        public void Add(SessionTimelineContribution contribution)
+        {
+            ArgumentNullException.ThrowIfNull(contribution);
+            if (!ContributionWriter.IsContextIdValue(contribution.Id) || contribution.Content is null ||
+                contribution.Content.Length > 64_000)
+                throw new ArgumentException("Session timeline contribution is invalid or oversized.", nameof(contribution));
+            lock (_gate)
+            {
+                if (_sealed) throw new InvalidOperationException("Session timeline collection is already complete.");
+                if (_items.Any(item => StringComparer.Ordinal.Equals(item.Id, contribution.Id)))
+                    throw new InvalidOperationException($"Duplicate timeline contribution id: {contribution.Id}");
+                _items.Add(new(source, contribution.Id, contribution.Sender, contribution.Content, contribution.At));
+            }
+        }
+
+        public IReadOnlyList<CollectedTimelineMessage> Seal()
+        {
+            lock (_gate)
+            {
+                _sealed = true;
+                return _items.ToArray();
+            }
+        }
+    }
+
+    private sealed class ContributionWriter(string source) : IRoundContextWriter
+    {
+        private readonly object _gate = new();
+        private readonly List<CollectedRoundContext> _items = [];
+        private bool _sealed;
+
+        public void Add(RoundContextContribution contribution)
+        {
+            ArgumentNullException.ThrowIfNull(contribution);
+            if (!IsContextIdValue(contribution.Id) || !IsContextIdValue(contribution.Section) || contribution.Content is null ||
+                contribution.Content.Length > 64_000)
+                throw new ArgumentException("Round context contribution is invalid or oversized.", nameof(contribution));
+            lock (_gate)
+            {
+                if (_sealed) throw new InvalidOperationException("Round context collection is already complete.");
+                if (_items.Any(item => StringComparer.Ordinal.Equals(item.Id, contribution.Id)))
+                    throw new InvalidOperationException($"Duplicate round context contribution id: {contribution.Id}");
+                _items.Add(new(source, contribution.Id, contribution.Section, contribution.Content, contribution.Order));
+            }
+        }
+
+        public IReadOnlyList<CollectedRoundContext> Seal()
+        {
+            lock (_gate)
+            {
+                _sealed = true;
+                return _items.ToArray();
+            }
+        }
+
+        public static bool IsContextIdValue(string value) => value is { Length: > 0 and <= 128 } &&
+            value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.');
+    }
 
     private string ResolveSessionDirectory(string sessionId)
     {

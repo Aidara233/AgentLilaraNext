@@ -145,7 +145,8 @@ public sealed class ChannelManager : IChannelManager
         {
             cancellationToken.ThrowIfCancellationRequested();
             var binding = channel.Bindings.Single(b => b.Adapter == envelope.Adapter && b.PlatformConversationId == envelope.PlatformConversationId);
-            var message = new ChannelMessage(envelope.EventId, channel.Address, binding, envelope.PlatformMessageId, envelope.Text, envelope.At);
+            var message = new ChannelMessage(envelope.EventId, channel.Address, binding, envelope.PlatformMessageId,
+                envelope.Text, envelope.At, envelope.Sender);
             var routed = new RoutedEvent("channel.message.accepted", channel.Address, envelope.EventId,
                 JsonSerializer.Serialize(message, JsonOptions));
             var queued = await _events.PublishAsync(routed, cancellationToken).ConfigureAwait(false);

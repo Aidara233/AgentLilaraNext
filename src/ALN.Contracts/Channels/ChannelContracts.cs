@@ -4,7 +4,7 @@ public sealed record ChannelBinding(Address Adapter, string PlatformConversation
 public sealed record ChannelSpec(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings);
 public sealed record ChannelInfo(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, bool Running);
 public sealed record ChannelMessage(Guid MessageId, Address Channel, ChannelBinding Binding,
-    string? PlatformMessageId, string Text, DateTimeOffset At);
+    string? PlatformMessageId, string Text, DateTimeOffset At, string? Sender = null);
 
 public interface IChannelManager
 {

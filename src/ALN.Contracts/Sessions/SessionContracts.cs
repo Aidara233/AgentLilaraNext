@@ -41,7 +41,50 @@ public sealed record SessionHistoryEntry(
     IReadOnlyList<ModelToolCall>? ToolCalls = null,
     string? ToolCallId = null,
     ModelUsage? Usage = null,
-    StopReason? StopReason = null);
+    StopReason? StopReason = null,
+    IReadOnlyList<SessionChannelMessage>? ChannelMessages = null);
+
+public sealed record SessionChannelMessage(
+    string Id,
+    string Source,
+    string? Sender,
+    string Content,
+    DateTimeOffset At);
+
+/// <summary>Durable channel messages accepted for one Session activation.</summary>
+public sealed record SessionTurnInput(IReadOnlyList<SessionChannelMessage> Messages);
+
+public sealed record RoundContextRequest(string SessionId, Guid ActivationId, int StepNumber);
+
+/// <summary>Ephemeral context to render into this model request; it is never persisted in Session history.</summary>
+public sealed record RoundContextContribution(string Id, string Section, string Content, int Order = 0);
+
+public sealed record SessionTimelineContribution(string Id, string? Sender, string Content, DateTimeOffset At);
+
+public interface ISessionTimelineWriter
+{
+    void Add(SessionTimelineContribution contribution);
+}
+
+public interface IRoundContextWriter
+{
+    void Add(RoundContextContribution contribution);
+}
+
+/// <summary>A registered module that performs just-in-time queries before a model request.</summary>
+public interface IRoundContextContributor
+{
+    string Id { get; }
+    ValueTask ContributeAsync(RoundContextRequest request, ISessionTimelineWriter timeline,
+        IRoundContextWriter roundContext, CancellationToken cancellationToken);
+}
+
+public interface IRoundContextContributorRegistry
+{
+    Result Register(IRoundContextContributor contributor);
+    Result Unregister(string contributorId);
+    IReadOnlyList<IRoundContextContributor> Snapshot();
+}
 
 public sealed record SessionTurnResult(
     string SessionId,
@@ -64,7 +107,7 @@ public interface ISessionManager
         string sessionId,
         SessionSpec spec,
         Guid activationId,
-        string userInput,
+        SessionTurnInput input,
         ISessionToolExecutor? toolExecutor,
         CancellationToken cancellationToken);
 

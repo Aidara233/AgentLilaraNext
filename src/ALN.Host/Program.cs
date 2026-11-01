@@ -28,13 +28,15 @@ var bindings = new InstanceBindingsProxy();
 var adapterFactories = new AdapterFactoryRegistry();
 var adapters = new AdapterManager(adapterTypes, bindings, adapterFactories);
 var modelManager = new ModelManager();
-var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager);
+var roundContextContributors = new RoundContextContributorRegistry();
+var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, roundContextContributors);
 var reloadState = new ModuleReloadStateStore();
 var hostServices = new HostServiceProvider(
     (typeof(IAdapterManager), adapters),
     (typeof(IAdapterFactoryRegistry), adapterFactories),
     (typeof(IModelManager), modelManager),
     (typeof(ISessionManager), sessions),
+    (typeof(IRoundContextContributorRegistry), roundContextContributors),
     (typeof(IFileMailbox), mailbox),
     (typeof(IEventSink), queue),
     (typeof(IModuleTypeCatalog), adapterTypes),
