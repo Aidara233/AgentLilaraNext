@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ALN 控制台</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="./app.css" />
+</head>
+<body>
+  <noscript>
+    <p class="hint" style="padding:16px">这个控制台是一个纯前端的静态页面，需要启用 JavaScript 才能运行。</p>
+  </noscript>
+
+  <!-- Login is a gate, not a page: without a token every request is a 401, so there is nothing to
+       render behind it. The token lives in sessionStorage and dies with the tab. -->
+  <section id="login" class="login" hidden>
+    <form id="login-form" class="card">
+      <h1>连接 ALN 核心</h1>
+      <label>接口地址
+        <input id="f-api" name="api" spellcheck="false" autocomplete="off" required />
+      </label>
+      <label>访问令牌
+        <input id="f-token" name="token" type="password" autocomplete="off" spellcheck="false" required />
+      </label>
+      <button type="submit" id="f-submit">连接</button>
+      <p id="login-error" class="form-error" role="alert"></p>
+      <p class="hint">
+        令牌只存在本标签页，不写入磁盘。跨源访问需要在核心的 <code>api/server.json</code> 里把本页地址
+        列进 <code>cors</code>，否则请求会被浏览器拦下。
+      </p>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <header class="bar">
+      <div class="brand">
+        <span id="conn" class="conn" title="连接状态"></span>
+        <strong>ALN</strong>
+        <span class="muted">控制台</span>
+      </div>
+      <nav id="nav" class="nav"></nav>
+      <div class="who">
+        <span id="actor" class="actor"></span>
+        <button id="signout" class="ghost" type="button">退出</button>
+      </div>
+    </header>
+
+    <main id="view" class="view"></main>
+
+    <footer class="foot">
+      <span id="status" class="status"></span>
+      <span class="spacer"></span>
+      <label class="live"><input id="live" type="checkbox" /> 自动刷新</label>
+      <code id="endpoint" class="endpoint"></code>
+    </footer>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script type="module" src="./js/main.js"></script>
+</body>
+</html>

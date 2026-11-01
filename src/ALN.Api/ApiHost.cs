@@ -25,8 +25,21 @@ public static class ApiHost
         builder.WebHost.ConfigureKestrel(options => { });
         builder.Services.Configure<HostOptions>(options => options.ShutdownTimeout = TimeSpan.FromSeconds(3));
         builder.WebHost.UseSetting(WebHostDefaults.ServerUrlsKey, string.Join(';', settings.Urls));
+        // Cross-origin access is off unless configured: a browser front end runs on its own origin and
+        // needs this, but every other caller does not.
+        if (settings.Origins.Count > 0) builder.Services.AddCors();
 
         var app = builder.Build();
+
+        // The policy is per-request and answers preflight before identity: a preflight request never
+        // carries the Authorization header, so it can't be authenticated.
+        if (settings.Origins.Count > 0)
+        {
+            app.UseCors(policy => policy
+                .WithOrigins([.. settings.Origins])
+                .AllowAnyHeader()
+                .AllowAnyMethod());
+        }
 
         // Bearer token -> Actor. Anonymous requests never reach an action.
         app.Use(async (context, next) =>
@@ -91,14 +104,16 @@ public static class ApiHost
         });
 
         await app.StartAsync(cancellationToken);
-        return new ApiInstance(app, settings.Urls);
+        return new ApiInstance(app, settings.Urls, settings.Origins);
     }
 }
 
 /// <summary>Handle for shutting the listener down with the rest of the process.</summary>
-public sealed class ApiInstance(WebApplication app, string[] urls) : IAsyncDisposable
+public sealed class ApiInstance(WebApplication app, string[] urls, IReadOnlyList<string> origins) : IAsyncDisposable
 {
     public string[] Urls { get; } = urls;
+
+    public IReadOnlyList<string> Origins { get; } = origins;
 
     public async ValueTask DisposeAsync()
     {

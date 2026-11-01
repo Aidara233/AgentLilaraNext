@@ -195,8 +195,11 @@ ALN.Api.ApiInstance? api = null;
 var apiSettings = ALN.Api.ApiSettings.Load(data.Root);
 if (apiSettings is not null)
 {
+    foreach (var rejected in apiSettings.RejectedOrigins)
+        Console.Error.WriteLine($"Warning: cors entry '{rejected}' is not an origin (scheme://host[:port]); ignored.");
     api = await ALN.Api.ApiHost.StartAsync(apiSettings, controlPlane, shutdown.Token);
-    Console.WriteLine($"API listening on {string.Join(", ", api.Urls)}; {controlPlane.Catalog.Count} actions; authentication required.");
+    Console.WriteLine($"API listening on {string.Join(", ", api.Urls)}; {controlPlane.Catalog.Count} actions; authentication required." +
+                      (api.Origins.Count == 0 ? " No cross-origin callers allowed." : $" CORS: {string.Join(", ", api.Origins)}."));
 }
 else
 {
