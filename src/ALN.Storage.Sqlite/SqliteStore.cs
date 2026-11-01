@@ -16,7 +16,7 @@ namespace ALN.Storage.Sqlite;
 /// Durability: <c>journal_mode=WAL</c> with <c>synchronous=NORMAL</c>, which survives a killed process (the
 /// case this whole state story is about) and can lose only the last commit on a power cut.
 /// </summary>
-public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomicWork, IDisposable
+public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomicWork, IEntryStore, IDisposable
 {
     private const int SchemaVersion = 1;
     private const int SqliteConstraint = 19;
@@ -219,6 +219,82 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             return Result<IReadOnlyList<StoredMessage>>.Success(messages);
         });
 
+    // ---- IEntryStore: lists that grow with traffic ---------------------------------------------
+
+    public ValueTask<Result> PutAsync(string scope, Address owner, string key, string value, int? capacity, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result.Failure, "Journal entry could not be written.", () =>
+        {
+            if (!IsToken(scope) || !IsToken(key) || !owner.IsInstance)
+                return Result.Failure(new(ErrorCode.Invalid, "Entry scope and key must be tokens, and the owner must be an instance."));
+            if (value is null) return Result.Failure(new(ErrorCode.Invalid, "Entry value must not be null."));
+            using var command = Command(
+                "INSERT INTO entry(scope, owner, key, value, at) VALUES($scope, $owner, $key, $value, $at) " +
+                "ON CONFLICT(scope, owner, key) DO UPDATE SET value=excluded.value, at=excluded.at;");
+            command.Parameters.AddWithValue("$scope", scope);
+            command.Parameters.AddWithValue("$owner", owner.ToString());
+            command.Parameters.AddWithValue("$key", key);
+            command.Parameters.AddWithValue("$value", value);
+            command.Parameters.AddWithValue("$at", Now());
+            command.ExecuteNonQuery();
+            if (capacity is not > 0) return Result.Success();
+
+            // One statement instead of read-filter-write: a journal that only ever grows is a journal nobody
+            // drains, and the oldest entries are the ones waiting longest for an acknowledgement that is not
+            // coming. Callers pass the capacity; they get told when it bites (see the count below).
+            using var trim = Command(
+                "DELETE FROM entry WHERE scope=$scope AND owner=$owner AND key IN (" +
+                "SELECT key FROM entry WHERE scope=$scope AND owner=$owner ORDER BY at DESC, key DESC LIMIT -1 OFFSET $capacity);");
+            trim.Parameters.AddWithValue("$scope", scope);
+            trim.Parameters.AddWithValue("$owner", owner.ToString());
+            trim.Parameters.AddWithValue("$capacity", capacity.Value);
+            trim.ExecuteNonQuery();
+            return Result.Success();
+        });
+
+    public ValueTask<Result> RemoveAsync(string scope, Address owner, string key, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result.Failure, "Journal entry could not be removed.", () =>
+        {
+            using var command = Command("DELETE FROM entry WHERE scope=$scope AND owner=$owner AND key=$key;");
+            command.Parameters.AddWithValue("$scope", scope);
+            command.Parameters.AddWithValue("$owner", owner.ToString());
+            command.Parameters.AddWithValue("$key", key);
+            command.ExecuteNonQuery();
+            return Result.Success();
+        });
+
+    public ValueTask<Result<IReadOnlyList<EntryRecord>>> ListAsync(string scope, Address owner, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<IReadOnlyList<EntryRecord>>.Failure, "Journal entries could not be read.", () =>
+        {
+            using var command = Command("SELECT key, value, at FROM entry WHERE scope=$scope AND owner=$owner ORDER BY at, key;");
+            command.Parameters.AddWithValue("$scope", scope);
+            command.Parameters.AddWithValue("$owner", owner.ToString());
+            var entries = new List<EntryRecord>();
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                entries.Add(new EntryRecord(reader.GetString(0), reader.GetString(1),
+                    DateTimeOffset.Parse(reader.GetString(2), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)));
+            }
+            return Result<IReadOnlyList<EntryRecord>>.Success(entries);
+        });
+
+    public ValueTask<Result<int>> RemoveAllAsync(string scope, Address owner, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<int>.Failure, "Journal entries could not be removed.", () =>
+        {
+            using var command = Command("DELETE FROM entry WHERE scope=$scope AND owner=$owner;");
+            command.Parameters.AddWithValue("$scope", scope);
+            command.Parameters.AddWithValue("$owner", owner.ToString());
+            return Result<int>.Success(command.ExecuteNonQuery());
+        });
+
+    public ValueTask<Result<int>> CountAsync(string scope, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<int>.Failure, "Journal could not be counted.", () =>
+        {
+            using var command = Command("SELECT COUNT(*) FROM entry WHERE scope=$scope;");
+            command.Parameters.AddWithValue("$scope", scope);
+            return Result<int>.Success(Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture));
+        });
+
     // ---- IAuditSink ----------------------------------------------------------------------------
 
     public ValueTask AppendAsync(AuditRecord record, CancellationToken cancellationToken) =>
@@ -373,6 +449,16 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             -- One platform message is one row per owner: the transport handing it over twice is not news.
             CREATE UNIQUE INDEX IF NOT EXISTS message_owner_platform
                 ON message(owner, platform_message_id) WHERE platform_message_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS entry(
+                scope TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                at TEXT NOT NULL,
+                PRIMARY KEY(scope, owner, key));
+
+            CREATE INDEX IF NOT EXISTS entry_scope_owner_at ON entry(scope, owner, at);
 
             CREATE TABLE IF NOT EXISTS audit(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

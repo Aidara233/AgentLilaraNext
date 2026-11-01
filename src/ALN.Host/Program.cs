@@ -74,6 +74,7 @@ var hostServices = new HostServiceProvider(
     (typeof(IMessageStore), messageStore),
     (typeof(IStateStore), stateStore),
     (typeof(IAtomicWork), storage),
+    (typeof(IEntryStore), storage),
     (typeof(IRestoreReporter), restore),
     (typeof(IInboundAcks), acks),
     (typeof(IParameterRegistry), parameters),

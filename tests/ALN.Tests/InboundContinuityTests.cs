@@ -50,7 +50,7 @@ public sealed class InboundContinuityTests : IDisposable
     [Fact]
     public async Task The_journal_is_bounded_and_gives_up_on_the_oldest_first()
     {
-        var journal = new InboundJournal(OpenStore(), new CollectingLogger(), "test", capacity: 3);
+        var journal = new InboundJournal(OpenStore(), new CollectingLogger(), Owner, capacity: 3);
         for (var index = 0; index < 5; index++)
             Assert.True((await journal.RememberAsync(Envelope($"m-{index}", "x"), default)).Ok);
 
@@ -63,10 +63,10 @@ public sealed class InboundContinuityTests : IDisposable
     public async Task An_unreadable_journal_starts_over_instead_of_refusing_to_boot()
     {
         var store = OpenStore();
-        var written = await store.WriteAsync(InboundJournal.Scope, "test", "{ this is not json", default);
-        Assert.True(written.Ok);
+        var written = await store.PutAsync(InboundJournal.Scope, Owner, "bad-row", "{ this is not json", null, default);
+        Assert.True(written.Ok, written.Error?.Message);
         var logger = new CollectingLogger();
-        var journal = new InboundJournal(store, logger, "test");
+        var journal = new InboundJournal(store, logger, Owner);
 
         var read = await journal.ReadAsync(default);
         Assert.True(read.Ok, read.Error?.Message);
@@ -77,7 +77,7 @@ public sealed class InboundContinuityTests : IDisposable
     [Fact]
     public async Task Without_a_state_store_the_journal_is_honest_about_being_ephemeral()
     {
-        var journal = new InboundJournal(null, new CollectingLogger(), "test");
+        var journal = new InboundJournal(null, new CollectingLogger(), Owner);
         Assert.False(journal.IsDurable);
         Assert.True((await journal.RememberAsync(Envelope("m-1", "x"), default)).Ok);
         Assert.Empty((await journal.ReadAsync(default)).Value!);
@@ -122,14 +122,16 @@ public sealed class InboundContinuityTests : IDisposable
         Assert.Contains("no profile", turn.Error!.Message, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static InboundJournal NewJournal(IStateStore store, out CollectingLogger logger)
+    private static InboundJournal NewJournal(IEntryStore store, out CollectingLogger logger)
     {
         logger = new CollectingLogger();
-        return new InboundJournal(store, logger, "test");
+        return new InboundJournal(store, logger, Owner);
     }
 
     private static AdapterEnvelope Envelope(string platformMessageId, string text) => new(
         new("adapter", "qq", "1"), "qq", "group-123456", platformMessageId, text, DateTimeOffset.UtcNow, "20000", false);
+
+    private static readonly Address Owner = new("adapter", "qq", "1");
 
     private sealed class CollectingLogger : IModuleLogger
     {

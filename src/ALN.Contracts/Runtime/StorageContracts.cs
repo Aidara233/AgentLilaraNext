@@ -28,6 +28,31 @@ public interface IMessageStore
 }
 
 /// <summary>
+/// A bag of small records one owner is accumulating — a journal, a to-do list — where each record is its own
+/// row and its own write.
+///
+/// Deliberately not <see cref="IStateStore"/>: a state key holds one blob, so "append one message" there means
+/// read the whole list, add to it, write it back. These lists are exactly the ones that grow with traffic, so
+/// they get one row per item, a delete per acknowledgement, and a query that can be read by a person.
+/// </summary>
+public interface IEntryStore
+{
+    /// <summary>Adds or replaces one record. Inserting past <paramref name="capacity"/> drops the oldest.</summary>
+    ValueTask<Result> PutAsync(string scope, Address owner, string key, string value, int? capacity, CancellationToken cancellationToken);
+
+    ValueTask<Result> RemoveAsync(string scope, Address owner, string key, CancellationToken cancellationToken);
+
+    /// <summary>Oldest first — the order they arrived in.</summary>
+    ValueTask<Result<IReadOnlyList<EntryRecord>>> ListAsync(string scope, Address owner, CancellationToken cancellationToken);
+
+    ValueTask<Result<int>> RemoveAllAsync(string scope, Address owner, CancellationToken cancellationToken);
+
+    ValueTask<Result<int>> CountAsync(string scope, CancellationToken cancellationToken);
+}
+
+public sealed record EntryRecord(string Key, string Value, DateTimeOffset At);
+
+/// <summary>
 /// Runs several storage writes as one unit when the backend can (the SQLite store does; a file-per-key
 /// backend cannot honestly promise it). Callers fall back to running the body sequentially.
 ///

@@ -33,14 +33,14 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity
     private Task? _replayLoop;
     private volatile string? _detail;
 
-    public QqAdapter(AdapterSpec spec, IEventSink sink, IModuleLogger log, IStateStore? state = null, IInboundAcks? acks = null)
+    public QqAdapter(AdapterSpec spec, IEventSink sink, IModuleLogger log, IInboundAcks? acks = null, IEntryStore? entries = null)
         : base(spec.Address, spec.Descriptor)
     {
         _sink = sink ?? throw new ArgumentNullException(nameof(sink));
         _log = log ?? throw new ArgumentNullException(nameof(log));
         _acks = acks;
-        // Namespaced per instance: two QQ accounts on one host must not share a journal.
-        _journal = new InboundJournal(state, _log, StateName.Encode(Address.ToString()));
+        // One journal per instance: two QQ accounts on one host must not share one.
+        _journal = new InboundJournal(entries, _log, Address);
 
         var settings = spec.Settings ?? new Dictionary<string, string>();
         if (!settings.TryGetValue("endpoint", out var endpoint) || string.IsNullOrWhiteSpace(endpoint))

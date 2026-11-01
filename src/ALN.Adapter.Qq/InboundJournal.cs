@@ -11,89 +11,57 @@ namespace ALN.Adapter.Qq;
 /// it is over. A restart publishes whatever is still here, with the original event id, and the acknowledgement
 /// that follows is the same one the first delivery would have produced.
 ///
-/// Bounded on purpose: an acknowledgement that never arrives must not fill the disk, so the oldest entries are
-/// given up on — loudly.
+/// One row per message, keyed by event id: appending is an insert, acknowledging is a delete, and
+/// "what will a restart replay" is a select. The capacity is a safety valve, applied by the store when it
+/// would otherwise grow without bound.
 /// </summary>
-public sealed class InboundJournal(IStateStore? state, IModuleLogger log, string key, int capacity = 512)
+public sealed class InboundJournal(IEntryStore? entries, IModuleLogger log, Address owner, int capacity = 512)
 {
     public const string Scope = "qq.inbound";
+    public const int DefaultCapacity = 512;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-    private readonly SemaphoreSlim _gate = new(1, 1);
 
     /// <summary>True when nothing will be written down: the adapter still works, just without the promise.</summary>
-    public bool IsDurable => state is not null;
+    public bool IsDurable => entries is not null;
 
     public async ValueTask<Result> RememberAsync(AdapterEnvelope envelope, CancellationToken cancellationToken)
     {
-        if (state is null) return Result.Success();
-        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            var entries = await ReadAsync(cancellationToken).ConfigureAwait(false);
-            if (entries.Error is { } readError) return Result.Failure(readError);
-            var kept = entries.Value!.Where(existing => existing.EventId != envelope.EventId).ToList();
-            kept.Add(envelope);
-            if (kept.Count > capacity)
-            {
-                var dropped = kept.Count - capacity;
-                kept.RemoveRange(0, dropped);
-                log.Warn("inbound journal is full; dropping the oldest undelivered messages", new Dictionary<string, string>
-                {
-                    ["dropped"] = dropped.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                    ["capacity"] = capacity.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                });
-            }
-            return await WriteAsync(kept, cancellationToken).ConfigureAwait(false);
-        }
-        finally { _gate.Release(); }
+        if (entries is null) return Result.Success();
+        var json = JsonSerializer.Serialize(envelope, JsonOptions);
+        return await entries.PutAsync(Scope, owner, envelope.EventId.ToString("D"), json, capacity, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask<Result> ForgetAsync(Guid eventId, CancellationToken cancellationToken)
     {
-        if (state is null) return Result.Success();
-        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            var entries = await ReadAsync(cancellationToken).ConfigureAwait(false);
-            if (entries.Error is { } readError) return Result.Failure(readError);
-            var kept = entries.Value!.Where(existing => existing.EventId != eventId).ToList();
-            if (kept.Count == entries.Value!.Count) return Result.Success();
-            return await WriteAsync(kept, cancellationToken).ConfigureAwait(false);
-        }
-        finally { _gate.Release(); }
+        if (entries is null) return Result.Success();
+        return await entries.RemoveAsync(Scope, owner, eventId.ToString("D"), cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask<Result<IReadOnlyList<AdapterEnvelope>>> ReadAsync(CancellationToken cancellationToken)
     {
-        if (state is null) return Result<IReadOnlyList<AdapterEnvelope>>.Success([]);
-        var read = await state.ReadAsync(Scope, key, cancellationToken).ConfigureAwait(false);
-        if (read.Error is { } readError) return Result<IReadOnlyList<AdapterEnvelope>>.Failure(readError);
-        // Absent is not an error: Result<T>.Ok is false for a null value, so absence is read off Error.
-        if (read.Value is null) return Result<IReadOnlyList<AdapterEnvelope>>.Success([]);
-        try
+        if (entries is null) return Result<IReadOnlyList<AdapterEnvelope>>.Success([]);
+        var stored = await entries.ListAsync(Scope, owner, cancellationToken).ConfigureAwait(false);
+        if (stored.Error is { } readError) return Result<IReadOnlyList<AdapterEnvelope>>.Failure(readError);
+        var envelopes = new List<AdapterEnvelope>(stored.Value!.Count);
+        foreach (var entry in stored.Value!)
         {
-            var stored = JsonSerializer.Deserialize<JournalFile>(read.Value, JsonOptions);
-            return Result<IReadOnlyList<AdapterEnvelope>>.Success(stored?.Events ?? []);
-        }
-        catch (JsonException ex)
-        {
-            // Refusing to boot over one unreadable state file helps nobody, and replaying a half-parsed
-            // journal is worse than saying so and starting clean.
-            log.Warn("inbound journal was unreadable; starting with an empty one", new Dictionary<string, string>
+            try
             {
-                ["key"] = key,
-                ["error"] = ex.Message
-            });
-            return Result<IReadOnlyList<AdapterEnvelope>>.Success([]);
+                var envelope = JsonSerializer.Deserialize<AdapterEnvelope>(entry.Value, JsonOptions);
+                if (envelope is not null) envelopes.Add(envelope);
+            }
+            catch (JsonException ex)
+            {
+                // One unreadable row must not stop the others from being replayed, and it must not be
+                // replayed as garbage either: say so and move on.
+                log.Warn("an inbound journal entry was unreadable and was dropped", new Dictionary<string, string>
+                {
+                    ["key"] = entry.Key,
+                    ["error"] = ex.Message
+                });
+                await entries.RemoveAsync(Scope, owner, entry.Key, cancellationToken).ConfigureAwait(false);
+            }
         }
+        return Result<IReadOnlyList<AdapterEnvelope>>.Success(envelopes);
     }
-
-    private async ValueTask<Result> WriteAsync(IReadOnlyList<AdapterEnvelope> entries, CancellationToken cancellationToken)
-    {
-        if (entries.Count == 0) return await state!.DeleteAsync(Scope, key, cancellationToken).ConfigureAwait(false);
-        var json = JsonSerializer.Serialize(new JournalFile(1, entries.ToArray()), JsonOptions);
-        return await state!.WriteAsync(Scope, key, json, cancellationToken).ConfigureAwait(false);
-    }
-
-    private sealed record JournalFile(int Schema, IReadOnlyList<AdapterEnvelope> Events);
 }

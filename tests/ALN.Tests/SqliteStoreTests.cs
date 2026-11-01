@@ -135,6 +135,43 @@ public sealed class SqliteStoreTests : IDisposable
         Assert.Equal(["denied", "ok"], store.ReadAudit().Select(record => record.Outcome));
     }
 
+    [Fact]
+    public async Task Journal_entries_are_their_own_rows_and_capacity_drops_the_oldest()
+    {
+        var store = OpenStore();
+        var owner = new Address("adapter", "qq", "1");
+        for (var index = 0; index < 4; index++)
+            Assert.True((await store.PutAsync(InboundScope, owner, $"k{index}", $"v{index}", capacity: 3, default)).Ok);
+
+        // One row per item; the oldest fell off because the caller said "at most three".
+        Assert.Equal(["k1", "k2", "k3"], (await store.ListAsync(InboundScope, owner, default)).Value!.Select(entry => entry.Key));
+        Assert.Equal(3, (await store.CountAsync(InboundScope, default)).Value);
+
+        // Rewriting the same key replaces the row rather than adding one.
+        Assert.True((await store.PutAsync(InboundScope, owner, "k3", "v3-again", null, default)).Ok);
+        Assert.Equal("v3-again", (await store.ListAsync(InboundScope, owner, default)).Value!.Last().Value);
+
+        Assert.True((await store.RemoveAsync(InboundScope, owner, "k2", default)).Ok);
+        Assert.Equal(2, (await store.CountAsync(InboundScope, default)).Value);
+        Assert.Equal(2, (await store.RemoveAllAsync(InboundScope, owner, default)).Value);
+        Assert.Empty((await store.ListAsync(InboundScope, owner, default)).Value!);
+    }
+
+    [Fact]
+    public async Task Journal_entries_belong_to_one_owner()
+    {
+        var store = OpenStore();
+        var mine = new Address("adapter", "qq", "1");
+        var theirs = new Address("adapter", "qq", "2");
+        Assert.True((await store.PutAsync(InboundScope, mine, "k", """{"a":1}""", null, default)).Ok);
+        Assert.True((await store.PutAsync(InboundScope, theirs, "k", """{"a":2}""", null, default)).Ok);
+
+        Assert.Equal("""{"a":1}""", Assert.Single((await store.ListAsync(InboundScope, mine, default)).Value!).Value);
+        Assert.Equal("""{"a":2}""", Assert.Single((await store.ListAsync(InboundScope, theirs, default)).Value!).Value);
+    }
+
+    private const string InboundScope = "qq.inbound";
+
     private static StoredMessage Message(string id, string platformId, string text, Address? owner = null,
         DateTimeOffset? at = null) =>
         new(id, owner ?? Owner, "chat-1", platformId, "alice", text, at ?? new(2026, 1, 2, 3, 4, 5, TimeSpan.Zero));

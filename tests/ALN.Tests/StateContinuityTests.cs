@@ -239,9 +239,8 @@ public sealed class StateContinuityTests : IDisposable
             Assert.True(await first.StepAsync());   // adapter.envelope → the Channel accepts, the answer is queued
             // Accepted, unanswered, and the process goes away before the round that would answer it.
             Assert.Empty(first.OutboxTexts("chat-1"));
-            var pending = await first.Storage.ReadAsync(ChannelManager.PendingScope,
-                ALN.Contracts.StateName.Encode(ChatOne.ToString()), default);
-            Assert.NotNull(pending.Value);
+            var pending = await first.Storage.ListAsync(ChannelManager.PendingScope, ChatOne, default);
+            Assert.NotEmpty(pending.Value!);
         }
 
         using var second = new Node(_root);
@@ -354,7 +353,7 @@ public sealed class StateContinuityTests : IDisposable
             Assert.True(_types.RegisterPackageTypes("test.channel", [new("channel.conversation", "channel")]).Ok);
             Adapters = new AdapterManager(_types, _bindings);
             Channels = new ChannelManager(Adapters, Events, _bindings,
-                new FileChannelSpecStore(Path.Combine(root, "channels")), Storage, Parameters, Storage, Report, Storage);
+                new FileChannelSpecStore(Path.Combine(root, "channels")), Storage, Parameters, Storage, Report, Storage, Storage);
             Graph = new GraphManager(Adapters, Channels, Clock, _types, new JintScriptExecutor(), Storage, Signals,
                 state: Storage, report: Report);
             _bindings.Bind(Graph);

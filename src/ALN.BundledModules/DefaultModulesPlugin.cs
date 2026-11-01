@@ -45,11 +45,12 @@ public sealed class DefaultModulesPlugin : IModulePlugin
             var state = context.HostServices.GetService(typeof(IStateStore)) as IStateStore;
             var report = context.HostServices.GetService(typeof(IRestoreReporter)) as IRestoreReporter;
             var atomic = context.HostServices.GetService(typeof(IAtomicWork)) as IAtomicWork;
+            var entries = context.HostServices.GetService(typeof(IEntryStore)) as IEntryStore;
             var channels = new ChannelManager(adapters, events, bindings,
                 context.HostServices.GetService(typeof(IChannelSpecStore)) as IChannelSpecStore,
                 context.HostServices.GetService(typeof(IMessageStore)) as IMessageStore,
                 context.HostServices.GetService(typeof(IParameterRegistry)) as IParameterRegistry,
-                state, report, atomic);
+                state, report, atomic, entries);
             var executor = new JintScriptExecutor();
             var graph = new GraphManager(adapters, channels, clock, types, executor, audit, journal, models, sessions, state, report);
             if (bindings is IInstanceBindingsProxy proxy) proxy.Bind(graph);

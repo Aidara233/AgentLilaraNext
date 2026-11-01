@@ -5,7 +5,7 @@ namespace ALN.Channel;
 
 public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, IInstanceBindings bindings,
     IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
-    IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null)
+    IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IEntryStore? entries = null)
     : IChannelManager, ILifecycleParticipant
 {
     /// <summary>Where the wish "this Channel should be running" is kept, so a stop survives a restart.</summary>
@@ -23,6 +23,8 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     private readonly IStateStore? _state = state;
     private readonly IRestoreReporter _report = report ?? NullRestoreReporter.Instance;
     private readonly IAtomicWork? _atomic = atomic;
+    // Accepted-but-unfinished markers are their own rows: one per message, not a list rewritten per message.
+    private readonly IEntryStore? _entries = entries;
     private readonly Dictionary<Address, ChannelInstance> _channels = new();
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
@@ -218,13 +220,11 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             }
             // A destroyed Channel takes its wish with it; otherwise a new Channel with the same address would
             // inherit "stopped" from one that no longer exists.
+            // A destroyed Channel takes its wish and its unfinished markers with it; otherwise a new Channel
+            // with the same address would inherit them from one that no longer exists.
             if (_state is not null)
-            {
                 await _state.DeleteAsync(DesiredScope, StateName.Encode(address.ToString()), cancellationToken).ConfigureAwait(false);
-                // Unfinished messages go with the Channel: their history is gone too, so replaying them
-                // would wake something that no longer exists.
-                await _state.DeleteAsync(PendingScope, StateName.Encode(address.ToString()), cancellationToken).ConfigureAwait(false);
-            }
+            if (_entries is not null) await _entries.RemoveAllAsync(PendingScope, address, cancellationToken).ConfigureAwait(false);
             return Result.Success();
         }
         catch (OperationCanceledException) { throw; }
@@ -287,14 +287,10 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
 
     public async ValueTask<Result> CompleteAcceptAsync(Address channel, Guid messageId, CancellationToken cancellationToken)
     {
-        if (_state is null) return Result.Success();
-        var pending = await ReadPendingAsync(channel, cancellationToken).ConfigureAwait(false);
-        if (pending.Error is { } readError) return Result.Failure(readError);
-        var messages = pending.Value!.ToList();
-        // Nothing to clear is the normal case for a message that never became pending (a stopped Channel,
-        // a duplicate delivery), so it is not an error.
-        if (messages.RemoveAll(entry => entry.MessageId == messageId.ToString("D")) == 0) return Result.Success();
-        return await WritePendingAsync(channel, messages, cancellationToken).ConfigureAwait(false);
+        // Removing a marker that is not there is the normal case for a message that never became pending
+        // (a stopped Channel, a duplicate delivery), so it is not an error.
+        if (_entries is null) return Result.Success();
+        return await _entries.RemoveAsync(PendingScope, channel, messageId.ToString("D"), cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask<Result<int>> ReplayPendingAsync(CancellationToken cancellationToken)
@@ -336,50 +332,39 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
 
     private async ValueTask<Result<IReadOnlyList<PendingAccept>>> ReadPendingAsync(Address channel, CancellationToken cancellationToken)
     {
-        if (_state is null) return Result<IReadOnlyList<PendingAccept>>.Success([]);
-        var read = await _state.ReadAsync(PendingScope, StateName.Encode(channel.ToString()), cancellationToken).ConfigureAwait(false);
-        if (read.Error is { } readError) return Result<IReadOnlyList<PendingAccept>>.Failure(readError);
-        // Absent is not an error: Result<T>.Ok is false when the value is null, so absence is read off Error.
-        if (read.Value is null) return Result<IReadOnlyList<PendingAccept>>.Success([]);
-        try
+        if (_entries is null) return Result<IReadOnlyList<PendingAccept>>.Success([]);
+        var stored = await _entries.ListAsync(PendingScope, channel, cancellationToken).ConfigureAwait(false);
+        if (stored.Error is { } readError) return Result<IReadOnlyList<PendingAccept>>.Failure(readError);
+        var pending = new List<PendingAccept>(stored.Value!.Count);
+        foreach (var entry in stored.Value!)
         {
-            var stored = JsonSerializer.Deserialize<PendingState>(read.Value, JsonOptions);
-            return Result<IReadOnlyList<PendingAccept>>.Success(stored?.Messages.ToList() ?? []);
+            try
+            {
+                var parsed = JsonSerializer.Deserialize<PendingAccept>(entry.Value, JsonOptions);
+                if (parsed is not null) pending.Add(parsed);
+            }
+            catch (JsonException ex)
+            {
+                // A marker we cannot read would replay forever otherwise. The message is still in history, so
+                // the honest move is to drop this one and say so.
+                _report.Note("channels", $"a pending marker for {channel} was unreadable ({ex.Message}); dropped");
+                await _entries.RemoveAsync(PendingScope, channel, entry.Key, cancellationToken).ConfigureAwait(false);
+            }
         }
-        catch (JsonException ex)
-        {
-            // Unreadable markers would replay forever otherwise. The messages are still in history, so the
-            // honest move is to say so and start the list over.
-            _report.Note("channels", $"pending markers for {channel} were unreadable ({ex.Message}); starting over");
-            return Result<IReadOnlyList<PendingAccept>>.Success([]);
-        }
+        return Result<IReadOnlyList<PendingAccept>>.Success(pending);
     }
 
     private async ValueTask<Result> AddPendingAsync(Address channel, PendingAccept entry, CancellationToken cancellationToken)
     {
-        if (_state is null) return Result.Success();
-        var pending = await ReadPendingAsync(channel, cancellationToken).ConfigureAwait(false);
-        if (pending.Error is { } readError) return Result.Failure(readError);
-        var messages = pending.Value!.ToList();
-        if (messages.Any(existing => existing.MessageId == entry.MessageId)) return Result.Success();
-        messages.Add(entry);
-        return await WritePendingAsync(channel, messages, cancellationToken).ConfigureAwait(false);
-    }
-
-    private async ValueTask<Result> WritePendingAsync(Address channel, IReadOnlyList<PendingAccept> messages, CancellationToken cancellationToken)
-    {
-        if (_state is null) return Result.Success();
-        var key = StateName.Encode(channel.ToString());
-        if (messages.Count == 0) return await _state.DeleteAsync(PendingScope, key, cancellationToken).ConfigureAwait(false);
-        var json = JsonSerializer.Serialize(new PendingState(1, messages.ToArray()), JsonOptions);
-        return await _state.WriteAsync(PendingScope, key, json, cancellationToken).ConfigureAwait(false);
+        if (_entries is null) return Result.Success();
+        var json = JsonSerializer.Serialize(entry, JsonOptions);
+        // One row, one insert. The marker is keyed by event id, so a retried accept replaces rather than adds.
+        return await _entries.PutAsync(PendingScope, channel, entry.MessageId, json, null, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>An accepted message whose round never finished. Enough to rebuild the wake-up without the history.</summary>
     private sealed record PendingAccept(string MessageId, string? PlatformMessageId, string Adapter, string Conversation,
         string Text, DateTimeOffset At, string? Sender);
-
-    private sealed record PendingState(int Schema, IReadOnlyList<PendingAccept> Messages);
 
     private static bool IsValidConversationId(string value) =>
         value is { Length: > 0 and <= 128 } && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_');
