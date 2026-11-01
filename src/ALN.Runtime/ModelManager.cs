@@ -5,7 +5,7 @@ using ALN.Contracts.Models;
 namespace ALN.Runtime;
 
 /// <summary>Core registry and router for provider kinds, provider instances and model profiles.</summary>
-public sealed class ModelManager : IModelManager, IModulePackageResourceRegistry
+public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? signalLog = null) : IModelManager, IModulePackageResourceRegistry
 {
     private readonly object _gate = new();
     private readonly Dictionary<string, (string PackageId, IModelProviderFactory Factory)> _factories = new(StringComparer.Ordinal);
@@ -179,16 +179,41 @@ public sealed class ModelManager : IModelManager, IModulePackageResourceRegistry
             _providers[profile.Provider] = (registration.PackageId, provider, registration.InFlight + 1);
         }
         var routedRequest = request with { ModelId = profile.ModelId, Sampling = request.Sampling ?? profile.DefaultSampling };
-        return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Success(Track(provider, profile.Provider, routedRequest, cancellationToken)));
+        return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Success(
+            Track(provider, profile.Id, profile.Provider, profile.ModelId, routedRequest, cancellationToken)));
     }
 
-    private async IAsyncEnumerable<ModelEvent> Track(IModelProvider provider, Address address, ModelRequest request,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    private async IAsyncEnumerable<ModelEvent> Track(IModelProvider provider, string profileId, Address address, string modelId,
+        ModelRequest request, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        var callId = Guid.NewGuid().ToString("N");
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var at = DateTimeOffset.UtcNow;
+        var text = new System.Text.StringBuilder();
+        var calls = new SortedDictionary<int, (string? Id, string? Name, System.Text.StringBuilder Arguments)>();
+        var eventCount = 0;
+        StopReason? stopReason = null;
+        ModelUsage? usage = null;
+        Error? failure = null;
         try
         {
             await foreach (var item in provider.CompleteAsync(request, cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
+                eventCount++;
+                switch (item)
+                {
+                    case TextDelta delta: text.Append(delta.Text); break;
+                    case ToolCallDelta call:
+                        if (!calls.TryGetValue(call.Index, out var partial))
+                            calls[call.Index] = partial = (null, null, new System.Text.StringBuilder());
+                        calls[call.Index] = (call.CallId ?? partial.Id, call.Name ?? partial.Name,
+                            partial.Arguments.Append(call.ArgumentsJsonFragment));
+                        break;
+                    case ModelCompleted completed: stopReason = completed.Reason; usage = completed.Usage; break;
+                    case ModelFailed failed: failure = failed.Error; break;
+                }
                 yield return item;
+            }
         }
         finally
         {
@@ -197,6 +222,54 @@ public sealed class ModelManager : IModelManager, IModulePackageResourceRegistry
                 if (_providers.TryGetValue(address, out var registration) && ReferenceEquals(registration.Provider, provider))
                     _providers[address] = (registration.PackageId, provider, Math.Max(0, registration.InFlight - 1));
             }
+            await PersistCallAsync(callId, at, profileId, address, modelId, request, text.ToString(),
+                calls.Select(pair => new ModelToolCall(pair.Value.Id ?? "", pair.Value.Name ?? "", pair.Value.Arguments.ToString()))
+                    .Where(call => call.Name.Length > 0).ToArray(),
+                stopReason, usage, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+                eventCount, failure, CancellationToken.None).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Model calls are large — full messages, tool schemas, responses — so they go to the storage
+    /// module, not the signal log. Failure to store must never fail the call it describes.
+    /// </summary>
+    private async ValueTask PersistCallAsync(string callId, DateTimeOffset at, string profileId, Address provider,
+        string modelId, ModelRequest request, string? responseText, IReadOnlyList<ModelToolCall> toolCalls,
+        StopReason? stopReason, ModelUsage? usage, double durationMs, int eventCount, Error? failure,
+        CancellationToken cancellationToken)
+    {
+        if (artifacts is null) return;
+        try
+        {
+            var record = new ModelCallRecord(callId, at, profileId, provider, modelId, request, responseText, toolCalls,
+                stopReason, usage, durationMs, eventCount, failure?.Message);
+            var json = JsonSerializer.SerializeToUtf8Bytes(record, new JsonSerializerOptions(JsonSerializerDefaults.Web)
+            { WriteIndented = false, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });
+            var stored = await artifacts.StoreAsync("model-calls", $"{at:HHmmssfff}-{callId}", json, cancellationToken).ConfigureAwait(false);
+            if (!stored.Ok)
+                signalLog?.Write(new()
+                {
+                    Group = "model",
+                    Name = profileId,
+                    Mechanism = "persist",
+                    Outcome = "failed",
+                    Level = SignalLevel.Warn,
+                    Detail = new Dictionary<string, string>
+                    { ["code"] = stored.Error?.Code.ToString() ?? "unknown", ["message"] = stored.Error?.Message ?? "" }
+                });
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            signalLog?.Write(new()
+            {
+                Group = "model",
+                Name = profileId,
+                Mechanism = "persist",
+                Outcome = "failed",
+                Level = SignalLevel.Warn,
+                Detail = new Dictionary<string, string> { ["message"] = ex.Message }
+            });
         }
     }
 }

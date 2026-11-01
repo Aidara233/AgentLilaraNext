@@ -61,6 +61,22 @@ public sealed record ModelUsage(int InputTokens, int OutputTokens, int? CacheRea
 
 public enum StopReason { EndTurn, ToolUse, MaxTokens, ContentFilter, StopSequence }
 
+public sealed record ModelCallRecord(
+    string CallId,
+    DateTimeOffset At,
+    string ProfileId,
+    Address Provider,
+    string ModelId,
+    ModelRequest Request,
+    string? ResponseText,
+    IReadOnlyList<ModelToolCall> ToolCalls,
+    StopReason? StopReason,
+    ModelUsage? Usage,
+    double DurationMs,
+    int EventCount,
+    string? Error,
+    string? ArtifactPath = null);
+
 public interface IModelProvider : IAsyncDisposable
 {
     Address Address { get; }

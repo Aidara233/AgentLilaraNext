@@ -28,7 +28,8 @@ var adapterTypes = new AdapterTypeCatalog();
 var bindings = new InstanceBindingsProxy();
 var adapterFactories = new AdapterFactoryRegistry();
 var adapters = new AdapterManager(adapterTypes, bindings, adapterFactories);
-var modelManager = new ModelManager();
+var artifacts = new FileArtifactStore(Path.Combine(data.Root, "artifacts"));
+var modelManager = new ModelManager(artifacts, signalLog);
 var roundContextContributors = new RoundContextContributorRegistry();
 var timeContributor = roundContextContributors.Register(new TimeContextContributor());
 if (!timeContributor.Ok) { Console.Error.WriteLine(timeContributor.Error?.Message); return 1; }
