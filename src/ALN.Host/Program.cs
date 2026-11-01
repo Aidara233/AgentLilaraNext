@@ -94,6 +94,8 @@ if (!graphResult.Ok || graphResult.Value is null || !channelResult.Ok || channel
 var graph = graphResult.Value;
 var channels = channelResult.Value;
 var clock = clockResult.Value;
+// The manager owns adapter startup; it only needs the heartbeat wired before the signal arrives.
+adapters.UseHeartbeat(new RecordingEventSink(queue, messageStore), clock, TimeSpan.FromSeconds(1));
 var adapterPackage = await modulePackages.LoadAsync(
     Path.Combine(AppContext.BaseDirectory, "modules", "adapter.file"), ModulePackageKind.Plugin, CancellationToken.None);
 if (!adapterPackage.Ok || adapterPackage.Value is null)
@@ -121,34 +123,27 @@ if (!loaded.Ok)
     return 1;
 }
 
+// Configuration, not startup: make sure the file Adapter has a spec to revive. Starting it is the
+// lifecycle coordinator's job, not the host's.
 var storedAdapters = await adapterSpecs.LoadAllAsync(CancellationToken.None);
 if (!storedAdapters.Ok)
 {
     Console.Error.WriteLine(storedAdapters.Error?.Message ?? "Stored Adapter specs could not be read.");
     return 1;
 }
-// The Host runs one file Adapter because it owns one mailbox; its spec is read from storage so the
-// instance can be renamed or repointed without editing code.
 var adapterSpec = storedAdapters.Value!.FirstOrDefault(s => s.Address.TypeId == "adapter.file")
     ?? new AdapterSpec(new Address("adapter", "file", "file-1"), new AdapterDescriptor("file", "file-1", AdapterDirection.Both));
+if (storedAdapters.Value!.Count == 0)
+{
+    var seeded = await adapterSpecs.SaveAsync(adapterSpec, CancellationToken.None);
+    if (!seeded.Ok)
+    {
+        Console.Error.WriteLine(seeded.Error?.Message ?? "Adapter spec could not be seeded.");
+        return 1;
+    }
+}
 if (storedAdapters.Value!.Count > 1)
     Console.Error.WriteLine("Warning: only the first adapter.file spec is started; additional Adapter instances need their own mailbox.");
-var created = await adapters.CreateAsync(adapterSpec, CancellationToken.None);
-if (!created.Ok || created.Value is null)
-{
-    Console.Error.WriteLine(created.Error?.Message ?? "Adapter creation failed.");
-    return 1;
-}
-created = default;
-
-var channelAddresses = new HashSet<Address>();
-var startupChannels = await LoadChannelsAsync();
-if (!startupChannels.Ok)
-{
-    Console.Error.WriteLine(startupChannels.Error?.Message);
-    await adapters.DestroyAsync(adapterSpec.Address, CancellationToken.None);
-    return 1;
-}
 
 using var shutdown = new CancellationTokenSource();
 using var pumpStop = new CancellationTokenSource();
@@ -156,22 +151,23 @@ Console.CancelKeyPress += (_, e) => { e.Cancel = true; shutdown.Cancel(); };
 var pump = new EventPump(queue, graph.DispatchAsync, signalLog);
 var pumpTask = pump.RunAsync(pumpStop.Token);
 var clockTask = clock.RunAsync(shutdown.Token);
-var started = await adapters.StartAsync(adapterSpec.Address, CancellationToken.None);
-if (!started.Ok)
+
+// The host's only startup act: hand one signal to the managers, in dependency order.
+var lifecycle = new LifecycleCoordinator(new RecordingEventSink(queue, messageStore), signalLog);
+var registered = lifecycle.Register(adapters);
+if (registered.Ok) registered = lifecycle.Register((ILifecycleParticipant)channels);
+if (!registered.Ok)
 {
-    Console.Error.WriteLine(started.Error?.Message ?? "Adapter start failed.");
+    Console.Error.WriteLine(registered.Error?.Message ?? "Lifecycle wiring failed.");
     shutdown.Cancel();
     queue.Complete();
-    try { await pumpTask; } catch (OperationCanceledException) { }
-    try { await clockTask; } catch (OperationCanceledException) { }
     return 1;
 }
-
-// The FileAdapter is polling-only: without a clock subscription nothing ever reads the inbox.
-var pollSubscription = await clock.RegisterAsync(adapterSpec.Address, TimeSpan.FromSeconds(1), CancellationToken.None);
-if (!pollSubscription.Ok)
+var lifecycleStarted = await lifecycle.StartAsync(shutdown.Token);
+if (!lifecycleStarted.Ok)
 {
-    Console.Error.WriteLine(pollSubscription.Error?.Message ?? "Adapter polling subscription failed.");
+    Console.Error.WriteLine(lifecycleStarted.Error?.Message ?? "Startup failed.");
+    await lifecycle.StopAsync(CancellationToken.None);
     shutdown.Cancel();
     queue.Complete();
     try { await pumpTask; } catch (OperationCanceledException) { }
@@ -187,14 +183,13 @@ try
 catch (OperationCanceledException) when (shutdown.IsCancellationRequested) { }
 finally
 {
-    await adapters.StopAsync(adapterSpec.Address, CancellationToken.None);
+    await lifecycle.StopAsync(CancellationToken.None);
     shutdown.Cancel();
     try { await clockTask; } catch (OperationCanceledException) { }
     queue.Complete();
     try { await pumpTask.WaitAsync(TimeSpan.FromSeconds(10)); }
     catch (TimeoutException) { pumpStop.Cancel(); try { await pumpTask; } catch (OperationCanceledException) { } }
     catch (OperationCanceledException) { }
-    foreach (var address in channelAddresses.ToArray()) await channels.DestroyAsync(address, CancellationToken.None);
     foreach (var profile in modelManager.ListProfiles()) modelManager.RemoveProfile(profile.Id);
     foreach (var provider in modelManager.List()) await modelManager.DestroyAsync(provider.Address, CancellationToken.None);
     await modulePackages.UnloadAsync(modelPackage.Value!.Id, TimeSpan.FromSeconds(10), force: true, CancellationToken.None);
@@ -239,25 +234,7 @@ async Task<Result> LoadModelConfigurationAsync(string modelsRoot)
 
 // Channels are created by scripts and persisted; startup only revives what already exists.
 // A conversation folder with no channel is not a channel — the next message routes into a new one.
-async Task<Result> LoadChannelsAsync()
-{
-    var stored = await channelSpecs.LoadAllAsync(CancellationToken.None);
-    if (!stored.Ok) return Result.Failure(stored.Error!);
-    foreach (var spec in stored.Value!)
-    {
-        if (channelAddresses.Contains(spec.Address)) continue;
-        var createdChannel = await channels.CreateAsync(spec, CancellationToken.None);
-        if (!createdChannel.Ok) return Result.Failure(createdChannel.Error!);
-        var channelStart = await channels.StartAsync(spec.Address, CancellationToken.None);
-        if (!channelStart.Ok)
-        {
-            await channels.DestroyAsync(spec.Address, CancellationToken.None);
-            return channelStart;
-        }
-        channelAddresses.Add(spec.Address);
-    }
-    return Result.Success();
-}
+// Channels are revived by their manager when the lifecycle signal arrives; the host keeps no list.
 
 sealed class HostServiceProvider(params (Type Type, object Service)[] services) : IServiceProvider
 {

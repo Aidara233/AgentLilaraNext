@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text.Json;
 using System.Threading.Channels;
 using ALN.Contracts;
 
@@ -91,23 +92,41 @@ public sealed class AdapterTypeCatalog : IModuleTypeRegistry
     }
 }
 
-public sealed class AdapterManager : IAdapterManager
+public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant
 {
     private readonly Dictionary<Address, IChatAdapter> _adapters = new();
     private readonly IModuleTypeCatalog _types;
     private readonly IInstanceBindings _bindings;
     private readonly IAdapterFactoryRegistry? _factories;
     private readonly IAdapterSpecStore? _specs;
+    private IEventSink? _events;
+    private IClockManager? _clock;
+    private TimeSpan _pollInterval = TimeSpan.FromSeconds(1);
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
 
     public AdapterManager(IModuleTypeCatalog types, IInstanceBindings bindings, IAdapterFactoryRegistry? factories = null,
-        IAdapterSpecStore? specs = null)
+        IAdapterSpecStore? specs = null, IEventSink? events = null, IClockManager? clock = null,
+        TimeSpan? pollInterval = null)
     {
         _types = types;
         _bindings = bindings;
         _factories = factories;
         _specs = specs;
+        _events = events;
+        _clock = clock;
+        _pollInterval = pollInterval ?? TimeSpan.FromSeconds(1);
+    }
+
+    /// <summary>
+    /// Wires the two things a manager needs but cannot be given at construction time (they live in
+    /// module packages resolved later). Must be called before the lifecycle signal arrives.
+    /// </summary>
+    public void UseHeartbeat(IEventSink events, IClockManager clock, TimeSpan? pollInterval = null)
+    {
+        _events = events ?? throw new ArgumentNullException(nameof(events));
+        _clock = clock ?? throw new ArgumentNullException(nameof(clock));
+        if (pollInterval is { } interval) _pollInterval = interval;
     }
 
     public ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, CancellationToken cancellationToken) =>
@@ -200,6 +219,62 @@ public sealed class AdapterManager : IAdapterManager
         }
         finally { _lifecycle.Release(); }
     }
+    /// <summary>
+    /// Manager startup: revive every stored Adapter, then hand the same start signal down to each
+    /// one. Children that need a heartbeat (polling adapters) get their clock subscription here, not
+    /// in the host — the host has no idea what an adapter needs.
+    /// </summary>
+    public string Name => "adapters";
+
+    public async ValueTask<Result> StartAsync(LifecycleSignal signal, CancellationToken cancellationToken)
+    {
+        if (_specs is null) return Result.Success();
+        var stored = await _specs.LoadAllAsync(cancellationToken).ConfigureAwait(false);
+        if (!stored.Ok) return Result.Failure(stored.Error!);
+        foreach (var spec in stored.Value!)
+        {
+            if (!Get(spec.Address).Ok)
+            {
+                var created = await CreateAsync(spec, cancellationToken).ConfigureAwait(false);
+                if (!created.Ok) return Result.Failure(created.Error!);
+            }
+            var started = await StartAsync(spec.Address, cancellationToken).ConfigureAwait(false);
+            if (!started.Ok) return started;
+            var children = await StartChildrenAsync(spec.Address, signal, cancellationToken).ConfigureAwait(false);
+            if (!children.Ok) return children;
+        }
+        return Result.Success();
+    }
+
+    private async ValueTask<Result> StartChildrenAsync(Address address, LifecycleSignal signal, CancellationToken cancellationToken)
+    {
+        if (Get(address).Value is IPollingAdapter && _clock is not null)
+        {
+            var subscribed = await _clock.RegisterAsync(address, _pollInterval, cancellationToken).ConfigureAwait(false);
+            if (!subscribed.Ok) return Result.Failure(subscribed.Error!);
+        }
+        if (_events is null) return Result.Success();
+        // The same signal, one level down: whatever is mounted on this Adapter sees lifecycle.start.
+        return await _events.PublishAsync(new(EventNames.LifecycleStart, address, Guid.NewGuid(),
+            JsonSerializer.Serialize(signal.For(address), new JsonSerializerOptions(JsonSerializerDefaults.Web)), address),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<Result> StopAsync(LifecycleSignal signal, CancellationToken cancellationToken)
+    {
+        foreach (var address in List().Select(a => a.Address))
+        {
+            if (_clock is not null)
+                await _clock.UnregisterTargetAsync(address, CancellationToken.None).ConfigureAwait(false);
+            await StopAsync(address, cancellationToken).ConfigureAwait(false);
+            if (_events is not null)
+                await _events.PublishAsync(new(EventNames.LifecycleStop, address, Guid.NewGuid(),
+                    JsonSerializer.Serialize(signal.For(address), new JsonSerializerOptions(JsonSerializerDefaults.Web)), address),
+                    cancellationToken).ConfigureAwait(false);
+        }
+        return Result.Success();
+    }
+
     public async ValueTask<Result<IReadOnlyList<AdapterInfo>>> SnapshotByTypeAsync(string concreteTypeId, CancellationToken cancellationToken)
     {
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);

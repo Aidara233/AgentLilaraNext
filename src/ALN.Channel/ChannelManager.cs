@@ -4,7 +4,7 @@ using ALN.Contracts;
 namespace ALN.Channel;
 
 public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, IInstanceBindings bindings,
-    IChannelSpecStore? specs = null, IMessageStore? messages = null) : IChannelManager
+    IChannelSpecStore? specs = null, IMessageStore? messages = null) : IChannelManager, ILifecycleParticipant
 {
     private readonly IAdapterManager _adapters = adapters;
     private readonly IEventSink _events = events;
@@ -193,6 +193,45 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
 
     private static bool IsValidConversationId(string value) =>
         value is { Length: > 0 and <= 128 } && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_');
+
+    /// <summary>
+    /// Manager startup: revive every stored Channel, then give each one the same signal so its
+    /// mounted scripts start too. Startup does not invent Channels — a folder is not a Channel.
+    /// </summary>
+    public string Name => "channels";
+
+    public async ValueTask<Result> StartAsync(LifecycleSignal signal, CancellationToken cancellationToken)
+    {
+        if (_specs is null) return Result.Success();
+        var stored = await _specs.LoadAllAsync(cancellationToken).ConfigureAwait(false);
+        if (!stored.Ok) return Result.Failure(stored.Error!);
+        foreach (var spec in stored.Value!)
+        {
+            if (Get(spec.Address).Ok) continue;
+            var created = await CreateAsync(spec, cancellationToken).ConfigureAwait(false);
+            if (!created.Ok) return Result.Failure(created.Error!);
+            var started = await StartAsync(spec.Address, cancellationToken).ConfigureAwait(false);
+            if (!started.Ok)
+            {
+                await DestroyAsync(spec.Address, CancellationToken.None).ConfigureAwait(false);
+                return started;
+            }
+            await _events.PublishAsync(new(EventNames.LifecycleStart, spec.Address, Guid.NewGuid(),
+                JsonSerializer.Serialize(signal.For(spec.Address), JsonOptions), spec.Address), cancellationToken).ConfigureAwait(false);
+        }
+        return Result.Success();
+    }
+
+    public async ValueTask<Result> StopAsync(LifecycleSignal signal, CancellationToken cancellationToken)
+    {
+        foreach (var address in List().Select(c => c.Address))
+        {
+            await StopAsync(address, cancellationToken).ConfigureAwait(false);
+            await _events.PublishAsync(new(EventNames.LifecycleStop, address, Guid.NewGuid(),
+                JsonSerializer.Serialize(signal.For(address), JsonOptions), address), cancellationToken).ConfigureAwait(false);
+        }
+        return Result.Success();
+    }
 
     private sealed class ChannelInstance(ChannelSpec spec)
     {
