@@ -4,13 +4,15 @@ using ALN.Contracts;
 namespace ALN.Channel;
 
 public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, IInstanceBindings bindings,
-    IChannelSpecStore? specs = null, IMessageStore? messages = null) : IChannelManager, ILifecycleParticipant
+    IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null)
+    : IChannelManager, ILifecycleParticipant
 {
     private readonly IAdapterManager _adapters = adapters;
     private readonly IEventSink _events = events;
     private readonly IInstanceBindings _bindings = bindings;
     private readonly IChannelSpecStore? _specs = specs;
     private readonly IMessageStore? _messages = messages;
+    private readonly IParameterRegistry? _parameters = parameters;
     private readonly Dictionary<Address, ChannelInstance> _channels = new();
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
@@ -71,7 +73,9 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                 foreach (var binding in spec.Bindings)
                     if (_channels.Values.Any(c => c.Bindings.Contains(binding)))
                         return Result<ChannelInfo>.Failure(new(ErrorCode.Conflict, "An Adapter/conversation binding can belong to only one Channel."));
-                _channels.Add(spec.Address, new ChannelInstance(spec));
+                var instance = new ChannelInstance(spec);
+                _channels.Add(spec.Address, instance);
+                ApplyParameters(instance);
             }
             var mounted = await _bindings.AttachAsync(spec.Address, cancellationToken).ConfigureAwait(false);
             if (!mounted.Ok)
@@ -246,9 +250,60 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         public Address Address { get; } = spec.Address;
         public string Name { get; } = spec.Name;
         public IReadOnlyList<ChannelBinding> Bindings { get; } = Array.AsReadOnly(spec.Bindings.ToArray());
-        public int? MaxMessages { get; } = spec.MaxMessages;
+        /// <summary>Spec value unless overridden at runtime; the window is read on every activation.</summary>
+        public int? MaxMessages { get; set; } = spec.MaxMessages;
         public bool Running { get; set; }
         public bool Draining { get; set; }
         public ChannelInfo ToInfo() => new(Address, Name, Bindings, Running, MaxMessages);
+
+        public IParameterTarget Parameters(ChannelManager owner) => new ChannelParameters(this, owner);
+    }
+
+    /// <summary>
+    /// The tunables of one Channel. The window is the one that matters today: it is read per activation, so
+    /// setting it has effect on the very next turn without restarting anything.
+    /// </summary>
+    private sealed class ChannelParameters(ChannelInstance channel, ChannelManager owner) : IParameterTarget
+    {
+        public const string MaxMessagesName = "maxMessages";
+
+        public string ParameterScope => channel.Address.ToString();
+
+        public IReadOnlyList<ParameterDescriptor> Parameters { get; } =
+        [
+            new(MaxMessagesName, ParameterKind.Integer, null,
+                "一轮最多携带多少条频道消息；更早的折叠成“省略更早的 N 条”。留空表示不限。",
+                ParameterApply.Immediate, Secret: false, Minimum: 1, Maximum: 100_000)
+        ];
+
+        public string? ReadParameter(string name) =>
+            string.Equals(name, MaxMessagesName, StringComparison.Ordinal)
+                ? channel.MaxMessages?.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                : null;
+
+        public ValueTask<Result> ApplyParameterAsync(string name, string value, CancellationToken cancellationToken)
+        {
+            _ = owner;
+            if (!string.Equals(name, MaxMessagesName, StringComparison.Ordinal))
+                return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, $"Unknown parameter: {name}")));
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                channel.MaxMessages = null;
+                return ValueTask.FromResult(Result.Success());
+            }
+            if (!int.TryParse(value, System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture, out var window) || window <= 0)
+                return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, $"maxMessages must be a positive integer: {value}")));
+            channel.MaxMessages = window;
+            return ValueTask.FromResult(Result.Success());
+        }
+    }
+
+    /// <summary>Registers a channel's tunables so they can be listed and changed while it runs.</summary>
+    private void ApplyParameters(ChannelInstance channel)
+    {
+        if (_parameters is null) return;
+        var registered = _parameters.Register(channel.Parameters(this));
+        if (!registered.Ok) return; // A duplicate scope is already somebody else's channel; nothing to do here.
     }
 }

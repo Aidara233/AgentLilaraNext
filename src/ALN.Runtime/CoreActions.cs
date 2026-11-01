@@ -22,6 +22,8 @@ public static class CoreActions
     public const string ChannelsSend = "channels.send";
     public const string GraphList = "graph.list";
     public const string GraphMount = "graph.mount";
+    public const string ParamsList = "params.list";
+    public const string ParamsSet = "params.set";
     public const string GraphUnmount = "graph.unmount";
     public const string ModelsList = "models.list";
     public const string SignalsRecent = "signals.recent";
@@ -31,7 +33,7 @@ public static class CoreActions
     private static JsonElement ToJson(object value) => JsonSerializer.SerializeToElement(value, JsonOptions);
 
     public static Result RegisterAll(ControlPlane plane, IAdapterManager adapters, IChannelManager channels,
-        IModelManager models, ISignalLog signals, IGraphRuntime graph)
+        IModelManager models, ISignalLog signals, IGraphRuntime graph, IParameterRegistry parameters)
     {
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
@@ -103,6 +105,33 @@ public static class CoreActions
             // not attached to anything by its lifecycle, so this is the only way it ever runs.
             (new(GraphMount, "Mount a manual script onto one instance.", Capabilities.GraphControl, true), MountScript),
             (new(GraphUnmount, "Unmount a script from one instance.", Capabilities.GraphControl, true), UnmountScript),
+
+            (new(ParamsList, "List every tunable the running components expose, with its current value.", Capabilities.ParamsRead, false),
+                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new { parameters = parameters.List() })))),
+
+            (new(ParamsSet, "Change a tunable: validated by its owner, applied now, persisted for restarts.", Capabilities.ParamsWrite, true),
+                async (arguments, ct) =>
+                {
+                    if (!TryReadText(arguments, "scope", out var scope) || scope.Trim().Length == 0)
+                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "params.set requires 'scope'."));
+                    if (!TryReadText(arguments, "name", out var name) || name.Trim().Length == 0)
+                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "params.set requires 'name'."));
+                    if (!TryReadText(arguments, "value", out var value))
+                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "params.set requires 'value' (send \"\" to clear)."));
+
+                    var changed = await parameters.SetAsync(scope.Trim(), name.Trim(), value, ct).ConfigureAwait(false);
+                    if (!changed.Ok) return Result<JsonElement>.Failure(changed.Error!);
+                    var current = parameters.List()
+                        .FirstOrDefault(p => p.Scope == scope.Trim() && p.Name == name.Trim());
+                    return Result<JsonElement>.Success(ToJson(new
+                    {
+                        scope = scope.Trim(),
+                        name = name.Trim(),
+                        value = current?.Value,
+                        apply = current?.Apply.ToString(),
+                        secret = current?.Secret ?? false
+                    }));
+                }),
 
             (new(ModelsList, "List provider instances and profiles without configuration or keys.", Capabilities.ModelsRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new

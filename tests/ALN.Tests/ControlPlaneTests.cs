@@ -86,7 +86,7 @@ public sealed class ControlPlaneTests : IDisposable
         var models = new FakeModels(new ModelProviderInfo(new Address("model", "openai-chat", "one"),
             new ModelProviderDescriptor("chat", "openai-chat", "OpenAI", ModelCapabilities.Streaming), 0));
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
-        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), models, _signals, new FakeGraph()).Ok);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), models, _signals, new FakeGraph(), new FakeParameters()).Ok);
 
         var result = await plane.InvokeAsync(User("models.read"), CoreActions.ModelsList, default, default);
 
@@ -136,6 +136,15 @@ public sealed class ControlPlaneTests : IDisposable
             records.Add(record);
             return ValueTask.CompletedTask;
         }
+    }
+
+    private sealed class FakeParameters : IParameterRegistry
+    {
+        public Result Register(IParameterTarget target) => Result.Success();
+        public Result Unregister(string scope) => Result.Success();
+        public IReadOnlyList<ParameterView> List() => [];
+        public ValueTask<Result> SetAsync(string scope, string name, string value, CancellationToken ct) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> RestoreAsync(CancellationToken ct) => ValueTask.FromResult(Result.Success());
     }
 
     /// <summary>Just enough graph to keep the action catalogue registrable; mounting has its own tests.</summary>

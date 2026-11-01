@@ -1,6 +1,88 @@
 namespace ALN.Contracts;
 
 public sealed record ChannelBinding(Address Adapter, string PlatformConversationId);
+
+/// <summary>
+/// One tunable, as a component describes it. The description is the contract: a parameter that cannot say
+/// what it accepts and when it takes effect is a parameter the UI has to guess about.
+/// </summary>
+/// <param name="Apply">When a change takes effect — see <see cref="ParameterApply"/>.</param>
+/// <param name="Secret">
+/// True means "settable, never readable". A token typed into a UI must not come back out of an API that a
+/// log, a screenshot or a support ticket can capture.
+/// </param>
+public sealed record ParameterDescriptor(
+    string Name,
+    ParameterKind Kind,
+    string? DefaultValue,
+    string Description,
+    ParameterApply Apply = ParameterApply.Immediate,
+    bool Secret = false,
+    double? Minimum = null,
+    double? Maximum = null);
+
+public enum ParameterKind { Integer, Number, Boolean, Text }
+
+/// <summary>
+/// When a change actually happens. Saying "immediate" for something that needs a rebind is a lie the caller
+/// only discovers later, so every parameter has to declare which of these it is.
+/// </summary>
+public enum ParameterApply
+{
+    /// <summary>Read on the next use; nothing needs restarting.</summary>
+    Immediate,
+    /// <summary>Takes effect on the next round/tick — same process, one cycle later.</summary>
+    NextRound,
+    /// <summary>Needs the owning connection or listener to be re-established.</summary>
+    Reconnect,
+    /// <summary>Only read at startup; stored now, honoured after a restart.</summary>
+    Restart
+}
+
+/// <summary>
+/// A component that exposes tunables. Values set at runtime are validated by the component, applied through
+/// <see cref="ApplyAsync"/> and persisted by the host, so a restart keeps them — and the component decides
+/// what "applied" means for it, because only it knows.
+/// </summary>
+public interface IParameterTarget
+{
+    /// <summary>Stable scope, e.g. <c>channel.conversation#my-group</c>.</summary>
+    string ParameterScope { get; }
+
+    IReadOnlyList<ParameterDescriptor> Parameters { get; }
+
+    /// <summary>Current effective value as text, or null when unset. Secrets return null.</summary>
+    string? ReadParameter(string name);
+
+    /// <summary>Validate-and-apply in one step; a rejected value must leave the old one in place.</summary>
+    ValueTask<Result> ApplyParameterAsync(string name, string value, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// Where the tunables live at runtime: every registered target, plus whatever has been overridden and
+/// persisted. Overrides are applied at startup, before anything reads the value.
+/// </summary>
+public interface IParameterRegistry
+{
+    Result Register(IParameterTarget target);
+    Result Unregister(string scope);
+    IReadOnlyList<ParameterView> List();
+    ValueTask<Result> SetAsync(string scope, string name, string value, CancellationToken cancellationToken);
+    /// <summary>Re-applies persisted overrides; called once after targets are registered.</summary>
+    ValueTask<Result> RestoreAsync(CancellationToken cancellationToken);
+}
+
+public sealed record ParameterView(
+    string Scope,
+    string Name,
+    ParameterKind Kind,
+    string? Value,
+    string? DefaultValue,
+    ParameterApply Apply,
+    bool Secret,
+    double? Minimum,
+    double? Maximum,
+    string Description);
 public sealed record ChannelSpec(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, int? MaxMessages = null);
 public sealed record ChannelInfo(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, bool Running,
     int? MaxMessages = null);

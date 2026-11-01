@@ -70,6 +70,8 @@ public static class Capabilities
     public const string MessagesWrite = "messages.write";
     public const string GraphRead = "graph.read";
     public const string GraphControl = "graph.control";
+    public const string ParamsRead = "params.read";
+    public const string ParamsWrite = "params.write";
     public const string ModelsRead = "models.read";
     public const string SignalsRead = "signals.read";
     public const string SessionsRead = "sessions.read";

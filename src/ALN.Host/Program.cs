@@ -44,6 +44,8 @@ if (!channelContributor.Ok) { Console.Error.WriteLine(channelContributor.Error?.
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.
 var stateStore = new FileStateStore(Path.Combine(data.Root, "state"));
+// One registry for every tunable: components register themselves, the registry validates, applies, persists.
+var parameters = new ParameterRegistry(stateStore);
 var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, roundContextContributors, signalLog);
 var reloadState = new ModuleReloadStateStore();
 var hostServices = new HostServiceProvider(
@@ -56,6 +58,7 @@ var hostServices = new HostServiceProvider(
     (typeof(IEventSink), new RecordingEventSink(queue, messageStore)),
     (typeof(IMessageStore), messageStore),
     (typeof(IStateStore), stateStore),
+    (typeof(IParameterRegistry), parameters),
     (typeof(IChannelSpecStore), channelSpecs),
     (typeof(IAdapterSpecStore), adapterSpecs),
     (typeof(IModuleTypeCatalog), adapterTypes),
@@ -185,6 +188,11 @@ if (!registered.Ok)
     return 1;
 }
 var lifecycleReport = await lifecycle.StartAsync(shutdown.Token);
+// Channels register their tunables when they are revived, so persisted overrides are applied after startup,
+// before anything reads a value.
+var restored = await parameters.RestoreAsync(CancellationToken.None);
+if (!restored.Ok)
+    Console.Error.WriteLine($"Warning: a persisted parameter could not be restored: {restored.Error?.Message} {restored.Error?.Detail}");
 foreach (var outcome in lifecycleReport.Outcomes.Where(o => o.Outcome != "ok"))
     Console.Error.WriteLine($"startup {outcome.Outcome}: {outcome.Name} — {outcome.Message}");
 if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
@@ -201,7 +209,7 @@ if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
 // The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
 // WebUI itself — it exposes actions, and a separate project consumes them.
 var controlPlane = new ControlPlane(auditStream.Sink, signalLog);
-var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph);
+var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters);
 if (!actionsRegistered.Ok)
 {
     Console.Error.WriteLine(actionsRegistered.Error?.Message ?? "Action registration failed.");
