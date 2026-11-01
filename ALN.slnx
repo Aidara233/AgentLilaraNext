@@ -15,8 +15,8 @@
     <Project Path="src/ALN.Scripting.Jint/ALN.Scripting.Jint.csproj" />
     <Project Path="src/ALN.WebUi/ALN.WebUi.csproj" />
   </Folder>
-  <Folder Name="/tools/">
-    <Project Path="tools/FakeOneBot/FakeOneBot.csproj" />
+  <Folder Name="/src/dev/">
+    <Project Path="src/ALN.Adapter.Qq/dev/FakeOneBot/FakeOneBot.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/ALN.Tests/ALN.Tests.csproj" />
