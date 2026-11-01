@@ -18,7 +18,9 @@ if (dataArg + 1 >= args.Length || string.IsNullOrWhiteSpace(args[dataArg + 1]))
     return 2;
 }
 var data = DataDirectory.Open(args[dataArg + 1]);
-var mailboxRoot = Path.Combine(data.Root, "adapters", "file-1");
+// Transport state, not configuration: the mailbox is IO and lives under io/, one directory per
+// type and instance, mirroring the spec tree under adapters/.
+var mailboxRoot = Path.Combine(data.Root, "io", "file", "file-1");
 var mailbox = new FileMailbox(mailboxRoot);
 await using var auditStream = new AsyncDisposeAdapter(new JsonlAuditSink(Path.Combine(data.Root, "audit", "capabilities.jsonl")));
 await using var signalLog = SignalLog.Open(Path.Combine(data.Root, "logs"));
@@ -177,6 +179,11 @@ if (!registered.Ok)
 var lifecycleReport = await lifecycle.StartAsync(shutdown.Token);
 foreach (var outcome in lifecycleReport.Outcomes.Where(o => o.Outcome != "ok"))
     Console.Error.WriteLine($"startup {outcome.Outcome}: {outcome.Name} — {outcome.Message}");
+// Specs left in the old flat layout are not guessed at: say which file to move, and where to.
+foreach (var legacy in adapterSpecs.LegacyLayout)
+    Console.Error.WriteLine(
+        $"Warning: '{Path.GetFileName(legacy)}' is in the pre-nesting layout and was ignored; " +
+        $"move it to adapters\\<type>\\<instance>\\{FileAdapterSpecStore.FileName} (e.g. adapters\\qq\\qq-1\\{FileAdapterSpecStore.FileName}).");
 if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
 {
     // Nothing came up at all: that is the only startup failure that justifies refusing to run.

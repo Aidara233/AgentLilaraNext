@@ -43,12 +43,19 @@ public sealed class PersistenceTests : IDisposable
         var loaded = Assert.Single((await store.LoadAllAsync(default)).Value!);
         Assert.Equal(spec.Address, loaded.Address);
         Assert.Equal(spec.Descriptor, loaded.Descriptor);
-        // The spec is meant to be hand-editable, so it is stored as indented JSON, not a blob.
-        Assert.Contains("\"platformId\": \"file\"", await File.ReadAllTextAsync(Path.Combine(_root, "adapters", "file-1.json")));
+        // The spec is meant to be hand-editable, so it is stored as indented JSON, not a blob — under
+        // adapters/<type>/<instance>/, mirroring the code's own nesting.
+        Assert.Contains("\"platformId\": \"file\"", await File.ReadAllTextAsync(SpecPath("file", "file-1")));
 
         Assert.True((await store.DeleteAsync(Adapter, default)).Ok);
         Assert.Empty((await store.LoadAllAsync(default)).Value!);
+        // Deleting the spec takes the now-empty instance directory with it; an empty tree that comes
+        // back on every start is how a storage layout rots.
+        Assert.False(Directory.Exists(Path.Combine(_root, "adapters", "file")));
     }
+
+    private string SpecPath(string type, string instance) =>
+        Path.Combine(_root, "adapters", type, instance, FileAdapterSpecStore.FileName);
 
     [Fact]
     public async Task Adapter_settings_round_trip_and_stay_out_of_the_plain_spec_file()
@@ -67,17 +74,16 @@ public sealed class PersistenceTests : IDisposable
         Assert.Equal("ws://127.0.0.1:3001", loaded.Settings!["endpoint"]);
         Assert.Equal("onebot-token", loaded.Settings["accessToken"]);
         // Hand-editable, like every other spec: the whole point is that a human can write this file.
-        var text = await File.ReadAllTextAsync(Path.Combine(_root, "adapters", "qq-1.json"));
+        var text = await File.ReadAllTextAsync(SpecPath("qq", "qq-1"));
         Assert.Contains("\"endpoint\": \"ws://127.0.0.1:3001\"", text);
     }
 
     [Fact]
     public async Task A_spec_written_before_settings_existed_still_loads()
     {
-        var root = Path.Combine(_root, "adapters");
-        Directory.CreateDirectory(root);
-        // Exactly what the previous version wrote: no settings key at all.
-        await File.WriteAllTextAsync(Path.Combine(root, "file-1.json"),
+        Directory.CreateDirectory(Path.Combine(_root, "adapters", "file", "file-1"));
+        // Exactly what the previous version wrote, in the nested place: no settings key at all.
+        await File.WriteAllTextAsync(SpecPath("file", "file-1"),
             """
             {
               "address": "adapter.file#file-1",
@@ -87,10 +93,47 @@ public sealed class PersistenceTests : IDisposable
             }
             """);
 
-        var store = new FileAdapterSpecStore(root);
+        var store = new FileAdapterSpecStore(Path.Combine(_root, "adapters"));
         var loaded = Assert.Single((await store.LoadAllAsync(default)).Value!);
         Assert.Equal("adapter.file#file-1", loaded.Address.ToString());
         Assert.Null(loaded.Settings);
+    }
+
+    [Fact]
+    public async Task A_spec_left_in_the_flat_layout_is_reported_and_not_loaded()
+    {
+        var root = Path.Combine(_root, "adapters");
+        Directory.CreateDirectory(root);
+        var flat = Path.Combine(root, "file-1.json");
+        await File.WriteAllTextAsync(flat,
+            """
+            { "address": "adapter.file#file-1", "platformId": "file", "accountId": "file-1", "direction": "Both" }
+            """);
+
+        var store = new FileAdapterSpecStore(root);
+        var loaded = await store.LoadAllAsync(default);
+
+        // Ignored rather than guessed at: a file that is silently interpreted is a file that is silently
+        // half-migrated. Reported, so the host can name it and say where it belongs.
+        Assert.True(loaded.Ok);
+        Assert.Empty(loaded.Value!);
+        Assert.Equal([flat], store.LegacyLayout);
+    }
+
+    [Fact]
+    public async Task A_spec_in_the_wrong_directory_is_an_error_that_names_both_places()
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "adapters", "qq", "qq-1"));
+        await File.WriteAllTextAsync(SpecPath("qq", "qq-1"),
+            """
+            { "address": "adapter.file#file-1", "platformId": "file", "accountId": "file-1", "direction": "Both" }
+            """);
+
+        var store = new FileAdapterSpecStore(Path.Combine(_root, "adapters"));
+        var loaded = await store.LoadAllAsync(default);
+
+        Assert.False(loaded.Ok);
+        Assert.Contains("expected file/file-1", loaded.Error!.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -100,7 +143,7 @@ public sealed class PersistenceTests : IDisposable
         Assert.True((await store.SaveAsync(new AdapterSpec(Adapter,
             new AdapterDescriptor("file", "file-1", AdapterDirection.Both)), default)).Ok);
 
-        var text = await File.ReadAllTextAsync(Path.Combine(_root, "adapters", "file-1.json"));
+        var text = await File.ReadAllTextAsync(SpecPath("file", "file-1"));
         Assert.DoesNotContain("settings", text, StringComparison.OrdinalIgnoreCase);
     }
 
