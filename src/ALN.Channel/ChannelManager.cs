@@ -177,7 +177,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                 return Result<int>.Failure(new(ErrorCode.Unavailable,
                     $"Bound Adapter is not available, message not delivered: {binding.Adapter}"));
             var message = new ChannelMessage(envelope.EventId, channel.Address, binding, envelope.PlatformMessageId,
-                envelope.Text, envelope.At, envelope.Sender);
+                envelope.Text, envelope.At, envelope.Sender, envelope.MentionsSelf);
             if (_messages is not null)
             {
                 // The channel keeps its own history; the mailbox folder is transport, not storage.

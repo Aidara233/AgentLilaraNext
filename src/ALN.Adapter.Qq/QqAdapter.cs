@@ -143,7 +143,7 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity
         if (inbound.MessageId is { Length: > 0 } id && !MarkSeen(id)) return;
 
         var envelope = new AdapterEnvelope(Address, Descriptor.PlatformId, inbound.ConversationId,
-            inbound.MessageId, inbound.Text, inbound.At, inbound.SenderId);
+            inbound.MessageId, inbound.Text, inbound.At, inbound.SenderId, inbound.MentionsSelf);
         var published = await _sink.PublishAsync(new RoutedEvent(EventNames.AdapterEnvelope, Address,
             envelope.EventId, JsonSerializer.Serialize(envelope, JsonOptions)), CancellationToken.None).ConfigureAwait(false);
         if (!published.Ok)

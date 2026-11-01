@@ -6,7 +6,7 @@ namespace ALN.Adapter.Qq;
 
 /// <summary>One inbound message, after protocol-level cleaning and before Channel-level meaning.</summary>
 public sealed record OneBotInbound(string ConversationId, string Platform, string? MessageId, string SenderId,
-    string? SenderName, string Text, DateTimeOffset At);
+    string? SenderName, string Text, DateTimeOffset At, bool MentionsSelf = false);
 
 /// <summary>The part of an action response that matters: did it work, and what id did the platform assign.</summary>
 public sealed record OneBotResponse(bool Ok, string? MessageId, long RetCode, string? Message);
@@ -34,8 +34,8 @@ public static partial class OneBotProtocol
     /// pure digits that can equal a QQ number. The prefix keeps the two namespaces apart — a group and
     /// a person with the same number are different conversations.
     /// </summary>
-    public const string GroupPrefix = "g-";
-    public const string PrivatePrefix = "p-";
+    public const string GroupPrefix = "group-";
+    public const string PrivatePrefix = "user-";
 
     public static string GroupConversation(long groupId) => $"{GroupPrefix}{Number(groupId)}";
     public static string PrivateConversation(long userId) => $"{PrivatePrefix}{Number(userId)}";
@@ -102,8 +102,42 @@ public static partial class OneBotProtocol
             : DateTimeOffset.UtcNow;
 
         return new OneBotInbound(conversationId, messageType, messageId, Number(senderId.Value),
-            ReadSenderName(root), text, at);
+            ReadSenderName(root), text, at, Mentions(root, selfId));
     }
+
+    /// <summary>
+    /// Whether this message addressed the bot by name. The adapter is the only layer that knows our own
+    /// account id, so it answers the question once and puts the answer on the envelope: a script that
+    /// compared "@nickname" against a stored nickname would break the first time somebody renamed the
+    /// bot, and "@全体成员" is not a mention of us.
+    /// </summary>
+    private static bool Mentions(JsonElement root, long? selfId)
+    {
+        if (selfId is not { } me) return false;
+        var meText = Number(me);
+        if (root.TryGetProperty("message", out var message))
+        {
+            if (message.ValueKind == JsonValueKind.Array) return MentionsSegments(message, meText);
+            if (message.ValueKind == JsonValueKind.String) return MentionsCq(HtmlDecode(message.GetString() ?? string.Empty), meText);
+        }
+        return TryString(root, "raw_message", out var raw) && MentionsCq(HtmlDecode(raw), meText);
+    }
+
+    private static bool MentionsSegments(JsonElement segments, string selfId)
+    {
+        foreach (var segment in segments.EnumerateArray())
+        {
+            if (segment.ValueKind != JsonValueKind.Object) continue;
+            if (!TryString(segment, "type", out var type) || type != "at") continue;
+            if (!segment.TryGetProperty("data", out var data)) continue;
+            if (TryString(data, "qq", out var qq) && qq == selfId) return true;
+        }
+        return false;
+    }
+
+    private static bool MentionsCq(string text, string selfId) =>
+        text.Length > 0 && CqCode().Matches(text).Any(match =>
+            match.Groups["type"].Value == "at" && CqArgument(match.Groups["args"].Value, "qq") == selfId);
 
     /// <summary>The account the listener is logged in as, from a heartbeat or lifecycle meta event.</summary>
     public static long? ReadSelfId(JsonElement root) =>

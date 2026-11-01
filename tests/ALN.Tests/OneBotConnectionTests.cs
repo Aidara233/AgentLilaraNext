@@ -51,12 +51,12 @@ public sealed class OneBotConnectionTests
             }
             Assert.Equal("adapter.qq#qq-1", envelope.Adapter.ToString());
             Assert.Equal("qq", envelope.PlatformId);
-            Assert.Equal("g-123456", envelope.PlatformConversationId);
+            Assert.Equal("group-123456", envelope.PlatformConversationId);
             Assert.Equal("4242", envelope.PlatformMessageId);
             Assert.Equal("20000", envelope.Sender);
             Assert.Equal("你好", envelope.Text);
 
-            var sent = await adapter.SendAsync(new OutboundMessage("g-123456", "收到"), default);
+            var sent = await adapter.SendAsync(new OutboundMessage("group-123456", "收到"), default);
             Assert.True(sent.Ok,
                 $"send failed: {sent.Error?.Code} {sent.Error?.Message} {sent.Error?.Detail} | " +
                 $"server: {bot.ServerError ?? "no error"} | {log.Text}");

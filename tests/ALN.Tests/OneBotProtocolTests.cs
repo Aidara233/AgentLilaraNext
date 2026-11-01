@@ -40,7 +40,7 @@ public sealed class OneBotProtocolTests
 
         Assert.NotNull(inbound);
         Assert.Equal("group", inbound!.Platform);
-        Assert.Equal("g-123456", inbound.ConversationId);
+        Assert.Equal("group-123456", inbound.ConversationId);
         Assert.Equal("4242", inbound.MessageId);
         Assert.Equal("20000", inbound.SenderId);
         Assert.Equal("蓝", inbound.SenderName);
@@ -65,7 +65,7 @@ public sealed class OneBotProtocolTests
 
         Assert.NotNull(inbound);
         Assert.Equal("private", inbound!.Platform);
-        Assert.Equal("p-1664093638", inbound.ConversationId);
+        Assert.Equal("user-1664093638", inbound.ConversationId);
         Assert.Equal("1664093638", inbound.SenderId);
     }
 
@@ -128,13 +128,13 @@ public sealed class OneBotProtocolTests
     }
 
     [Theory]
-    [InlineData("g-123456", true, 123456L, "group")]
-    [InlineData("g-1", true, 1L, "group")]
-    [InlineData("p-1664093638", true, 1664093638L, "private")]
+    [InlineData("group-123456", true, 123456L, "group")]
+    [InlineData("group-1", true, 1L, "group")]
+    [InlineData("user-1664093638", true, 1664093638L, "private")]
     [InlineData("123456", false, 0L, "")]
     [InlineData("x-123456", false, 0L, "")]
-    [InlineData("g-", false, 0L, "")]
-    [InlineData("g-abc", false, 0L, "")]
+    [InlineData("group-", false, 0L, "")]
+    [InlineData("group-abc", false, 0L, "")]
     [InlineData(null, false, 0L, "")]
     public void Conversation_ids_round_trip_and_reject_anything_else(string? conversationId, bool ok, long id,
         string platform)
@@ -178,6 +178,48 @@ public sealed class OneBotProtocolTests
         var parameters = privateSend.GetProperty("params");
         Assert.Equal(1664093638, parameters.GetProperty("user_id").GetInt64());
         Assert.False(parameters.TryGetProperty("group_id", out _));
+    }
+
+    [Fact]
+    public void Mentions_self_is_decided_by_the_adapter_not_by_reading_the_text()
+    {
+        var atSelf = """
+            {
+              "post_type": "message", "message_type": "group", "self_id": 10000, "group_id": 1,
+              "user_id": 2, "message_id": 3,
+              "message": [
+                { "type": "at", "data": { "qq": "10000" } },
+                { "type": "text", "data": { "text": " 在吗" } }
+              ]
+            }
+            """;
+        var atAll = atSelf.Replace("\"qq\": \"10000\"", "\"qq\": \"all\"");
+        var atSomebodyElse = atSelf.Replace("\"qq\": \"10000\"", "\"qq\": \"7\"");
+        var plain = """
+            {
+              "post_type": "message", "message_type": "group", "self_id": 10000, "group_id": 1,
+              "user_id": 2, "message_id": 3,
+              "message": [{ "type": "text", "data": { "text": "今天下雨" } }]
+            }
+            """;
+
+        Assert.True(OneBotProtocol.ReadMessage(Parse(atSelf), selfId: 10000)!.MentionsSelf);
+        // Addressing the whole group is not addressing us: a valve that treats it as ours would answer
+        // every announcement in the group.
+        Assert.False(OneBotProtocol.ReadMessage(Parse(atAll), selfId: 10000)!.MentionsSelf);
+        Assert.False(OneBotProtocol.ReadMessage(Parse(atSomebodyElse), selfId: 10000)!.MentionsSelf);
+        Assert.False(OneBotProtocol.ReadMessage(Parse(plain), selfId: 10000)!.MentionsSelf);
+        // Without knowing our own id there is nothing honest to answer.
+        Assert.False(OneBotProtocol.ReadMessage(Parse(atSelf), selfId: null)!.MentionsSelf);
+
+        // CQ-string form has to agree with the segment form.
+        var cq = """
+            {
+              "post_type": "message", "message_type": "group", "self_id": 10000, "group_id": 1,
+              "user_id": 2, "message_id": 3, "message": "[CQ:at,qq=10000] 在吗"
+            }
+            """;
+        Assert.True(OneBotProtocol.ReadMessage(Parse(cq), selfId: 10000)!.MentionsSelf);
     }
 
     [Fact]
