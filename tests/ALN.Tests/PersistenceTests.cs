@@ -64,6 +64,32 @@ public sealed class PersistenceTests : IDisposable
     }
 
     [Fact]
+    public async Task Channel_can_be_created_before_its_adapter_and_delivery_reports_the_missing_one()
+    {
+        var types = new AdapterTypeCatalog();
+        Assert.True(types.RegisterPackageTypes("test.adapter", [new("adapter.file", "adapter")]).Ok);
+        var bindings = new StubBindings();
+        var events = new EventQueue(8);
+        var channels = new ALN.Channel.ChannelManager(new AdapterManager(types, bindings), events, bindings);
+        var adapter = new Address("adapter", "file", "later-1");
+        var spec = new ChannelSpec(new("channel", "logical", "chat-1"), "chat-1", [new ChannelBinding(adapter, "chat-1")]);
+
+        // Creation must not depend on startup order: the Adapter is simply not there yet.
+        var created = await channels.CreateAsync(spec, default);
+        Assert.True(created.Ok, created.Error?.Message);
+        Assert.True((await channels.StartAsync(spec.Address, default)).Ok);
+
+        var envelope = new AdapterEnvelope(adapter, "file", "chat-1", "m-1", "hello", DateTimeOffset.UtcNow);
+        var delivered = await channels.AcceptAsync(envelope, default);
+
+        Assert.False(delivered.Ok);
+        Assert.Equal(ErrorCode.Unavailable, delivered.Error?.Code);
+        Assert.Contains("later-1", delivered.Error?.Message, StringComparison.Ordinal);
+        // Nothing was queued for a delivery that never happened.
+        Assert.False(events.TryRead(out _));
+    }
+
+    [Fact]
     public void Address_round_trips_through_its_text_form()
     {
         Assert.True(Address.TryParse("adapter.file#file-1", out var parsed));
@@ -72,6 +98,12 @@ public sealed class PersistenceTests : IDisposable
         Assert.Equal(Channel, channel);
         Assert.False(Address.TryParse("adapter.#x", out _));
         Assert.False(Address.TryParse("adapter.file#", out _));
+    }
+
+    private sealed class StubBindings : IInstanceBindings
+    {
+        public ValueTask<Result> AttachAsync(Address target, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> DetachAsync(Address target, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
     }
 
     [Fact]

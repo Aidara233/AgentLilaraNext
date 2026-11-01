@@ -155,8 +155,9 @@ var clockTask = clock.RunAsync(shutdown.Token);
 // The host's only startup act: hand one signal to the managers, in dependency order.
 var lifecycle = new LifecycleCoordinator(new RecordingEventSink(queue, messageStore), signalLog);
 var registered = lifecycle.Register(adapters);
-// Channels are bound to Adapters, so they wait one wave — a data dependency, not a startup order rule.
-if (registered.Ok) registered = lifecycle.Register((ILifecycleParticipant)channels, "adapters");
+// No dependency between adapters and channels: availability is checked when a message is delivered,
+// so neither manager has to wait for the other.
+if (registered.Ok) registered = lifecycle.Register((ILifecycleParticipant)channels);
 if (!registered.Ok)
 {
     Console.Error.WriteLine(registered.Error?.Message ?? "Lifecycle wiring failed.");

@@ -54,9 +54,8 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "Channel binding contains an invalid Adapter address or conversation id."));
         if (spec.Bindings.Distinct().Count() != spec.Bindings.Count)
             return Result<ChannelInfo>.Failure(new(ErrorCode.Conflict, "Channel contains duplicate bindings."));
-        foreach (var binding in spec.Bindings)
-            if (!_adapters.Get(binding.Adapter).Ok)
-                return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, $"Bound Adapter not found: {binding.Adapter}"));
+        // The bound Adapter is NOT required to exist yet: startup order is not guaranteed and a
+        // Channel may be created before its Adapter. Availability is checked at delivery instead.
 
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -172,6 +171,11 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         {
             cancellationToken.ThrowIfCancellationRequested();
             var binding = channel.Bindings.Single(b => b.Adapter == envelope.Adapter && b.PlatformConversationId == envelope.PlatformConversationId);
+            // Delivery is where availability actually matters: the Channel may have been created
+            // before its Adapter, so this is the first moment we can honestly check it.
+            if (!_adapters.Get(binding.Adapter).Ok)
+                return Result<int>.Failure(new(ErrorCode.Unavailable,
+                    $"Bound Adapter is not available, message not delivered: {binding.Adapter}"));
             var message = new ChannelMessage(envelope.EventId, channel.Address, binding, envelope.PlatformMessageId,
                 envelope.Text, envelope.At, envelope.Sender);
             if (_messages is not null)
