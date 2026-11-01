@@ -313,8 +313,11 @@ public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationTo
         await foreach (var routedEvent in queue.ReadAllAsync(cancellationToken).ConfigureAwait(false))
         {
             var now = DateTimeOffset.UtcNow;
+            var intakeId = Guid.NewGuid();
             signalLog.Write(new()
             {
+                Id = intakeId,
+                ParentId = SignalScope.CurrentId,
                 Group = "queue",
                 Name = routedEvent.Name,
                 StepId = routedEvent.EventId,
@@ -325,10 +328,13 @@ public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationTo
                 DurationMs = routedEvent.EnqueuedAt is { } enqueued ? (now - enqueued).TotalMilliseconds : 0,
                 Level = SignalLevel.Debug
             });
-            var dispatched = await dispatch(routedEvent, cancellationToken).ConfigureAwait(false);
+            Result dispatched;
+            using (SignalScope.Enter(intakeId, routedEvent.EventId))
+                dispatched = await dispatch(routedEvent, cancellationToken).ConfigureAwait(false);
             if (!dispatched.Ok)
                 signalLog.Write(new()
                 {
+                    ParentId = intakeId,
                     Group = "queue",
                     Name = routedEvent.Name,
                     StepId = routedEvent.EventId,

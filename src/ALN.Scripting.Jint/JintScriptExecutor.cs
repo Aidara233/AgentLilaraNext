@@ -41,6 +41,7 @@ public sealed class JintScriptExecutor : IScriptExecutor
             engine.SetValue("__pollSelf", new Func<Task<string>>(() => api.PollSelfAsync(cancellationToken)));
             engine.SetValue("__channelAccept", new Func<Task<string>>(() => api.AcceptIntoChannelAsync(cancellationToken)));
             engine.SetValue("__channelReply", new Func<string, Task<string>>(json => api.ReplyThroughChannelAsync(json, cancellationToken)));
+            engine.SetValue("__log", new Action<string, string, string>((level, message, detailJson) => api.Log(level, message, detailJson)));
             var source = $$"""
                 (async function() {
                   const event = JSON.parse(__eventJson);
@@ -51,11 +52,17 @@ public sealed class JintScriptExecutor : IScriptExecutor
                   const pollSelf = __pollSelf;
                   const acceptChannel = __channelAccept;
                   const replyChannel = __channelReply;
+                  const log = Object.freeze({
+                    info: (message, detail) => __log("info", String(message ?? ""), detail === undefined ? "" : JSON.stringify(detail)),
+                    warn: (message, detail) => __log("warn", String(message ?? ""), detail === undefined ? "" : JSON.stringify(detail)),
+                    error: (message, detail) => __log("error", String(message ?? ""), detail === undefined ? "" : JSON.stringify(detail))
+                  });
                   const ctx = Object.freeze({
                     session: Object.freeze({ run: (spec, input) => runSession(spec, input) }),
                     model: Object.freeze({ complete: (profileId, request) => completeModel(profileId, request) }),
                     self: Object.freeze({ adapter: Object.freeze({ send: (message) => sendSelf(JSON.stringify(message)), poll: () => pollSelf() }) }),
                     channel: Object.freeze({ accept: () => acceptChannel(), reply: (message) => replyChannel(JSON.stringify(message)) }),
+                    log,
                     eventName
                   });
                   {{package.Source}}

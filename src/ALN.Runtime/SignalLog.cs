@@ -105,7 +105,14 @@ public sealed class SignalLog : ISignalLog, IAsyncDisposable
         try
         {
             if (record is null || !IsEnabled(record.Level)) return;
-            var stamped = record with { Sequence = Interlocked.Increment(ref _sequence) };
+            var stamped = record with
+            {
+                Sequence = Interlocked.Increment(ref _sequence),
+                Id = record.Id == Guid.Empty ? Guid.NewGuid() : record.Id,
+                // Ambient correlation: a record written inside a dispatch belongs to that step
+                // even if the producer did not know the root event id.
+                StepId = record.StepId == Guid.Empty ? SignalScope.StepId ?? Guid.Empty : record.StepId
+            };
             if (_memoryWindow > 0)
             {
                 _recent.Enqueue(stamped);

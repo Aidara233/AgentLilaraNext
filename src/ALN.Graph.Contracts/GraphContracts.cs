@@ -46,6 +46,8 @@ public interface IScriptApi : ISessionToolExecutor
     Task<string> AcceptIntoChannelAsync(CancellationToken cancellationToken);
     Task<string> ReplyThroughChannelAsync(string outboundMessageJson, CancellationToken cancellationToken);
     Task<string> PollSelfAsync(CancellationToken cancellationToken);
+    /// <summary>Point log for script business narration. Level is info, warn or error; never throws.</summary>
+    void Log(string level, string message, string? detailJson);
 }
 
 public interface IGraphScriptCatalog

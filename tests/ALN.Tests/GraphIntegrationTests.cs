@@ -129,6 +129,58 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.False(invalid.Ok);
     }
 
+    [Fact]
+    public async Task Point_logs_land_on_the_same_tree_as_the_edge_that_produced_them()
+    {
+        var loggingIntake = new ScriptPackage(
+            new("adapter.log-intake", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
+                [ScriptCapabilities.ChannelAccept], TrustDomain.Builtin),
+            "async function onEvent(event, ctx) { ctx.log.info('saw message', { conversation: event.platformConversationId }); await ctx.channel.accept(); }");
+        Assert.True((await _graph.LoadAsync([loggingIntake], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        var channel = new Address("channel", "logical", "chat-1");
+        await AddChannelAsync(channel, "chat-1");
+        await _adapters.StartAsync(_adapterAddress, default);
+
+        var envelope = new AdapterEnvelope(_adapterAddress, "file", "chat-1", "m-1", "hello", DateTimeOffset.UtcNow);
+        var dispatched = await _graph.DispatchAsync(new(EventNames.AdapterEnvelope, _adapterAddress, envelope.EventId,
+            JsonSerializer.Serialize(envelope, new JsonSerializerOptions(JsonSerializerDefaults.Web))), default);
+        Assert.True(dispatched.Ok, dispatched.Error?.Detail ?? dispatched.Error?.Message);
+
+        var records = _signals.Snapshot();
+        var edge = Assert.Single(records, r => r.Group == "dispatch");
+        Assert.Equal(envelope.EventId, edge.StepId);
+        Assert.Null(edge.ParentId);
+        Assert.Contains(records, r => r.Group == "module" && r.ParentId == edge.Id);
+        Assert.Contains(records, r => r.Group == "capability" && r.ParentId == edge.Id);
+        // One tree: every non-root record points at a record that is also in the log.
+        var ids = records.Select(r => r.Id).ToHashSet();
+        Assert.All(records.Where(r => r.ParentId is not null), r => Assert.Contains(r.ParentId!.Value, ids));
+        Assert.All(records, r => Assert.Equal(envelope.EventId, r.StepId));
+    }
+
+    [Fact]
+    public async Task Script_log_records_are_capped_and_never_break_the_handler()
+    {
+        var chatty = new ScriptPackage(
+            new("adapter.chatty", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent", [],
+                TrustDomain.Builtin),
+            "async function onEvent(event, ctx) { for (let i = 0; i < 500; i++) ctx.log.error('spam ' + i); }");
+        Assert.True((await _graph.LoadAsync([chatty], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        await _adapters.StartAsync(_adapterAddress, default);
+
+        var envelope = new AdapterEnvelope(_adapterAddress, "file", "chat-1", "m-1", "hello", DateTimeOffset.UtcNow);
+        var dispatched = await _graph.DispatchAsync(new(EventNames.AdapterEnvelope, _adapterAddress, envelope.EventId,
+            JsonSerializer.Serialize(envelope, new JsonSerializerOptions(JsonSerializerDefaults.Web))), default);
+
+        Assert.True(dispatched.Ok, dispatched.Error?.Detail ?? dispatched.Error?.Message);
+        var moduleRecords = _signals.Snapshot().Where(r => r.Group == "module").ToArray();
+        Assert.Equal(201, moduleRecords.Length);
+        Assert.Single(moduleRecords, r => r.Outcome == "truncated");
+        Assert.Equal(200, moduleRecords.Count(r => r.Outcome == "error"));
+    }
+
     private async Task AddChannelAsync(Address address, string conversation)
     {
         var result = await _channels.CreateAsync(new(address, conversation, [new(_adapterAddress, conversation)]), default);

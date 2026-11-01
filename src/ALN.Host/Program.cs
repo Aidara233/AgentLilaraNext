@@ -22,6 +22,7 @@ var mailboxRoot = Path.Combine(data.Root, "adapters", "file-1");
 var mailbox = new FileMailbox(mailboxRoot);
 await using var auditStream = new AsyncDisposeAdapter(new JsonlAuditSink(Path.Combine(data.Root, "audit", "capabilities.jsonl")));
 await using var signalLog = SignalLog.Open(Path.Combine(data.Root, "logs"));
+var moduleLoggers = new SignalModuleLoggerFactory(signalLog);
 var queue = new EventQueue(capacity: 256);
 var adapterTypes = new AdapterTypeCatalog();
 var bindings = new InstanceBindingsProxy();
@@ -43,6 +44,7 @@ var hostServices = new HostServiceProvider(
     (typeof(IModuleTypeRegistry), adapterTypes),
     (typeof(IInstanceBindings), bindings),
     (typeof(ISignalLog), signalLog),
+    (typeof(IModuleLoggerFactory), moduleLoggers),
     (typeof(IAuditSink), auditStream.Sink),
     (typeof(IModuleReloadStateStore), reloadState),
     (typeof(ModuleHostPaths), new ModuleHostPaths(AppContext.BaseDirectory, data.Root)));

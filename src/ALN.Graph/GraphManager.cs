@@ -200,13 +200,23 @@ public sealed class GraphManager : IGraphRuntime
             {
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 deadline.CancelAfter(TimeSpan.FromMilliseconds(mount.Package.Manifest.TimeoutMilliseconds));
-                var api = new ScriptApi(_adapters, _channels, _clock, _audit, _signalLog, _models, _sessions, mount, routedEvent, deadline.Token);
                 // One record per traversed edge — this loop is the only place an edge is followed.
                 var edgeId = EdgeId(mount, routedEvent.Name);
+                var invocationId = Guid.NewGuid();
+                var parentId = SignalScope.CurrentId;
                 var started = System.Diagnostics.Stopwatch.GetTimestamp();
-                var result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
+                Result result;
+                using (SignalScope.Enter(invocationId, routedEvent.EventId))
+                {
+                    var api = new ScriptApi(_adapters, _channels, _clock, _audit, _signalLog, _models, _sessions, mount, routedEvent, deadline.Token);
+                    result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
+                }
+                // The record settles after the handler returns, but its id existed during it, so
+                // everything the handler logged or invoked already points here.
                 _signalLog.Write(new()
                 {
+                    Id = invocationId,
+                    ParentId = parentId,
                     Group = "dispatch",
                     Name = edgeId,
                     StepId = routedEvent.EventId,
@@ -463,15 +473,19 @@ public sealed class GraphManager : IGraphRuntime
 
         private async Task<T> InvokeAsync<T>(string capability, Func<Task<T>> body)
         {
+            var recordId = Guid.NewGuid();
+            var parentId = SignalScope.CurrentId;
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
-                var value = await body().ConfigureAwait(false);
+                T value;
+                using (SignalScope.Enter(recordId, current.EventId))
+                    value = await body().ConfigureAwait(false);
                 if (value is Result<string> { Ok: false } failed)
                     Record(capability, failed.Error?.Code == ErrorCode.Denied ? "denied" : "failed", started,
-                        SignalLevel.Warn, failed.Error?.Message);
+                        SignalLevel.Warn, failed.Error?.Message, recordId, parentId);
                 else
-                    Record(capability, "ok", started, SignalLevel.Info, null);
+                    Record(capability, "ok", started, SignalLevel.Info, null, recordId, parentId);
                 return value;
             }
             catch (UnauthorizedAccessException)
@@ -481,20 +495,23 @@ public sealed class GraphManager : IGraphRuntime
             }
             catch (OperationCanceledException)
             {
-                Record(capability, "timeout", started, SignalLevel.Warn, "Cancelled or timed out");
+                Record(capability, "timeout", started, SignalLevel.Warn, "Cancelled or timed out", recordId, parentId);
                 throw;
             }
             catch (Exception ex)
             {
-                Record(capability, "failed", started, SignalLevel.Warn, ex.Message);
+                Record(capability, "failed", started, SignalLevel.Warn, ex.Message, recordId, parentId);
                 throw;
             }
         }
 
-        private void Record(string capability, string outcome, long started, SignalLevel level, string? detail)
+        private void Record(string capability, string outcome, long started, SignalLevel level, string? detail,
+            Guid recordId, Guid? parentId)
         {
             signalLog.Write(new()
             {
+                Id = recordId,
+                ParentId = parentId,
                 Group = "capability",
                 Name = capability,
                 StepId = current.EventId,
@@ -516,6 +533,74 @@ public sealed class GraphManager : IGraphRuntime
             _ => mount.Target.ToString()
         };
 
+        /// <summary>
+        /// Point log from script code. Correlated with the dispatch that produced it (same StepId),
+        /// capped per invocation, and never allowed to throw into the script.
+        /// </summary>
+        public void Log(string level, string message, string? detailJson)
+        {
+            try
+            {
+                var normalized = level?.Trim().ToLowerInvariant() switch
+                {
+                    "warn" => SignalLevel.Warn,
+                    "error" => SignalLevel.Error,
+                    _ => SignalLevel.Info
+                };
+                if (!signalLog.IsEnabled(normalized)) return;
+                var count = Interlocked.Increment(ref _logRecords);
+                if (count > MaxLogRecords)
+                {
+                    if (count == MaxLogRecords + 1)
+                        signalLog.Write(new()
+                        {
+                            Group = "module", Name = mount.Package.Manifest.Id, StepId = current.EventId,
+                            From = mount.Target.ToString(), Mechanism = "log", Outcome = "truncated",
+                            Level = SignalLevel.Warn, Detail = new Dictionary<string, string>
+                            { ["message"] = $"Script log cap reached ({MaxLogRecords} records); further entries were dropped." }
+                        });
+                    return;
+                }
+                var text = message is { Length: > MaxLogMessageLength } ? message[..MaxLogMessageLength] : message ?? "";
+                var detail = new Dictionary<string, string> { ["message"] = text };
+                if (detailJson is { Length: > 0 and <= 4_000 })
+                {
+                    try
+                    {
+                        using var document = JsonDocument.Parse(detailJson);
+                        if (document.RootElement.ValueKind == JsonValueKind.Object)
+                            foreach (var property in document.RootElement.EnumerateObject().Take(MaxLogDetailEntries))
+                                detail[property.Name.Length > 64 ? property.Name[..64] : property.Name] = property.Value.ValueKind switch
+                                {
+                                    JsonValueKind.String => Truncate(property.Value.GetString() ?? ""),
+                                    JsonValueKind.Null or JsonValueKind.Undefined => "",
+                                    _ => Truncate(property.Value.GetRawText())
+                                };
+                    }
+                    catch (JsonException) { /* unparsable detail is dropped; the message still lands */ }
+                }
+                signalLog.Write(new()
+                {
+                    Group = "module",
+                    Name = mount.Package.Manifest.Id,
+                    ParentId = SignalScope.CurrentId,
+                    StepId = current.EventId,
+                    From = mount.Target.ToString(),
+                    Mechanism = "log",
+                    Outcome = normalized.ToString().ToLowerInvariant(),
+                    Level = normalized,
+                    Detail = detail
+                });
+            }
+            catch
+            {
+                // A script's logging call must never change its own outcome.
+            }
+        }
+
+        private static string Truncate(string value) =>
+            value.Length > MaxLogDetailValueLength ? value[..MaxLogDetailValueLength] : value;
+
         private async ValueTask RequireCapabilityAsync(string capability, CancellationToken cancellationToken)
         {
             if (mount.Package.Manifest.Capabilities.Contains(capability, StringComparer.Ordinal)) return;
@@ -528,6 +613,7 @@ public sealed class GraphManager : IGraphRuntime
             {
                 Group = "capability",
                 Name = action,
+                ParentId = SignalScope.CurrentId,
                 StepId = current.EventId,
                 From = $"{mount.Package.Manifest.Id}@{mount.Target}",
                 To = CapabilityTarget(action),
@@ -554,6 +640,11 @@ public sealed class GraphManager : IGraphRuntime
 
         private static T Parse<T>(string json) => JsonSerializer.Deserialize<T>(json, JsonOptions) ?? throw new ArgumentException("Script API received invalid JSON.");
         private sealed record SessionSendArguments(string Text);
+        private const int MaxLogRecords = 200;
+        private const int MaxLogMessageLength = 2_000;
+        private const int MaxLogDetailEntries = 16;
+        private const int MaxLogDetailValueLength = 512;
+        private int _logRecords;
     }
 }
 

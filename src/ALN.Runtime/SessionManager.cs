@@ -37,17 +37,22 @@ public sealed class SessionManager : ISessionManager
         string sessionId, SessionSpec spec, Guid activationId, SessionTurnInput input,
         ISessionToolExecutor? toolExecutor, CancellationToken cancellationToken)
     {
+        var recordId = Guid.NewGuid();
+        var parentId = SignalScope.CurrentId;
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
-            var result = await RunTurnCoreAsync(sessionId, spec, activationId, input, toolExecutor, cancellationToken).ConfigureAwait(false);
-            RecordTurn(sessionId, spec, activationId, result, started);
+            Result<SessionTurnResult> result;
+            using (SignalScope.Enter(recordId, activationId))
+                result = await RunTurnCoreAsync(sessionId, spec, activationId, input, toolExecutor, cancellationToken).ConfigureAwait(false);
+            RecordTurn(sessionId, spec, activationId, result, started, recordId, parentId);
             return result;
         }
         catch (OperationCanceledException)
         {
             _signalLog.Write(new()
             {
+                Id = recordId, ParentId = parentId,
                 Group = "session", Name = sessionId, StepId = activationId,
                 From = "session", To = $"model:{spec.ModelProfileId}", Mechanism = "session.turn",
                 Outcome = "timeout", Level = SignalLevel.Warn,
@@ -58,11 +63,13 @@ public sealed class SessionManager : ISessionManager
     }
 
     private void RecordTurn(string sessionId, SessionSpec spec, Guid activationId,
-        Result<SessionTurnResult> result, long started)
+        Result<SessionTurnResult> result, long started, Guid recordId, Guid? parentId)
     {
         var level = result.Ok ? SignalLevel.Info : SignalLevel.Warn;
         _signalLog.Write(new()
         {
+            Id = recordId,
+            ParentId = parentId,
             Group = "session",
             Name = sessionId,
             StepId = activationId,
@@ -183,6 +190,9 @@ public sealed class SessionManager : ISessionManager
             while (true)
             {
                 var modelStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+                var modelRecordId = Guid.NewGuid();
+                var modelParentId = SignalScope.CurrentId;
+                using var modelScope = SignalScope.Enter(modelRecordId, activationId);
                 var modelStarted = await _models.CompleteAsync(session.Value.Spec.ModelProfileId,
                     new ModelRequest(messages, session.Value.Spec.Tools), cancellationToken).ConfigureAwait(false);
                 if (!modelStarted.Ok || modelStarted.Value is null)
@@ -224,6 +234,8 @@ public sealed class SessionManager : ISessionManager
                     return Result<SessionTurnResult>.Failure(new(ErrorCode.Unavailable, "Model provider ended without a terminal event."));
                 _signalLog.Write(new()
                 {
+                    Id = modelRecordId,
+                    ParentId = modelParentId,
                     Group = "model",
                     Name = session.Value.Spec.ModelProfileId,
                     StepId = activationId,
