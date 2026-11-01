@@ -97,14 +97,17 @@ public sealed class AdapterManager : IAdapterManager
     private readonly IModuleTypeCatalog _types;
     private readonly IInstanceBindings _bindings;
     private readonly IAdapterFactoryRegistry? _factories;
+    private readonly IAdapterSpecStore? _specs;
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
 
-    public AdapterManager(IModuleTypeCatalog types, IInstanceBindings bindings, IAdapterFactoryRegistry? factories = null)
+    public AdapterManager(IModuleTypeCatalog types, IInstanceBindings bindings, IAdapterFactoryRegistry? factories = null,
+        IAdapterSpecStore? specs = null)
     {
         _types = types;
         _bindings = bindings;
         _factories = factories;
+        _specs = specs;
     }
 
     public ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, CancellationToken cancellationToken) =>
@@ -153,6 +156,17 @@ public sealed class AdapterManager : IAdapterManager
             {
                 lock (_gate) _adapters.Remove(spec.Address);
                 return Result<IChatAdapter>.Failure(attached.Error!);
+            }
+            if (_specs is not null)
+            {
+                // The Adapter is a configured object, not a side effect of a folder existing.
+                var persisted = await _specs.SaveAsync(spec, cancellationToken).ConfigureAwait(false);
+                if (!persisted.Ok)
+                {
+                    lock (_gate) _adapters.Remove(spec.Address);
+                    await _bindings.DetachAsync(spec.Address, CancellationToken.None).ConfigureAwait(false);
+                    return Result<IChatAdapter>.Failure(persisted.Error!);
+                }
             }
             return Result<IChatAdapter>.Success(adapter);
         }
@@ -267,6 +281,11 @@ public sealed class AdapterManager : IAdapterManager
                     return stopped;
                 }
                 lock (_gate) _adapters.Remove(address);
+                if (_specs is not null)
+                {
+                    var removed = await _specs.DeleteAsync(address, cancellationToken).ConfigureAwait(false);
+                    if (!removed.Ok) return removed;
+                }
                 return Result.Success();
             }
             catch
@@ -305,6 +324,7 @@ public sealed class EventQueue : IEventSink
         return ValueTask.FromResult(Result.Success());
     }
     public IAsyncEnumerable<RoutedEvent> ReadAllAsync(CancellationToken ct) => _queue.Reader.ReadAllAsync(ct);
+    public bool TryRead(out RoutedEvent routedEvent) => _queue.Reader.TryRead(out routedEvent!);
     public void Complete() => _queue.Writer.TryComplete();
 }
 

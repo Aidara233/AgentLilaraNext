@@ -44,6 +44,8 @@ public interface IScriptApi : ISessionToolExecutor
     Task<string> CompleteModelAsync(string profileId, string requestJson, CancellationToken cancellationToken);
     Task<string> SendSelfAsync(string outboundMessageJson, CancellationToken cancellationToken);
     Task<string> AcceptIntoChannelAsync(CancellationToken cancellationToken);
+    /// <summary>Deliver the current Adapter message to its Channel, creating that Channel if no binding exists yet.</summary>
+    Task<string> RouteIntoChannelAsync(string optionsJson, CancellationToken cancellationToken);
     Task<string> ReplyThroughChannelAsync(string outboundMessageJson, CancellationToken cancellationToken);
     Task<string> PollSelfAsync(CancellationToken cancellationToken);
     /// <summary>Point log for script business narration. Level is info, warn or error; never throws.</summary>
@@ -71,6 +73,7 @@ public static class ScriptCapabilities
     public const string ModelComplete = "model.complete";
     public const string SelfAdapterSend = "self.adapter.send";
     public const string ChannelAccept = "channel.accept";
+    public const string ChannelRoute = "channel.route";
     public const string ChannelReply = "channel.bound-send";
     public const string SelfAdapterPoll = "self.adapter.poll";
 }

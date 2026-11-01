@@ -5,6 +5,29 @@ public readonly record struct Address(string Module, string? Kind = null, string
     public string TypeId => Kind is null ? Module : $"{Module}.{Kind}";
     public override string ToString() => Instance is null ? TypeId : $"{TypeId}#{Instance}";
     public bool IsInstance => !string.IsNullOrWhiteSpace(Module) && !string.IsNullOrWhiteSpace(Kind) && !string.IsNullOrWhiteSpace(Instance);
+
+    /// <summary>Inverse of <see cref="ToString"/>: "adapter.file#file-1" → (adapter, file, file-1).</summary>
+    public static bool TryParse(string? text, out Address address)
+    {
+        address = default;
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        var hash = text.IndexOf('#');
+        var typeId = hash < 0 ? text : text[..hash];
+        var instance = hash < 0 ? null : text[(hash + 1)..];
+        if (hash >= 0 && string.IsNullOrWhiteSpace(instance)) return false;
+        var dot = typeId.IndexOf('.');
+        if (dot < 0)
+        {
+            if (string.IsNullOrWhiteSpace(typeId)) return false;
+            address = new Address(typeId, null, instance);
+            return true;
+        }
+        var module = typeId[..dot];
+        var kind = typeId[(dot + 1)..];
+        if (string.IsNullOrWhiteSpace(module) || string.IsNullOrWhiteSpace(kind) || kind.Contains('.')) return false;
+        address = new Address(module, kind, instance);
+        return true;
+    }
 }
 public enum ErrorCode { Invalid, Conflict, Unavailable, Timeout, Denied, Internal }
 public sealed record Error(ErrorCode Code, string Message, string? Detail = null, bool Retryable = false);

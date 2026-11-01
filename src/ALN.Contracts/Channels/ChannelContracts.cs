@@ -11,6 +11,8 @@ public interface IChannelManager
     Result<ChannelInfo> Get(Address address);
     IReadOnlyList<ChannelInfo> List();
     bool IsBound(Address channel, Address adapter, string platformConversationId);
+    /// <summary>Locates the running channel bound to an Adapter conversation; absence is a normal outcome.</summary>
+    Result<ChannelInfo> FindBound(Address adapter, string platformConversationId);
     ValueTask<Result<ChannelInfo>> CreateAsync(ChannelSpec spec, CancellationToken cancellationToken);
     ValueTask<Result> StartAsync(Address address, CancellationToken cancellationToken);
     ValueTask<Result> StopAsync(Address address, CancellationToken cancellationToken);

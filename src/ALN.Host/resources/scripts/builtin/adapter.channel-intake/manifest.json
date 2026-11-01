@@ -5,7 +5,7 @@
   "mount": "default",
   "events": ["adapter.envelope", "clock.pulse"],
   "entryPoint": "onEvent",
-  "capabilities": ["channel.accept", "self.adapter.poll"],
+  "capabilities": ["channel.route", "self.adapter.poll"],
   "trustDomain": "builtin",
   "maxStatements": 10000,
   "timeoutMilliseconds": 1000,

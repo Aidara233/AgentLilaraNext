@@ -12,7 +12,7 @@ namespace ALN.Graph;
 public sealed class GraphManager : IGraphRuntime
 {
     private static readonly HashSet<string> AllowedCapabilities = new(StringComparer.Ordinal)
-    { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelReply, ScriptCapabilities.ModelComplete, ScriptCapabilities.SessionRun };
+    { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelRoute, ScriptCapabilities.ChannelReply, ScriptCapabilities.ModelComplete, ScriptCapabilities.SessionRun };
     private readonly IAdapterManager _adapters;
     private readonly IChannelManager _channels;
     private readonly IClockManager _clock;
@@ -438,6 +438,59 @@ public sealed class GraphManager : IGraphRuntime
             return await SendAsync(envelope.EventId, current.Source, message, cancellationToken).ConfigureAwait(false);
         }
 
+        public Task<string> RouteIntoChannelAsync(string json, CancellationToken cancellationToken) =>
+            InvokeAsync(ScriptCapabilities.ChannelRoute, () => RouteIntoChannelCoreAsync(json, cancellationToken));
+
+        /// <summary>
+        /// The script owns the policy: if a Channel is already bound to this Adapter conversation,
+        /// deliver; otherwise create one from the caller's naming and deliver into it. Creation is
+        /// idempotent by binding, so two simultaneous messages cannot mint two Channels.
+        /// </summary>
+        private async Task<string> RouteIntoChannelCoreAsync(string json, CancellationToken cancellationToken)
+        {
+            await RequireCapabilityAsync(ScriptCapabilities.ChannelRoute, cancellationToken).ConfigureAwait(false);
+            if (current.Name != EventNames.AdapterEnvelope || current.Source != mount.Target)
+                await DenyAsync(ScriptCapabilities.ChannelRoute, "Not the source Adapter event.", cancellationToken).ConfigureAwait(false);
+            var envelope = Parse<AdapterEnvelope>(current.PayloadJson);
+            if (envelope.Adapter != current.Source || envelope.EventId != current.EventId)
+                await DenyAsync(ScriptCapabilities.ChannelRoute, "Adapter payload does not match routed event.", cancellationToken).ConfigureAwait(false);
+            var options = string.IsNullOrWhiteSpace(json) ? new RouteOptions(null, null) : Parse<RouteOptions>(json);
+            var channelId = string.IsNullOrWhiteSpace(options.ChannelId)
+                ? envelope.PlatformConversationId
+                : options.ChannelId!;
+            if (channelId.Length is 0 or > 128 || channelId.Any(c => !char.IsAsciiLetterOrDigit(c) && c is not ('-' or '_')))
+                throw new InvalidOperationException($"Channel id is not usable: {channelId}");
+
+            var existing = channels.FindBound(envelope.Adapter, envelope.PlatformConversationId);
+            var created = false;
+            Address channelAddress;
+            if (existing.Ok && existing.Value is { } bound)
+                channelAddress = bound.Address;
+            else
+            {
+                channelAddress = new Address("channel", "logical", channelId);
+                var spec = new ChannelSpec(channelAddress, string.IsNullOrWhiteSpace(options.Name) ? channelId : options.Name!,
+                    [new ChannelBinding(envelope.Adapter, envelope.PlatformConversationId)]);
+                var minted = await channels.CreateAsync(spec, cancellationToken).ConfigureAwait(false);
+                if (!minted.Ok) throw new InvalidOperationException(minted.Error?.Message ?? "Channel creation failed.");
+                var started = await channels.StartAsync(channelAddress, cancellationToken).ConfigureAwait(false);
+                if (!started.Ok)
+                {
+                    await channels.DestroyAsync(channelAddress, CancellationToken.None).ConfigureAwait(false);
+                    throw new InvalidOperationException(started.Error?.Message ?? "Channel start failed.");
+                }
+                created = true;
+            }
+
+            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id, channelAddress,
+                ScriptCapabilities.ChannelRoute, created ? "created" : "allowed"), cancellationToken).ConfigureAwait(false);
+            var accepted = await channels.AcceptAsync(envelope, cancellationToken).ConfigureAwait(false);
+            if (!accepted.Ok) throw new InvalidOperationException(accepted.Error?.Message ?? "Channel intake failed.");
+            if (!channels.IsBound(channelAddress, envelope.Adapter, envelope.PlatformConversationId))
+                throw new InvalidOperationException("Channel routing produced no bound Channel.");
+            return JsonSerializer.Serialize(new { channel = channelAddress.ToString(), created, acceptedChannels = accepted.Value }, JsonOptions);
+        }
+
         public Task<string> AcceptIntoChannelAsync(CancellationToken cancellationToken) =>
             InvokeAsync(ScriptCapabilities.ChannelAccept, () => AcceptIntoChannelCoreAsync(cancellationToken));
 
@@ -555,7 +608,8 @@ public sealed class GraphManager : IGraphRuntime
         {
             ScriptCapabilities.ModelComplete => "model",
             ScriptCapabilities.SessionRun => "session",
-            ScriptCapabilities.ChannelAccept or ScriptCapabilities.ChannelReply => current.Source.ToString(),
+            ScriptCapabilities.ChannelAccept or ScriptCapabilities.ChannelReply or ScriptCapabilities.ChannelRoute
+                => current.Source.ToString(),
             _ => mount.Target.ToString()
         };
 
@@ -666,6 +720,7 @@ public sealed class GraphManager : IGraphRuntime
 
         private static T Parse<T>(string json) => JsonSerializer.Deserialize<T>(json, JsonOptions) ?? throw new ArgumentException("Script API received invalid JSON.");
         private sealed record SessionSendArguments(string Text);
+        private sealed record RouteOptions(string? ChannelId, string? Name);
         private const int MaxLogRecords = 200;
         private const int MaxLogMessageLength = 2_000;
         private const int MaxLogDetailEntries = 16;

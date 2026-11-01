@@ -40,7 +40,9 @@ public sealed class DefaultModulesPlugin : IModulePlugin
             var sessions = HostService<ISessionManager>(context);
 
             var clock = new ClockSource(events);
-            var channels = new ChannelManager(adapters, events, bindings);
+            var channels = new ChannelManager(adapters, events, bindings,
+                context.HostServices.GetService(typeof(IChannelSpecStore)) as IChannelSpecStore,
+                context.HostServices.GetService(typeof(IMessageStore)) as IMessageStore);
             var executor = new JintScriptExecutor();
             var graph = new GraphManager(adapters, channels, clock, types, executor, audit, journal, models, sessions);
             if (bindings is IInstanceBindingsProxy proxy) proxy.Bind(graph);

@@ -24,10 +24,13 @@ await using var auditStream = new AsyncDisposeAdapter(new JsonlAuditSink(Path.Co
 await using var signalLog = SignalLog.Open(Path.Combine(data.Root, "logs"));
 var moduleLoggers = new SignalModuleLoggerFactory(signalLog);
 var queue = new EventQueue(capacity: 256);
+var messageStore = new FileMessageStore(Path.Combine(data.Root, "messages"));
+var adapterSpecs = new FileAdapterSpecStore(Path.Combine(data.Root, "adapters"));
+var channelSpecs = new FileChannelSpecStore(Path.Combine(data.Root, "channels"));
 var adapterTypes = new AdapterTypeCatalog();
 var bindings = new InstanceBindingsProxy();
 var adapterFactories = new AdapterFactoryRegistry();
-var adapters = new AdapterManager(adapterTypes, bindings, adapterFactories);
+var adapters = new AdapterManager(adapterTypes, bindings, adapterFactories, adapterSpecs);
 var artifacts = new FileArtifactStore(Path.Combine(data.Root, "artifacts"));
 var modelManager = new ModelManager(artifacts, signalLog);
 var roundContextContributors = new RoundContextContributorRegistry();
@@ -44,7 +47,10 @@ var hostServices = new HostServiceProvider(
     (typeof(ISessionManager), sessions),
     (typeof(IRoundContextContributorRegistry), roundContextContributors),
     (typeof(IFileMailbox), mailbox),
-    (typeof(IEventSink), queue),
+    (typeof(IEventSink), new RecordingEventSink(queue, messageStore)),
+    (typeof(IMessageStore), messageStore),
+    (typeof(IChannelSpecStore), channelSpecs),
+    (typeof(IAdapterSpecStore), adapterSpecs),
     (typeof(IModuleTypeCatalog), adapterTypes),
     (typeof(IModuleTypeRegistry), adapterTypes),
     (typeof(IInstanceBindings), bindings),
@@ -115,7 +121,18 @@ if (!loaded.Ok)
     return 1;
 }
 
-var adapterSpec = new AdapterSpec(new Address("adapter", "file", "file-1"), new AdapterDescriptor("file", "file-1", AdapterDirection.Both));
+var storedAdapters = await adapterSpecs.LoadAllAsync(CancellationToken.None);
+if (!storedAdapters.Ok)
+{
+    Console.Error.WriteLine(storedAdapters.Error?.Message ?? "Stored Adapter specs could not be read.");
+    return 1;
+}
+// The Host runs one file Adapter because it owns one mailbox; its spec is read from storage so the
+// instance can be renamed or repointed without editing code.
+var adapterSpec = storedAdapters.Value!.FirstOrDefault(s => s.Address.TypeId == "adapter.file")
+    ?? new AdapterSpec(new Address("adapter", "file", "file-1"), new AdapterDescriptor("file", "file-1", AdapterDirection.Both));
+if (storedAdapters.Value!.Count > 1)
+    Console.Error.WriteLine("Warning: only the first adapter.file spec is started; additional Adapter instances need their own mailbox.");
 var created = await adapters.CreateAsync(adapterSpec, CancellationToken.None);
 if (!created.Ok || created.Value is null)
 {
@@ -125,7 +142,7 @@ if (!created.Ok || created.Value is null)
 created = default;
 
 var channelAddresses = new HashSet<Address>();
-var startupChannels = await ReconcileChannelsAsync();
+var startupChannels = await LoadChannelsAsync();
 if (!startupChannels.Ok)
 {
     Console.Error.WriteLine(startupChannels.Error?.Message);
@@ -220,25 +237,24 @@ async Task<Result> LoadModelConfigurationAsync(string modelsRoot)
     { return Result.Failure(new(ErrorCode.Invalid, "Model configuration could not be loaded.", ex.Message)); }
 }
 
-async Task<Result> ReconcileChannelsAsync()
+// Channels are created by scripts and persisted; startup only revives what already exists.
+// A conversation folder with no channel is not a channel — the next message routes into a new one.
+async Task<Result> LoadChannelsAsync()
 {
-    IReadOnlyList<string> conversationIds;
-    try { conversationIds = await mailbox.GetConversationIdsAsync(CancellationToken.None); }
-    catch (Exception ex) { return Result.Failure(new(ErrorCode.Unavailable, "Could not enumerate FileAdapter conversations.", ex.Message)); }
-    foreach (var conversationId in conversationIds)
+    var stored = await channelSpecs.LoadAllAsync(CancellationToken.None);
+    if (!stored.Ok) return Result.Failure(stored.Error!);
+    foreach (var spec in stored.Value!)
     {
-        var address = new Address("channel", "logical", conversationId);
-        if (channelAddresses.Contains(address)) continue;
-        var spec = new ChannelSpec(address, conversationId, [new ChannelBinding(adapterSpec.Address, conversationId)]);
+        if (channelAddresses.Contains(spec.Address)) continue;
         var createdChannel = await channels.CreateAsync(spec, CancellationToken.None);
         if (!createdChannel.Ok) return Result.Failure(createdChannel.Error!);
-        var channelStart = await channels.StartAsync(address, CancellationToken.None);
+        var channelStart = await channels.StartAsync(spec.Address, CancellationToken.None);
         if (!channelStart.Ok)
         {
-            await channels.DestroyAsync(address, CancellationToken.None);
+            await channels.DestroyAsync(spec.Address, CancellationToken.None);
             return channelStart;
         }
-        channelAddresses.Add(address);
+        channelAddresses.Add(spec.Address);
     }
     return Result.Success();
 }

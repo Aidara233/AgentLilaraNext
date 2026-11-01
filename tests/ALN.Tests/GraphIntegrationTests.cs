@@ -234,6 +234,54 @@ public sealed class GraphIntegrationTests : IDisposable
             c.Record.Name == ScriptCapabilities.ChannelAccept);
     }
 
+    [Fact]
+    public async Task Routing_creates_a_channel_when_missing_and_reuses_it_afterwards()
+    {
+        var intake = new ScriptPackage(
+            new("adapter.router", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
+                [ScriptCapabilities.ChannelRoute], TrustDomain.Builtin),
+            "async function onEvent(event, ctx) { return await ctx.channel.route({ channelId: event.platformConversationId }); }");
+        var loaded = await _graph.LoadAsync([intake], default);
+        Assert.True(loaded.Ok, loaded.Error?.Detail ?? loaded.Error?.Message);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        await _adapters.StartAsync(_adapterAddress, default);
+
+        var first = new AdapterEnvelope(_adapterAddress, "file", "chat-9", "m-1", "hello", DateTimeOffset.UtcNow);
+        var firstDispatch = await DispatchEnvelopeAsync(first);
+        Assert.True(firstDispatch.Ok, firstDispatch.Error?.Detail ?? firstDispatch.Error?.Message);
+        var created = Assert.Single(_channels.List());
+        Assert.Equal(new Address("channel", "logical", "chat-9"), created.Address);
+        Assert.True(created.Running);
+
+        var second = new AdapterEnvelope(_adapterAddress, "file", "chat-9", "m-2", "again", DateTimeOffset.UtcNow);
+        Assert.True((await DispatchEnvelopeAsync(second)).Ok);
+
+        // Reuse: still one channel, and the script was told it was not created the second time.
+        Assert.Single(_channels.List());
+        Assert.Contains(_signals.Snapshot(), r => r.Name == ScriptCapabilities.ChannelRoute && r.Outcome == "ok");
+    }
+
+    [Fact]
+    public async Task Routing_without_the_route_capability_is_denied()
+    {
+        var intake = new ScriptPackage(
+            new("adapter.router-denied", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
+                [ScriptCapabilities.SelfAdapterPoll], TrustDomain.Builtin),
+            "async function onEvent(event, ctx) { await ctx.channel.route({ channelId: event.platformConversationId }); }");
+        Assert.True((await _graph.LoadAsync([intake], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        await _adapters.StartAsync(_adapterAddress, default);
+
+        var dispatched = await DispatchEnvelopeAsync(new(_adapterAddress, "file", "chat-9", "m-1", "hello", DateTimeOffset.UtcNow));
+        Assert.False(dispatched.Ok);
+        Assert.Empty(_channels.List());
+        Assert.Contains(_signals.Snapshot(), r => r.Outcome == "denied");
+    }
+
+    private async Task<Result> DispatchEnvelopeAsync(AdapterEnvelope envelope) => await _graph.DispatchAsync(
+        new(EventNames.AdapterEnvelope, _adapterAddress, envelope.EventId,
+            JsonSerializer.Serialize(envelope, new JsonSerializerOptions(JsonSerializerDefaults.Web))), default);
+
     private async Task AddChannelAsync(Address address, string conversation)
     {
         var result = await _channels.CreateAsync(new(address, conversation, [new(_adapterAddress, conversation)]), default);

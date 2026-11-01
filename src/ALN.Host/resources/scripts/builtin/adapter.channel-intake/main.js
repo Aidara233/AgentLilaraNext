@@ -3,5 +3,6 @@ async function onEvent(event, ctx) {
     await ctx.self.adapter.poll();
     return;
   }
-  await ctx.channel.accept();
+  // The script owns channel policy: reuse the channel bound to this conversation, or create one.
+  await ctx.channel.route({ channelId: event.platformConversationId });
 }

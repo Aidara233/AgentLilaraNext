@@ -3,18 +3,18 @@ using ALN.Contracts;
 
 namespace ALN.Channel;
 
-public sealed class ChannelManager : IChannelManager
+public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, IInstanceBindings bindings,
+    IChannelSpecStore? specs = null, IMessageStore? messages = null) : IChannelManager
 {
-    private readonly IAdapterManager _adapters;
-    private readonly IEventSink _events;
-    private readonly IInstanceBindings _bindings;
+    private readonly IAdapterManager _adapters = adapters;
+    private readonly IEventSink _events = events;
+    private readonly IInstanceBindings _bindings = bindings;
+    private readonly IChannelSpecStore? _specs = specs;
+    private readonly IMessageStore? _messages = messages;
     private readonly Dictionary<Address, ChannelInstance> _channels = new();
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-
-    public ChannelManager(IAdapterManager adapters, IEventSink events, IInstanceBindings bindings)
-    { _adapters = adapters; _events = events; _bindings = bindings; }
 
     public Result<ChannelInfo> Get(Address address)
     {
@@ -30,6 +30,18 @@ public sealed class ChannelManager : IChannelManager
         lock (_gate)
             return _channels.TryGetValue(channelAddress, out var channel) && channel.Running &&
                    channel.Bindings.Any(b => b.Adapter == adapter && b.PlatformConversationId == platformConversationId);
+    }
+
+    public Result<ChannelInfo> FindBound(Address adapter, string platformConversationId)
+    {
+        lock (_gate)
+        {
+            var channel = _channels.Values.FirstOrDefault(c => c.Running && !c.Draining && c.Bindings.Any(b =>
+                b.Adapter == adapter && b.PlatformConversationId == platformConversationId));
+            return channel is null
+                ? Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "No running Channel is bound to this Adapter conversation."))
+                : Result<ChannelInfo>.Success(channel.ToInfo());
+        }
     }
 
     public async ValueTask<Result<ChannelInfo>> CreateAsync(ChannelSpec spec, CancellationToken cancellationToken)
@@ -63,6 +75,16 @@ public sealed class ChannelManager : IChannelManager
             {
                 lock (_gate) _channels.Remove(spec.Address);
                 return Result<ChannelInfo>.Failure(mounted.Error!);
+            }
+            if (_specs is not null)
+            {
+                var persisted = await _specs.SaveAsync(spec, cancellationToken).ConfigureAwait(false);
+                if (!persisted.Ok)
+                {
+                    lock (_gate) _channels.Remove(spec.Address);
+                    await _bindings.DetachAsync(spec.Address, CancellationToken.None).ConfigureAwait(false);
+                    return Result<ChannelInfo>.Failure(persisted.Error!);
+                }
             }
             return Get(spec.Address);
         }
@@ -127,6 +149,11 @@ public sealed class ChannelManager : IChannelManager
                 channel.Running = false;
                 _channels.Remove(address);
             }
+            if (_specs is not null)
+            {
+                var removed = await _specs.DeleteAsync(address, cancellationToken).ConfigureAwait(false);
+                if (!removed.Ok) return removed;
+            }
             return Result.Success();
         }
         catch (OperationCanceledException) { throw; }
@@ -147,6 +174,14 @@ public sealed class ChannelManager : IChannelManager
             var binding = channel.Bindings.Single(b => b.Adapter == envelope.Adapter && b.PlatformConversationId == envelope.PlatformConversationId);
             var message = new ChannelMessage(envelope.EventId, channel.Address, binding, envelope.PlatformMessageId,
                 envelope.Text, envelope.At, envelope.Sender);
+            if (_messages is not null)
+            {
+                // The channel keeps its own history; the mailbox folder is transport, not storage.
+                var recorded = await _messages.AppendAsync(new StoredMessage(envelope.EventId.ToString("N"), channel.Address,
+                    envelope.PlatformConversationId, envelope.PlatformMessageId, envelope.Sender, envelope.Text,
+                    envelope.At), cancellationToken).ConfigureAwait(false);
+                if (!recorded.Ok) return Result<int>.Failure(recorded.Error!);
+            }
             var routed = new RoutedEvent("channel.message.accepted", channel.Address, envelope.EventId,
                 JsonSerializer.Serialize(message, JsonOptions));
             var queued = await _events.PublishAsync(routed, cancellationToken).ConfigureAwait(false);
