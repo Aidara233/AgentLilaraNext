@@ -224,7 +224,85 @@ public sealed class StateContinuityTests : IDisposable
         Assert.Single(second.OutboxTexts("chat-1"));
     }
 
-    /// <summary>Reads a shipped sample from disk, so a sample that stops being a valid script fails a test.</summary>
+    [Fact]
+    public async Task A_message_that_was_accepted_but_never_answered_is_replayed_once_after_a_restart()
+    {
+        using (var first = new Node(_root))
+        {
+            await first.StartAsync([Intake(), Echo("channel.responder", "answered")]);
+            await first.AddChannelAsync("chat-1");
+            Assert.True((await first.Graph.AddRuleAsync(new("channel.responder", MountScope.ForType("channel.conversation")), default)).Ok);
+
+            await first.SayAsync("chat-1", "你在吗");
+            Assert.True(await first.StepAsync());   // clock.pulse → the Adapter polls and publishes the envelope
+            Assert.True(await first.StepAsync());   // adapter.envelope → the Channel accepts, the answer is queued
+            // Accepted, unanswered, and the process goes away before the round that would answer it.
+            Assert.Empty(first.OutboxTexts("chat-1"));
+            Assert.NotEmpty(Directory.GetFiles(Path.Combine(_root, "state", "channel.pending"), "*.json"));
+        }
+
+        using var second = new Node(_root);
+        await second.StartAsync([Intake(), Echo("channel.responder", "answered")]);
+        Assert.Contains(second.Report.Snapshot(), note => note.Component == "channels" && note.Summary.Contains("replayed"));
+        await second.DrainAsync();
+        Assert.Equal(["answered"], second.OutboxTexts("chat-1"));
+
+        // The round finished, so the marker is gone: a third boot has nothing left to replay.
+        using var third = new Node(_root);
+        await third.StartAsync([Intake(), Echo("channel.responder", "answered")]);
+        Assert.DoesNotContain(third.Report.Snapshot(), note => note.Component == "channels" && note.Summary.Contains("replayed"));
+        await third.DrainAsync();
+        Assert.Equal(["answered"], third.OutboxTexts("chat-1"));
+    }
+
+    [Fact]
+    public async Task The_same_platform_message_delivered_twice_is_answered_once()
+    {
+        using var node = new Node(_root);
+        await node.StartAsync([Intake(), Echo("channel.responder", "once")]);
+        await node.AddChannelAsync("chat-1");
+        Assert.True((await node.Graph.AddRuleAsync(new("channel.responder", MountScope.ForType("channel.conversation")), default)).Ok);
+
+        await node.SayAsync("chat-1", "hi", messageId: "platform-1");
+        await node.DrainAsync();
+        // The transport hands the very same message over again — a redelivery, not a new message.
+        await node.SayAsync("chat-1", "hi", messageId: "platform-1");
+        await node.DrainAsync();
+
+        Assert.Single(node.OutboxTexts("chat-1"));
+        var history = await node.Messages.ReadAsync(ChatOne, default);
+        Assert.Single(history.Value!);
+    }
+
+    [Fact]
+    public async Task A_claimed_input_that_was_never_acknowledged_is_offered_again()
+    {
+        using (var first = new Node(_root))
+        {
+            await first.StartAsync([Intake(), Echo("channel.responder", "recovered")]);
+            await first.AddChannelAsync("chat-1");
+            Assert.True((await first.Graph.AddRuleAsync(new("channel.responder", MountScope.ForType("channel.conversation")), default)).Ok);
+
+            await first.SayAsync("chat-1", "你好");
+            Assert.True(await first.StepAsync());   // the Adapter claims the file and publishes the envelope
+            // Claimed, published, never dispatched: the mailbox must not believe this is done.
+            Assert.NotEmpty(Directory.GetFiles(Path.Combine(_root, "io", "file", "file-1", "inflight", "chat-1")));
+            Assert.Empty(first.OutboxTexts("chat-1"));
+        }
+
+        using var second = new Node(_root);
+        await second.LoadAsync([Intake(), Echo("channel.responder", "recovered")]);
+        // Starting the Adapter is what reclaims: the claim outlived the process that made it.
+        await second.ReviveAsync();
+        Assert.Single(Directory.GetFiles(Path.Combine(_root, "io", "file", "file-1", "inbox", "chat-1")));
+
+        Assert.True((await second.Clock.PulseDueAsync(DateTimeOffset.UtcNow.AddSeconds(2), default)).Ok);
+        await second.DrainAsync();
+        Assert.Equal(["recovered"], second.OutboxTexts("chat-1"));
+        Assert.Single(Directory.GetFiles(Path.Combine(_root, "io", "file", "file-1", "processed", "chat-1")));
+    }
+
+
     private static ScriptPackage SamplePackage(string id)
     {
         var directory = Path.Combine(RepositoryRoot(), "samples", "scripts", "trusted", id);
@@ -277,8 +355,9 @@ public sealed class StateContinuityTests : IDisposable
             Graph = new GraphManager(Adapters, Channels, Clock, _types, new JintScriptExecutor(), Audit, Signals,
                 state: State, report: Report);
             _bindings.Bind(Graph);
+            Settlers = new EventSettlers(new ChannelAcceptSettler(Channels), new InboundAckSettler(Acks));
             Mailbox = new FileMailbox(Path.Combine(root, "io", "file", "file-1"));
-            Adapter = new FileAdapter(new(_adapterAddress, new("file", "acc", AdapterDirection.Both)), Mailbox, Events, Clock);
+            Adapter = new FileAdapter(new(_adapterAddress, new("file", "acc", AdapterDirection.Both)), Mailbox, Events, Clock, Acks);
         }
 
         public string Root { get; }
@@ -295,6 +374,8 @@ public sealed class StateContinuityTests : IDisposable
         public GraphManager Graph { get; }
         public FileMailbox Mailbox { get; }
         public FileAdapter Adapter { get; }
+        public InboundAckRegistry Acks { get; } = new();
+        public EventSettlers Settlers { get; }
 
         public async Task LoadAsync(IEnumerable<ScriptPackage> scripts)
         {
@@ -313,6 +394,9 @@ public sealed class StateContinuityTests : IDisposable
             // Channels register their tunables while they are revived, so this is the earliest honest restore.
             var restored = await Parameters.RestoreAsync(default);
             Assert.True(restored.Ok, restored.Error?.Message);
+            // Accepted-but-unfinished messages get their wake-up back, exactly as the host does after startup.
+            var replayed = await Channels.ReplayPendingAsync(default);
+            Assert.True(replayed.Ok, replayed.Error?.Message);
         }
 
         public async Task StartAsync(IEnumerable<ScriptPackage> scripts)
@@ -331,25 +415,32 @@ public sealed class StateContinuityTests : IDisposable
                 Assert.True((await Channels.StartAsync(address, default)).Ok);
         }
 
-        public async Task SayAsync(string conversation, string text)
+        public async Task SayAsync(string conversation, string text, string? messageId = null)
         {
             var directory = Path.Combine(Mailbox.Root, "inbox", conversation);
             Directory.CreateDirectory(directory);
             await File.WriteAllTextAsync(Path.Combine(directory, $"{Guid.NewGuid():N}.ready.json"),
-                JsonSerializer.Serialize(new { text, messageId = Guid.NewGuid().ToString("N") }));
+                JsonSerializer.Serialize(new { text, messageId = messageId ?? Guid.NewGuid().ToString("N") }));
             var pulsed = await Clock.PulseDueAsync(DateTimeOffset.UtcNow.AddSeconds(1), default);
             Assert.True(pulsed.Ok, pulsed.Error?.Message);
+        }
+
+        /// <summary>Dispatches exactly one queued event and settles it, the way the pump does one at a time.</summary>
+        public async Task<bool> StepAsync()
+        {
+            if (!Events.TryRead(out var queued)) return false;
+            var dispatched = await Graph.DispatchAsync(queued, default);
+            Assert.True(dispatched.Ok, dispatched.Error?.Detail ?? dispatched.Error?.Message);
+            var settled = await Settlers.SettleAsync(queued, default);
+            Assert.True(settled.Ok, settled.Error?.Detail ?? settled.Error?.Message);
+            return true;
         }
 
         public async Task DrainAsync()
         {
             var guard = 0;
-            while (Events.TryRead(out var queued))
-            {
+            while (await StepAsync())
                 Assert.True(++guard < 64, "event queue did not settle");
-                var dispatched = await Graph.DispatchAsync(queued, default);
-                Assert.True(dispatched.Ok, dispatched.Error?.Detail ?? dispatched.Error?.Message);
-            }
         }
 
         public string[] OutboxTexts(string conversation)

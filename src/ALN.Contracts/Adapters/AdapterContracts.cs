@@ -172,7 +172,39 @@ public sealed record MailboxInput(string ConversationId, string Token, string Js
 public interface IFileMailbox
 {
     ValueTask<IReadOnlyList<string>> GetConversationIdsAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Claims the pending inputs and hands them over. Claiming is a rename (inbox → inflight), so a second
+    /// reader cannot see them and a crash leaves them claimed rather than lost: the next boot reclaims them.
+    /// </summary>
     ValueTask<IReadOnlyList<MailboxInput>> ReadPendingAsync(CancellationToken cancellationToken);
+
+    /// <summary>Moves a claimed input to processed or rejected. Nothing is final before this.</summary>
     ValueTask CompleteAsync(string conversationId, string token, bool accepted, string? error, CancellationToken cancellationToken);
+
+    /// <summary>Puts claimed-but-unfinished inputs back in the inbox. Called once at boot, before polling.</summary>
+    ValueTask<int> ReclaimAsync(CancellationToken cancellationToken);
+
+    /// <summary>Gives one claimed input back (publication failed): it is offered again on the next poll.</summary>
+    ValueTask ReleaseAsync(string conversationId, string token, CancellationToken cancellationToken);
+
     ValueTask<string> WriteOutputAsync(OutboundMessage message, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// Acknowledge an inbound delivery only after the event it produced has been handled.
+///
+/// The reason this exists at all: an Adapter can say "I published this" but only the pump knows the event
+/// round is over, and "published" is not "handled" — a crash in between would otherwise drop the wake-up
+/// while the mailbox already believes the file was dealt with.
+/// </summary>
+public interface IInboundAcks
+{
+    /// <summary>Registers what to do once the event with this id has been dispatched.</summary>
+    void Expect(Guid eventId, Func<CancellationToken, ValueTask> settle);
+
+    /// <summary>Cancels a registration whose event never made it out (publish failed).</summary>
+    void Forget(Guid eventId);
+
+    ValueTask<Result> SettleAsync(Guid eventId, CancellationToken cancellationToken);
 }

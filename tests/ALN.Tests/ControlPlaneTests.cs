@@ -186,6 +186,8 @@ public sealed class ControlPlaneTests : IDisposable
         public ValueTask<Result> StopAsync(Address address, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result> DestroyAsync(Address address, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result<int>> AcceptAsync(AdapterEnvelope envelope, CancellationToken ct) => throw new NotSupportedException();
+        public ValueTask<Result> CompleteAcceptAsync(Address channel, Guid messageId, CancellationToken ct) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result<int>> ReplayPendingAsync(CancellationToken ct) => ValueTask.FromResult(Result<int>.Success(0));
         public Result<ChannelInfo> Get(Address address) => Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "none"));
         public IReadOnlyList<ChannelInfo> List() => [];
         public bool IsBound(Address channel, Address adapter, string conversation) => false;

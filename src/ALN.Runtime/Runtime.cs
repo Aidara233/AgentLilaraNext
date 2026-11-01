@@ -403,7 +403,7 @@ public sealed class EventQueue : IEventSink
     public void Complete() => _queue.Writer.TryComplete();
 }
 
-public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationToken, ValueTask<Result>> dispatch, ISignalLog signalLog)
+public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationToken, ValueTask<Result>> dispatch, ISignalLog signalLog, IEventSettler? settler = null)
 {
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -445,6 +445,27 @@ public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationTo
                     {
                         ["code"] = dispatched.Error?.Code.ToString() ?? "unknown",
                         ["message"] = dispatched.Error?.Message ?? ""
+                    }
+                });
+            // Settling happens for a finished round whatever its outcome: a poisoned event that failed is
+            // worse to retry forever than to acknowledge once and leave the failure in the log.
+            if (settler is null) continue;
+            var settled = await settler.SettleAsync(routedEvent, cancellationToken).ConfigureAwait(false);
+            if (!settled.Ok)
+                signalLog.Write(new()
+                {
+                    ParentId = intakeId,
+                    Group = "queue",
+                    Name = routedEvent.Name,
+                    StepId = routedEvent.EventId,
+                    From = routedEvent.Source.ToString(),
+                    Mechanism = "settle",
+                    Outcome = "failed",
+                    Level = SignalLevel.Warn,
+                    Detail = new Dictionary<string, string>
+                    {
+                        ["code"] = settled.Error?.Code.ToString() ?? "unknown",
+                        ["message"] = settled.Error?.Message ?? ""
                     }
                 });
         }

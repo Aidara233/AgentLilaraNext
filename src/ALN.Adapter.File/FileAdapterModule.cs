@@ -32,6 +32,7 @@ public sealed class FileAdapterModule : IModulePlugin
         cancellationToken.ThrowIfCancellationRequested();
         var mailbox = GetHostService<IFileMailbox>(context);
         var events = GetHostService<IEventSink>(context);
+        var acks = context.HostServices.GetService(typeof(ALN.Contracts.IInboundAcks)) as ALN.Contracts.IInboundAcks;
         var clockResult = context.GetService<IClockManager>("clock.manager");
         if (!clockResult.Ok || clockResult.Value is null)
             return Result.Failure(clockResult.Error ?? new(ErrorCode.Unavailable, "Clock service is not available."));
@@ -39,7 +40,7 @@ public sealed class FileAdapterModule : IModulePlugin
         _adapters = GetHostService<IAdapterManager>(context);
         _factories = GetHostService<IAdapterFactoryRegistry>(context);
         _reloadState = GetHostService<IModuleReloadStateStore>(context);
-        _factory = new FileAdapterFactory(mailbox, events, _clock);
+        _factory = new FileAdapterFactory(mailbox, events, _clock, acks);
         var registered = _factories.Register(PackageId, _factory);
         if (!registered.Ok) return registered;
         _started = true;
@@ -135,9 +136,9 @@ public sealed class FileAdapterModule : IModulePlugin
         return service as T ?? throw new InvalidOperationException($"Required host service is missing: {typeof(T).FullName}");
     }
 
-    private sealed class FileAdapterFactory(IFileMailbox mailbox, IEventSink events, IClockManager clock) : IAdapterFactory
+    private sealed class FileAdapterFactory(IFileMailbox mailbox, IEventSink events, IClockManager clock, IInboundAcks? acks) : IAdapterFactory
     {
         public string TypeId => "adapter.file";
-        public IChatAdapter Create(AdapterSpec spec) => new FileAdapter(spec, mailbox, events, clock);
+        public IChatAdapter Create(AdapterSpec spec) => new FileAdapter(spec, mailbox, events, clock, acks);
     }
 }

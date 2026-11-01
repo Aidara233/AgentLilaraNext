@@ -128,4 +128,17 @@ public interface IChannelManager
     ValueTask<Result> StopAsync(Address address, CancellationToken cancellationToken);
     ValueTask<Result> DestroyAsync(Address channel, CancellationToken cancellationToken);
     ValueTask<Result<int>> AcceptAsync(AdapterEnvelope envelope, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Clears the "accepted but not finished" marker for one message. Called once the event round for that
+    /// message is over; until then a restart will replay it.
+    /// </summary>
+    ValueTask<Result> CompleteAcceptAsync(Address channel, Guid messageId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Re-publishes the wake-up for messages that were accepted but whose round never finished. This is the
+    /// answer to "the process died between accepting a message and answering it": the message is in the
+    /// Channel's history, and this is what makes something come back and look at it again.
+    /// </summary>
+    ValueTask<Result<int>> ReplayPendingAsync(CancellationToken cancellationToken);
 }

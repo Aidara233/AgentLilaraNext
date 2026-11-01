@@ -30,6 +30,7 @@ public sealed class FileMailbox : IFileMailbox
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private readonly string _root;
     private readonly string _inbox;
+    private readonly string _inflight;
     private readonly string _processed;
     private readonly string _rejected;
     private readonly string _outbox;
@@ -41,10 +42,14 @@ public sealed class FileMailbox : IFileMailbox
         _root = Path.GetFullPath(root, Environment.CurrentDirectory);
         SafeFileSystem.EnsureDirectory(_root);
         _inbox = Path.Combine(_root, "inbox");
+        // Claimed but not yet acknowledged: a file sits here between "the Adapter took it" and "the event
+        // that carries it was handled". It is the only directory whose contents are unfinished work.
+        _inflight = Path.Combine(_root, "inflight");
         _processed = Path.Combine(_root, "processed");
         _rejected = Path.Combine(_root, "rejected");
         _outbox = Path.Combine(_root, "outbox");
         SafeFileSystem.EnsureDirectory(_inbox);
+        SafeFileSystem.EnsureDirectory(_inflight);
         SafeFileSystem.EnsureDirectory(_processed);
         SafeFileSystem.EnsureDirectory(_rejected);
         SafeFileSystem.EnsureDirectory(_outbox);
@@ -99,7 +104,14 @@ public sealed class FileMailbox : IFileMailbox
                 var token = fileName[..^ReadySuffix.Length];
                 ValidateToken(token);
                 SafeFileSystem.VerifyFile(item.Path, item.Directory);
-                var bytes = await ReadAtMostAsync(item.Path, MaxInputBytes + 1, cancellationToken).ConfigureAwait(false);
+                // Claim it: the rename is what stops a second reader from publishing the same input twice,
+                // and what leaves it recoverable if this process dies mid-round.
+                var claimedDirectory = Path.Combine(_inflight, item.ConversationId);
+                SafeFileSystem.EnsureDirectory(claimedDirectory);
+                var claimed = Path.Combine(claimedDirectory, token + ".json");
+                SafeFileSystem.VerifyNewFilePath(claimed, claimedDirectory);
+                System.IO.File.Move(item.Path, claimed);
+                var bytes = await ReadAtMostAsync(claimed, MaxInputBytes + 1, cancellationToken).ConfigureAwait(false);
                 string json;
                 if (bytes.Length > MaxInputBytes) json = "null";
                 else
@@ -122,9 +134,23 @@ public sealed class FileMailbox : IFileMailbox
         try
         {
             SafeFileSystem.VerifyDirectory(_root);
-            var sourceDirectory = Path.Combine(_inbox, conversationId);
+            // A claimed input lives in inflight; an unclaimed one (rejected before publication) is still in
+            // the inbox. Both are completed the same way, so callers never have to know which it was.
+            var inflightDirectory = Path.Combine(_inflight, conversationId);
+            var srcDirectory = Path.Combine(_inbox, conversationId);
+            string source;
+            string sourceDirectory;
+            if (System.IO.File.Exists(Path.Combine(inflightDirectory, token + ".json")))
+            {
+                sourceDirectory = inflightDirectory;
+                source = Path.Combine(sourceDirectory, token + ".json");
+            }
+            else
+            {
+                sourceDirectory = srcDirectory;
+                source = Path.Combine(sourceDirectory, token + ReadySuffix);
+            }
             SafeFileSystem.VerifyDirectory(sourceDirectory);
-            var source = Path.Combine(sourceDirectory, token + ReadySuffix);
             var destinationRoot = accepted ? _processed : _rejected;
             SafeFileSystem.EnsureDirectory(destinationRoot);
             var destinationDirectory = Path.Combine(destinationRoot, conversationId);
@@ -134,6 +160,63 @@ public sealed class FileMailbox : IFileMailbox
             SafeFileSystem.VerifyNewFilePath(destination, destinationDirectory);
             cancellationToken.ThrowIfCancellationRequested();
             System.IO.File.Move(source, destination);
+        }
+        finally { _ioLock.Release(); }
+    }
+
+    public async ValueTask<int> ReclaimAsync(CancellationToken cancellationToken)
+    {
+        await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            SafeFileSystem.VerifyDirectory(_root);
+            SafeFileSystem.VerifyDirectory(_inflight);
+            var reclaimed = 0;
+            foreach (var conversationDirectory in Directory.EnumerateDirectories(_inflight, "*", SearchOption.TopDirectoryOnly))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var conversationId = Path.GetFileName(conversationDirectory);
+                ValidateConversationId(conversationId);
+                SafeFileSystem.VerifyDirectory(conversationDirectory);
+                var inboxDirectory = Path.Combine(_inbox, conversationId);
+                SafeFileSystem.EnsureDirectory(inboxDirectory);
+                foreach (var path in Directory.EnumerateFiles(conversationDirectory, "*.json", SearchOption.TopDirectoryOnly).ToArray())
+                {
+                    var token = Path.GetFileName(path)[..^".json".Length];
+                    if (ValidateTokenOrFalse(token) is false) continue;
+                    var destination = Path.Combine(inboxDirectory, token + ReadySuffix);
+                    SafeFileSystem.VerifyFile(path, conversationDirectory);
+                    // Back to "ready": whatever claimed this input is gone, so it has to be offered again.
+                    System.IO.File.Move(path, destination);
+                    reclaimed++;
+                }
+            }
+            return reclaimed;
+        }
+        finally { _ioLock.Release(); }
+    }
+
+    private static bool ValidateTokenOrFalse(string token)
+    {
+        try { ValidateToken(token); return true; }
+        catch (Exception) { return false; }
+    }
+
+    public async ValueTask ReleaseAsync(string conversationId, string token, CancellationToken cancellationToken)
+    {
+        ValidateConversationId(conversationId);
+        ValidateToken(token);
+        await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var claimedDirectory = Path.Combine(_inflight, conversationId);
+            var claimed = Path.Combine(claimedDirectory, token + ".json");
+            if (!System.IO.File.Exists(claimed)) return;
+            var inboxDirectory = Path.Combine(_inbox, conversationId);
+            SafeFileSystem.EnsureDirectory(inboxDirectory);
+            SafeFileSystem.VerifyFile(claimed, claimedDirectory);
+            // Back to "ready": the publication it was claimed for did not happen, so this is a retry.
+            System.IO.File.Move(claimed, Path.Combine(inboxDirectory, token + ReadySuffix));
         }
         finally { _ioLock.Release(); }
     }

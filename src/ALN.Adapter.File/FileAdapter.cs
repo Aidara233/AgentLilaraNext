@@ -8,15 +8,17 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter
     private readonly IFileMailbox _mailbox;
     private readonly IEventSink _sink;
     private readonly IClockManager _clock;
+    private readonly IInboundAcks? _acks;
     private readonly SemaphoreSlim _pollGate = new(1, 1);
     private Guid? _clockSubscriptionId;
 
-    public FileAdapter(AdapterSpec spec, IFileMailbox mailbox, IEventSink sink, IClockManager clock)
+    public FileAdapter(AdapterSpec spec, IFileMailbox mailbox, IEventSink sink, IClockManager clock, IInboundAcks? acks = null)
         : base(spec.Address, spec.Descriptor)
     {
         _mailbox = mailbox ?? throw new ArgumentNullException(nameof(mailbox));
         _sink = sink ?? throw new ArgumentNullException(nameof(sink));
         _clock = clock ?? throw new ArgumentNullException(nameof(clock));
+        _acks = acks;
     }
 
     public TimeSpan PollInterval { get; set; } = TimeSpan.FromMilliseconds(200);
@@ -25,6 +27,9 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter
     {
         var started = await base.StartAsync(cancellationToken).ConfigureAwait(false);
         if (!started.Ok) return started;
+        // Whatever was claimed by a process that is no longer here is unfinished: put it back where it will
+        // be found again. Doing this before the first poll is what makes a forced exit recoverable.
+        await _mailbox.ReclaimAsync(cancellationToken).ConfigureAwait(false);
         if (_clockSubscriptionId.HasValue) return Result.Success();
         var registration = await _clock.RegisterAsync(Address, PollInterval, cancellationToken).ConfigureAwait(false);
         if (!registration.Ok)
@@ -115,13 +120,35 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter
             try
             {
                 var payload = JsonSerializer.Serialize(envelope, new JsonSerializerOptions(JsonSerializerDefaults.Web));
-                published = await _sink.PublishAsync(new RoutedEvent(EventNames.AdapterEnvelope, Address, envelope!.EventId, payload), cancellationToken).ConfigureAwait(false);
+                // Registered before publication: the pump may settle the event the instant it can read it,
+                // and an acknowledgement that arrives after the settle would be lost.
+                var eventId = envelope!.EventId;
+                _acks?.Expect(eventId, settleToken =>
+                    _mailbox.CompleteAsync(input.ConversationId, input.Token, true, null, settleToken));
+                try
+                {
+                    published = await _sink.PublishAsync(new RoutedEvent(EventNames.AdapterEnvelope, Address, eventId, payload), cancellationToken).ConfigureAwait(false);
+                }
+                catch
+                {
+                    _acks?.Forget(eventId);
+                    throw;
+                }
+                if (!published.Ok)
+                {
+                    _acks?.Forget(eventId);
+                    // A full queue is a retry, not a rejection: hand the claim back so the next poll offers it.
+                    await _mailbox.ReleaseAsync(input.ConversationId, input.Token, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
             }
             catch (Exception ex) { return Result<int>.Failure(new(ErrorCode.Internal, "Event publication failed.", ex.Message, true)); }
-            if (!published.Ok) continue;
             try
             {
-                await _mailbox.CompleteAsync(input.ConversationId, input.Token, true, null, cancellationToken).ConfigureAwait(false);
+                // With an acknowledger, the file stays claimed until the event round is over: publishing is
+                // not handling, and a crash in between must leave the input recoverable rather than "done".
+                if (_acks is null)
+                    await _mailbox.CompleteAsync(input.ConversationId, input.Token, true, null, cancellationToken).ConfigureAwait(false);
                 accepted++;
             }
             catch (Exception ex) { return Result<int>.Failure(new(ErrorCode.Internal, "Unable to complete mailbox input.", ex.Message, true)); }

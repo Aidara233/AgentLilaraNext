@@ -46,6 +46,9 @@ if (!channelContributor.Ok) { Console.Error.WriteLine(channelContributor.Error?.
 var stateStore = new FileStateStore(Path.Combine(data.Root, "state"));
 // The startup receipt: whoever restores something says what it restored, and the host prints it once.
 var restore = new RestoreReport();
+// Acknowledgements owed to Adapters: published is not handled, so the mailbox file is only settled after
+// the event round it produced is over.
+var acks = new InboundAckRegistry();
 // One registry for every tunable: components register themselves, the registry validates, applies, persists.
 var parameters = new ParameterRegistry(stateStore);
 var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, roundContextContributors, signalLog);
@@ -61,6 +64,7 @@ var hostServices = new HostServiceProvider(
     (typeof(IMessageStore), messageStore),
     (typeof(IStateStore), stateStore),
     (typeof(IRestoreReporter), restore),
+    (typeof(IInboundAcks), acks),
     (typeof(IParameterRegistry), parameters),
     (typeof(IChannelSpecStore), channelSpecs),
     (typeof(IAdapterSpecStore), adapterSpecs),
@@ -173,7 +177,10 @@ if (storedAdapters.Value!.Count > 1)
 using var shutdown = new CancellationTokenSource();
 using var pumpStop = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; shutdown.Cancel(); };
-var pump = new EventPump(queue, graph.DispatchAsync, signalLog);
+var pump = new EventPump(queue, graph.DispatchAsync, signalLog,
+    // Two things are owed after a round: the mailbox file stays claimed until the event it carries is done,
+    // and a Channel message stops being "accepted but unfinished" so a restart has nothing to replay.
+    new EventSettlers(new ChannelAcceptSettler(channels), new InboundAckSettler(acks)));
 var pumpTask = pump.RunAsync(pumpStop.Token);
 var clockTask = clock.RunAsync(shutdown.Token);
 
@@ -196,6 +203,10 @@ var lifecycleReport = await lifecycle.StartAsync(shutdown.Token);
 var restored = await parameters.RestoreAsync(CancellationToken.None);
 if (!restored.Ok)
     Console.Error.WriteLine($"Warning: a persisted parameter could not be restored: {restored.Error?.Message} {restored.Error?.Detail}");
+// Messages that were accepted but whose round never finished: replay them now that Channels are alive.
+var replayed = await channels.ReplayPendingAsync(CancellationToken.None);
+if (!replayed.Ok)
+    Console.Error.WriteLine($"Warning: unfinished messages could not be replayed: {replayed.Error?.Message} {replayed.Error?.Detail}");
 foreach (var outcome in lifecycleReport.Outcomes.Where(o => o.Outcome != "ok"))
     Console.Error.WriteLine($"startup {outcome.Outcome}: {outcome.Name} — {outcome.Message}");
 foreach (var note in restore.Snapshot())

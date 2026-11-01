@@ -11,6 +11,9 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     /// <summary>Where the wish "this Channel should be running" is kept, so a stop survives a restart.</summary>
     public const string DesiredScope = "channel.desired";
 
+    /// <summary>Accepted messages whose event round has not finished: the list a restart replays.</summary>
+    public const string PendingScope = "channel.pending";
+
     private readonly IAdapterManager _adapters = adapters;
     private readonly IEventSink _events = events;
     private readonly IInstanceBindings _bindings = bindings;
@@ -215,7 +218,12 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             // A destroyed Channel takes its wish with it; otherwise a new Channel with the same address would
             // inherit "stopped" from one that no longer exists.
             if (_state is not null)
+            {
                 await _state.DeleteAsync(DesiredScope, StateName.Encode(address.ToString()), cancellationToken).ConfigureAwait(false);
+                // Unfinished messages go with the Channel: their history is gone too, so replaying them
+                // would wake something that no longer exists.
+                await _state.DeleteAsync(PendingScope, StateName.Encode(address.ToString()), cancellationToken).ConfigureAwait(false);
+            }
             return Result.Success();
         }
         catch (OperationCanceledException) { throw; }
@@ -241,6 +249,17 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                     $"Bound Adapter is not available, message not delivered: {binding.Adapter}"));
             var message = new ChannelMessage(envelope.EventId, channel.Address, binding, envelope.PlatformMessageId,
                 envelope.Text, envelope.At, envelope.Sender, envelope.MentionsSelf);
+            // Idempotent acceptance: one platform message is one row of history however many times the
+            // transport hands it over. A duplicate publishes nothing on purpose — the wake-up for a first
+            // delivery belongs to the pending marker, so there is nothing here worth waking twice.
+            if (!string.IsNullOrWhiteSpace(envelope.PlatformMessageId) && _messages is not null)
+            {
+                var history = await _messages.ReadAsync(channel.Address, cancellationToken).ConfigureAwait(false);
+                if (history.Error is { } readError) return Result<int>.Failure(readError);
+                if (history.Value?.Any(stored => stored.Direction == MessageDirection.Inbound &&
+                                                 stored.PlatformMessageId == envelope.PlatformMessageId) == true)
+                    continue;
+            }
             if (_messages is not null)
             {
                 // The channel keeps its own history; the mailbox folder is transport, not storage.
@@ -249,6 +268,12 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                     envelope.At), cancellationToken).ConfigureAwait(false);
                 if (!recorded.Ok) return Result<int>.Failure(recorded.Error!);
             }
+            // Written before the event is queued: from this moment "accepted but unfinished" is durable, so a
+            // crash before the round ends gets replayed instead of leaving a message nobody ever looks at.
+            var pending = await AddPendingAsync(channel.Address, new PendingAccept(envelope.EventId.ToString("D"),
+                envelope.PlatformMessageId, binding.Adapter.ToString(), binding.PlatformConversationId,
+                envelope.Text, envelope.At, envelope.Sender), cancellationToken).ConfigureAwait(false);
+            if (!pending.Ok) return Result<int>.Failure(pending.Error!);
             var routed = new RoutedEvent("channel.message.accepted", channel.Address, envelope.EventId,
                 JsonSerializer.Serialize(message, JsonOptions));
             var queued = await _events.PublishAsync(routed, cancellationToken).ConfigureAwait(false);
@@ -257,6 +282,98 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         }
         return Result<int>.Success(accepted);
     }
+
+    public async ValueTask<Result> CompleteAcceptAsync(Address channel, Guid messageId, CancellationToken cancellationToken)
+    {
+        if (_state is null) return Result.Success();
+        var pending = await ReadPendingAsync(channel, cancellationToken).ConfigureAwait(false);
+        if (pending.Error is { } readError) return Result.Failure(readError);
+        var messages = pending.Value!.ToList();
+        // Nothing to clear is the normal case for a message that never became pending (a stopped Channel,
+        // a duplicate delivery), so it is not an error.
+        if (messages.RemoveAll(entry => entry.MessageId == messageId.ToString("D")) == 0) return Result.Success();
+        return await WritePendingAsync(channel, messages, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<Result<int>> ReplayPendingAsync(CancellationToken cancellationToken)
+    {
+        var replayed = 0;
+        foreach (var channel in List())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var pending = await ReadPendingAsync(channel.Address, cancellationToken).ConfigureAwait(false);
+            if (pending.Error is { } readError) return Result<int>.Failure(readError);
+            foreach (var entry in pending.Value!)
+            {
+                if (!Guid.TryParse(entry.MessageId, out var eventId))
+                {
+                    // A marker we cannot even address: drop it rather than replay it forever.
+                    await CompleteAcceptAsync(channel.Address, Guid.Empty, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+                var binding = channel.Bindings.FirstOrDefault(candidate =>
+                    candidate.Adapter.ToString() == entry.Adapter && candidate.PlatformConversationId == entry.Conversation);
+                if (binding is null) continue;   // the binding changed under it; leave the marker alone
+                var message = new ChannelMessage(eventId, channel.Address, binding, entry.PlatformMessageId,
+                    entry.Text, entry.At, entry.Sender);
+                // The same event id, so the original round and this one are the same round as far as any
+                // downstream bookkeeping (and the acknowledgement) is concerned.
+                var published = await _events.PublishAsync(new("channel.message.accepted", channel.Address, eventId,
+                    JsonSerializer.Serialize(message, JsonOptions)), cancellationToken).ConfigureAwait(false);
+                if (!published.Ok) return Result<int>.Failure(published.Error!);
+                replayed++;
+            }
+        }
+        if (replayed > 0) _report.Note("channels", $"{replayed} accepted message(s) replayed: they were never finished");
+        return Result<int>.Success(replayed);
+    }
+
+    private async ValueTask<Result<IReadOnlyList<PendingAccept>>> ReadPendingAsync(Address channel, CancellationToken cancellationToken)
+    {
+        if (_state is null) return Result<IReadOnlyList<PendingAccept>>.Success([]);
+        var read = await _state.ReadAsync(PendingScope, StateName.Encode(channel.ToString()), cancellationToken).ConfigureAwait(false);
+        if (read.Error is { } readError) return Result<IReadOnlyList<PendingAccept>>.Failure(readError);
+        // Absent is not an error: Result<T>.Ok is false when the value is null, so absence is read off Error.
+        if (read.Value is null) return Result<IReadOnlyList<PendingAccept>>.Success([]);
+        try
+        {
+            var stored = JsonSerializer.Deserialize<PendingState>(read.Value, JsonOptions);
+            return Result<IReadOnlyList<PendingAccept>>.Success(stored?.Messages.ToList() ?? []);
+        }
+        catch (JsonException ex)
+        {
+            // Unreadable markers would replay forever otherwise. The messages are still in history, so the
+            // honest move is to say so and start the list over.
+            _report.Note("channels", $"pending markers for {channel} were unreadable ({ex.Message}); starting over");
+            return Result<IReadOnlyList<PendingAccept>>.Success([]);
+        }
+    }
+
+    private async ValueTask<Result> AddPendingAsync(Address channel, PendingAccept entry, CancellationToken cancellationToken)
+    {
+        if (_state is null) return Result.Success();
+        var pending = await ReadPendingAsync(channel, cancellationToken).ConfigureAwait(false);
+        if (pending.Error is { } readError) return Result.Failure(readError);
+        var messages = pending.Value!.ToList();
+        if (messages.Any(existing => existing.MessageId == entry.MessageId)) return Result.Success();
+        messages.Add(entry);
+        return await WritePendingAsync(channel, messages, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<Result> WritePendingAsync(Address channel, IReadOnlyList<PendingAccept> messages, CancellationToken cancellationToken)
+    {
+        if (_state is null) return Result.Success();
+        var key = StateName.Encode(channel.ToString());
+        if (messages.Count == 0) return await _state.DeleteAsync(PendingScope, key, cancellationToken).ConfigureAwait(false);
+        var json = JsonSerializer.Serialize(new PendingState(1, messages.ToArray()), JsonOptions);
+        return await _state.WriteAsync(PendingScope, key, json, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>An accepted message whose round never finished. Enough to rebuild the wake-up without the history.</summary>
+    private sealed record PendingAccept(string MessageId, string? PlatformMessageId, string Adapter, string Conversation,
+        string Text, DateTimeOffset At, string? Sender);
+
+    private sealed record PendingState(int Schema, IReadOnlyList<PendingAccept> Messages);
 
     private static bool IsValidConversationId(string value) =>
         value is { Length: > 0 and <= 128 } && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_');
