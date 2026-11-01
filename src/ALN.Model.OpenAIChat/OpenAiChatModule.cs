@@ -63,11 +63,12 @@ public sealed class OpenAiChatProviderFactory(ModelProviderDescriptor descriptor
         catch (JsonException ex) { return ValueTask.FromResult(Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "OpenAI Chat configuration is invalid JSON.", ex.Message))); }
         if (options is null || string.IsNullOrWhiteSpace(options.ApiKey))
             return ValueTask.FromResult(Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "OpenAI Chat configuration requires apiKey.")));
-        var endpoint = options.Endpoint ?? "https://api.openai.com/v1/chat/completions";
-        if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var endpointUri) || endpointUri.Scheme is not ("https" or "http") ||
-            endpointUri.Scheme == "http" && !endpointUri.IsLoopback || !string.IsNullOrEmpty(endpointUri.UserInfo))
-            return ValueTask.FromResult(Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "OpenAI Chat endpoint must use HTTPS; plain HTTP is allowed only for loopback endpoints.")));
-        return ValueTask.FromResult(Result<IModelProvider>.Success(new OpenAiChatProvider(spec.Address, descriptor, endpointUri, options.ApiKey)));
+        // The operator fills in the host (or pastes a full method URL); the protocol completes the path.
+        var endpoint = ChatEndpoint.Normalize(options.Endpoint);
+        if (!endpoint.Ok || endpoint.Value is null)
+            return ValueTask.FromResult(Result<IModelProvider>.Failure(endpoint.Error!));
+        return ValueTask.FromResult(Result<IModelProvider>.Success(
+            new OpenAiChatProvider(spec.Address, descriptor, endpoint.Value, options.ApiKey)));
     }
 }
 

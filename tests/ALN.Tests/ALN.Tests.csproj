@@ -24,5 +24,6 @@
     <ProjectReference Include="..\..\src\ALN.Adapter.File\ALN.Adapter.File.csproj" />
     <ProjectReference Include="..\..\src\ALN.Clock\ALN.Clock.csproj" />
     <ProjectReference Include="..\..\src\ALN.Api\ALN.Api.csproj" />
+    <ProjectReference Include="..\..\src\ALN.Model.OpenAIChat\ALN.Model.OpenAIChat.csproj" />
   </ItemGroup>
 </Project>
