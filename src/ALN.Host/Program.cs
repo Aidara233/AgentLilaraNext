@@ -155,7 +155,8 @@ var clockTask = clock.RunAsync(shutdown.Token);
 // The host's only startup act: hand one signal to the managers, in dependency order.
 var lifecycle = new LifecycleCoordinator(new RecordingEventSink(queue, messageStore), signalLog);
 var registered = lifecycle.Register(adapters);
-if (registered.Ok) registered = lifecycle.Register((ILifecycleParticipant)channels);
+// Channels are bound to Adapters, so they wait one wave — a data dependency, not a startup order rule.
+if (registered.Ok) registered = lifecycle.Register((ILifecycleParticipant)channels, "adapters");
 if (!registered.Ok)
 {
     Console.Error.WriteLine(registered.Error?.Message ?? "Lifecycle wiring failed.");
@@ -163,10 +164,12 @@ if (!registered.Ok)
     queue.Complete();
     return 1;
 }
-var lifecycleStarted = await lifecycle.StartAsync(shutdown.Token);
-if (!lifecycleStarted.Ok)
+var lifecycleReport = await lifecycle.StartAsync(shutdown.Token);
+foreach (var outcome in lifecycleReport.Outcomes.Where(o => o.Outcome != "ok"))
+    Console.Error.WriteLine($"startup {outcome.Outcome}: {outcome.Name} — {outcome.Message}");
+if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
 {
-    Console.Error.WriteLine(lifecycleStarted.Error?.Message ?? "Startup failed.");
+    // Nothing came up at all: that is the only startup failure that justifies refusing to run.
     await lifecycle.StopAsync(CancellationToken.None);
     shutdown.Cancel();
     queue.Complete();

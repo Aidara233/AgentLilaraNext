@@ -26,3 +26,17 @@ public interface ILifecycleParticipant
     ValueTask<Result> StartAsync(LifecycleSignal signal, CancellationToken cancellationToken);
     ValueTask<Result> StopAsync(LifecycleSignal signal, CancellationToken cancellationToken);
 }
+
+/// <summary>What happened to one participant: ok, failed, or skipped because a dependency did not start.</summary>
+public sealed record LifecycleOutcome(string Name, string Outcome, string? Message = null);
+
+/// <summary>
+/// Result of starting the whole tree. Startup never aborts the world: a failed participant is
+/// reported, its dependents are skipped, and everything independent is still running.
+/// </summary>
+public sealed record LifecycleReport(IReadOnlyList<LifecycleOutcome> Outcomes)
+{
+    public IEnumerable<LifecycleOutcome> Failed => Outcomes.Where(o => o.Outcome == "failed");
+    public IEnumerable<LifecycleOutcome> Skipped => Outcomes.Where(o => o.Outcome == "skipped");
+    public bool AllRunning => Outcomes.Count > 0 && Outcomes.All(o => o.Outcome == "ok");
+}

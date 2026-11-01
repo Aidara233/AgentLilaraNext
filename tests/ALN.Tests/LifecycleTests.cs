@@ -14,54 +14,57 @@ public sealed class LifecycleTests : IDisposable
     }
 
     [Fact]
-    public async Task Managers_start_in_registration_order_and_the_signal_carries_no_state_of_its_own()
+    public async Task Independent_managers_start_together_in_one_wave()
     {
-        var order = new List<string>();
         var events = new EventQueue(8);
         var coordinator = new LifecycleCoordinator(events, SignalLog.Open(null));
-        Assert.True(coordinator.Register(new Recorder("clock", order)).Ok);
-        Assert.True(coordinator.Register(new Recorder("channels", order)).Ok);
-        Assert.True(coordinator.Register(new Recorder("adapters", order)).Ok);
+        // Both wait for each other: a sequential loop would deadlock into a failed outcome.
+        var latch = new Latch(2);
+        Assert.True(coordinator.Register(new Recorder("adapters", []) { Latch = latch }).Ok);
+        Assert.True(coordinator.Register(new Recorder("models", []) { Latch = latch }).Ok);
 
-        var started = await coordinator.StartAsync(default);
+        var report = await coordinator.StartAsync(default);
 
-        Assert.True(started.Ok, started.Error?.Message);
-        Assert.Equal(["clock", "channels", "adapters"], order);
-        Assert.Equal(["clock", "channels", "adapters"], coordinator.Order);
-        // One observer event once the whole tree is up.
+        Assert.True(report.AllRunning, string.Join("; ", report.Outcomes.Select(o => $"{o.Name}:{o.Outcome}")));
+        Assert.Equal(["adapters", "models"], report.Outcomes.Select(o => o.Name).Order());
         Assert.True(events.TryRead(out var marker));
         Assert.Equal(EventNames.LifecycleStarted, marker.Name);
     }
 
     [Fact]
-    public async Task A_failing_manager_stops_the_chain_before_later_managers_start()
+    public async Task A_failed_manager_only_takes_down_its_dependents()
     {
-        var order = new List<string>();
         var coordinator = new LifecycleCoordinator(new EventQueue(8), SignalLog.Open(null));
-        Assert.True(coordinator.Register(new Recorder("channels", order)).Ok);
-        Assert.True(coordinator.Register(new Recorder("adapters", order) { FailOnStart = true }).Ok);
-        Assert.True(coordinator.Register(new Recorder("models", order)).Ok);
+        Assert.True(coordinator.Register(new Recorder("adapters", []) { FailOnStart = true }).Ok);
+        // Declares the real data dependency: a Channel is bound to an Adapter.
+        Assert.True(coordinator.Register(new Recorder("channels", []), "adapters").Ok);
+        // Independent of the failure, so it must still start.
+        Assert.True(coordinator.Register(new Recorder("models", []), "clock").Ok);
+        Assert.True(coordinator.Register(new Recorder("clock", [])).Ok);
 
-        var started = await coordinator.StartAsync(default);
+        var report = await coordinator.StartAsync(default);
 
-        Assert.False(started.Ok);
-        Assert.Equal(["channels", "adapters"], order);
+        Assert.Equal("failed", report.Outcomes.Single(o => o.Name == "adapters").Outcome);
+        Assert.Equal("skipped", report.Outcomes.Single(o => o.Name == "channels").Outcome);
+        Assert.Equal("ok", report.Outcomes.Single(o => o.Name == "clock").Outcome);
+        Assert.Equal("ok", report.Outcomes.Single(o => o.Name == "models").Outcome);
+        Assert.False(report.AllRunning);
     }
 
     [Fact]
-    public async Task Start_is_idempotent_and_stop_runs_in_reverse_order()
+    public async Task Start_is_idempotent_and_stop_runs_users_before_what_they_depend_on()
     {
         var order = new List<string>();
         var coordinator = new LifecycleCoordinator(new EventQueue(8), SignalLog.Open(null));
-        Assert.True(coordinator.Register(new Recorder("clock", order)).Ok);
-        Assert.True(coordinator.Register(new Recorder("channels", order)).Ok);
+        Assert.True(coordinator.Register(new Recorder("adapters", order)).Ok);
+        Assert.True(coordinator.Register(new Recorder("channels", order), "adapters").Ok);
 
-        Assert.True((await coordinator.StartAsync(default)).Ok);
-        Assert.True((await coordinator.StartAsync(default)).Ok);
-        Assert.Equal(["clock", "channels"], order);
+        Assert.True((await coordinator.StartAsync(default)).AllRunning);
+        Assert.True((await coordinator.StartAsync(default)).Outcomes.Count == 0);
+        Assert.Equal(["adapters", "channels"], order);
 
         Assert.True((await coordinator.StopAsync(default)).Ok);
-        Assert.Equal(["clock", "channels", "channels", "clock"], order);
+        Assert.Equal(["adapters", "channels", "channels", "adapters"], order);
         // Registration after start is a conflict, not a silent extra participant.
         Assert.False(coordinator.Register(new Recorder("late", order)).Ok);
     }
@@ -96,20 +99,36 @@ public sealed class LifecycleTests : IDisposable
     private sealed class Recorder(string name, List<string> order) : ILifecycleParticipant
     {
         public bool FailOnStart { get; init; }
+        /// <summary>When set, the participant waits for its peers so a wave only passes if it runs concurrently.</summary>
+        public Latch? Latch { get; init; }
         public string Name => name;
 
-        public ValueTask<Result> StartAsync(LifecycleSignal signal, CancellationToken cancellationToken)
+        public async ValueTask<Result> StartAsync(LifecycleSignal signal, CancellationToken cancellationToken)
         {
             order.Add(name);
-            return ValueTask.FromResult(FailOnStart
+            // A sequential loop would time out here instead of finishing, which is the point.
+            if (Latch is not null) await Latch.ArriveAsync().WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+            return FailOnStart
                 ? Result.Failure(new(ErrorCode.Unavailable, $"{name} refused to start."))
-                : Result.Success());
+                : Result.Success();
         }
 
         public ValueTask<Result> StopAsync(LifecycleSignal signal, CancellationToken cancellationToken)
         {
             order.Add(name);
             return ValueTask.FromResult(Result.Success());
+        }
+    }
+
+    /// <summary>Releases all waiters only after every participant has arrived.</summary>
+    private sealed class Latch(int count)
+    {
+        private readonly TaskCompletionSource _all = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _remaining = count;
+        public Task ArriveAsync()
+        {
+            if (Interlocked.Decrement(ref _remaining) == 0) _all.TrySetResult();
+            return _all.Task;
         }
     }
 
