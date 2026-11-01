@@ -40,12 +40,17 @@ public sealed class DefaultModulesPlugin : IModulePlugin
             var sessions = HostService<ISessionManager>(context);
 
             var clock = new ClockSource(events);
+            // Both managers own state that has to survive a restart: the Channel's wish to run, and the
+            // graph's mount rules. Neither invents a path — the host says where, they say what.
+            var state = context.HostServices.GetService(typeof(IStateStore)) as IStateStore;
+            var report = context.HostServices.GetService(typeof(IRestoreReporter)) as IRestoreReporter;
             var channels = new ChannelManager(adapters, events, bindings,
                 context.HostServices.GetService(typeof(IChannelSpecStore)) as IChannelSpecStore,
                 context.HostServices.GetService(typeof(IMessageStore)) as IMessageStore,
-                context.HostServices.GetService(typeof(IParameterRegistry)) as IParameterRegistry);
+                context.HostServices.GetService(typeof(IParameterRegistry)) as IParameterRegistry,
+                state, report);
             var executor = new JintScriptExecutor();
-            var graph = new GraphManager(adapters, channels, clock, types, executor, audit, journal, models, sessions);
+            var graph = new GraphManager(adapters, channels, clock, types, executor, audit, journal, models, sessions, state, report);
             if (bindings is IInstanceBindingsProxy proxy) proxy.Bind(graph);
 
             foreach (var (id, service) in new (string, object)[]

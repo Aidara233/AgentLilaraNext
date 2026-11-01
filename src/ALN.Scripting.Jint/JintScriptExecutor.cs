@@ -44,6 +44,19 @@ public sealed class JintScriptExecutor : IScriptExecutor
             engine.SetValue("__channelReply", new Func<string, Task<string>>(json => api.ReplyThroughChannelAsync(json, cancellationToken)));
             engine.SetValue("__channelRoute", new Func<string, Task<string>>(json => api.RouteIntoChannelAsync(json, cancellationToken)));
             engine.SetValue("__log", new Action<string, string, string>((level, message, detailJson) => api.Log(level, message, detailJson)));
+            // State is handed over as JSON text in both directions: the script decides what a value means,
+            // the host only knows a namespace and a key.
+            engine.SetValue("__stateGet", new Func<string, Task<string>>(key => api.ReadStateAsync(key, cancellationToken)));
+            engine.SetValue("__stateSet", new Func<string, string, Task<string>>(async (key, json) =>
+            {
+                await api.SetStateAsync(key, json, cancellationToken).ConfigureAwait(false);
+                return "";
+            }));
+            engine.SetValue("__stateDelete", new Func<string, Task<string>>(async key =>
+            {
+                await api.DeleteStateAsync(key, cancellationToken).ConfigureAwait(false);
+                return "";
+            }));
             var source = $$"""
                 (async function() {
                   const event = JSON.parse(__eventJson);
@@ -61,12 +74,19 @@ public sealed class JintScriptExecutor : IScriptExecutor
                     warn: (message, detail) => __log("warn", String(message ?? ""), detail === undefined ? "" : JSON.stringify(detail)),
                     error: (message, detail) => __log("error", String(message ?? ""), detail === undefined ? "" : JSON.stringify(detail))
                   });
+                  // The script's own durable memory: survives restarts, scoped by the host to this mount.
+                  const state = Object.freeze({
+                    get: async (key) => { const raw = await __stateGet(String(key)); return raw === "" ? undefined : JSON.parse(raw); },
+                    set: async (key, value) => { await __stateSet(String(key), JSON.stringify(value === undefined ? null : value)); },
+                    delete: async (key) => { await __stateDelete(String(key)); }
+                  });
                   const ctx = Object.freeze({
                     session: Object.freeze({ run: (spec, input) => runSession(spec, input), activate: (spec) => activateSession(spec) }),
                     model: Object.freeze({ complete: (profileId, request) => completeModel(profileId, request) }),
                     self: Object.freeze({ adapter: Object.freeze({ send: (message) => sendSelf(JSON.stringify(message)), poll: () => pollSelf() }) }),
                     channel: Object.freeze({ accept: () => acceptChannel(), route: (options) => routeChannel(JSON.stringify(options ?? {})), reply: (message) => replyChannel(JSON.stringify(message)) }),
                     log,
+                    state,
                     eventName
                   });
                   {{package.Source}}

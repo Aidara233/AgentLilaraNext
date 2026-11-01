@@ -4,15 +4,21 @@ using ALN.Contracts;
 namespace ALN.Channel;
 
 public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, IInstanceBindings bindings,
-    IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null)
+    IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
+    IStateStore? state = null, IRestoreReporter? report = null)
     : IChannelManager, ILifecycleParticipant
 {
+    /// <summary>Where the wish "this Channel should be running" is kept, so a stop survives a restart.</summary>
+    public const string DesiredScope = "channel.desired";
+
     private readonly IAdapterManager _adapters = adapters;
     private readonly IEventSink _events = events;
     private readonly IInstanceBindings _bindings = bindings;
     private readonly IChannelSpecStore? _specs = specs;
     private readonly IMessageStore? _messages = messages;
     private readonly IParameterRegistry? _parameters = parameters;
+    private readonly IStateStore? _state = state;
+    private readonly IRestoreReporter _report = report ?? NullRestoreReporter.Instance;
     private readonly Dictionary<Address, ChannelInstance> _channels = new();
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
@@ -105,29 +111,74 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            lock (_gate)
-            {
-                if (!_channels.TryGetValue(address, out var channel)) return Result.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
-                channel.Running = true;
-                return Result.Success();
-            }
+            var set = SetRunning(address, running: true);
+            if (!set.Ok) return set;
+            // Running is a wish as much as a fact, so it is written down: a Channel stopped on purpose must
+            // not come back to life just because the process restarted.
+            var stored = await PersistDesiredAsync(address, running: true, cancellationToken).ConfigureAwait(false);
+            return stored.Ok
+                ? Result.Success()
+                : Result.Failure(new(ErrorCode.Unavailable,
+                    $"{address} is running but that could not be persisted; it will start anyway on the next boot.",
+                    stored.Error?.Message));
         }
         finally { _lifecycle.Release(); }
     }
+
     public async ValueTask<Result> StopAsync(Address address, CancellationToken cancellationToken)
     {
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            lock (_gate)
-            {
-                if (!_channels.TryGetValue(address, out var channel)) return Result.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
-                channel.Running = false;
-                return Result.Success();
-            }
+            var set = SetRunning(address, running: false);
+            if (!set.Ok) return set;
+            var stored = await PersistDesiredAsync(address, running: false, cancellationToken).ConfigureAwait(false);
+            return stored.Ok
+                ? Result.Success()
+                : Result.Failure(new(ErrorCode.Unavailable,
+                    $"{address} is stopped but that could not be persisted; it will be running again after a restart.",
+                    stored.Error?.Message));
         }
         finally { _lifecycle.Release(); }
     }
+
+    /// <summary>In-memory only: shutdown uses this, because stopping everything is not a change of wish.</summary>
+    private Result SetRunning(Address address, bool running)
+    {
+        lock (_gate)
+        {
+            if (!_channels.TryGetValue(address, out var channel)) return Result.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
+            channel.Running = running;
+            return Result.Success();
+        }
+    }
+
+    private async ValueTask<Result> PersistDesiredAsync(Address address, bool running, CancellationToken cancellationToken)
+    {
+        if (_state is null) return Result.Success();
+        var json = JsonSerializer.Serialize(new DesiredState(running), JsonOptions);
+        return await _state.WriteAsync(DesiredScope, StateName.Encode(address.ToString()), json, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<Result<bool?>> ReadDesiredAsync(Address address, CancellationToken cancellationToken)
+    {
+        if (_state is null) return Result<bool?>.Success(null);
+        var read = await _state.ReadAsync(DesiredScope, StateName.Encode(address.ToString()), cancellationToken).ConfigureAwait(false);
+        if (read.Error is { } readError) return Result<bool?>.Failure(readError);
+        // Null value with no error means "never written": Result<bool?>.Ok is false in that case, so the
+        // absence has to be read off Error, not Ok.
+        if (read.Value is null) return Result<bool?>.Success(null);
+        try
+        {
+            return Result<bool?>.Success(JsonSerializer.Deserialize<DesiredState>(read.Value, JsonOptions)?.Running);
+        }
+        catch (JsonException ex)
+        {
+            return Result<bool?>.Failure(new(ErrorCode.Invalid, "Stored Channel state is unreadable.", ex.Message));
+        }
+    }
+
+    private sealed record DesiredState(bool Running);
     public async ValueTask<Result> DestroyAsync(Address address, CancellationToken cancellationToken)
     {
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -161,6 +212,10 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                 var removed = await _specs.DeleteAsync(address, cancellationToken).ConfigureAwait(false);
                 if (!removed.Ok) return removed;
             }
+            // A destroyed Channel takes its wish with it; otherwise a new Channel with the same address would
+            // inherit "stopped" from one that no longer exists.
+            if (_state is not null)
+                await _state.DeleteAsync(DesiredScope, StateName.Encode(address.ToString()), cancellationToken).ConfigureAwait(false);
             return Result.Success();
         }
         catch (OperationCanceledException) { throw; }
@@ -217,20 +272,28 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         if (_specs is null) return Result.Success();
         var stored = await _specs.LoadAllAsync(cancellationToken).ConfigureAwait(false);
         if (!stored.Ok) return Result.Failure(stored.Error!);
+        var revived = 0;
+        var keptStopped = 0;
         foreach (var spec in stored.Value!)
         {
             if (Get(spec.Address).Ok) continue;
             var created = await CreateAsync(spec, cancellationToken).ConfigureAwait(false);
             if (!created.Ok) return Result.Failure(created.Error!);
-            var started = await StartAsync(spec.Address, cancellationToken).ConfigureAwait(false);
-            if (!started.Ok)
+            // A Channel comes back in the state somebody left it in, not in a default one.
+            var desired = await ReadDesiredAsync(spec.Address, cancellationToken).ConfigureAwait(false);
+            if (desired.Error is { } readError) return Result.Failure(readError);
+            if (desired.Value == false) keptStopped++; else revived++;
+            var set = SetRunning(spec.Address, desired.Value ?? true);
+            if (!set.Ok)
             {
                 await DestroyAsync(spec.Address, CancellationToken.None).ConfigureAwait(false);
-                return started;
+                return set;
             }
             await _events.PublishAsync(new(EventNames.LifecycleStart, spec.Address, Guid.NewGuid(),
                 JsonSerializer.Serialize(signal.For(spec.Address), JsonOptions), spec.Address), cancellationToken).ConfigureAwait(false);
         }
+        if (revived + keptStopped > 0)
+            _report.Note("channels", $"{revived} revived running, {keptStopped} kept stopped as they were left");
         return Result.Success();
     }
 
@@ -238,7 +301,8 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     {
         foreach (var address in List().Select(c => c.Address))
         {
-            await StopAsync(address, cancellationToken).ConfigureAwait(false);
+            // Shutdown is not a change of wish: stop in memory, leave the stored state alone.
+            SetRunning(address, running: false);
             await _events.PublishAsync(new(EventNames.LifecycleStop, address, Guid.NewGuid(),
                 JsonSerializer.Serialize(signal.For(address), JsonOptions), address), cancellationToken).ConfigureAwait(false);
         }

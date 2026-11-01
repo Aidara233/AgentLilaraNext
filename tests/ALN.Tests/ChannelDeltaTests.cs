@@ -59,7 +59,7 @@ public sealed class ChannelDeltaTests : IDisposable
     {
         var (store, delta) = Create();
         Assert.True((await store.AppendAsync(Message("m1", "before restart"), default)).Ok);
-        Assert.Equal(1, (await delta.TakeDeltaAsync(Channel, null, default)).Value!.Messages.Count);
+        Assert.Single((await delta.TakeDeltaAsync(Channel, null, default)).Value!.Messages);
 
         // A fresh instance on the same root is what a restart looks like.
         var restarted = new FileChannelDeltaSource(store, new FileStateStore(Path.Combine(_root, "state")));
@@ -73,7 +73,7 @@ public sealed class ChannelDeltaTests : IDisposable
     {
         var (store, delta) = Create();
         Assert.True((await store.AppendAsync(Message("m1", "hello"), default)).Ok);
-        Assert.Equal(1, (await delta.TakeDeltaAsync(Channel, null, default)).Value!.Messages.Count);
+        Assert.Single((await delta.TakeDeltaAsync(Channel, null, default)).Value!.Messages);
 
         // Replaying is visible and the Session timeline deduplicates by message id; skipping would silently
         // lose what people said, which is worse.
@@ -101,7 +101,7 @@ public sealed class ChannelDeltaTests : IDisposable
 
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
         var request = Assert.Single(model.Requests);
-        var user = request.Messages.FirstOrDefault(m => m.Content.Contains("<channel_context>", StringComparison.Ordinal));
+        var user = request.Messages.FirstOrDefault(m => m.Content?.Contains("<channel_context>", StringComparison.Ordinal) == true);
         Assert.NotNull(user);
         // Same XML shape as before: the delta did not invent a new format, it just arrived later.
         Assert.Contains("<channel_messages>", user!.Content, StringComparison.Ordinal);

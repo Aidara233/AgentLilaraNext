@@ -24,16 +24,31 @@ public sealed class GraphManager : IGraphRuntime
     private readonly ISessionManager? _sessions;
     private readonly Dictionary<string, ScriptPackage> _packages = new(StringComparer.Ordinal);
     private readonly List<MountedScript> _mounted = new();
+    // Durable intents: what should be mounted, not what happens to be mounted right now. A rule whose
+    // instance does not exist yet is still a rule; that is how "mount on every Channel" survives a restart
+    // that happens before the Channel does.
+    private readonly List<MountRule> _rules = new();
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly HashSet<Address> _drainingTargets = new();
     private readonly Dictionary<Address, int> _activeDispatches = new();
     private readonly Dictionary<Address, TaskCompletionSource> _dispatchDrained = new();
+    private readonly IStateStore? _state;
+    private readonly IRestoreReporter _report;
     private bool _loaded;
+    private bool _rulesRestored;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    // Rules are a file a person may open: enums go out as names, not as their numeric value.
+    private static readonly JsonSerializerOptions RuleJson = new(JsonSerializerDefaults.Web)
+    { Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) } };
+
+    /// <summary>Where rules live. One file, replaced whole: a half-written rule list is a mount nobody meant.</summary>
+    public const string StateScope = "graph";
+    public const string StateKey = "mounts";
 
     public GraphManager(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IModuleTypeCatalog types,
-        IScriptExecutor executor, IAuditSink audit, ISignalLog signalLog, IModelManager? models = null, ISessionManager? sessions = null)
-    { _adapters = adapters; _channels = channels; _clock = clock; _types = types; _executor = executor; _audit = audit; _signalLog = signalLog; _models = models; _sessions = sessions; }
+        IScriptExecutor executor, IAuditSink audit, ISignalLog signalLog, IModelManager? models = null, ISessionManager? sessions = null,
+        IStateStore? state = null, IRestoreReporter? report = null)
+    { _adapters = adapters; _channels = channels; _clock = clock; _types = types; _executor = executor; _audit = audit; _signalLog = signalLog; _models = models; _sessions = sessions; _state = state; _report = report ?? NullRestoreReporter.Instance; }
 
     public IReadOnlyList<MountedScript> Mounted
     { get { _gate.Wait(); try { return _mounted.ToArray(); } finally { _gate.Release(); } } }
@@ -66,18 +81,264 @@ public sealed class GraphManager : IGraphRuntime
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var targets = _adapters.List().Select(a => a.Address).Concat(_channels.List().Select(c => c.Address)).ToArray();
-            var mounts = new List<MountedScript>();
-            foreach (var package in incoming.Where(p => p.Manifest.Mount == MountMode.Default))
-            foreach (var target in targets)
-                if (IsCompatible(package.Manifest.TargetType, target)) mounts.Add(new(package, target));
+            var restored = await RestoreRulesAsync(cancellationToken).ConfigureAwait(false);
+            if (!restored.Ok) return restored;
+            var targets = Targets();
             _packages.Clear();
             foreach (var pair in candidate) _packages.Add(pair.Key, pair.Value);
-            _mounted.Clear(); _mounted.AddRange(mounts); _loaded = true;
+            _mounted.Clear();
+            // Two sources, one list: bundle scripts follow their package, rules follow a durable intent.
+            foreach (var package in incoming.Where(p => p.Manifest.Mount == MountMode.Default))
+            foreach (var target in targets)
+                if (IsCompatible(package.Manifest.TargetType, target)) _mounted.Add(new(package, target));
+            foreach (var target in targets) ApplyRulesTo(target);
+            _loaded = true;
+            ReportRestore();
             return Result.Success();
         }
         finally { _gate.Release(); }
     }
+
+    public IReadOnlyList<MountRule> Rules
+    { get { _gate.Wait(); try { return _rules.ToArray(); } finally { _gate.Release(); } } }
+
+    /// <summary>A rule with nothing to apply to right now: the instance it names does not exist, or its script is gone.</summary>
+    public IReadOnlyList<MountRule> PendingRules
+    {
+        get
+        {
+            _gate.Wait();
+            try
+            {
+                var targets = Targets();
+                return _rules.Where(rule => !targets.Any(target => Resolves(rule, target))).ToArray();
+            }
+            finally { _gate.Release(); }
+        }
+    }
+
+    /// <summary>
+    /// Adds a durable rule and applies it to whatever already matches. An instance-scoped rule must name a
+    /// target that exists — mounting onto a typo is not an intent, it is a mistake that would stay silent
+    /// forever. Type and module scopes may match nothing yet: that is exactly how "every new Channel gets
+    /// this" is expressed.
+    /// </summary>
+    public async ValueTask<Result<MountRule>> AddRuleAsync(MountRequest request, CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!_packages.TryGetValue(request.ScriptId, out var package))
+                return Result<MountRule>.Failure(new(ErrorCode.Invalid, $"Script not found: {request.ScriptId}"));
+            if (package.Manifest.Mount != MountMode.Manual)
+                return Result<MountRule>.Failure(new(ErrorCode.Denied, "Default scripts are mounted by instance lifecycle."));
+            if (request.Budget is < 1)
+                return Result<MountRule>.Failure(new(ErrorCode.Invalid, $"Budget must be at least 1 or absent: {request.Budget}"));
+            if (CheckScope(request.Scope) is { } scopeError) return Result<MountRule>.Failure(scopeError);
+
+            var targets = Targets();
+            if (request.Scope.Kind == MountScopeKind.Instance)
+            {
+                if (!Address.TryParse(request.Scope.Selector, out var named) || !named.IsInstance)
+                    return Result<MountRule>.Failure(new(ErrorCode.Invalid, "Instance scope needs a concrete address."));
+                if (_drainingTargets.Contains(named))
+                    return Result<MountRule>.Failure(new(ErrorCode.Unavailable, "Manual mount target is draining.", Retryable: true));
+                if (!TargetExists(named) || !IsCompatible(package.Manifest.TargetType, named))
+                    return Result<MountRule>.Failure(new(ErrorCode.Invalid, "Manual mount target is absent or incompatible."));
+            }
+            else if (targets.Any(target => Matches(request.Scope, target) && IsCompatible(package.Manifest.TargetType, target) &&
+                                           _mounted.Any(m => m.Package.Manifest.Id == request.ScriptId && m.Target == target)))
+            {
+                return Result<MountRule>.Failure(new(ErrorCode.Conflict, "Script is already mounted on a matching target."));
+            }
+
+            var rule = new MountRule(NewRuleId(), request.ScriptId, request.Scope, MountRule.ManualSource,
+                DateTimeOffset.UtcNow, request.Budget, request.StateScope);
+            _rules.Add(rule);
+            foreach (var target in targets) ApplyRulesTo(target);
+
+            var persisted = await PersistRulesAsync(cancellationToken).ConfigureAwait(false);
+            if (!persisted.Ok)
+            {
+                // Persist before anything is claimed: a rule that exists only in memory is a rule that
+                // disappears at the next restart, and the caller would have no way to know.
+                _rules.Remove(rule);
+                _mounted.RemoveAll(m => m.RuleId == rule.Id);
+                return Result<MountRule>.Failure(persisted.Error!);
+            }
+
+            // Conflict is reported from what actually got mounted, so a scope that matched nothing is not a lie.
+            if (request.Scope.Kind == MountScopeKind.Instance && _mounted.All(m => m.RuleId != rule.Id))
+            {
+                _rules.Remove(rule);
+                await PersistRulesAsync(CancellationToken.None).ConfigureAwait(false);
+                return Result<MountRule>.Failure(new(ErrorCode.Conflict, "Script is already mounted."));
+            }
+            return Result<MountRule>.Success(rule);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async ValueTask<Result> RemoveRuleAsync(string ruleId, CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var index = _rules.FindIndex(rule => rule.Id == ruleId);
+            if (index < 0) return Result.Failure(new(ErrorCode.Invalid, $"Mount rule not found: {ruleId}"));
+            var rule = _rules[index];
+            _rules.RemoveAt(index);
+            _mounted.RemoveAll(m => m.RuleId == ruleId);
+            var persisted = await PersistRulesAsync(cancellationToken).ConfigureAwait(false);
+            return persisted.Ok
+                ? Result.Success()
+                : Result.Failure(new(ErrorCode.Unavailable,
+                    $"Rule {rule.ScriptId} was removed from the running graph but could not be persisted; it will come back on restart.",
+                    persisted.Error?.Message));
+        }
+        finally { _gate.Release(); }
+    }
+
+    private Error? CheckScope(MountScope scope)
+    {
+        if (string.IsNullOrWhiteSpace(scope.Selector))
+            return new(ErrorCode.Invalid, "Mount scope needs a selector.");
+        return scope.Kind switch
+        {
+            MountScopeKind.Instance => null,
+            MountScopeKind.Type => _types.IsConcrete(scope.Selector)
+                ? null
+                : new(ErrorCode.Invalid, $"Type scope needs a concrete module type: {scope.Selector}"),
+            MountScopeKind.Module => _types.IsKnownAbstract(scope.Selector)
+                ? null
+                : new(ErrorCode.Invalid, $"Module scope needs a module type: {scope.Selector}"),
+            _ => new(ErrorCode.Invalid, $"Unknown mount scope: {scope.Kind}")
+        };
+    }
+
+    private static string NewRuleId() => "r" + Guid.NewGuid().ToString("N")[..8];
+
+    private Address[] Targets() =>
+        _adapters.List().Select(a => a.Address).Concat(_channels.List().Select(c => c.Address)).ToArray();
+
+    private bool Matches(MountScope scope, Address target) => scope.Kind switch
+    {
+        MountScopeKind.Instance => Address.TryParse(scope.Selector, out var named) && named == target,
+        // "channel" (a module) and "channel.conversation" (a type) are the same walk up the type tree;
+        // keeping them separate kinds is about what a person means, and about validating it.
+        MountScopeKind.Type or MountScopeKind.Module => _types.IsAssignableTo(target.TypeId, scope.Selector),
+        _ => false
+    };
+
+    /// <summary>True when this rule actually puts a script on this target right now.</summary>
+    private bool Resolves(MountRule rule, Address target) =>
+        !rule.IsSpent(target) &&
+        Matches(rule.Scope, target) &&
+        _packages.TryGetValue(rule.ScriptId, out var package) &&
+        IsCompatible(package.Manifest.TargetType, target);
+
+    /// <summary>Call with the gate held: brings one target in line with every rule that names it.</summary>
+    private void ApplyRulesTo(Address target)
+    {
+        foreach (var rule in _rules)
+        {
+            if (!Resolves(rule, target)) continue;
+            if (_mounted.Any(m => m.Package.Manifest.Id == rule.ScriptId && m.Target == target)) continue;
+            _mounted.Add(new(_packages[rule.ScriptId], target, rule.Id, rule.RemainingFor(target)));
+        }
+    }
+
+    private void ReportRestore()
+    {
+        var pending = _rules.Count(rule => !Targets().Any(target => Resolves(rule, target)));
+        var fromRules = _mounted.Count(m => m.RuleId is not null);
+        _report.Note("graph", $"{_rules.Count} mount rule(s) → {fromRules} mount(s); {pending} rule(s) waiting for their target; " +
+                              $"{_mounted.Count - fromRules} bundle mount(s)");
+    }
+
+    private async ValueTask<Result> RestoreRulesAsync(CancellationToken cancellationToken)
+    {
+        if (_rulesRestored) return Result.Success();
+        if (_state is null) { _rulesRestored = true; return Result.Success(); }
+
+        var read = await _state.ReadAsync(StateScope, StateKey, cancellationToken).ConfigureAwait(false);
+        if (read.Error is { } readError) return Result.Failure(readError);
+        if (read.Value is null) { _rulesRestored = true; _report.Note("graph", "no mount rules stored"); return Result.Success(); }
+
+        StoredRules? stored;
+        try { stored = JsonSerializer.Deserialize<StoredRules>(read.Value, RuleJson); }
+        catch (JsonException ex)
+        {
+            // Keep the evidence and start with none: refusing to boot over one state file helps nobody, and
+            // pretending it parsed would mount things nobody asked for.
+            var keeper = StateName.Encode("unreadable-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            await _state.WriteAsync(StateScope, keeper, read.Value, CancellationToken.None).ConfigureAwait(false);
+            await _state.DeleteAsync(StateScope, StateKey, CancellationToken.None).ConfigureAwait(false);
+            _rulesRestored = true;
+            _report.Note("graph", $"stored mount rules were unreadable ({ex.Message}); kept as {StateScope}/{keeper}, started with none");
+            return Result.Success();
+        }
+
+        var rejected = 0;
+        foreach (var rule in stored?.Rules ?? [])
+        {
+            if (rule is null || string.IsNullOrWhiteSpace(rule.Id) || string.IsNullOrWhiteSpace(rule.ScriptId) ||
+                rule.Scope is null || CheckScope(rule.Scope) is not null || rule.Budget is < 1)
+            {
+                rejected++;
+                continue;
+            }
+            if (_rules.Any(existing => existing.Id == rule.Id)) { rejected++; continue; }
+            _rules.Add(rule);
+        }
+        _rulesRestored = true;
+        if (rejected > 0) _report.Note("graph", $"{rejected} stored mount rule(s) were rejected as malformed");
+        return Result.Success();
+    }
+
+    /// <summary>
+    /// Takes one dispatch out of a mount's budget. Called with the gate held, before the handler runs.
+    /// An exhausted mount is gone immediately; an exhausted instance rule is deleted, while a broader rule
+    /// keeps a zero for this target so a restart does not silently resurrect it here.
+    /// </summary>
+    private void Spend(MountedScript mount, Address target)
+    {
+        var left = (mount.Remaining ?? 1) - 1;
+        var index = _mounted.FindIndex(m => m.Package.Manifest.Id == mount.Package.Manifest.Id &&
+                                            m.Target == target && m.RuleId == mount.RuleId);
+        if (index >= 0) _mounted[index] = mount with { Remaining = left };
+
+        var ruleIndex = mount.RuleId is null ? -1 : _rules.FindIndex(rule => rule.Id == mount.RuleId);
+        if (ruleIndex >= 0) _rules[ruleIndex] = _rules[ruleIndex].WithRemaining(target, left);
+        if (left > 0) return;
+
+        _mounted.RemoveAll(m => m.Package.Manifest.Id == mount.Package.Manifest.Id &&
+                                 m.Target == target && m.RuleId == mount.RuleId);
+        if (ruleIndex >= 0 && _rules[ruleIndex].Scope.Kind == MountScopeKind.Instance) _rules.RemoveAt(ruleIndex);
+    }
+
+    /// <summary>
+    /// The state namespace a script sees: per target by default (two channels are two conversations), or one
+    /// namespace per rule when the rule says so. Bundle mounts have no rule, so they are always per target.
+    /// Keying the per-target case by script and target — not by rule id — means unmounting and remounting a
+    /// script does not wipe what it remembered.
+    /// </summary>
+    private string? StateScopeFor(MountedScript mount)
+    {
+        if (_state is null) return null;
+        var rule = mount.RuleId is null ? null : _rules.FirstOrDefault(existing => existing.Id == mount.RuleId);
+        if (rule is not null && rule.StateScope == ScriptStateScope.Shared) return "script." + StateName.Encode(rule.Id);
+        return "script." + StateName.Encode(mount.Package.Manifest.Id) + "." + StateName.Encode(mount.Target.ToString());
+    }
+
+    private async ValueTask<Result> PersistRulesAsync(CancellationToken cancellationToken)
+    {
+        if (_state is null) return Result.Success();
+        var json = JsonSerializer.Serialize(new StoredRules(1, _rules.ToArray()), RuleJson);
+        return await _state.WriteAsync(StateScope, StateKey, json, cancellationToken).ConfigureAwait(false);
+    }
+
+    private sealed record StoredRules(int Schema, IReadOnlyList<MountRule> Rules);
 
     public async ValueTask<Result> AttachAsync(Address target, CancellationToken cancellationToken)
     {
@@ -90,6 +351,11 @@ public sealed class GraphManager : IGraphRuntime
             _drainingTargets.Remove(target);
             foreach (var package in _packages.Values.Where(p => p.Manifest.Mount == MountMode.Default && IsCompatible(p.Manifest.TargetType, target)))
                 if (!_mounted.Any(m => m.Package.Manifest.Id == package.Manifest.Id && m.Target == target)) _mounted.Add(new(package, target));
+            // A target that appears now is also a target that some rule was already waiting for.
+            var beforeRules = _mounted.Count(m => m.RuleId is not null);
+            ApplyRulesTo(target);
+            var applied = _mounted.Count(m => m.RuleId is not null) - beforeRules;
+            if (applied > 0) _report.Note("graph", $"{applied} waiting rule(s) applied to {target}");
             return Result.Success();
         }
         finally { _gate.Release(); }
@@ -148,17 +414,8 @@ public sealed class GraphManager : IGraphRuntime
 
     public async ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken cancellationToken)
     {
-        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            if (!_packages.TryGetValue(scriptId, out var package)) return Result.Failure(new(ErrorCode.Invalid, $"Script not found: {scriptId}"));
-            if (package.Manifest.Mount != MountMode.Manual) return Result.Failure(new(ErrorCode.Denied, "Default scripts are mounted by instance lifecycle."));
-            if (_drainingTargets.Contains(target)) return Result.Failure(new(ErrorCode.Unavailable, "Manual mount target is draining.", Retryable: true));
-            if (!IsCompatible(package.Manifest.TargetType, target) || !TargetExists(target)) return Result.Failure(new(ErrorCode.Invalid, "Manual mount target is absent or incompatible."));
-            if (_mounted.Any(m => m.Package.Manifest.Id == scriptId && m.Target == target)) return Result.Failure(new(ErrorCode.Conflict, "Script is already mounted."));
-            _mounted.Add(new(package, target)); return Result.Success();
-        }
-        finally { _gate.Release(); }
+        var added = await AddRuleAsync(new MountRequest(scriptId, MountScope.ForInstance(target)), cancellationToken).ConfigureAwait(false);
+        return added.Ok ? Result.Success() : Result.Failure(added.Error!);
     }
 
     public async ValueTask<Result> UnmountAsync(string scriptId, Address target, CancellationToken cancellationToken)
@@ -167,7 +424,15 @@ public sealed class GraphManager : IGraphRuntime
         try
         {
             var removed = _mounted.RemoveAll(m => m.Package.Manifest.Id == scriptId && m.Target == target);
-            return removed == 0 ? Result.Failure(new(ErrorCode.Invalid, "Mount not found.")) : Result.Success();
+            // An instance-scoped rule for this exact pair has no meaning once its mount is gone; a type or
+            // module rule is broader than one target, so it stays and the caller must remove it by id.
+            var rulesRemoved = _rules.RemoveAll(rule => rule.ScriptId == scriptId &&
+                rule.Scope.Kind == MountScopeKind.Instance &&
+                Address.TryParse(rule.Scope.Selector, out var named) && named == target);
+            if (rulesRemoved > 0) await PersistRulesAsync(cancellationToken).ConfigureAwait(false);
+            return removed == 0 && rulesRemoved == 0
+                ? Result.Failure(new(ErrorCode.Invalid, "Mount not found. A type- or module-scoped rule is removed by rule id."))
+                : Result.Success();
         }
         finally { _gate.Release(); }
     }
@@ -207,6 +472,7 @@ public sealed class GraphManager : IGraphRuntime
         try
         {
             MountedScript[] handlers;
+            string?[] stateScopes;
             await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
@@ -215,11 +481,30 @@ public sealed class GraphManager : IGraphRuntime
                 _activeDispatches[target] = _activeDispatches.GetValueOrDefault(target) + 1;
                 dispatchEntered = true;
                 handlers = _mounted.Where(m => m.Target == target && m.Package.Manifest.Events.Contains(routedEvent.Name, StringComparer.Ordinal)).OrderBy(m => m.Package.Manifest.Id, StringComparer.Ordinal).ToArray();
+                // Namespaces are resolved against the rules while the gate is held: the execution loop runs
+                // outside it, and a shared namespace must not change shape halfway through a fan-out.
+                stateScopes = handlers.Select(StateScopeFor).ToArray();
+                // The budget is spent before any handler runs. A crash mid-handler then costs one unused
+                // dispatch at worst; the alternative is running a "once" script twice.
+                var budgeted = handlers.Where(handler => handler.Remaining is not null).ToArray();
+                if (budgeted.Length > 0)
+                {
+                    foreach (var handler in budgeted) Spend(handler, target);
+                    var stored = await PersistRulesAsync(cancellationToken).ConfigureAwait(false);
+                    if (!stored.Ok)
+                        _signalLog.Write(new()
+                        {
+                            Group = "graph", Name = "mount.budget", StepId = routedEvent.EventId,
+                            From = target.ToString(), Mechanism = "state", Outcome = "failed", Level = SignalLevel.Warn,
+                            Detail = new Dictionary<string, string> { ["message"] = stored.Error?.Message ?? "" }
+                        });
+                }
             }
             finally { _gate.Release(); }
             Error? firstFailure = null;
-            foreach (var mount in handlers)
+            for (var handlerIndex = 0; handlerIndex < handlers.Length; handlerIndex++)
             {
+                var mount = handlers[handlerIndex];
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 deadline.CancelAfter(TimeSpan.FromMilliseconds(mount.Package.Manifest.TimeoutMilliseconds));
                 // One record per traversed edge — this loop is the only place an edge is followed.
@@ -230,7 +515,8 @@ public sealed class GraphManager : IGraphRuntime
                 Result result;
                 using (SignalScope.Enter(invocationId, routedEvent.EventId))
                 {
-                    var api = new ScriptApi(_adapters, _channels, _clock, _audit, _signalLog, _models, _sessions, mount, routedEvent, deadline.Token);
+                    var api = new ScriptApi(_adapters, _channels, _clock, _audit, _signalLog, _models, _sessions, mount, routedEvent,
+                        stateScopes[handlerIndex], _state, deadline.Token);
                     result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
                 }
                 // The record settles after the handler returns, but its id existed during it, so
@@ -293,8 +579,50 @@ public sealed class GraphManager : IGraphRuntime
     { "adapter" => _adapters.Get(target).Ok, "channel" => _channels.Get(target).Ok, _ => false };
 
     private sealed class ScriptApi(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IAuditSink audit,
-        ISignalLog signalLog, IModelManager? models, ISessionManager? sessions, MountedScript mount, RoutedEvent current, CancellationToken ct) : IScriptApi
+        ISignalLog signalLog, IModelManager? models, ISessionManager? sessions, MountedScript mount, RoutedEvent current,
+        string? stateScope, IStateStore? state, CancellationToken ct) : IScriptApi
     {
+        /// <summary>
+        /// Script state: the component owns the meaning, the host owns where it lives. Keys are encoded, not
+        /// trusted, and the size is capped — this is memory for a mounted script, not an artifact store.
+        /// </summary>
+        public async Task<string> ReadStateAsync(string key, CancellationToken cancellationToken)
+        {
+            var read = await State().ReadAsync(Scope(), StateKey(key), cancellationToken).ConfigureAwait(false);
+            // A missing key comes back as Ok with a null value, and Result<string?>.Ok is false for null:
+            // "absent" has to be read off Error, or every unwritten key looks like a failure.
+            if (read.Error is { } error) throw new InvalidOperationException(error.Message);
+            return read.Value ?? "";
+        }
+
+        public async Task SetStateAsync(string key, string json, CancellationToken cancellationToken)
+        {
+            if (json is null) throw new ArgumentException("Script state must be JSON text.");
+            if (json.Length > MaxStateBytes) throw new ArgumentException($"Script state value exceeds {MaxStateBytes} characters.");
+            ct.ThrowIfCancellationRequested();
+            var written = await State().WriteAsync(Scope(), StateKey(key), json, cancellationToken).ConfigureAwait(false);
+            if (!written.Ok) throw new InvalidOperationException(written.Error?.Message ?? "Script state write failed.");
+        }
+
+        public async Task DeleteStateAsync(string key, CancellationToken cancellationToken)
+        {
+            var removed = await State().DeleteAsync(Scope(), StateKey(key), cancellationToken).ConfigureAwait(false);
+            if (!removed.Ok) throw new InvalidOperationException(removed.Error?.Message ?? "Script state delete failed.");
+        }
+
+        private IStateStore State() => state ?? throw new InvalidOperationException("Script state is unavailable: the host has no state store.");
+
+        private string Scope() => stateScope ?? throw new InvalidOperationException("Script state is unavailable: this mount has no state namespace.");
+
+        private static string StateKey(string key)
+        {
+            if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("Script state needs a key.");
+            if (key.Length > 512) throw new ArgumentException("Script state key is too long.");
+            return StateName.Encode(key);
+        }
+
+        private const int MaxStateBytes = 64 * 1024;
+
         public Task<string> RunSessionAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken) =>
             InvokeAsync(ScriptCapabilities.SessionRun, () => RunSessionCoreAsync(sessionSpecJson, userInput, cancellationToken));
 

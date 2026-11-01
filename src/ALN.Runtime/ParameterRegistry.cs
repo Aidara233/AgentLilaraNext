@@ -12,7 +12,7 @@ namespace ALN.Runtime;
 /// live and the caller gets an error saying it would not survive a restart — whereas persisting first and
 /// failing to apply would leave the file promising something the process is not doing.
 /// </summary>
-public sealed class ParameterRegistry(IStateStore state, string scope = "params") : IParameterRegistry
+public sealed class ParameterRegistry(IStateStore state) : IParameterRegistry
 {
     private readonly Dictionary<string, IParameterTarget> _targets = new(StringComparer.Ordinal);
     private readonly object _gate = new();
@@ -151,15 +151,9 @@ public sealed class ParameterRegistry(IStateStore state, string scope = "params"
     /// <summary>
     /// A scope is an address ("channel.conversation#test"), a key in the state store is a file name. Encoding
     /// here keeps that store strict about what it will write, instead of widening its rules for everybody.
+    /// The rule itself lives in <see cref="StateName"/> because the graph needs the same one.
     /// </summary>
-    public static string ScopeKey(string scope)
-    {
-        var safe = new string(scope.Select(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-' or '.' ? c : '_').ToArray());
-        if (safe == scope && safe.Length is > 0 and <= 64) return safe;
-        var hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(scope)))[..8].ToLowerInvariant();
-        var trimmed = safe.Length > 48 ? safe[..48] : safe;
-        return $"{trimmed}-{hash}";
-    }
+    public static string ScopeKey(string scope) => StateName.Encode(scope);
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 

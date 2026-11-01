@@ -20,14 +20,34 @@ public sealed record ScriptManifest(
     long MemoryLimitBytes = 16 * 1024 * 1024);
 
 public sealed record ScriptPackage(ScriptManifest Manifest, string Source, string Fingerprint = "");
-public sealed record MountedScript(ScriptPackage Package, Address Target);
+
+/// <summary>
+/// A rule resolved onto one instance. <paramref name="RuleId"/> is null for bundle mounts, which are not
+/// rules: they follow their package's lifecycle and are re-derived on every start.
+/// </summary>
+public sealed record MountedScript(ScriptPackage Package, Address Target, string? RuleId = null, int? Remaining = null);
 
 public interface IGraphRuntime : IInstanceBindings
 {
     ValueTask<Result> LoadAsync(IEnumerable<ScriptPackage> packages, CancellationToken cancellationToken);
+
+    /// <summary>Mount a manual script on one instance. Equivalent to adding an instance-scoped rule.</summary>
     ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken cancellationToken);
+
+    /// <summary>Drop every mount of one script on one instance; an instance-scoped rule that produced them goes with it.</summary>
     ValueTask<Result> UnmountAsync(string scriptId, Address target, CancellationToken cancellationToken);
+
     IReadOnlyList<MountedScript> Mounted { get; }
+
+    /// <summary>Every durable rule, including those whose scope currently matches nothing.</summary>
+    IReadOnlyList<MountRule> Rules { get; }
+
+    /// <summary>Rules that resolved to no target yet: the instance they are waiting for does not exist.</summary>
+    IReadOnlyList<MountRule> PendingRules { get; }
+
+    ValueTask<Result<MountRule>> AddRuleAsync(MountRequest request, CancellationToken cancellationToken);
+    ValueTask<Result> RemoveRuleAsync(string ruleId, CancellationToken cancellationToken);
+
     ValueTask<Result> DispatchAsync(RoutedEvent routedEvent, CancellationToken cancellationToken);
 }
 
@@ -54,6 +74,17 @@ public interface IScriptApi : ISessionToolExecutor
     Task<string> RouteIntoChannelAsync(string optionsJson, CancellationToken cancellationToken);
     Task<string> ReplyThroughChannelAsync(string outboundMessageJson, CancellationToken cancellationToken);
     Task<string> PollSelfAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The mounted script's own memory: JSON text, namespaced by (rule, target) unless the rule declares a
+    /// shared state scope. This is what lets a script survive a restart — "already greeted this one",
+    /// "last seen id" — without the host having to know what any of it means.
+    /// </summary>
+    /// <returns>The stored JSON, or an empty string when the key was never written.</returns>
+    Task<string> ReadStateAsync(string key, CancellationToken cancellationToken);
+    Task SetStateAsync(string key, string json, CancellationToken cancellationToken);
+    Task DeleteStateAsync(string key, CancellationToken cancellationToken);
+
     /// <summary>Point log for script business narration. Level is info, warn or error; never throws.</summary>
     void Log(string level, string message, string? detailJson);
 }

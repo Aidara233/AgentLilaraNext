@@ -40,6 +40,29 @@ public interface IStateStore
     ValueTask<Result> DeleteAsync(string scope, string key, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// Turns an address or a scope name into something a state store will accept as a file name. Callers keep
+/// their own readable scope ("channel.desired", "graph"); this maps the part that names an instance.
+///
+/// Two callers want exactly this rule — the parameter registry (scope = component address) and the graph
+/// (scope = mount rule and target) — so it lives here rather than being copied until the copies drift.
+/// </summary>
+public static class StateName
+{
+    public const int MaxLength = 64;
+    private const int MaxKeptPrefix = 48;
+
+    /// <summary>Keeps [A-Za-z0-9_.-], replaces anything else, and disambiguates long or graffiti-ish input with a hash suffix.</summary>
+    public static string Encode(string value)
+    {
+        var safe = new string(value.Select(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-' or '.' ? c : '_').ToArray());
+        if (safe == value && safe.Length is > 0 and <= MaxLength) return safe;
+        var hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value)))[..8].ToLowerInvariant();
+        var trimmed = safe.Length > MaxKeptPrefix ? safe[..MaxKeptPrefix] : safe;
+        return $"{trimmed}-{hash}";
+    }
+}
+
 /// <summary>Adapter specs survive restarts; the mailbox directory is data, not configuration.</summary>
 public interface IAdapterSpecStore
 {

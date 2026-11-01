@@ -153,7 +153,7 @@ public sealed class SessionManager : ISessionManager
             var activationUser = activationEntries.FirstOrDefault(e => e.Role == "user");
             if (activationEntries.Length > 0 && activationUser is null)
                 return Result<SessionTurnResult>.Failure(new(ErrorCode.Conflict, "Session activation is incomplete and cannot be resumed safely."));
-            if (activationUser is not null && !SameChannelMessages(activationUser.ChannelMessages, input.Messages))
+            if (activationUser is not null && !SameChannelMessages(activationUser.ChannelMessages, input.Messages ?? []))
                 return Result<SessionTurnResult>.Failure(new(ErrorCode.Conflict, "Activation id was reused with different channel messages."));
 
             var state = session.Value.State;

@@ -44,6 +44,8 @@ if (!channelContributor.Ok) { Console.Error.WriteLine(channelContributor.Error?.
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.
 var stateStore = new FileStateStore(Path.Combine(data.Root, "state"));
+// The startup receipt: whoever restores something says what it restored, and the host prints it once.
+var restore = new RestoreReport();
 // One registry for every tunable: components register themselves, the registry validates, applies, persists.
 var parameters = new ParameterRegistry(stateStore);
 var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, roundContextContributors, signalLog);
@@ -58,6 +60,7 @@ var hostServices = new HostServiceProvider(
     (typeof(IEventSink), new RecordingEventSink(queue, messageStore)),
     (typeof(IMessageStore), messageStore),
     (typeof(IStateStore), stateStore),
+    (typeof(IRestoreReporter), restore),
     (typeof(IParameterRegistry), parameters),
     (typeof(IChannelSpecStore), channelSpecs),
     (typeof(IAdapterSpecStore), adapterSpecs),
@@ -195,6 +198,8 @@ if (!restored.Ok)
     Console.Error.WriteLine($"Warning: a persisted parameter could not be restored: {restored.Error?.Message} {restored.Error?.Detail}");
 foreach (var outcome in lifecycleReport.Outcomes.Where(o => o.Outcome != "ok"))
     Console.Error.WriteLine($"startup {outcome.Outcome}: {outcome.Name} — {outcome.Message}");
+foreach (var note in restore.Snapshot())
+    Console.WriteLine($"restored {note.Component}: {note.Summary}");
 if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
 {
     // Nothing came up at all: that is the only startup failure that justifies refusing to run.

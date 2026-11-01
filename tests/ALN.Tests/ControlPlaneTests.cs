@@ -154,6 +154,11 @@ public sealed class ControlPlaneTests : IDisposable
         public ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result> UnmountAsync(string scriptId, Address target, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public IReadOnlyList<MountedScript> Mounted => [];
+        public IReadOnlyList<MountRule> Rules => [];
+        public IReadOnlyList<MountRule> PendingRules => [];
+        public ValueTask<Result<MountRule>> AddRuleAsync(MountRequest request, CancellationToken ct) =>
+            ValueTask.FromResult(Result<MountRule>.Failure(new(ErrorCode.Invalid, "Fake graph does not keep rules.")));
+        public ValueTask<Result> RemoveRuleAsync(string ruleId, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result> DispatchAsync(RoutedEvent routedEvent, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result> AttachAsync(Address target, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result> DetachAsync(Address target, CancellationToken ct) => ValueTask.FromResult(Result.Success());

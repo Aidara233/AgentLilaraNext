@@ -87,19 +87,37 @@ public static class CoreActions
             (new(ChannelsStop, "Stop one channel.", Capabilities.ChannelsControl, true), StopChannel),
             (new(ChannelsSend, "Send one text message through a channel's binding.", Capabilities.MessagesWrite, true), SendChannel),
 
-            (new(GraphList, "List mounted scripts and their targets.", Capabilities.GraphRead, false),
-                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+            (new(GraphList, "List mounted scripts, durable mount rules, and which rules are still waiting.", Capabilities.GraphRead, false),
+                (_, _) =>
                 {
-                    mounted = graph.Mounted.Select(m => new
+                    var pending = graph.PendingRules.Select(rule => rule.Id).ToHashSet(StringComparer.Ordinal);
+                    return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
                     {
-                        script = m.Package.Manifest.Id,
-                        version = m.Package.Manifest.Version,
-                        targetType = m.Package.Manifest.TargetType,
-                        events = m.Package.Manifest.Events,
-                        trustDomain = m.Package.Manifest.TrustDomain.ToString(),
-                        target = m.Target.ToString()
-                    })
-                })))),
+                        mounted = graph.Mounted.Select(m => new
+                        {
+                            script = m.Package.Manifest.Id,
+                            version = m.Package.Manifest.Version,
+                            targetType = m.Package.Manifest.TargetType,
+                            events = m.Package.Manifest.Events,
+                            trustDomain = m.Package.Manifest.TrustDomain.ToString(),
+                            target = m.Target.ToString(),
+                            rule = m.RuleId,
+                            remaining = m.Remaining
+                        }),
+                        rules = graph.Rules.Select(rule => new
+                        {
+                            id = rule.Id,
+                            script = rule.ScriptId,
+                            scope = rule.Scope.Kind.ToString(),
+                            selector = rule.Scope.Selector,
+                            source = rule.Source,
+                            budget = rule.Budget,
+                            remaining = rule.Remaining,
+                            stateScope = rule.StateScope.ToString(),
+                            pending = pending.Contains(rule.Id)
+                        })
+                    })));
+                }),
 
             // Manual scripts are the per-instance policy switch: a script declared "mount": "manual" is
             // not attached to anything by its lifecycle, so this is the only way it ever runs.
@@ -207,23 +225,79 @@ public static class CoreActions
 
         async ValueTask<Result<JsonElement>> MountScript(JsonElement arguments, CancellationToken ct)
         {
-            var target = ReadAddress(arguments, "target");
-            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
             if (!TryReadText(arguments, "script", out var scriptId) || scriptId.Trim().Length == 0)
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.mount requires 'script' (the script id)."));
 
-            var mounted = await graph.MountAsync(scriptId.Trim(), target.Value, ct).ConfigureAwait(false);
-            return mounted.Ok
-                ? Result<JsonElement>.Success(ToJson(new { script = scriptId.Trim(), target = target.Value.ToString(), mounted = true }))
-                : Result<JsonElement>.Failure(mounted.Error!);
+            int? budget = null;
+            if (arguments.ValueKind == JsonValueKind.Object && arguments.TryGetProperty("budget", out var budgetElement) &&
+                budgetElement.ValueKind != JsonValueKind.Null)
+            {
+                if (!budgetElement.TryGetInt32(out var requested) || requested < 1)
+                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.mount 'budget' must be a positive integer (1 = one dispatch only)."));
+                budget = requested;
+            }
+
+            var stateScope = ScriptStateScope.PerTarget;
+            if (TryReadText(arguments, "stateScope", out var stateScopeText))
+            {
+                if (!Enum.TryParse<ScriptStateScope>(stateScopeText.Trim(), ignoreCase: true, out var parsed))
+                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.mount 'stateScope' must be perTarget or shared."));
+                stateScope = parsed;
+            }
+
+            MountScope scope;
+            if (TryReadText(arguments, "scope", out var scopeKind) && scopeKind.Trim().Length > 0)
+            {
+                if (!TryReadText(arguments, "selector", out var selector) || selector.Trim().Length == 0)
+                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.mount with 'scope' also needs 'selector'."));
+                switch (scopeKind.Trim().ToLowerInvariant())
+                {
+                    case "instance": scope = new(MountScopeKind.Instance, selector.Trim()); break;
+                    case "type": scope = MountScope.ForType(selector.Trim()); break;
+                    case "module": scope = MountScope.ForModule(selector.Trim()); break;
+                    default:
+                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.mount 'scope' must be instance, type or module."));
+                }
+            }
+            else
+            {
+                // The original shape: one script, one instance.
+                var target = ReadAddress(arguments, "target");
+                if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
+                scope = MountScope.ForInstance(target.Value);
+            }
+
+            var added = await graph.AddRuleAsync(new(scriptId.Trim(), scope, budget, stateScope), ct).ConfigureAwait(false);
+            if (!added.Ok || added.Value is null) return Result<JsonElement>.Failure(added.Error ?? new(ErrorCode.Internal, "Mount rule was not created."));
+            var rule = added.Value;
+            return Result<JsonElement>.Success(ToJson(new
+            {
+                rule = rule.Id,
+                script = rule.ScriptId,
+                scope = rule.Scope.Kind.ToString(),
+                selector = rule.Scope.Selector,
+                budget = rule.Budget,
+                stateScope = rule.StateScope.ToString(),
+                // Empty means the rule is waiting: the instance it names does not exist yet.
+                targets = graph.Mounted.Where(m => m.RuleId == rule.Id).Select(m => m.Target.ToString()).ToArray()
+            }));
         }
 
         async ValueTask<Result<JsonElement>> UnmountScript(JsonElement arguments, CancellationToken ct)
         {
+            // A rule is the durable thing; removing one takes its mounts with it.
+            if (TryReadText(arguments, "rule", out var ruleId) && ruleId.Trim().Length > 0)
+            {
+                var removedRule = await graph.RemoveRuleAsync(ruleId.Trim(), ct).ConfigureAwait(false);
+                return removedRule.Ok
+                    ? Result<JsonElement>.Success(ToJson(new { rule = ruleId.Trim(), removed = true }))
+                    : Result<JsonElement>.Failure(removedRule.Error!);
+            }
+
             var target = ReadAddress(arguments, "target");
             if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
             if (!TryReadText(arguments, "script", out var scriptId) || scriptId.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.unmount requires 'script' (the script id)."));
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.unmount requires 'rule', or 'script' and 'target'."));
 
             var unmounted = await graph.UnmountAsync(scriptId.Trim(), target.Value, ct).ConfigureAwait(false);
             return unmounted.Ok
@@ -254,7 +328,7 @@ public static class CoreActions
             var replyTo = TryReadText(arguments, "replyTo", out var reply) ? reply : null;
 
             var channel = channels.Get(target.Value);
-            if (!channel.Ok) return Result<JsonElement>.Failure(channel.Error!);
+            if (!channel.Ok || channel.Value is null) return Result<JsonElement>.Failure(channel.Error!);
             if (!channel.Value.Running)
                 return Result<JsonElement>.Failure(new(ErrorCode.Conflict, $"Channel is not running: {target.Value}"));
             if (channel.Value.Bindings.Count != 1)
@@ -264,11 +338,11 @@ public static class CoreActions
 
             var binding = channel.Value.Bindings[0];
             var adapter = adapters.Get(binding.Adapter);
-            if (!adapter.Ok) return Result<JsonElement>.Failure(adapter.Error!);
+            if (!adapter.Ok || adapter.Value is null) return Result<JsonElement>.Failure(adapter.Error!);
 
             var sent = await adapter.Value.SendAsync(new OutboundMessage(binding.PlatformConversationId, text, replyTo), ct)
                 .ConfigureAwait(false);
-            if (!sent.Ok) return Result<JsonElement>.Failure(sent.Error!);
+            if (!sent.Ok || sent.Value is null) return Result<JsonElement>.Failure(sent.Error!);
             return Result<JsonElement>.Success(ToJson(new
             {
                 channel = target.Value.ToString(),
