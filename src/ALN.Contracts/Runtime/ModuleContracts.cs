@@ -83,6 +83,37 @@ public interface IModuleUnloadParticipant
         ValueTask.FromResult(Result.Failure(new(ErrorCode.Unavailable, "Participant does not implement disconnection.")));
 }
 
+/// <summary>
+/// What the host currently has loaded. Read-only on purpose: loading is a host decision with a trusted source,
+/// so it is not something an API caller can do — but seeing what is in the process should not require a log.
+/// </summary>
+/// <summary>What the host can do with a package directory. Narrow on purpose: dropping a module in must not
+/// require access to the loader's unloading and replacement machinery.</summary>
+public interface IModulePackageLoader
+{
+    ValueTask<Result<ModulePackageManifest>> LoadAsync(string packageDirectory, ModulePackageKind packageKind,
+        CancellationToken cancellationToken);
+}
+
+/// <summary>The outcome of one dropped-in package, so the host can report it without parsing error strings.</summary>
+public sealed record DroppedModule(string Directory, ModulePackageManifest? Manifest, Error? Failure)
+{
+    public string Name => Manifest?.Id ?? System.IO.Path.GetFileName(Directory) ?? Directory;
+    public bool Loaded => Failure is null;
+}
+
+public interface IModuleCatalog
+{
+    IReadOnlyList<ModulePackageManifest> Loaded { get; }
+}
+
+/// <summary>The contract surface a module compiles against. A module.json that names a different one is refused
+/// with a message instead of failing later inside a method call.</summary>
+public static class ModuleContracts
+{
+    public const string Version = "1";
+}
+
 public interface IModulePlugin : IModuleUnloadParticipant
 {
     ModulePackageManifest Manifest { get; }

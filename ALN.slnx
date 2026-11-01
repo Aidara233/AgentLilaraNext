@@ -22,4 +22,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/ALN.Tests/ALN.Tests.csproj" />
   </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/plugins/sample.environment/SampleEnvironment.csproj" />
+  </Folder>
 </Solution>

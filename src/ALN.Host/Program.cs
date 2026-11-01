@@ -145,6 +145,15 @@ if (!qqPackage.Ok || qqPackage.Value is null)
     return 1;
 }
 
+// Modules the operator dropped in live under the data root, not next to the binary: an upgrade replaces the
+// binary directory, and a plugin is not part of the upgrade. A broken one is reported and skipped — a
+// third-party package must not be able to stop the host from starting.
+foreach (var dropped in await DroppedModules.LoadAsync(modulePackages, Path.Combine(data.Root, "modules"), CancellationToken.None))
+{
+    if (dropped.Loaded) restore.Note("modules", $"plugin {dropped.Manifest!.Id} {dropped.Manifest.Version} from {Path.GetFileName(dropped.Directory)}");
+    else Console.Error.WriteLine($"plugin skipped: {Path.GetFileName(dropped.Directory)} — {dropped.Failure?.Message} {dropped.Failure?.Detail}".TrimEnd());
+}
+
 var scriptCatalog = moduleServices.GetService<IGraphScriptCatalog>("graph.script-catalog");
 if (!scriptCatalog.Ok || scriptCatalog.Value is null)
 {
@@ -237,7 +246,7 @@ if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
 // The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
 // WebUI itself — it exposes actions, and a separate project consumes them.
 var controlPlane = new ControlPlane(auditSink, signalLog);
-var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters);
+var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages);
 if (!actionsRegistered.Ok)
 {
     Console.Error.WriteLine(actionsRegistered.Error?.Message ?? "Action registration failed.");

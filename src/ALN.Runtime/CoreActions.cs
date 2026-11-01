@@ -26,6 +26,7 @@ public static class CoreActions
     public const string ParamsSet = "params.set";
     public const string GraphUnmount = "graph.unmount";
     public const string ModelsList = "models.list";
+    public const string ModulesList = "modules.list";
     public const string SignalsRecent = "signals.recent";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -33,7 +34,8 @@ public static class CoreActions
     private static JsonElement ToJson(object value) => JsonSerializer.SerializeToElement(value, JsonOptions);
 
     public static Result RegisterAll(ControlPlane plane, IAdapterManager adapters, IChannelManager channels,
-        IModelManager models, ISignalLog signals, IGraphRuntime graph, IParameterRegistry parameters)
+        IModelManager models, ISignalLog signals, IGraphRuntime graph, IParameterRegistry parameters,
+        IModuleCatalog? modules = null)
     {
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
@@ -151,6 +153,20 @@ public static class CoreActions
                     }));
                 }),
 
+            (new(ModulesList, "Module packages loaded into this process, with what each provides.", Capabilities.SystemRead, false),
+                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+                {
+                    modules = modules?.Loaded.Select(manifest => new
+                    {
+                        id = manifest.Id,
+                        version = manifest.Version,
+                        kind = JsonNamingPolicy.CamelCase.ConvertName(manifest.PackageKind.ToString()),
+                        reload = JsonNamingPolicy.CamelCase.ConvertName(manifest.ReloadPolicy.ToString()),
+                        provides = manifest.Provides.Select(type => type.TypeId),
+                        dependencies = manifest.Dependencies.Select(dependency => dependency.Id)
+                    }) ?? [],
+                    contracts = ModuleContracts.Version
+                })))),
             (new(ModelsList, "List provider instances and profiles without configuration or keys.", Capabilities.ModelsRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
                 {

@@ -11,7 +11,7 @@ namespace ALN.Runtime;
 /// entry assembly. Contract assemblies already loaded by the host are shared;
 /// package-private dependencies are resolved beside the entry assembly.
 /// </summary>
-public sealed class ModulePackageLoader : IAsyncDisposable
+public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IModulePackageLoader
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     { Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) } };
@@ -446,6 +446,9 @@ public sealed class ModulePackageLoader : IAsyncDisposable
                 file.Dependencies.Any(d => d is null || string.IsNullOrWhiteSpace(d.Id) || string.IsNullOrWhiteSpace(d.VersionRange)) ||
                 file.ReloadPolicy is not (ModuleReloadPolicy.None or ModuleReloadPolicy.Replace))
                 return Result<PackageFileManifest>.Failure(new(ErrorCode.Invalid, "Invalid module.json manifest."));
+            if (file.Contracts is { Length: > 0 } contracts && contracts != ModuleContracts.Version)
+                return Result<PackageFileManifest>.Failure(new(ErrorCode.Invalid,
+                    $"Package targets module contract {contracts}; this host speaks {ModuleContracts.Version}."));
             if (file.Provides.Select(t => t.TypeId).Distinct(StringComparer.Ordinal).Count() != file.Provides.Length ||
                 file.Dependencies.Select(d => d.Id).Distinct(StringComparer.Ordinal).Count() != file.Dependencies.Length)
                 return Result<PackageFileManifest>.Failure(new(ErrorCode.Conflict, "Module manifest has duplicate ids."));
@@ -486,7 +489,9 @@ public sealed class ModulePackageLoader : IAsyncDisposable
         string EntryType,
         ModuleTypeProvision[] Provides,
         ModuleDependency[] Dependencies,
-        ModuleReloadPolicy ReloadPolicy);
+        ModuleReloadPolicy ReloadPolicy,
+        /// <summary>Which contract surface this package was compiled against; absent means "the current one".</summary>
+        string? Contracts = null);
 
     private sealed class LoadedPackage(ModulePackageManifest manifest, string packageDirectory, IModulePlugin plugin,
         ModuleAssemblyLoadContext loadContext, PackageContext context)

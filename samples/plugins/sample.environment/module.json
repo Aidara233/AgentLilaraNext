@@ -1,0 +1,10 @@
+{
+  "id": "sample.environment",
+  "version": "1.0.0",
+  "contracts": "1",
+  "entryAssembly": "SampleEnvironment.dll",
+  "entryType": "SampleEnvironment.Plugin",
+  "provides": [],
+  "dependencies": [],
+  "reloadPolicy": "replace"
+}
