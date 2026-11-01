@@ -24,7 +24,12 @@ public enum ModuleReloadPolicy
     Replace
 }
 
-public sealed record ModuleDependency(string Id, string VersionRange, bool Optional = false);
+/// <summary>
+/// Another package this one wants loaded first. In practice only the id matters: a package should not need
+/// another package to exist at all — that is usually two things that belong in one package — so the version
+/// is a *narrowing* ("2.1.0") for the rare exception, not the normal case. Null, "" and "*" all mean "any".
+/// </summary>
+public sealed record ModuleDependency(string Id, string? VersionRange = null, bool Optional = false);
 public sealed record ModuleTypeProvision(string TypeId, string? ParentTypeId, bool IsAbstract = false);
 
 public interface IModuleTypeRegistry : IModuleTypeCatalog
@@ -107,7 +112,7 @@ public interface IModuleCatalog
     IReadOnlyList<ModulePackageManifest> Loaded { get; }
 }
 
-/// <summary>The contract surface a module compiles against. A module.json that names a different one is refused
+/// <summary>The contract surface a module compiles against. A plugin.json that names a different one is refused
 /// with a message instead of failing later inside a method call.</summary>
 public static class ModuleContracts
 {

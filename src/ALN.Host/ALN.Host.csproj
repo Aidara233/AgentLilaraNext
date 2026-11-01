@@ -21,20 +21,20 @@
   </ItemGroup>
   <Target Name="CopyModulePackages" AfterTargets="Build">
     <MakeDir Directories="$(OutDir)modules/adapter.file" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)/../ALN.Adapter.File/bin/$(Configuration)/net10.0/ALN.Adapter.File.dll;$(MSBuildProjectDirectory)/../ALN.Adapter.File/bin/$(Configuration)/net10.0/ALN.Adapter.File.deps.json;$(MSBuildProjectDirectory)/../ALN.Adapter.File/module.json"
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/../ALN.Adapter.File/bin/$(Configuration)/net10.0/ALN.Adapter.File.dll;$(MSBuildProjectDirectory)/../ALN.Adapter.File/bin/$(Configuration)/net10.0/ALN.Adapter.File.deps.json;$(MSBuildProjectDirectory)/../ALN.Adapter.File/plugin.json"
           DestinationFolder="$(OutDir)modules/adapter.file" />
     <MakeDir Directories="$(OutDir)modules/adapter.qq" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)/../ALN.Adapter.Qq/bin/$(Configuration)/net10.0/ALN.Adapter.Qq.dll;$(MSBuildProjectDirectory)/../ALN.Adapter.Qq/bin/$(Configuration)/net10.0/ALN.Adapter.Qq.deps.json;$(MSBuildProjectDirectory)/../ALN.Adapter.Qq/module.json"
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/../ALN.Adapter.Qq/bin/$(Configuration)/net10.0/ALN.Adapter.Qq.dll;$(MSBuildProjectDirectory)/../ALN.Adapter.Qq/bin/$(Configuration)/net10.0/ALN.Adapter.Qq.deps.json;$(MSBuildProjectDirectory)/../ALN.Adapter.Qq/plugin.json"
           DestinationFolder="$(OutDir)modules/adapter.qq" />
     <MakeDir Directories="$(OutDir)modules/bundled.runtime" />
     <ItemGroup>
       <BundledModuleFiles Include="$(MSBuildProjectDirectory)/../ALN.BundledModules/bin/$(Configuration)/net10.0/*.dll" />
       <BundledModuleFiles Include="$(MSBuildProjectDirectory)/../ALN.BundledModules/bin/$(Configuration)/net10.0/ALN.BundledModules.deps.json" />
-      <BundledModuleFiles Include="$(MSBuildProjectDirectory)/../ALN.BundledModules/module.json" />
+      <BundledModuleFiles Include="$(MSBuildProjectDirectory)/../ALN.BundledModules/plugin.json" />
     </ItemGroup>
     <Copy SourceFiles="@(BundledModuleFiles)" DestinationFolder="$(OutDir)modules/bundled.runtime" />
     <MakeDir Directories="$(OutDir)modules/model.openai-chat" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)/../ALN.Model.OpenAIChat/bin/$(Configuration)/net10.0/ALN.Model.OpenAIChat.dll;$(MSBuildProjectDirectory)/../ALN.Model.OpenAIChat/bin/$(Configuration)/net10.0/ALN.Model.OpenAIChat.deps.json;$(MSBuildProjectDirectory)/../ALN.Model.OpenAIChat/module.json"
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/../ALN.Model.OpenAIChat/bin/$(Configuration)/net10.0/ALN.Model.OpenAIChat.dll;$(MSBuildProjectDirectory)/../ALN.Model.OpenAIChat/bin/$(Configuration)/net10.0/ALN.Model.OpenAIChat.deps.json;$(MSBuildProjectDirectory)/../ALN.Model.OpenAIChat/plugin.json"
           DestinationFolder="$(OutDir)modules/model.openai-chat" />
   </Target>
 </Project>

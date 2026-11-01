@@ -148,7 +148,7 @@ if (!qqPackage.Ok || qqPackage.Value is null)
 // Modules the operator dropped in live under the data root, not next to the binary: an upgrade replaces the
 // binary directory, and a plugin is not part of the upgrade. A broken one is reported and skipped — a
 // third-party package must not be able to stop the host from starting.
-foreach (var dropped in await DroppedModules.LoadAsync(modulePackages, Path.Combine(data.Root, "modules"), CancellationToken.None))
+foreach (var dropped in await DroppedModules.LoadAsync(modulePackages, Path.Combine(data.Root, "plugins"), CancellationToken.None))
 {
     if (dropped.Loaded) restore.Note("modules", $"plugin {dropped.Manifest!.Id} {dropped.Manifest.Version} from {Path.GetFileName(dropped.Directory)}");
     else Console.Error.WriteLine($"plugin skipped: {Path.GetFileName(dropped.Directory)} — {dropped.Failure?.Message} {dropped.Failure?.Detail}".TrimEnd());

@@ -1,5 +1,7 @@
 using ALN.Contracts;
 using ALN.Contracts.Sessions;
+using ALN.Graph;
+using ALN.Graph.Contracts;
 using ALN.Runtime;
 using ALN.Runtime.Hosting;
 
@@ -81,7 +83,7 @@ public sealed class ModulePluginTests : IDisposable
         var good = WriteSamplePackage("sample.environment");
         var broken = Path.Combine(_root, "modules", "broken");
         Directory.CreateDirectory(broken);
-        await File.WriteAllTextAsync(Path.Combine(broken, "module.json"), "{ this is not json");
+        await File.WriteAllTextAsync(Path.Combine(broken, "plugin.json"), "{ this is not json");
         await using var loader = CreateLoader(new RoundContextContributorRegistry());
 
         var outcomes = await DroppedModules.LoadAsync(loader, Path.Combine(_root, "modules"), default);
@@ -106,16 +108,84 @@ public sealed class ModulePluginTests : IDisposable
         Assert.Equal(ErrorCode.Conflict, again.Error!.Code);
     }
 
-    /// <summary>Writes a package directory the way an operator would: module.json beside the built assembly.</summary>
+    [Fact]
+    public async Task A_plugin_can_ship_scripts_and_they_are_read_from_its_folder()
+    {
+        WriteSamplePluginFolder();
+        var catalog = new JsonScriptCatalog(Path.Combine(_root, "program"), _root);
+
+        var packages = await catalog.LoadAsync(default);
+
+        Assert.True(packages.Ok, packages.Error?.Message);
+        var script = Assert.Single(packages.Value!, package => package.Manifest.Id == "sample.clock");
+        // Dropping the plugin in is the trust decision, so its scripts are trusted — and they say where they came from.
+        Assert.Equal(TrustDomain.Trusted, script.Manifest.TrustDomain);
+        Assert.Equal("plugin:sample.environment", script.Origin);
+    }
+
+    [Fact]
+    public async Task A_shipped_script_cannot_claim_to_be_builtin()
+    {
+        var folder = WriteSamplePluginFolder();
+        var manifestPath = Path.Combine(folder, "scripts", "sample.clock", "manifest.json");
+        await File.WriteAllTextAsync(manifestPath,
+            (await File.ReadAllTextAsync(manifestPath)).Replace("\"trusted\"", "\"builtin\""));
+        var catalog = new JsonScriptCatalog(Path.Combine(_root, "program"), _root);
+
+        var packages = await catalog.LoadAsync(default);
+
+        Assert.False(packages.Ok);
+        Assert.Equal(ErrorCode.Denied, packages.Error!.Code);
+        Assert.Contains("sample.clock", packages.Error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Two_scripts_with_one_id_are_refused_with_both_paths()
+    {
+        WriteSamplePluginFolder();
+        // A hand-written script with the same id as the one the plugin ships.
+        var trusted = Path.Combine(_root, "scripts", "trusted", "mine");
+        Directory.CreateDirectory(trusted);
+        foreach (var file in Directory.GetFiles(Path.Combine(_root, "plugins", "sample.environment", "scripts", "sample.clock")))
+            File.Copy(file, Path.Combine(trusted, Path.GetFileName(file)));
+        var catalog = new JsonScriptCatalog(Path.Combine(_root, "program"), _root);
+
+        var packages = await catalog.LoadAsync(default);
+
+        Assert.Equal(ErrorCode.Conflict, packages.Error!.Code);
+        Assert.Contains("sample.clock", packages.Error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>The plugin folder as it ships: manifest beside the scripts (the assembly is not needed here).</summary>
+    private string WriteSamplePluginFolder()
+    {
+        var source = Path.Combine(RepositoryRoot(), "samples", "plugins", "sample.environment");
+        var target = Path.Combine(_root, "plugins", "sample.environment");
+        Directory.CreateDirectory(target);
+        File.Copy(Path.Combine(source, "plugin.json"), Path.Combine(target, "plugin.json"));
+        CopyTree(Path.Combine(source, "scripts"), Path.Combine(target, "scripts"));
+        return target;
+    }
+
+    private static void CopyTree(string source, string target)
+    {
+        Directory.CreateDirectory(target);
+        foreach (var directory in Directory.GetDirectories(source, "*", SearchOption.AllDirectories))
+            Directory.CreateDirectory(Path.Combine(target, Path.GetRelativePath(source, directory)));
+        foreach (var file in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
+            File.Copy(file, Path.Combine(target, Path.GetRelativePath(source, file)), overwrite: true);
+    }
+
+    /// <summary>Writes a package directory the way an operator would: plugin.json beside the built assembly.</summary>
     private string WriteSamplePackage(string name, string? contracts = null)
     {
         var directory = Path.Combine(_root, "modules", name);
         Directory.CreateDirectory(directory);
         foreach (var file in Directory.GetFiles(AppContext.BaseDirectory, "SampleEnvironment.*"))
             File.Copy(file, Path.Combine(directory, Path.GetFileName(file)), overwrite: true);
-        var manifest = File.ReadAllText(Path.Combine(RepositoryRoot(), "samples", "plugins", name, "module.json"));
+        var manifest = File.ReadAllText(Path.Combine(RepositoryRoot(), "samples", "plugins", name, "plugin.json"));
         if (contracts is not null) manifest = manifest.Replace("\"contracts\": \"1\"", $"\"contracts\": \"{contracts}\"");
-        File.WriteAllText(Path.Combine(directory, "module.json"), manifest);
+        File.WriteAllText(Path.Combine(directory, "plugin.json"), manifest);
         return directory;
     }
 

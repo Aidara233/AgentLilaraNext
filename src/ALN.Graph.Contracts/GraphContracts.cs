@@ -19,7 +19,9 @@ public sealed record ScriptManifest(
     int TimeoutMilliseconds = 1_000,
     long MemoryLimitBytes = 16 * 1024 * 1024);
 
-public sealed record ScriptPackage(ScriptManifest Manifest, string Source, string Fingerprint = "");
+public sealed record ScriptPackage(ScriptManifest Manifest, string Source, string Fingerprint = "",
+    /// <summary>Where it came from when that is not the operator's own script tree: "plugin:&lt;id&gt;".</summary>
+    string? Origin = null);
 
 /// <summary>
 /// A rule resolved onto one instance. <paramref name="RuleId"/> is null for bundle mounts, which are not

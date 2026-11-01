@@ -7,7 +7,7 @@ using ALN.Contracts;
 namespace ALN.Runtime;
 
 /// <summary>
-/// Loads .NET module packages from directories containing module.json and an
+/// Loads module packages from directories containing plugin.json and an
 /// entry assembly. Contract assemblies already loaded by the host are shared;
 /// package-private dependencies are resolved beside the entry assembly.
 /// </summary>
@@ -84,7 +84,7 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
             {
                 if (!dependencies.TryGetValue(dependency.Id, out var found))
                     return Result<ModulePackageManifest>.Failure(new(ErrorCode.Unavailable, $"Required package is not loaded: {dependency.Id}"));
-                if (!MatchesVersion(found.Version, dependency.VersionRange))
+                if (dependency.VersionRange is { Length: > 0 } range && range != "*" && !MatchesVersion(found.Version, range))
                     return Result<ModulePackageManifest>.Failure(new(ErrorCode.Conflict,
                         $"Package {dependency.Id} version {found.Version} does not satisfy {dependency.VersionRange}."));
             }
@@ -112,7 +112,7 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
                     return Result<ModulePackageManifest>.Failure(new(ErrorCode.Invalid, "Plugin entry type requires a public parameterless constructor."));
                 plugin = instance;
                 if (!MetadataMatches(plugin.Manifest, manifest))
-                    return Result<ModulePackageManifest>.Failure(new(ErrorCode.Invalid, "Plugin entry manifest does not match module.json."));
+                    return Result<ModulePackageManifest>.Failure(new(ErrorCode.Invalid, "Plugin entry manifest does not match plugin.json."));
 
                 var registered = _unloads.RegisterPackage(manifest);
                 if (!registered.Ok) return Result<ModulePackageManifest>.Failure(registered.Error!);
@@ -438,14 +438,17 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
         try
         {
             var root = Path.GetFullPath(packageDirectory);
-            var manifestPath = Path.Combine(root, "module.json");
+            var manifestPath = Path.Combine(root, "plugin.json");
+            if (!File.Exists(manifestPath) && File.Exists(Path.Combine(root, "module.json")))
+                return Result<PackageFileManifest>.Failure(new(ErrorCode.Invalid,
+                    "Found module.json: the manifest was renamed to plugin.json (same fields). Rename the file."));
             var file = JsonSerializer.Deserialize<PackageFileManifest>(File.ReadAllText(manifestPath), JsonOptions);
             if (file is null || string.IsNullOrWhiteSpace(file.Id) || string.IsNullOrWhiteSpace(file.Version) ||
                 string.IsNullOrWhiteSpace(file.EntryAssembly) || string.IsNullOrWhiteSpace(file.EntryType) ||
                 file.Provides is null || file.Dependencies is null || file.Provides.Any(t => t is null || string.IsNullOrWhiteSpace(t.TypeId)) ||
-                file.Dependencies.Any(d => d is null || string.IsNullOrWhiteSpace(d.Id) || string.IsNullOrWhiteSpace(d.VersionRange)) ||
+                file.Dependencies.Any(d => d is null || string.IsNullOrWhiteSpace(d.Id)) ||
                 file.ReloadPolicy is not (ModuleReloadPolicy.None or ModuleReloadPolicy.Replace))
-                return Result<PackageFileManifest>.Failure(new(ErrorCode.Invalid, "Invalid module.json manifest."));
+                return Result<PackageFileManifest>.Failure(new(ErrorCode.Invalid, "Invalid plugin.json manifest."));
             if (file.Contracts is { Length: > 0 } contracts && contracts != ModuleContracts.Version)
                 return Result<PackageFileManifest>.Failure(new(ErrorCode.Invalid,
                     $"Package targets module contract {contracts}; this host speaks {ModuleContracts.Version}."));
@@ -454,7 +457,7 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
                 return Result<PackageFileManifest>.Failure(new(ErrorCode.Conflict, "Module manifest has duplicate ids."));
             return Result<PackageFileManifest>.Success(file);
         }
-        catch (Exception ex) { return Result<PackageFileManifest>.Failure(new(ErrorCode.Invalid, "Could not read module.json.", ex.Message)); }
+        catch (Exception ex) { return Result<PackageFileManifest>.Failure(new(ErrorCode.Invalid, "Could not read plugin.json.", ex.Message)); }
     }
 
     private static string? ResolvePackagePath(string packageDirectory, string relativePath)

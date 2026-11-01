@@ -1141,35 +1141,68 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
     public async ValueTask<Result<IReadOnlyList<ScriptPackage>>> LoadAsync(CancellationToken cancellationToken)
     {
         var packages = new List<ScriptPackage>();
+        var seen = new Dictionary<string, string>(StringComparer.Ordinal);
         try
         {
             var roots = new[]
             {
-                (Path.Combine(programRoot, "resources", "scripts", "builtin"), TrustDomain.Builtin),
-                (Path.Combine(dataRoot, "scripts", "trusted"), TrustDomain.Trusted),
-                (Path.Combine(dataRoot, "scripts", "restricted"), TrustDomain.Restricted)
+                (Path.Combine(programRoot, "resources", "scripts", "builtin"), TrustDomain.Builtin, (string?)null),
+                (Path.Combine(dataRoot, "scripts", "trusted"), TrustDomain.Trusted, null),
+                (Path.Combine(dataRoot, "scripts", "restricted"), TrustDomain.Restricted, null)
             };
-            foreach (var (root, expectedDomain) in roots)
+            foreach (var (root, expectedDomain, pluginId) in roots)
             {
-                if (!Directory.Exists(root)) continue;
-                foreach (var manifestPath in Directory.EnumerateFiles(root, "manifest.json", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
+                var failure = await LoadRootAsync(root, expectedDomain, pluginId, packages, seen, cancellationToken).ConfigureAwait(false);
+                if (failure is not null) return Result<IReadOnlyList<ScriptPackage>>.Failure(failure);
+            }
+
+            // Scripts shipped inside a plugin: dropping the plugin in is the trust decision, so they must declare
+            // "trusted" — a shipped script cannot claim to be builtin. They are not written by the operator, so
+            // they are read from the plugin folder and never written to.
+            var pluginsRoot = Path.Combine(dataRoot, "plugins");
+            if (Directory.Exists(pluginsRoot))
+            {
+                foreach (var plugin in Directory.GetDirectories(pluginsRoot).Order(StringComparer.Ordinal))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    var bytes = await File.ReadAllBytesAsync(manifestPath, cancellationToken).ConfigureAwait(false);
-                    if (bytes.Length > 64_000) return Result<IReadOnlyList<ScriptPackage>>.Failure(new(ErrorCode.Invalid, "Script manifest exceeds 64 KB."));
-                    var manifest = JsonSerializer.Deserialize<ScriptFileManifest>(bytes, Options);
-                    if (manifest is null || manifest.TrustDomain != expectedDomain) return Result<IReadOnlyList<ScriptPackage>>.Failure(new(ErrorCode.Denied, $"Invalid manifest or trust domain mismatch: {manifestPath}"));
-                    var scriptPath = Path.Combine(Path.GetDirectoryName(manifestPath)!, "main.js");
-                    var source = await File.ReadAllTextAsync(scriptPath, cancellationToken).ConfigureAwait(false);
-                    if (source.Length > 256_000) return Result<IReadOnlyList<ScriptPackage>>.Failure(new(ErrorCode.Invalid, $"Script source exceeds 256 KB: {manifest.Id}"));
-                    var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source)));
-                    packages.Add(new(new(manifest.Id, manifest.Version, manifest.TargetType, manifest.Mount, manifest.Events,
-                        manifest.EntryPoint, manifest.Capabilities, manifest.TrustDomain, manifest.MaxStatements, manifest.TimeoutMilliseconds, manifest.MemoryLimitBytes), source, fingerprint));
+                    var scriptsRoot = Path.Combine(plugin, "scripts");
+                    if (!Directory.Exists(scriptsRoot)) continue;
+                    if (await LoadRootAsync(scriptsRoot, TrustDomain.Trusted, Path.GetFileName(plugin), packages, seen, cancellationToken)
+                        .ConfigureAwait(false) is { } failure) return Result<IReadOnlyList<ScriptPackage>>.Failure(failure);
                 }
             }
             return Result<IReadOnlyList<ScriptPackage>>.Success(packages);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex) { return Result<IReadOnlyList<ScriptPackage>>.Failure(new(ErrorCode.Invalid, "Could not load script catalog.", ex.Message)); }
+    }
+
+    /// <summary>One source of script packages. Returns a failure to stop the whole catalog, null when fine.</summary>
+    private static async ValueTask<Error?> LoadRootAsync(string root, TrustDomain expectedDomain, string? pluginId,
+        List<ScriptPackage> packages, Dictionary<string, string> seen, CancellationToken cancellationToken)
+    {
+        if (!Directory.Exists(root)) return null;
+        foreach (var manifestPath in Directory.EnumerateFiles(root, "manifest.json", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var bytes = await File.ReadAllBytesAsync(manifestPath, cancellationToken).ConfigureAwait(false);
+            if (bytes.Length > 64_000) return new(ErrorCode.Invalid, "Script manifest exceeds 64 KB.");
+            var manifest = JsonSerializer.Deserialize<ScriptFileManifest>(bytes, Options);
+            if (manifest is null || manifest.TrustDomain != expectedDomain)
+                return new(ErrorCode.Denied, $"Invalid manifest or trust domain mismatch: {manifestPath}");
+            // Two scripts with one id would make graph.mount ambiguous; say which two, do not pick one.
+            if (seen.TryGetValue(manifest.Id, out var first))
+                return new(ErrorCode.Conflict, $"Duplicate script id {manifest.Id}: {first} and {manifestPath}");
+            var scriptPath = Path.Combine(Path.GetDirectoryName(manifestPath)!, "main.js");
+            var source = await File.ReadAllTextAsync(scriptPath, cancellationToken).ConfigureAwait(false);
+            if (source.Length > 256_000) return new(ErrorCode.Invalid, $"Script source exceeds 256 KB: {manifest.Id}");
+            var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source)));
+            seen[manifest.Id] = manifestPath;
+            packages.Add(new(new(manifest.Id, manifest.Version, manifest.TargetType, manifest.Mount, manifest.Events,
+                manifest.EntryPoint, manifest.Capabilities, manifest.TrustDomain, manifest.MaxStatements,
+                manifest.TimeoutMilliseconds, manifest.MemoryLimitBytes), source, fingerprint,
+                pluginId is null ? null : $"plugin:{pluginId}"));
+        }
+        return null;
     }
 }
