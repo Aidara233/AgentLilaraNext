@@ -533,7 +533,12 @@ public sealed class GraphManager : IGraphRuntime
                     Mechanism = "emit",
                     Outcome = result.Ok ? "ok" : deadline.IsCancellationRequested ? "timeout" : "failed",
                     DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds,
-                    Level = result.Ok ? SignalLevel.Info : SignalLevel.Warn,
+                    // A successful clock pulse is a wake-up, not a fact: at Debug, so a polling adapter cannot
+                    // flood the default graph with one record per tick per mounted script. A failed one stays
+                    // at Warn because that is the interesting half.
+                    Level = !result.Ok ? SignalLevel.Warn
+                        : routedEvent.Name == EventNames.ClockPulse ? SignalLevel.Debug
+                        : SignalLevel.Info,
                     Detail = result.Ok ? null : new Dictionary<string, string>
                     {
                         ["event"] = routedEvent.Name,

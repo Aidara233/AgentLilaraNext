@@ -15,7 +15,9 @@ public sealed class GraphIntegrationTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-channel-tests-" + Guid.NewGuid().ToString("N"));
     private readonly SqliteStore _audit;
-    private readonly SignalLog _signals = SignalLog.Open(null);
+    // These tests assert on the whole dispatch graph, including the clock pulses that wake the polling
+    // adapter, so they ask for Debug explicitly. The default level leaves those out on purpose.
+    private readonly SignalLog _signals = SignalLog.Open(null, new SignalLogOptions(SignalLevel.Debug));
     private readonly AdapterTypeCatalog _adapterTypes = new();
     private readonly IModuleTypeCatalog _types;
     private readonly EventQueue _events = new(32);
