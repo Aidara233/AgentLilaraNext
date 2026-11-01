@@ -1,0 +1,13 @@
+{
+  "id": "channel.greeting",
+  "version": 1,
+  "targetType": "channel",
+  "mount": "manual",
+  "events": ["channel.message.accepted"],
+  "entryPoint": "onEvent",
+  "capabilities": ["channel.bound-send"],
+  "trustDomain": "trusted",
+  "maxStatements": 2000,
+  "timeoutMilliseconds": 5000,
+  "memoryLimitBytes": 16777216
+}

@@ -198,6 +198,59 @@ public sealed class StateContinuityTests : IDisposable
         Assert.True(afterRestart.Value!.IsEmpty);
     }
 
+    [Fact]
+    public async Task The_greeting_sample_greets_once_even_across_a_restart()
+    {
+        var sample = SamplePackage("channel.greeting");
+        using (var first = new Node(_root))
+        {
+            await first.StartAsync([Intake(), sample]);
+            await first.AddChannelAsync("chat-1");
+            Assert.True((await first.Graph.AddRuleAsync(
+                new("channel.greeting", MountScope.ForType("channel.conversation")), default)).Ok);
+
+            await first.SayAsync("chat-1", "在吗");
+            await first.DrainAsync();
+            await first.SayAsync("chat-1", "还没回我");
+            await first.DrainAsync();
+            // Two messages, one greeting: the flag is in ctx.state, not in a variable.
+            Assert.Single(first.OutboxTexts("chat-1"));
+        }
+
+        using var second = new Node(_root);
+        await second.StartAsync([Intake(), sample]);
+        await second.SayAsync("chat-1", "重启了");
+        await second.DrainAsync();
+        Assert.Single(second.OutboxTexts("chat-1"));
+    }
+
+    /// <summary>Reads a shipped sample from disk, so a sample that stops being a valid script fails a test.</summary>
+    private static ScriptPackage SamplePackage(string id)
+    {
+        var directory = Path.Combine(RepositoryRoot(), "samples", "scripts", "trusted", id);
+        var manifest = JsonSerializer.Deserialize<ScriptFileManifest>(
+            File.ReadAllText(Path.Combine(directory, "manifest.json")),
+                        new JsonSerializerOptions
+                        {
+                            PropertyNameCaseInsensitive = true,
+                            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                            Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter(JsonNamingPolicy.CamelCase) }
+                        })
+                    ?? throw new InvalidOperationException($"Sample manifest is unreadable: {id}");
+        return new(new(manifest.Id, manifest.Version, manifest.TargetType, manifest.Mount, manifest.Events,
+                manifest.EntryPoint, manifest.Capabilities, manifest.TrustDomain, manifest.MaxStatements,
+                manifest.TimeoutMilliseconds, manifest.MemoryLimitBytes),
+            File.ReadAllText(Path.Combine(directory, "main.js")));
+    }
+
+    private static string RepositoryRoot()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "ALN.slnx")))
+            directory = directory.Parent;
+        return directory?.FullName ?? throw new InvalidOperationException("Repository root was not found.");
+    }
+
     /// <summary>One process worth of components over a data root; dispose it and build another to "restart".</summary>
     private sealed class Node : IDisposable
     {
