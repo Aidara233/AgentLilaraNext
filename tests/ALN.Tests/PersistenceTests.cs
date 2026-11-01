@@ -100,12 +100,11 @@ public sealed class PersistenceTests : IDisposable
     }
 
     [Fact]
-    public async Task A_spec_left_in_the_flat_layout_is_reported_and_not_loaded()
+    public async Task A_spec_left_in_a_flat_layout_is_an_error_that_names_the_right_place()
     {
         var root = Path.Combine(_root, "adapters");
         Directory.CreateDirectory(root);
-        var flat = Path.Combine(root, "file-1.json");
-        await File.WriteAllTextAsync(flat,
+        await File.WriteAllTextAsync(Path.Combine(root, "file-1.json"),
             """
             { "address": "adapter.file#file-1", "platformId": "file", "accountId": "file-1", "direction": "Both" }
             """);
@@ -113,11 +112,10 @@ public sealed class PersistenceTests : IDisposable
         var store = new FileAdapterSpecStore(root);
         var loaded = await store.LoadAllAsync(default);
 
-        // Ignored rather than guessed at: a file that is silently interpreted is a file that is silently
-        // half-migrated. Reported, so the host can name it and say where it belongs.
-        Assert.True(loaded.Ok);
-        Assert.Empty(loaded.Value!);
-        Assert.Equal([flat], store.LegacyLayout);
+        // No compatibility path: the layout is the contract, so a stray file is reported rather than
+        // half-interpreted, and the message says where it belongs.
+        Assert.False(loaded.Ok);
+        Assert.Contains("<type>/<instance>/adapter.json", loaded.Error!.Message, StringComparison.Ordinal);
     }
 
     [Fact]

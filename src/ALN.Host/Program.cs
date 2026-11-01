@@ -179,11 +179,6 @@ if (!registered.Ok)
 var lifecycleReport = await lifecycle.StartAsync(shutdown.Token);
 foreach (var outcome in lifecycleReport.Outcomes.Where(o => o.Outcome != "ok"))
     Console.Error.WriteLine($"startup {outcome.Outcome}: {outcome.Name} — {outcome.Message}");
-// Specs left in the old flat layout are not guessed at: say which file to move, and where to.
-foreach (var legacy in adapterSpecs.LegacyLayout)
-    Console.Error.WriteLine(
-        $"Warning: '{Path.GetFileName(legacy)}' is in the pre-nesting layout and was ignored; " +
-        $"move it to adapters\\<type>\\<instance>\\{FileAdapterSpecStore.FileName} (e.g. adapters\\qq\\qq-1\\{FileAdapterSpecStore.FileName}).");
 if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
 {
     // Nothing came up at all: that is the only startup failure that justifies refusing to run.
