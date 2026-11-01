@@ -46,8 +46,8 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
 
     public async ValueTask<Result<ChannelInfo>> CreateAsync(ChannelSpec spec, CancellationToken cancellationToken)
     {
-        if (spec.Address.Module != "channel" || spec.Address.Kind != "logical" || string.IsNullOrWhiteSpace(spec.Address.Instance))
-            return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "Channel address must be channel.logical#<id>."));
+        if (spec.Address.Module != "channel" || spec.Address.Kind != "conversation" || string.IsNullOrWhiteSpace(spec.Address.Instance))
+            return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "Channel address must be channel.conversation#<id>."));
         if (string.IsNullOrWhiteSpace(spec.Name) || spec.Bindings is null || spec.Bindings.Count == 0)
             return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "Channel requires a name and at least one Adapter binding."));
         if (spec.Bindings.Any(b => !b.Adapter.IsInstance || !IsValidConversationId(b.PlatformConversationId)))

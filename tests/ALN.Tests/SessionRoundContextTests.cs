@@ -12,7 +12,7 @@ public sealed class SessionRoundContextTests : IDisposable
     private readonly ScriptedModel _model = new();
     private readonly RoundContextContributorRegistry _contributors = new();
     private readonly SessionManager _sessions;
-    private static readonly Address Channel = new("channel", "logical", "chat-1");
+    private static readonly Address Channel = new("channel", "conversation", "chat-1");
     private static readonly ChannelBinding Binding = new(new("adapter", "file", "file-1"), "chat-1");
 
     public SessionRoundContextTests()

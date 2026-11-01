@@ -39,14 +39,34 @@ public sealed class OneBotProtocolTests
         var inbound = OneBotProtocol.ReadMessage(Parse(GroupMessage), selfId: 10000);
 
         Assert.NotNull(inbound);
-        Assert.Equal(123456, inbound!.GroupId);
-        Assert.Equal("g-123456", OneBotProtocol.GroupConversation(inbound.GroupId));
+        Assert.Equal("group", inbound!.Platform);
+        Assert.Equal("g-123456", inbound.ConversationId);
         Assert.Equal("4242", inbound.MessageId);
         Assert.Equal("20000", inbound.SenderId);
         Assert.Equal("蓝", inbound.SenderName);
         // Image and face do not disappear: the model should know something it cannot read is there.
         Assert.Equal("在吗 @10000[图片][表情]", inbound.Text);
         Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1730000000), inbound.At);
+    }
+
+    [Fact]
+    public void A_private_message_becomes_a_p_conversation_named_after_the_sender()
+    {
+        var privateMessage = """
+            {
+              "post_type": "message", "message_type": "private", "sub_type": "friend",
+              "self_id": 10000, "user_id": 1664093638, "message_id": 11, "time": 1730000000,
+              "sender": { "user_id": 1664093638, "nickname": "对方" },
+              "message": [{ "type": "text", "data": { "text": "私聊测试" } }]
+            }
+            """;
+
+        var inbound = OneBotProtocol.ReadMessage(Parse(privateMessage), selfId: 10000);
+
+        Assert.NotNull(inbound);
+        Assert.Equal("private", inbound!.Platform);
+        Assert.Equal("p-1664093638", inbound.ConversationId);
+        Assert.Equal("1664093638", inbound.SenderId);
     }
 
     [Fact]
@@ -62,7 +82,6 @@ public sealed class OneBotProtocolTests
     }
 
     [Theory]
-    [InlineData("\"message_type\": \"group\"", "\"message_type\": \"private\"")] // private: not in v1 scope
     [InlineData("\"post_type\": \"message\"", "\"post_type\": \"notice\"")]
     [InlineData("\"post_type\": \"message\"", "\"post_type\": \"meta_event\"")]
     [InlineData("\"post_type\": \"message\"", "\"post_type\": \"request\"")]
@@ -109,23 +128,27 @@ public sealed class OneBotProtocolTests
     }
 
     [Theory]
-    [InlineData("g-123456", true, 123456)]
-    [InlineData("g-1", true, 1)]
-    [InlineData("123456", false, 0)]
-    [InlineData("p-123456", false, 0)]
-    [InlineData("g-", false, 0)]
-    [InlineData("g-abc", false, 0)]
-    [InlineData(null, false, 0)]
-    public void Conversation_ids_round_trip_and_reject_anything_else(string? conversationId, bool ok, long groupId)
+    [InlineData("g-123456", true, 123456L, "group")]
+    [InlineData("g-1", true, 1L, "group")]
+    [InlineData("p-1664093638", true, 1664093638L, "private")]
+    [InlineData("123456", false, 0L, "")]
+    [InlineData("x-123456", false, 0L, "")]
+    [InlineData("g-", false, 0L, "")]
+    [InlineData("g-abc", false, 0L, "")]
+    [InlineData(null, false, 0L, "")]
+    public void Conversation_ids_round_trip_and_reject_anything_else(string? conversationId, bool ok, long id,
+        string platform)
     {
-        Assert.Equal(ok, OneBotProtocol.TryReadGroupConversation(conversationId, out var parsed));
-        if (ok) Assert.Equal(groupId, parsed);
+        Assert.Equal(ok, OneBotProtocol.TryReadConversation(conversationId, out var parsed, out var parsedPlatform));
+        if (!ok) return;
+        Assert.Equal(id, parsed);
+        Assert.Equal(platform, parsedPlatform);
     }
 
     [Fact]
     public void A_send_is_a_text_segment_and_quotes_only_a_numeric_id()
     {
-        var plain = Parse(OneBotProtocol.BuildGroupSend("echo-1", 123456, "你好"));
+        var plain = Parse(OneBotProtocol.BuildSend("echo-1", 123456, "group", "你好"));
         Assert.Equal("send_group_msg", plain.GetProperty("action").GetString());
         Assert.Equal("echo-1", plain.GetProperty("echo").GetString());
         var parameters = plain.GetProperty("params");
@@ -135,15 +158,41 @@ public sealed class OneBotProtocolTests
         Assert.Equal("text", segments[0].GetProperty("type").GetString());
         Assert.Equal("你好", segments[0].GetProperty("data").GetProperty("text").GetString());
 
-        var quoted = Parse(OneBotProtocol.BuildGroupSend("echo-2", 1, "回你", "4242"));
+        var quoted = Parse(OneBotProtocol.BuildSend("echo-2", 1, "group", "回你", "4242"));
         var quotedSegments = quoted.GetProperty("params").GetProperty("message").EnumerateArray().ToArray();
         Assert.Equal(2, quotedSegments.Length);
         Assert.Equal("reply", quotedSegments[0].GetProperty("type").GetString());
         Assert.Equal("4242", quotedSegments[0].GetProperty("data").GetProperty("id").GetString());
 
         // A non-numeric id would be rejected by the platform; dropping the quote is better than failing the send.
-        var notQuoted = Parse(OneBotProtocol.BuildGroupSend("echo-3", 1, "回你", "abc"));
+        var notQuoted = Parse(OneBotProtocol.BuildSend("echo-3", 1, "group", "回你", "abc"));
         Assert.Single(notQuoted.GetProperty("params").GetProperty("message").EnumerateArray());
+    }
+
+    [Fact]
+    public void A_private_send_targets_the_user_not_a_group()
+    {
+        var privateSend = Parse(OneBotProtocol.BuildSend("echo-p", 1664093638, "private", "私聊回你"));
+
+        Assert.Equal("send_private_msg", privateSend.GetProperty("action").GetString());
+        var parameters = privateSend.GetProperty("params");
+        Assert.Equal(1664093638, parameters.GetProperty("user_id").GetInt64());
+        Assert.False(parameters.TryGetProperty("group_id", out _));
+    }
+
+    [Fact]
+    public void Login_info_gives_back_the_account_the_platform_says_we_are()
+    {
+        var login = OneBotProtocol.ReadLoginInfo(Parse("""{ "user_id": 1664093638, "nickname": "Lilara" }"""));
+
+        Assert.NotNull(login);
+        Assert.Equal(1664093638, login!.UserId);
+        Assert.Equal("Lilara", login.Nickname);
+
+        // Nothing usable: no id, so nothing to learn. The caller keeps whatever it had.
+        Assert.Null(OneBotProtocol.ReadLoginInfo(Parse("""{ "nickname": "x" }""")));
+        Assert.Null(OneBotProtocol.ReadLoginInfo(Parse("""{ "user_id": 0 }""")));
+        Assert.Null(OneBotProtocol.ReadLoginInfo(Parse("""[]""")));
     }
 
     [Theory]

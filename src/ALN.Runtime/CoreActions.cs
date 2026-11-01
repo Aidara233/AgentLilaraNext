@@ -18,6 +18,7 @@ public static class CoreActions
     public const string ChannelsList = "channels.list";
     public const string ChannelsStart = "channels.start";
     public const string ChannelsStop = "channels.stop";
+    public const string ChannelsSend = "channels.send";
     public const string ModelsList = "models.list";
     public const string SignalsRecent = "signals.recent";
 
@@ -46,7 +47,10 @@ public static class CoreActions
                     {
                         address = a.Address.ToString(),
                         platform = a.Descriptor.PlatformId,
-                        account = a.Descriptor.AccountId,
+                        // The declared label, and — when the adapter can learn it — who it actually is.
+                        account = Identity(a.Address)?.AccountId ?? a.Descriptor.AccountId,
+                        declaredAccount = a.Descriptor.AccountId,
+                        displayName = Identity(a.Address)?.DisplayName,
                         direction = a.Descriptor.Direction.ToString(),
                         state = a.State.ToString(),
                         // Whether the connection behind the state is actually up. Null when the adapter
@@ -74,6 +78,7 @@ public static class CoreActions
 
             (new(ChannelsStart, "Start one channel.", Capabilities.ChannelsControl, true), StartChannel),
             (new(ChannelsStop, "Stop one channel.", Capabilities.ChannelsControl, true), StopChannel),
+            (new(ChannelsSend, "Send one text message through a channel's binding.", Capabilities.MessagesWrite, true), SendChannel),
 
             (new(ModelsList, "List provider instances and profiles without configuration or keys.", Capabilities.ModelsRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
@@ -147,6 +152,55 @@ public static class CoreActions
             return found.Ok ? found.Value as IAdapterHealth : null;
         }
 
+        IAdapterIdentity? Identity(Address address)
+        {
+            var found = adapters.Get(address);
+            return found.Ok ? found.Value as IAdapterIdentity : null;
+        }
+
+        /// <summary>
+        /// One text, one binding, no policy: this is the action a human or a test uses to prove that the
+        /// Channel → Adapter → platform path works without waiting for somebody to talk to the bot.
+        ///
+        /// It refuses a channel with zero or several bindings rather than picking one: guessing which
+        /// conversation a message was meant for is exactly the kind of guess that ends up in the wrong
+        /// group.
+        /// </summary>
+        async ValueTask<Result<JsonElement>> SendChannel(JsonElement arguments, CancellationToken ct)
+        {
+            var target = ReadAddress(arguments, "address");
+            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
+            if (!TryReadText(arguments, "text", out var text) || text.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.send requires a non-empty 'text'."));
+            var replyTo = TryReadText(arguments, "replyTo", out var reply) ? reply : null;
+
+            var channel = channels.Get(target.Value);
+            if (!channel.Ok) return Result<JsonElement>.Failure(channel.Error!);
+            if (!channel.Value.Running)
+                return Result<JsonElement>.Failure(new(ErrorCode.Conflict, $"Channel is not running: {target.Value}"));
+            if (channel.Value.Bindings.Count != 1)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
+                    $"Channel has {channel.Value.Bindings.Count} bindings; channels.send needs exactly one. " +
+                    "Sending to a chosen binding among several is not implemented."));
+
+            var binding = channel.Value.Bindings[0];
+            var adapter = adapters.Get(binding.Adapter);
+            if (!adapter.Ok) return Result<JsonElement>.Failure(adapter.Error!);
+
+            var sent = await adapter.Value.SendAsync(new OutboundMessage(binding.PlatformConversationId, text, replyTo), ct)
+                .ConfigureAwait(false);
+            if (!sent.Ok) return Result<JsonElement>.Failure(sent.Error!);
+            return Result<JsonElement>.Success(ToJson(new
+            {
+                channel = target.Value.ToString(),
+                adapter = binding.Adapter.ToString(),
+                conversation = binding.PlatformConversationId,
+                sent = sent.Value.Sent,
+                messageId = sent.Value.AttemptId,
+                detail = sent.Value.Detail
+            }));
+        }
+
         ValueTask<Result<JsonElement>> RecentSignals(JsonElement arguments, CancellationToken ct)
         {
             var limit = 200;
@@ -173,6 +227,15 @@ public static class CoreActions
                 });
             return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new { records })));
         }
+    }
+
+    private static bool TryReadText(JsonElement arguments, string property, out string value)
+    {
+        value = string.Empty;
+        if (arguments.ValueKind != JsonValueKind.Object || !arguments.TryGetProperty(property, out var found) ||
+            found.ValueKind != JsonValueKind.String) return false;
+        value = found.GetString() ?? string.Empty;
+        return true;
     }
 
     private static Result<Address> ReadAddress(JsonElement arguments, string property)

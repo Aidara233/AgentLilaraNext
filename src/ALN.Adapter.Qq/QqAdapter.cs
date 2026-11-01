@@ -14,7 +14,7 @@ namespace ALN.Adapter.Qq;
 /// v1 scope: group text in, group text out. Private chats, images, mentions and rate-limit pacing are
 /// not implemented — see docs/16.
 /// </summary>
-public sealed class QqAdapter : AdapterBase, IAdapterHealth
+public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private const int SeenCapacity = 512;
@@ -49,8 +49,13 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth
 
     public bool Connected => _connection.IsConnected;
 
+    // Learned from the platform on connect, not typed into a config file. Null until the platform says.
+    public string? AccountId => _connection.SelfId?.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    public string? DisplayName => _connection.Nickname;
+
     public string? HealthDetail => _connection.IsConnected
-        ? $"已连接 {_endpoint}"
+        ? $"已连接 {_endpoint}" + (DisplayName is { Length: > 0 } name ? $"（{name} / {AccountId}）" : string.Empty)
         : _detail ?? _connection.LastError;
 
     public override async ValueTask<Result> StartAsync(CancellationToken cancellationToken)
@@ -96,31 +101,33 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth
             return Result<SendResult>.Failure(new(ErrorCode.Unavailable, "QQ adapter is not running."));
         if (message is null || string.IsNullOrWhiteSpace(message.Text))
             return Result<SendResult>.Failure(new(ErrorCode.Invalid, "Outbound text must be non-empty."));
-        if (!OneBotProtocol.TryReadGroupConversation(message.PlatformConversationId, out var groupId))
+        if (!OneBotProtocol.TryReadConversation(message.PlatformConversationId, out var target, out var platform))
             return Result<SendResult>.Failure(new(ErrorCode.Invalid,
-                $"v1 只支持群聊会话（{OneBotProtocol.GroupPrefix}<群号>），收到：{message.PlatformConversationId}"));
+                $"无法识别的会话 id（应为 {OneBotProtocol.GroupPrefix}<群号> 或 {OneBotProtocol.PrivatePrefix}<QQ号>）：{message.PlatformConversationId}"));
 
         var sent = await _connection.CallAsync(
-            echo => OneBotProtocol.BuildGroupSend(echo, groupId, message.Text, message.ReplyTo),
+            echo => OneBotProtocol.BuildSend(echo, target, platform, message.Text, message.ReplyTo),
             cancellationToken).ConfigureAwait(false);
-        if (!sent.Ok || sent.Value is null)
+        if (!sent.Ok)
             return Result<SendResult>.Failure(sent.Error ?? new(ErrorCode.Unavailable, "OneBot send failed."));
 
-        var response = sent.Value;
+        var response = sent.Value.Response;
         if (!response.Ok)
         {
             // retcode from OneBot carries the platform's own reason (muted, not a member, rate limited).
             _log.Warn("OneBot rejected a send", new Dictionary<string, string>
             {
-                ["group"] = groupId.ToString(),
+                ["platform"] = platform,
+                ["target"] = target.ToString(),
                 ["retcode"] = response.RetCode.ToString(),
                 ["message"] = response.Message ?? string.Empty
             });
             return Result<SendResult>.Failure(new(ErrorCode.Unavailable,
-                $"OneBot retcode {response.RetCode}: {response.Message ?? "no message"}", $"group:{groupId}", true));
+                $"OneBot retcode {response.RetCode}: {response.Message ?? "no message"}", $"{platform}:{target}", true));
         }
 
-        return Result<SendResult>.Success(new SendResult(true, response.MessageId ?? $"g-{groupId}"));
+        return Result<SendResult>.Success(new SendResult(true,
+            response.MessageId ?? message.PlatformConversationId));
     }
 
     /// <summary>
@@ -135,9 +142,8 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth
         if (inbound is null) return;
         if (inbound.MessageId is { Length: > 0 } id && !MarkSeen(id)) return;
 
-        var envelope = new AdapterEnvelope(Address, Descriptor.PlatformId,
-            OneBotProtocol.GroupConversation(inbound.GroupId), inbound.MessageId, inbound.Text, inbound.At,
-            inbound.SenderId);
+        var envelope = new AdapterEnvelope(Address, Descriptor.PlatformId, inbound.ConversationId,
+            inbound.MessageId, inbound.Text, inbound.At, inbound.SenderId);
         var published = await _sink.PublishAsync(new RoutedEvent(EventNames.AdapterEnvelope, Address,
             envelope.EventId, JsonSerializer.Serialize(envelope, JsonOptions)), CancellationToken.None).ConfigureAwait(false);
         if (!published.Ok)

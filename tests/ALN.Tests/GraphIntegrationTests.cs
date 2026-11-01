@@ -34,7 +34,7 @@ public sealed class GraphIntegrationTests : IDisposable
         _bindings = new();
         _audit = new JsonlAuditSink(Path.Combine(_root, "audit", "test.jsonl"));
         Assert.True(_adapterTypes.RegisterPackageTypes("test.adapter.file", [new("adapter.file", "adapter")]).Ok);
-        Assert.True(_adapterTypes.RegisterPackageTypes("test.channel", [new("channel.logical", "channel")]).Ok);
+        Assert.True(_adapterTypes.RegisterPackageTypes("test.channel", [new("channel.conversation", "channel")]).Ok);
         _types = _adapterTypes;
         _adapters = new AdapterManager(_types, _bindings);
         _channels = new ChannelManager(_adapters, _events, _bindings);
@@ -56,8 +56,8 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         Assert.True((await _graph.LoadAsync([AdapterIntake(), ChannelReply()], default)).Ok);
         Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
-        var channelOne = new Address("channel", "logical", "chat-1");
-        var channelTwo = new Address("channel", "logical", "chat-2");
+        var channelOne = new Address("channel", "conversation", "chat-1");
+        var channelTwo = new Address("channel", "conversation", "chat-2");
         await AddChannelAsync(channelOne, "chat-1");
         await AddChannelAsync(channelTwo, "chat-2");
         Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
@@ -84,8 +84,8 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         Assert.True((await _graph.LoadAsync([AdapterIntake(), ChannelReply()], default)).Ok);
         Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
-        await AddChannelAsync(new("channel", "logical", "chat-1"), "chat-1");
-        var duplicate = await _channels.CreateAsync(new(new("channel", "logical", "duplicate"), "duplicate", [new(_adapterAddress, "chat-1")]), default);
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
+        var duplicate = await _channels.CreateAsync(new(new("channel", "conversation", "duplicate"), "duplicate", [new(_adapterAddress, "chat-1")]), default);
         Assert.False(duplicate.Ok);
         await _adapters.StartAsync(_adapterAddress, default);
         await WriteInputAsync("chat-3", "nobody owns this room");
@@ -103,7 +103,7 @@ public sealed class GraphIntegrationTests : IDisposable
             "async function onEvent(event, ctx) { await ctx.channel.reply({ platformConversationId: 'chat-2', text: event.text }); }");
         Assert.True((await _graph.LoadAsync([AdapterIntake(), maliciousReply], default)).Ok);
         Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
-        await AddChannelAsync(new("channel", "logical", "chat-1"), "chat-1");
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
         await _adapters.StartAsync(_adapterAddress, default);
         await WriteInputAsync("chat-1", "restricted");
         Assert.Equal(1, (await PulseAdapterAsync()).Value);
@@ -125,7 +125,7 @@ public sealed class GraphIntegrationTests : IDisposable
         var restricted = AdapterIntake() with { Manifest = AdapterIntake().Manifest with { TrustDomain = TrustDomain.Restricted } };
         Assert.False((await _graph.LoadAsync([restricted], default)).Ok);
         Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
-        var invalid = await _channels.CreateAsync(new(new("channel", "logical", "bad"), "bad", [new(_adapterAddress, "../escape")]), default);
+        var invalid = await _channels.CreateAsync(new(new("channel", "conversation", "bad"), "bad", [new(_adapterAddress, "../escape")]), default);
         Assert.False(invalid.Ok);
     }
 
@@ -138,7 +138,7 @@ public sealed class GraphIntegrationTests : IDisposable
             "async function onEvent(event, ctx) { ctx.log.info('saw message', { conversation: event.platformConversationId }); await ctx.channel.accept(); }");
         Assert.True((await _graph.LoadAsync([loggingIntake], default)).Ok);
         Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
-        var channel = new Address("channel", "logical", "chat-1");
+        var channel = new Address("channel", "conversation", "chat-1");
         await AddChannelAsync(channel, "chat-1");
         await _adapters.StartAsync(_adapterAddress, default);
 
@@ -218,7 +218,7 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         Assert.True((await _graph.LoadAsync([AdapterIntake(), ChannelReply()], default)).Ok);
         Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
-        await AddChannelAsync(new("channel", "logical", "chat-1"), "chat-1");
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
         await _adapters.StartAsync(_adapterAddress, default);
         await WriteInputAsync("chat-1", "one");
         Assert.Equal(1, (await PulseAdapterAsync()).Value);
@@ -250,7 +250,7 @@ public sealed class GraphIntegrationTests : IDisposable
         var firstDispatch = await DispatchEnvelopeAsync(first);
         Assert.True(firstDispatch.Ok, firstDispatch.Error?.Detail ?? firstDispatch.Error?.Message);
         var created = Assert.Single(_channels.List());
-        Assert.Equal(new Address("channel", "logical", "chat-9"), created.Address);
+        Assert.Equal(new Address("channel", "conversation", "chat-9"), created.Address);
         Assert.True(created.Running);
 
         var second = new AdapterEnvelope(_adapterAddress, "file", "chat-9", "m-2", "again", DateTimeOffset.UtcNow);

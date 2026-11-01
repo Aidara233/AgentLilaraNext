@@ -17,7 +17,7 @@ public sealed class DefaultModulesPlugin : IModulePlugin
         PackageId,
         "1.0.0",
         ModulePackageKind.Bundled,
-        [new ModuleTypeProvision("channel.logical", "channel")],
+        [new ModuleTypeProvision("channel.conversation", "channel")],
         [],
         ModuleReloadPolicy.None);
 

@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using ALN.Contracts;
 using Microsoft.AspNetCore.Builder;
@@ -16,6 +17,9 @@ namespace ALN.Api;
 /// </summary>
 public static class ApiHost
 {
+    /// <summary>Throws <see cref="DecoderFallbackException"/> on bytes that are not valid UTF-8.</summary>
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
     public static async Task<ApiInstance> StartAsync(ApiSettings settings, IControlPlane plane,
         CancellationToken cancellationToken)
     {
@@ -82,7 +86,17 @@ public static class ApiHost
             {
                 try
                 {
-                    arguments = await JsonSerializer.DeserializeAsync<JsonElement>(context.Request.Body, cancellationToken: ct);
+                    // Decode strictly instead of letting JsonDocument tolerate bad bytes: an argument that
+                    // is not UTF-8 would otherwise surface much later, inside whatever action first reads
+                    // the string, as an unfixable-looking 502.
+                    using var body = new MemoryStream();
+                    await context.Request.Body.CopyToAsync(body, ct);
+                    var text = StrictUtf8.GetString(body.ToArray());
+                    arguments = JsonSerializer.Deserialize<JsonElement>(text);
+                }
+                catch (DecoderFallbackException)
+                {
+                    return Results.Json(new { error = "body_must_be_utf8" }, statusCode: StatusCodes.Status400BadRequest);
                 }
                 catch (JsonException)
                 {

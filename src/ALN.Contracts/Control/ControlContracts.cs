@@ -67,6 +67,7 @@ public static class Capabilities
     public const string AdaptersControl = "adapters.control";
     public const string ChannelsRead = "channels.read";
     public const string ChannelsControl = "channels.control";
+    public const string MessagesWrite = "messages.write";
     public const string ModelsRead = "models.read";
     public const string SignalsRead = "signals.read";
     public const string SessionsRead = "sessions.read";

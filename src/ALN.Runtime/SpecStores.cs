@@ -8,7 +8,7 @@ namespace ALN.Runtime;
 /// Both spec stores share one layout, because a spec is a spec:
 /// <code>
 /// &lt;root&gt;/&lt;type&gt;/&lt;instance&gt;/&lt;file&gt;    adapters/qq/qq-1/adapter.json
-///                                        channels/logical/qq-123456/channel.json
+///                                        channels/conversation/qq-123456/channel.json
 /// </code>
 /// The type segment is the last part of the type id (<c>adapter.qq</c> → <c>qq</c>), since the parent
 /// directory already says what kind of thing this is. One instance is one directory, so anything an

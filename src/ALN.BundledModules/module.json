@@ -5,7 +5,7 @@
   "entryType": "ALN.BundledModules.DefaultModulesPlugin",
   "provides": [
     {
-      "typeId": "channel.logical",
+      "typeId": "channel.conversation",
       "parentTypeId": "channel",
       "isAbstract": false
     }

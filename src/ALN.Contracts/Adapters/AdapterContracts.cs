@@ -102,8 +102,23 @@ public interface IChatAdapter : IInboundAdapter, IOutboundAdapter
 public interface IAdapterHealth
 {
     bool Connected { get; }
+
     /// <summary>Human readable last condition: last error, endpoint, next retry. Never contains secrets.</summary>
     string? HealthDetail { get; }
+}
+
+/// <summary>
+/// Optional: an Adapter that logs in somewhere can tell us which account it ended up as. The spec's
+/// <c>accountId</c> is then a label rather than a fact to maintain — a QQ number is something the
+/// platform already knows, and typing it into a config file is a chance to type it wrong.
+/// </summary>
+public interface IAdapterIdentity
+{
+    /// <summary>Platform account id, once the platform has told us; null before that.</summary>
+    string? AccountId { get; }
+
+    /// <summary>Display name from the platform, if it gave one.</summary>
+    string? DisplayName { get; }
 }
 public interface IAdapterFactory
 {

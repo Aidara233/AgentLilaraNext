@@ -468,7 +468,7 @@ public sealed class GraphManager : IGraphRuntime
                 channelAddress = bound.Address;
             else
             {
-                channelAddress = new Address("channel", "logical", channelId);
+                channelAddress = new Address("channel", "conversation", channelId);
                 var spec = new ChannelSpec(channelAddress, string.IsNullOrWhiteSpace(options.Name) ? channelId : options.Name!,
                     [new ChannelBinding(envelope.Adapter, envelope.PlatformConversationId)]);
                 var minted = await channels.CreateAsync(spec, cancellationToken).ConfigureAwait(false);

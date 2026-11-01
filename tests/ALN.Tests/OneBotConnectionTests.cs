@@ -57,9 +57,10 @@ public sealed class OneBotConnectionTests
             Assert.Equal("你好", envelope.Text);
 
             var sent = await adapter.SendAsync(new OutboundMessage("g-123456", "收到"), default);
-            Assert.True(sent.Ok, sent.Error?.Detail ?? sent.Error?.Message);
+            Assert.True(sent.Ok,
+                $"send failed: {sent.Error?.Code} {sent.Error?.Message} {sent.Error?.Detail} | " +
+                $"server: {bot.ServerError ?? "no error"} | {log.Text}");
             Assert.Equal("9999", sent.Value!.AttemptId);
-
             var action = await bot.NextSendAsync();
             Assert.Equal("send_group_msg", action.GetProperty("action").GetString());
             Assert.Equal(123456, action.GetProperty("params").GetProperty("group_id").GetInt64());
@@ -73,7 +74,7 @@ public sealed class OneBotConnectionTests
     }
 
     [Fact]
-    public async Task Sending_to_a_conversation_that_is_not_a_group_fails_before_touching_the_socket()
+    public async Task Sending_to_a_conversation_we_cannot_parse_fails_before_touching_the_socket()
     {
         var sink = new RecordingSink();
         var adapter = CreateAdapter(new Uri("ws://127.0.0.1:9"), sink); // never connected, and never needed
@@ -82,9 +83,11 @@ public sealed class OneBotConnectionTests
         Assert.True(started.Ok);
         try
         {
-            var sent = await adapter.SendAsync(new OutboundMessage("p-20000", "私聊还不支持"), default);
+            // A bare id has no platform: guessing group vs private is how a message ends up in the wrong place.
+            var sent = await adapter.SendAsync(new OutboundMessage("1664093638", "不知道发到哪"), default);
             Assert.False(sent.Ok);
             Assert.Equal(ErrorCode.Invalid, sent.Error!.Code);
+            Assert.Contains("p-", sent.Error.Message, StringComparison.Ordinal);
         }
         finally
         {

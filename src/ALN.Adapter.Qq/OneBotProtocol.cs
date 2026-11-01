@@ -4,47 +4,65 @@ using System.Text.RegularExpressions;
 
 namespace ALN.Adapter.Qq;
 
-/// <summary>One inbound group message, after protocol-level cleaning and before Channel-level meaning.</summary>
-public sealed record OneBotInbound(long GroupId, string? MessageId, string SenderId, string? SenderName,
-    string Text, DateTimeOffset At);
+/// <summary>One inbound message, after protocol-level cleaning and before Channel-level meaning.</summary>
+public sealed record OneBotInbound(string ConversationId, string Platform, string? MessageId, string SenderId,
+    string? SenderName, string Text, DateTimeOffset At);
 
 /// <summary>The part of an action response that matters: did it work, and what id did the platform assign.</summary>
 public sealed record OneBotResponse(bool Ok, string? MessageId, long RetCode, string? Message);
+
+/// <summary>Who the listener is logged in as, learned from the platform rather than configured.</summary>
+public sealed record OneBotLogin(long UserId, string? Nickname);
 
 /// <summary>
 /// OneBot v11 wire formats, as pure functions. Everything here is testable without a socket, which is
 /// the point: the socket is thin, the mapping rules are where the bugs live (self echoes, CQ codes,
 /// conversation ids).
 ///
-/// Scope is deliberately narrow: group text in, group text out. Private chats, images, mentions on
-/// the way out are not implemented; unsupported segments become visible placeholders rather than
-/// silently disappearing, so a model reading the text knows something is there that it cannot see.
+/// Scope: group and private text. Images, mentions on the way out and other rich segments are not
+/// implemented; unsupported segments become visible placeholders rather than silently disappearing,
+/// so a model reading the text knows something is there that it cannot see.
 /// </summary>
 public static partial class OneBotProtocol
 {
     public const string PlatformId = "qq";
+    public const string GroupPlatform = "group";
+    public const string PrivatePlatform = "private";
 
     /// <summary>
     /// Conversation ids must fit the Channel rule ([A-Za-z0-9_-], ≤128 chars), and QQ group numbers are
-    /// pure digits that can equal a QQ number. The prefix keeps the two namespaces apart and keeps a
-    /// future private-chat conversation from colliding with a group of the same number.
+    /// pure digits that can equal a QQ number. The prefix keeps the two namespaces apart — a group and
+    /// a person with the same number are different conversations.
     /// </summary>
     public const string GroupPrefix = "g-";
+    public const string PrivatePrefix = "p-";
 
-    public static string GroupConversation(long groupId) => $"{GroupPrefix}{groupId.ToString(CultureInfo.InvariantCulture)}";
+    public static string GroupConversation(long groupId) => $"{GroupPrefix}{Number(groupId)}";
+    public static string PrivateConversation(long userId) => $"{PrivatePrefix}{Number(userId)}";
 
-    public static bool TryReadGroupConversation(string? conversationId, out long groupId)
+    /// <summary>Parses a conversation id back into (platform, id). Anything else is not ours to send to.</summary>
+    public static bool TryReadConversation(string? conversationId, out long id, out string platform)
     {
-        groupId = 0;
-        if (conversationId is null || !conversationId.StartsWith(GroupPrefix, StringComparison.Ordinal)) return false;
-        var digits = conversationId.AsSpan(GroupPrefix.Length);
-        return digits.Length > 0 && long.TryParse(digits, NumberStyles.None, CultureInfo.InvariantCulture, out groupId);
+        id = 0;
+        platform = string.Empty;
+        if (conversationId is null) return false;
+        if (conversationId.StartsWith(GroupPrefix, StringComparison.Ordinal))
+        {
+            platform = GroupPlatform;
+            return TryParseNumber(conversationId.AsSpan(GroupPrefix.Length), out id);
+        }
+        if (conversationId.StartsWith(PrivatePrefix, StringComparison.Ordinal))
+        {
+            platform = PrivatePlatform;
+            return TryParseNumber(conversationId.AsSpan(PrivatePrefix.Length), out id);
+        }
+        return false;
     }
 
     /// <summary>
-    /// Reads one pushed event, or returns null when the event must be ignored: a meta event, a private
-    /// message (not in scope), the bot's own message echoed back, or a message with nothing in it.
-    /// Ignoring is normal here, so it is not an error path.
+    /// Reads one pushed message, or returns null when the event must be ignored: a meta event, a notice,
+    /// a message from a group the bot is not in the scope of, the bot's own message echoed back, or a
+    /// message with nothing in it. Ignoring is normal here, so it is not an error path.
     /// </summary>
     public static OneBotInbound? ReadMessage(JsonElement root, long? selfId)
     {
@@ -55,15 +73,25 @@ public static partial class OneBotProtocol
         // look like user input and start a self-feeding loop.
         if (postType == "message_sent") return null;
         if (postType != "message") return null;
-        if (!TryString(root, "message_type", out var messageType) || messageType != "group") return null;
-        if (!TryLong(root, "group_id", out var groupId)) return null;
+        if (!TryString(root, "message_type", out var messageType)) return null;
+
+        // Conversation id encodes the platform object, so a group and a person with the same number are
+        // different conversations rather than the same one.
+        var conversationId = messageType switch
+        {
+            "group" when TryLong(root, "group_id", out var groupId) => GroupConversation(groupId),
+            "private" when ReadSenderId(root) is { } privateUser => PrivateConversation(privateUser),
+            // "guild" and anything newer: not in scope, and guessing would be worse than ignoring.
+            _ => null
+        };
+        if (conversationId is null) return null;
 
         var senderId = ReadSenderId(root);
         if (senderId is null) return null;
         if (selfId is { } me && senderId == me) return null;
 
         var messageId = TryLong(root, "message_id", out var numericId)
-            ? numericId.ToString(CultureInfo.InvariantCulture)
+            ? Number(numericId)
             : TryString(root, "message_id", out var textId) ? textId : null;
 
         var text = ReadText(root);
@@ -73,7 +101,7 @@ public static partial class OneBotProtocol
             ? DateTimeOffset.FromUnixTimeSeconds(unix)
             : DateTimeOffset.UtcNow;
 
-        return new OneBotInbound(groupId, messageId, senderId.Value.ToString(CultureInfo.InvariantCulture),
+        return new OneBotInbound(conversationId, messageType, messageId, Number(senderId.Value),
             ReadSenderName(root), text, at);
     }
 
@@ -82,21 +110,32 @@ public static partial class OneBotProtocol
         TryLong(root, "self_id", out var selfId) ? selfId : null;
 
     /// <summary>
-    /// <c>send_group_msg</c>. The text goes as a text segment rather than a CQ-code string so that a
-    /// message containing "[CQ:at,qq=all]" is sent as literal text and not as an instruction.
+    /// <c>send_group_msg</c> or <c>send_private_msg</c>, chosen by the conversation id. The text goes as a
+    /// text segment rather than a CQ-code string so that a message containing "[CQ:at,qq=all]" is sent as
+    /// literal text and not as an instruction.
     /// </summary>
-    public static string BuildGroupSend(string echo, long groupId, string text, string? replyTo = null) =>
-        JsonSerializer.Serialize(new
-        {
-            action = "send_group_msg",
-            @params = new
-            {
-                group_id = groupId,
-                message = BuildOutboundSegments(text, replyTo),
-                auto_escape = false
-            },
-            echo
-        }, Json);
+    public static string BuildSend(string echo, long targetId, string platform, string text, string? replyTo = null)
+    {
+        var segments = BuildOutboundSegments(text, replyTo);
+        return platform == PrivatePlatform
+            ? JsonSerializer.Serialize(new { action = "send_private_msg", @params = new { user_id = targetId, message = segments, auto_escape = false }, echo }, Json)
+            : JsonSerializer.Serialize(new { action = "send_group_msg", @params = new { group_id = targetId, message = segments, auto_escape = false }, echo }, Json);
+    }
+
+    /// <summary><c>get_login_info</c>: how the account id is learned instead of typed in by hand.</summary>
+    public static string BuildLoginInfo(string echo) =>
+        JsonSerializer.Serialize(new { action = "get_login_info", @params = new { }, echo }, Json);
+
+    /// <summary>
+    /// Parses the <c>data</c> object of a <c>get_login_info</c> answer (the caller already unwrapped the
+    /// envelope, so this is the account object itself).
+    /// </summary>
+    public static OneBotLogin? ReadLoginInfo(JsonElement data)
+    {
+        if (data.ValueKind != JsonValueKind.Object) return null;
+        if (!TryLong(data, "user_id", out var userId) || userId <= 0) return null;
+        return new OneBotLogin(userId, TryString(data, "nickname", out var nickname) ? nickname : null);
+    }
 
     /// <summary>
     /// A reply segment needs a numeric id; anything else is dropped rather than sent as a broken
@@ -125,7 +164,7 @@ public static partial class OneBotProtocol
         {
             messageId = id.ValueKind switch
             {
-                JsonValueKind.Number => id.TryGetInt64(out var numeric) ? numeric.ToString(CultureInfo.InvariantCulture) : id.GetRawText(),
+                JsonValueKind.Number => id.TryGetInt64(out var numeric) ? Number(numeric) : id.GetRawText(),
                 JsonValueKind.String => id.GetString(),
                 _ => null
             };
@@ -139,6 +178,14 @@ public static partial class OneBotProtocol
     // ---- internals ----
 
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+
+    private static string Number(long value) => value.ToString(CultureInfo.InvariantCulture);
+
+    private static bool TryParseNumber(ReadOnlySpan<char> digits, out long value)
+    {
+        value = 0;
+        return digits.Length > 0 && long.TryParse(digits, NumberStyles.None, CultureInfo.InvariantCulture, out value);
+    }
 
     private static long? ReadSenderId(JsonElement root)
     {

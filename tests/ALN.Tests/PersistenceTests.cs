@@ -8,7 +8,7 @@ public sealed class PersistenceTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-persist-" + Guid.NewGuid().ToString("N"));
     private static readonly Address Adapter = new("adapter", "file", "file-1");
-    private static readonly Address Channel = new("channel", "logical", "chat-1");
+    private static readonly Address Channel = new("channel", "conversation", "chat-1");
 
     public void Dispose()
     {
@@ -30,7 +30,7 @@ public sealed class PersistenceTests : IDisposable
         Assert.Equal(["first", "second"], adapterMessages.Value!.Select(m => m.Text));
         Assert.Equal(["first"], channelMessages.Value!.Select(m => m.Text));
         Assert.True(File.Exists(Path.Combine(_root, "messages", "file", "file-1", "20260102.jsonl")));
-        Assert.True(File.Exists(Path.Combine(_root, "messages", "logical", "chat-1", "20260102.jsonl")));
+        Assert.True(File.Exists(Path.Combine(_root, "messages", "conversation", "chat-1", "20260102.jsonl")));
     }
 
     [Fact]
@@ -167,7 +167,7 @@ public sealed class PersistenceTests : IDisposable
         var events = new EventQueue(8);
         var channels = new ALN.Channel.ChannelManager(new AdapterManager(types, bindings), events, bindings);
         var adapter = new Address("adapter", "file", "later-1");
-        var spec = new ChannelSpec(new("channel", "logical", "chat-1"), "chat-1", [new ChannelBinding(adapter, "chat-1")]);
+        var spec = new ChannelSpec(new("channel", "conversation", "chat-1"), "chat-1", [new ChannelBinding(adapter, "chat-1")]);
 
         // Creation must not depend on startup order: the Adapter is simply not there yet.
         var created = await channels.CreateAsync(spec, default);
@@ -189,7 +189,7 @@ public sealed class PersistenceTests : IDisposable
     {
         Assert.True(Address.TryParse("adapter.file#file-1", out var parsed));
         Assert.Equal(Adapter, parsed);
-        Assert.True(Address.TryParse("channel.logical#chat-1", out var channel));
+        Assert.True(Address.TryParse("channel.conversation#chat-1", out var channel));
         Assert.Equal(Channel, channel);
         Assert.False(Address.TryParse("adapter.#x", out _));
         Assert.False(Address.TryParse("adapter.file#", out _));
