@@ -5,6 +5,7 @@
     <ProjectReference Include="..\ALN.Runtime\ALN.Runtime.csproj" />
     <ProjectReference Include="..\ALN.Api\ALN.Api.csproj" />
     <ProjectReference Include="..\ALN.Adapter.File\ALN.Adapter.File.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\ALN.Adapter.Qq\ALN.Adapter.Qq.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\ALN.BundledModules\ALN.BundledModules.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\ALN.Model.OpenAIChat\ALN.Model.OpenAIChat.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
@@ -21,6 +22,9 @@
     <MakeDir Directories="$(OutDir)modules/adapter.file" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)/../ALN.Adapter.File/bin/$(Configuration)/net10.0/ALN.Adapter.File.dll;$(MSBuildProjectDirectory)/../ALN.Adapter.File/bin/$(Configuration)/net10.0/ALN.Adapter.File.deps.json;$(MSBuildProjectDirectory)/../ALN.Adapter.File/module.json"
           DestinationFolder="$(OutDir)modules/adapter.file" />
+    <MakeDir Directories="$(OutDir)modules/adapter.qq" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/../ALN.Adapter.Qq/bin/$(Configuration)/net10.0/ALN.Adapter.Qq.dll;$(MSBuildProjectDirectory)/../ALN.Adapter.Qq/bin/$(Configuration)/net10.0/ALN.Adapter.Qq.deps.json;$(MSBuildProjectDirectory)/../ALN.Adapter.Qq/module.json"
+          DestinationFolder="$(OutDir)modules/adapter.qq" />
     <MakeDir Directories="$(OutDir)modules/bundled.runtime" />
     <ItemGroup>
       <BundledModuleFiles Include="$(MSBuildProjectDirectory)/../ALN.BundledModules/bin/$(Configuration)/net10.0/*.dll" />

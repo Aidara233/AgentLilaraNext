@@ -103,6 +103,15 @@ if (!adapterPackage.Ok || adapterPackage.Value is null)
     Console.Error.WriteLine(adapterPackage.Error?.Message ?? "FileAdapter module load failed.");
     return 1;
 }
+// The QQ adapter is optional in the sense that no spec may use it; a load failure is still fatal,
+// because a package that fails to load but leaves specs referring to it would start up half-blind.
+var qqPackage = await modulePackages.LoadAsync(
+    Path.Combine(AppContext.BaseDirectory, "modules", "adapter.qq"), ModulePackageKind.Plugin, CancellationToken.None);
+if (!qqPackage.Ok || qqPackage.Value is null)
+{
+    Console.Error.WriteLine(qqPackage.Error?.Message ?? "QQ adapter module load failed.");
+    return 1;
+}
 
 var scriptCatalog = moduleServices.GetService<IGraphScriptCatalog>("graph.script-catalog");
 if (!scriptCatalog.Ok || scriptCatalog.Value is null)

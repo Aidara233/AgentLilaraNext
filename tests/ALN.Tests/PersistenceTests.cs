@@ -51,6 +51,60 @@ public sealed class PersistenceTests : IDisposable
     }
 
     [Fact]
+    public async Task Adapter_settings_round_trip_and_stay_out_of_the_plain_spec_file()
+    {
+        var store = new FileAdapterSpecStore(Path.Combine(_root, "adapters"));
+        var settings = new Dictionary<string, string>
+        {
+            ["endpoint"] = "ws://127.0.0.1:3001",
+            ["accessToken"] = "onebot-token"
+        };
+        var spec = new AdapterSpec(new Address("adapter", "qq", "qq-1"),
+            new AdapterDescriptor("qq", "123456", AdapterDirection.Both), settings);
+        Assert.True((await store.SaveAsync(spec, default)).Ok);
+
+        var loaded = Assert.Single((await store.LoadAllAsync(default)).Value!);
+        Assert.Equal("ws://127.0.0.1:3001", loaded.Settings!["endpoint"]);
+        Assert.Equal("onebot-token", loaded.Settings["accessToken"]);
+        // Hand-editable, like every other spec: the whole point is that a human can write this file.
+        var text = await File.ReadAllTextAsync(Path.Combine(_root, "adapters", "qq-1.json"));
+        Assert.Contains("\"endpoint\": \"ws://127.0.0.1:3001\"", text);
+    }
+
+    [Fact]
+    public async Task A_spec_written_before_settings_existed_still_loads()
+    {
+        var root = Path.Combine(_root, "adapters");
+        Directory.CreateDirectory(root);
+        // Exactly what the previous version wrote: no settings key at all.
+        await File.WriteAllTextAsync(Path.Combine(root, "file-1.json"),
+            """
+            {
+              "address": "adapter.file#file-1",
+              "platformId": "file",
+              "accountId": "file-1",
+              "direction": "Both"
+            }
+            """);
+
+        var store = new FileAdapterSpecStore(root);
+        var loaded = Assert.Single((await store.LoadAllAsync(default)).Value!);
+        Assert.Equal("adapter.file#file-1", loaded.Address.ToString());
+        Assert.Null(loaded.Settings);
+    }
+
+    [Fact]
+    public async Task An_adapter_without_settings_does_not_grow_an_empty_settings_object()
+    {
+        var store = new FileAdapterSpecStore(Path.Combine(_root, "adapters"));
+        Assert.True((await store.SaveAsync(new AdapterSpec(Adapter,
+            new AdapterDescriptor("file", "file-1", AdapterDirection.Both)), default)).Ok);
+
+        var text = await File.ReadAllTextAsync(Path.Combine(_root, "adapters", "file-1.json"));
+        Assert.DoesNotContain("settings", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Channel_specs_survive_a_round_trip_including_bindings()
     {
         var store = new FileChannelSpecStore(Path.Combine(_root, "channels"));

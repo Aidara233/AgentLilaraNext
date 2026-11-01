@@ -3,54 +3,6 @@ using ALN.Contracts;
 
 namespace ALN.Adapter.File;
 
-public abstract class AdapterBase : IChatAdapter
-{
-    private int _state = (int)AdapterState.Created;
-
-    protected AdapterBase(Address address, AdapterDescriptor descriptor)
-    {
-        Address = address;
-        Descriptor = descriptor;
-    }
-
-    public Address Address { get; }
-    public AdapterDescriptor Descriptor { get; }
-    public AdapterState State => (AdapterState)Volatile.Read(ref _state);
-
-    public virtual ValueTask<Result> StartAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        while (true)
-        {
-            var state = State;
-            if (state == AdapterState.Running)
-                return ValueTask.FromResult(Result.Success());
-            if (state is not (AdapterState.Created or AdapterState.Stopped))
-                return ValueTask.FromResult(Result.Failure(new(ErrorCode.Conflict, $"Adapter cannot start from {state}.")));
-            if (Interlocked.CompareExchange(ref _state, (int)AdapterState.Running, (int)state) == (int)state)
-                return ValueTask.FromResult(Result.Success());
-        }
-    }
-
-    public virtual ValueTask<Result> StopAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        while (true)
-        {
-            var state = State;
-            if (state == AdapterState.Stopped)
-                return ValueTask.FromResult(Result.Success());
-            if (state != AdapterState.Running && state != AdapterState.Created)
-                return ValueTask.FromResult(Result.Failure(new(ErrorCode.Conflict, $"Adapter cannot stop from {state}.")));
-            if (Interlocked.CompareExchange(ref _state, (int)AdapterState.Stopped, (int)state) == (int)state)
-                return ValueTask.FromResult(Result.Success());
-        }
-    }
-
-    protected bool IsRunning => State == AdapterState.Running;
-    public abstract ValueTask<Result<SendResult>> SendAsync(OutboundMessage message, CancellationToken cancellationToken);
-}
-
 public sealed class FileAdapter : AdapterBase, IPollingAdapter
 {
     private readonly IFileMailbox _mailbox;

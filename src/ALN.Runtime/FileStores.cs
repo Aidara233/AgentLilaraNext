@@ -78,12 +78,16 @@ public sealed class FileMessageStore(string root) : IMessageStore
 /// <summary>Adapter specs: one JSON file per instance under <c>&lt;root&gt;</c>.</summary>
 public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        WriteIndented = true,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+    };
 
     public ValueTask<Result> SaveAsync(AdapterSpec spec, CancellationToken cancellationToken) =>
         SpecFile.WriteAsync(root, spec.Address, new AdapterSpecDocument(
             spec.Address.ToString(), spec.Descriptor.PlatformId, spec.Descriptor.AccountId,
-            spec.Descriptor.Direction.ToString()), JsonOptions, cancellationToken);
+            spec.Descriptor.Direction.ToString(), spec.Settings), JsonOptions, cancellationToken);
 
     public ValueTask<Result> DeleteAsync(Address address, CancellationToken cancellationToken) =>
         SpecFile.DeleteAsync(root, address, cancellationToken);
@@ -99,12 +103,18 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
                 return Result<IReadOnlyList<AdapterSpec>>.Failure(new(ErrorCode.Invalid, $"Stored Adapter address is invalid: {document.Address}"));
             if (!Enum.TryParse<AdapterDirection>(document.Direction, ignoreCase: true, out var direction))
                 return Result<IReadOnlyList<AdapterSpec>>.Failure(new(ErrorCode.Invalid, $"Stored Adapter direction is invalid: {document.Direction}"));
-            specs.Add(new AdapterSpec(address, new AdapterDescriptor(document.PlatformId, document.AccountId, direction)));
+            specs.Add(new AdapterSpec(address, new AdapterDescriptor(document.PlatformId, document.AccountId, direction),
+                document.Settings));
         }
         return Result<IReadOnlyList<AdapterSpec>>.Success(specs);
     }
 
-    public sealed record AdapterSpecDocument(string Address, string PlatformId, string AccountId, string Direction);
+    /// <summary>
+    /// <c>Settings</c> is written only when present, so a spec that doesn't need any stays a three-line
+    /// file and existing files load unchanged.
+    /// </summary>
+    public sealed record AdapterSpecDocument(string Address, string PlatformId, string AccountId, string Direction,
+        IReadOnlyDictionary<string, string>? Settings = null);
 }
 
 /// <summary>Channel specs: one JSON file per channel under <c>&lt;root&gt;</c>.</summary>

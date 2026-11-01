@@ -1,0 +1,13 @@
+{
+  "id": "channel.chat",
+  "version": 1,
+  "targetType": "channel",
+  "mount": "default",
+  "events": ["channel.message.accepted"],
+  "entryPoint": "onEvent",
+  "capabilities": ["session.run", "channel.bound-send"],
+  "trustDomain": "trusted",
+  "maxStatements": 5000,
+  "timeoutMilliseconds": 60000,
+  "memoryLimitBytes": 33554432
+}

@@ -53,7 +53,15 @@ public sealed record AdapterEnvelope(Address Adapter, string PlatformId, string 
 public sealed record OutboundMessage(string PlatformConversationId, string Text, string? ReplyTo = null);
 public sealed record SendResult(bool Sent, string AttemptId, string? Detail = null);
 public sealed record AdapterInfo(Address Address, AdapterDescriptor Descriptor, AdapterState State);
-public sealed record AdapterSpec(Address Address, AdapterDescriptor Descriptor);
+
+/// <summary>
+/// A stored Adapter instance. <paramref name="Settings"/> is opaque to the core: an endpoint, a token,
+/// a polling interval — the core neither reads nor validates the keys, it only hands the dictionary to
+/// the factory. Keeping it here rather than in a side file means one persisted unit per instance, and
+/// that the value never leaves the process through an action (the DTOs don't carry it).
+/// </summary>
+public sealed record AdapterSpec(Address Address, AdapterDescriptor Descriptor,
+    IReadOnlyDictionary<string, string>? Settings = null);
 
 public sealed record RoutedEvent(string Name, Address Source, Guid EventId, string PayloadJson, Address? Target = null)
 {
@@ -84,6 +92,18 @@ public interface IChatAdapter : IInboundAdapter, IOutboundAdapter
     AdapterState State { get; }
     ValueTask<Result> StartAsync(CancellationToken cancellationToken);
     ValueTask<Result> StopAsync(CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// Optional: an Adapter that maintains a connection can say whether it is up right now. <see cref="AdapterState"/>
+/// only says whether somebody asked it to run — a socket that keeps dropping is still "Running", and a
+/// list that shows only that is a list that lies during exactly the incident you are debugging.
+/// </summary>
+public interface IAdapterHealth
+{
+    bool Connected { get; }
+    /// <summary>Human readable last condition: last error, endpoint, next retry. Never contains secrets.</summary>
+    string? HealthDetail { get; }
 }
 public interface IAdapterFactory
 {

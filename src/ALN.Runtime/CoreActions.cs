@@ -48,7 +48,11 @@ public static class CoreActions
                         platform = a.Descriptor.PlatformId,
                         account = a.Descriptor.AccountId,
                         direction = a.Descriptor.Direction.ToString(),
-                        state = a.State.ToString()
+                        state = a.State.ToString(),
+                        // Whether the connection behind the state is actually up. Null when the adapter
+                        // type has no opinion, so "false" never means "unknown".
+                        connected = Health(a.Address)?.Connected,
+                        detail = Health(a.Address)?.HealthDetail
                     }))))),
 
             (new(AdaptersStart, "Start one adapter.", Capabilities.AdaptersControl, true), StartAdapter),
@@ -133,6 +137,14 @@ public static class CoreActions
             return stopped.Ok
                 ? Result<JsonElement>.Success(ToJson(new { address = target.Value.ToString(), state = "stopped" }))
                 : Result<JsonElement>.Failure(stopped.Error!);
+        }
+
+        // Optional per-adapter health: the state says whether somebody asked it to run, this says
+        // whether it is actually connected right now.
+        IAdapterHealth? Health(Address address)
+        {
+            var found = adapters.Get(address);
+            return found.Ok ? found.Value as IAdapterHealth : null;
         }
 
         ValueTask<Result<JsonElement>> RecentSignals(JsonElement arguments, CancellationToken ct)

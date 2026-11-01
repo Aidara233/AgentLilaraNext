@@ -1,0 +1,21 @@
+{
+  "id": "aln.adapter.qq",
+  "version": "1.0.0",
+  "entryAssembly": "ALN.Adapter.Qq.dll",
+  "entryType": "ALN.Adapter.Qq.QqAdapterModule",
+  "provides": [
+    {
+      "typeId": "adapter.qq",
+      "parentTypeId": "adapter",
+      "isAbstract": false
+    }
+  ],
+  "dependencies": [
+    {
+      "id": "aln.bundled.runtime",
+      "versionRange": "*",
+      "optional": false
+    }
+  ],
+  "reloadPolicy": "replace"
+}

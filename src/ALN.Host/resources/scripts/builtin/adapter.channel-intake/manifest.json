@@ -1,11 +1,11 @@
 {
   "id": "adapter.channel-intake",
-  "version": 1,
+  "version": 2,
   "targetType": "adapter",
   "mount": "default",
   "events": ["adapter.envelope", "clock.pulse"],
   "entryPoint": "onEvent",
-  "capabilities": ["channel.route", "self.adapter.poll"],
+  "capabilities": ["channel.accept", "self.adapter.poll"],
   "trustDomain": "builtin",
   "maxStatements": 10000,
   "timeoutMilliseconds": 1000,

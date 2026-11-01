@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/ALN.Adapter.File/ALN.Adapter.File.csproj" />
+    <Project Path="src/ALN.Adapter.Qq/ALN.Adapter.Qq.csproj" />
     <Project Path="src/ALN.Api/ALN.Api.csproj" />
     <Project Path="src/ALN.BundledModules/ALN.BundledModules.csproj" />
     <Project Path="src/ALN.Channel/ALN.Channel.csproj" />
@@ -13,6 +14,9 @@
     <Project Path="src/ALN.Runtime/ALN.Runtime.csproj" />
     <Project Path="src/ALN.Scripting.Jint/ALN.Scripting.Jint.csproj" />
     <Project Path="src/ALN.WebUi/ALN.WebUi.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/FakeOneBot/FakeOneBot.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/ALN.Tests/ALN.Tests.csproj" />
