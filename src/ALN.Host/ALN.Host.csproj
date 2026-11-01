@@ -3,6 +3,7 @@
     <ProjectReference Include="..\ALN.Contracts\ALN.Contracts.csproj" />
     <ProjectReference Include="..\ALN.Graph.Contracts\ALN.Graph.Contracts.csproj" />
     <ProjectReference Include="..\ALN.Runtime\ALN.Runtime.csproj" />
+    <ProjectReference Include="..\ALN.Api\ALN.Api.csproj" />
     <ProjectReference Include="..\ALN.Adapter.File\ALN.Adapter.File.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\ALN.BundledModules\ALN.BundledModules.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\ALN.Model.OpenAIChat\ALN.Model.OpenAIChat.csproj" ReferenceOutputAssembly="false" />

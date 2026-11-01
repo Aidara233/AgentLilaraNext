@@ -23,5 +23,6 @@
     <ProjectReference Include="..\..\src\ALN.Scripting.Jint\ALN.Scripting.Jint.csproj" />
     <ProjectReference Include="..\..\src\ALN.Adapter.File\ALN.Adapter.File.csproj" />
     <ProjectReference Include="..\..\src\ALN.Clock\ALN.Clock.csproj" />
+    <ProjectReference Include="..\..\src\ALN.Api\ALN.Api.csproj" />
   </ItemGroup>
 </Project>

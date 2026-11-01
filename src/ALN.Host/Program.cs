@@ -179,6 +179,30 @@ if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
     return 1;
 }
 
+// The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
+// WebUI itself — it exposes actions, and a separate project consumes them.
+var controlPlane = new ControlPlane(auditStream.Sink, signalLog);
+var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog);
+if (!actionsRegistered.Ok)
+{
+    Console.Error.WriteLine(actionsRegistered.Error?.Message ?? "Action registration failed.");
+    await lifecycle.StopAsync(CancellationToken.None);
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
+ALN.Api.ApiInstance? api = null;
+var apiSettings = ALN.Api.ApiSettings.Load(data.Root);
+if (apiSettings is not null)
+{
+    api = await ALN.Api.ApiHost.StartAsync(apiSettings, controlPlane, shutdown.Token);
+    Console.WriteLine($"API listening on {string.Join(", ", api.Urls)}; {controlPlane.Catalog.Count} actions; authentication required.");
+}
+else
+{
+    Console.WriteLine("API disabled: no api/server.json.");
+}
+
 Console.WriteLine($"ALN is running. Data: {data.Root}; inbox: {Path.Combine(mailboxRoot, "inbox")}; create conversation subdirectories before starting. Ctrl+C to stop.");
 try
 {
@@ -187,6 +211,7 @@ try
 catch (OperationCanceledException) when (shutdown.IsCancellationRequested) { }
 finally
 {
+    if (api is not null) await api.DisposeAsync();
     await lifecycle.StopAsync(CancellationToken.None);
     shutdown.Cancel();
     try { await clockTask; } catch (OperationCanceledException) { }
