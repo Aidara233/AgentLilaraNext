@@ -30,6 +30,10 @@ var adapterFactories = new AdapterFactoryRegistry();
 var adapters = new AdapterManager(adapterTypes, bindings, adapterFactories);
 var modelManager = new ModelManager();
 var roundContextContributors = new RoundContextContributorRegistry();
+var timeContributor = roundContextContributors.Register(new TimeContextContributor());
+if (!timeContributor.Ok) { Console.Error.WriteLine(timeContributor.Error?.Message); return 1; }
+var channelContributor = roundContextContributors.Register(new ChannelInfoContributor());
+if (!channelContributor.Ok) { Console.Error.WriteLine(channelContributor.Error?.Message); return 1; }
 var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, roundContextContributors, signalLog);
 var reloadState = new ModuleReloadStateStore();
 var hostServices = new HostServiceProvider(
@@ -138,6 +142,18 @@ var started = await adapters.StartAsync(adapterSpec.Address, CancellationToken.N
 if (!started.Ok)
 {
     Console.Error.WriteLine(started.Error?.Message ?? "Adapter start failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    try { await pumpTask; } catch (OperationCanceledException) { }
+    try { await clockTask; } catch (OperationCanceledException) { }
+    return 1;
+}
+
+// The FileAdapter is polling-only: without a clock subscription nothing ever reads the inbox.
+var pollSubscription = await clock.RegisterAsync(adapterSpec.Address, TimeSpan.FromSeconds(1), CancellationToken.None);
+if (!pollSubscription.Ok)
+{
+    Console.Error.WriteLine(pollSubscription.Error?.Message ?? "Adapter polling subscription failed.");
     shutdown.Cancel();
     queue.Complete();
     try { await pumpTask; } catch (OperationCanceledException) { }

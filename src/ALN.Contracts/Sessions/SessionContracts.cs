@@ -51,10 +51,18 @@ public sealed record SessionChannelMessage(
     string Content,
     DateTimeOffset At);
 
-/// <summary>Durable channel messages accepted for one Session activation.</summary>
-public sealed record SessionTurnInput(IReadOnlyList<SessionChannelMessage> Messages);
+/// <summary>Durable channel messages accepted for one Session activation, plus the Channel they came from.</summary>
+public sealed record SessionTurnInput(
+    IReadOnlyList<SessionChannelMessage> Messages,
+    Address? Channel = null,
+    ChannelBinding? Binding = null);
 
-public sealed record RoundContextRequest(string SessionId, Guid ActivationId, int StepNumber);
+public sealed record RoundContextRequest(
+    string SessionId,
+    Guid ActivationId,
+    int StepNumber,
+    Address? Channel = null,
+    ChannelBinding? Binding = null);
 
 /// <summary>Ephemeral context to render into this model request; it is never persisted in Session history.</summary>
 public sealed record RoundContextContribution(string Id, string Section, string Content, int Order = 0);

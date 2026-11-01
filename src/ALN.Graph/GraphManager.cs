@@ -320,7 +320,7 @@ public sealed class GraphManager : IGraphRuntime
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
                 mount.Target, ScriptCapabilities.SessionRun, "allowed", sessionId), cancellationToken).ConfigureAwait(false);
             var input = new SessionTurnInput([new SessionChannelMessage(channelMessage.MessageId.ToString("N"), "user",
-                channelMessage.Sender, channelMessage.Text, channelMessage.At)]);
+                channelMessage.Sender, channelMessage.Text, channelMessage.At)], channelMessage.Channel, channelMessage.Binding);
             var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, input, this, cancellationToken).ConfigureAwait(false);
             if (!result.Ok || result.Value is null)
             {
@@ -543,7 +543,10 @@ public sealed class GraphManager : IGraphRuntime
                 Mechanism = "call",
                 Outcome = outcome,
                 DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds,
-                Level = level,
+                // Heartbeat polling fires every second; it is visible at Debug but must not flood the default graph.
+                Level = capability == ScriptCapabilities.SelfAdapterPoll
+                    ? (level == SignalLevel.Info ? SignalLevel.Debug : level)
+                    : level,
                 Detail = detail is null ? null : new Dictionary<string, string> { ["message"] = detail }
             });
         }

@@ -315,6 +315,7 @@ public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationTo
         await foreach (var routedEvent in queue.ReadAllAsync(cancellationToken).ConfigureAwait(false))
         {
             var now = DateTimeOffset.UtcNow;
+            var eventLevel = routedEvent.Name == EventNames.ClockPulse ? SignalLevel.Debug : SignalLevel.Info;
             var intakeId = Guid.NewGuid();
             signalLog.Write(new()
             {
@@ -329,7 +330,7 @@ public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationTo
                 Mechanism = "dequeue",
                 Outcome = "ok",
                 DurationMs = routedEvent.EnqueuedAt is { } enqueued ? (now - enqueued).TotalMilliseconds : 0,
-                Level = SignalLevel.Debug
+                Level = eventLevel
             });
             Result dispatched;
             using (SignalScope.Enter(intakeId, routedEvent.EventId))

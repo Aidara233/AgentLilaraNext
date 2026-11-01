@@ -171,7 +171,8 @@ public sealed class SessionManager : ISessionManager
             };
             messages.AddRange(history.Where(entry => entry.ChannelMessages is null).Select(ToModelMessage));
             var collected = await CollectRoundContextAsync(
-                new RoundContextRequest(sessionId, activationId, state.StepNumber + 1), cancellationToken).ConfigureAwait(false);
+                new RoundContextRequest(sessionId, activationId, state.StepNumber + 1, input.Channel, input.Binding),
+                cancellationToken).ConfigureAwait(false);
             if (!collected.Ok || collected.Value is null) return Result<SessionTurnResult>.Failure(collected.Error!);
 
             var persistedTimeline = await PersistTimelineContributionsAsync(directory, activation, state, history,
@@ -244,7 +245,7 @@ public sealed class SessionManager : ISessionManager
                     Mechanism = "model.request",
                     Outcome = modelError is null ? "ok" : "failed",
                     DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(modelStartedAt).TotalMilliseconds,
-                    Level = modelError is null ? SignalLevel.Debug : SignalLevel.Warn,
+                    Level = modelError is null ? SignalLevel.Info : SignalLevel.Warn,
                     Detail = new Dictionary<string, string>
                     {
                         ["step"] = (state.StepNumber + 1).ToString(),
