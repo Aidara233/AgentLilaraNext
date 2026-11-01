@@ -21,7 +21,7 @@ var data = DataDirectory.Open(args[dataArg + 1]);
 var mailboxRoot = Path.Combine(data.Root, "adapters", "file-1");
 var mailbox = new FileMailbox(mailboxRoot);
 await using var auditStream = new AsyncDisposeAdapter(new JsonlAuditSink(Path.Combine(data.Root, "audit", "capabilities.jsonl")));
-var journal = new ExecutionJournal();
+await using var signalLog = SignalLog.Open(Path.Combine(data.Root, "logs"));
 var queue = new EventQueue(capacity: 256);
 var adapterTypes = new AdapterTypeCatalog();
 var bindings = new InstanceBindingsProxy();
@@ -29,7 +29,7 @@ var adapterFactories = new AdapterFactoryRegistry();
 var adapters = new AdapterManager(adapterTypes, bindings, adapterFactories);
 var modelManager = new ModelManager();
 var roundContextContributors = new RoundContextContributorRegistry();
-var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, roundContextContributors);
+var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, roundContextContributors, signalLog);
 var reloadState = new ModuleReloadStateStore();
 var hostServices = new HostServiceProvider(
     (typeof(IAdapterManager), adapters),
@@ -42,7 +42,7 @@ var hostServices = new HostServiceProvider(
     (typeof(IModuleTypeCatalog), adapterTypes),
     (typeof(IModuleTypeRegistry), adapterTypes),
     (typeof(IInstanceBindings), bindings),
-    (typeof(IExecutionJournal), journal),
+    (typeof(ISignalLog), signalLog),
     (typeof(IAuditSink), auditStream.Sink),
     (typeof(IModuleReloadStateStore), reloadState),
     (typeof(ModuleHostPaths), new ModuleHostPaths(AppContext.BaseDirectory, data.Root)));
@@ -129,7 +129,7 @@ if (!startupChannels.Ok)
 using var shutdown = new CancellationTokenSource();
 using var pumpStop = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; shutdown.Cancel(); };
-var pump = new EventPump(queue, graph.DispatchAsync);
+var pump = new EventPump(queue, graph.DispatchAsync, signalLog);
 var pumpTask = pump.RunAsync(pumpStop.Token);
 var clockTask = clock.RunAsync(shutdown.Token);
 var started = await adapters.StartAsync(adapterSpec.Address, CancellationToken.None);

@@ -4,19 +4,6 @@ using ALN.Contracts;
 
 namespace ALN.Runtime;
 
-public sealed class ExecutionJournal : IExecutionJournal
-{
-    private readonly ConcurrentQueue<ExecutionRecord> _records = new();
-    private readonly int _capacity;
-    public ExecutionJournal(int capacity = 10_000) => _capacity = Math.Max(1, capacity);
-    public void Record(ExecutionRecord record)
-    {
-        _records.Enqueue(record);
-        while (_records.Count > _capacity) _records.TryDequeue(out _);
-    }
-    public IReadOnlyList<ExecutionRecord> Snapshot() => _records.ToArray();
-}
-
 public sealed record AdapterTypeDefinition(string Id, string? ParentId, bool IsAbstract);
 
 public sealed class AdapterTypeCatalog : IModuleTypeRegistry
@@ -309,7 +296,9 @@ public sealed class EventQueue : IEventSink
         if (routedEvent is null || string.IsNullOrWhiteSpace(routedEvent.Name) || !routedEvent.Source.IsInstance ||
             string.IsNullOrWhiteSpace(routedEvent.PayloadJson) || routedEvent.Target is { IsInstance: false })
             return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, "Invalid routed event.")));
-        if (!_queue.Writer.TryWrite(routedEvent))
+        if (!_queue.Writer.TryWrite(routedEvent.EnqueuedAt is null
+                ? routedEvent with { EnqueuedAt = DateTimeOffset.UtcNow }
+                : routedEvent))
             return ValueTask.FromResult(Result.Failure(new(ErrorCode.Unavailable, "Event queue is full or closed.", Retryable: true)));
         return ValueTask.FromResult(Result.Success());
     }
@@ -317,11 +306,42 @@ public sealed class EventQueue : IEventSink
     public void Complete() => _queue.Writer.TryComplete();
 }
 
-public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationToken, ValueTask<Result>> dispatch)
+public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationToken, ValueTask<Result>> dispatch, ISignalLog signalLog)
 {
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         await foreach (var routedEvent in queue.ReadAllAsync(cancellationToken).ConfigureAwait(false))
-            await dispatch(routedEvent, cancellationToken).ConfigureAwait(false);
+        {
+            var now = DateTimeOffset.UtcNow;
+            signalLog.Write(new()
+            {
+                Group = "queue",
+                Name = routedEvent.Name,
+                StepId = routedEvent.EventId,
+                From = routedEvent.Source.ToString(),
+                To = routedEvent.Target?.ToString() ?? "",
+                Mechanism = "dequeue",
+                Outcome = "ok",
+                DurationMs = routedEvent.EnqueuedAt is { } enqueued ? (now - enqueued).TotalMilliseconds : 0,
+                Level = SignalLevel.Debug
+            });
+            var dispatched = await dispatch(routedEvent, cancellationToken).ConfigureAwait(false);
+            if (!dispatched.Ok)
+                signalLog.Write(new()
+                {
+                    Group = "queue",
+                    Name = routedEvent.Name,
+                    StepId = routedEvent.EventId,
+                    From = routedEvent.Source.ToString(),
+                    Mechanism = "pump",
+                    Outcome = "failed",
+                    Level = SignalLevel.Warn,
+                    Detail = new Dictionary<string, string>
+                    {
+                        ["code"] = dispatched.Error?.Code.ToString() ?? "unknown",
+                        ["message"] = dispatched.Error?.Message ?? ""
+                    }
+                });
+        }
     }
 }

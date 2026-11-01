@@ -19,6 +19,7 @@ public sealed class GraphManager : IGraphRuntime
     private readonly IModuleTypeCatalog _types;
     private readonly IScriptExecutor _executor;
     private readonly IAuditSink _audit;
+    private readonly ISignalLog _signalLog;
     private readonly IModelManager? _models;
     private readonly ISessionManager? _sessions;
     private readonly Dictionary<string, ScriptPackage> _packages = new(StringComparer.Ordinal);
@@ -31,8 +32,8 @@ public sealed class GraphManager : IGraphRuntime
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     public GraphManager(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IModuleTypeCatalog types,
-        IScriptExecutor executor, IAuditSink audit, IModelManager? models = null, ISessionManager? sessions = null)
-    { _adapters = adapters; _channels = channels; _clock = clock; _types = types; _executor = executor; _audit = audit; _models = models; _sessions = sessions; }
+        IScriptExecutor executor, IAuditSink audit, ISignalLog signalLog, IModelManager? models = null, ISessionManager? sessions = null)
+    { _adapters = adapters; _channels = channels; _clock = clock; _types = types; _executor = executor; _audit = audit; _signalLog = signalLog; _models = models; _sessions = sessions; }
 
     public IReadOnlyList<MountedScript> Mounted
     { get { _gate.Wait(); try { return _mounted.ToArray(); } finally { _gate.Release(); } } }
@@ -199,8 +200,30 @@ public sealed class GraphManager : IGraphRuntime
             {
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 deadline.CancelAfter(TimeSpan.FromMilliseconds(mount.Package.Manifest.TimeoutMilliseconds));
-                var api = new ScriptApi(_adapters, _channels, _clock, _audit, _models, _sessions, mount, routedEvent, deadline.Token);
+                var api = new ScriptApi(_adapters, _channels, _clock, _audit, _signalLog, _models, _sessions, mount, routedEvent, deadline.Token);
+                // One record per traversed edge — this loop is the only place an edge is followed.
+                var edgeId = EdgeId(mount, routedEvent.Name);
+                var started = System.Diagnostics.Stopwatch.GetTimestamp();
                 var result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
+                _signalLog.Write(new()
+                {
+                    Group = "dispatch",
+                    Name = edgeId,
+                    StepId = routedEvent.EventId,
+                    From = routedEvent.Source.ToString(),
+                    To = mount.Target.ToString(),
+                    Mechanism = "emit",
+                    Outcome = result.Ok ? "ok" : deadline.IsCancellationRequested ? "timeout" : "failed",
+                    DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+                    Level = result.Ok ? SignalLevel.Info : SignalLevel.Warn,
+                    Detail = result.Ok ? null : new Dictionary<string, string>
+                    {
+                        ["event"] = routedEvent.Name,
+                        ["script"] = mount.Package.Manifest.Id,
+                        ["code"] = result.Error?.Code.ToString() ?? "unknown",
+                        ["message"] = result.Error?.Message ?? ""
+                    }
+                });
                 if (!result.Ok) firstFailure ??= result.Error;
             }
             return firstFailure is null ? Result.Success() : Result.Failure(firstFailure);
@@ -231,13 +254,18 @@ public sealed class GraphManager : IGraphRuntime
     }
 
     private bool IsCompatible(string targetType, Address target) => _types.IsAssignableTo(target.TypeId, targetType);
-    private bool TargetExists(Address target) => target.Module switch
+    /// <summary>Stable edge identity derived from assembly-time data, not runtime names.</summary>
+    internal static string EdgeId(MountedScript mount, string eventName) =>
+        $"{mount.Package.Manifest.Id}@{mount.Target}#{eventName}";    private bool TargetExists(Address target) => target.Module switch
     { "adapter" => _adapters.Get(target).Ok, "channel" => _channels.Get(target).Ok, _ => false };
 
     private sealed class ScriptApi(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IAuditSink audit,
-        IModelManager? models, ISessionManager? sessions, MountedScript mount, RoutedEvent current, CancellationToken ct) : IScriptApi
+        ISignalLog signalLog, IModelManager? models, ISessionManager? sessions, MountedScript mount, RoutedEvent current, CancellationToken ct) : IScriptApi
     {
-        public async Task<string> RunSessionAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken)
+        public Task<string> RunSessionAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken) =>
+            InvokeAsync(ScriptCapabilities.SessionRun, () => RunSessionCoreAsync(sessionSpecJson, userInput, cancellationToken));
+
+        private async Task<string> RunSessionCoreAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken)
         {
             await RequireCapabilityAsync(ScriptCapabilities.SessionRun, cancellationToken).ConfigureAwait(false);
             if (sessions is null) throw new InvalidOperationException("Session manager is unavailable.");
@@ -272,7 +300,11 @@ public sealed class GraphManager : IGraphRuntime
             return JsonSerializer.Serialize(new { ok = true, result = result.Value }, JsonOptions);
         }
 
-        public async ValueTask<Result<string>> ExecuteAsync(string sessionId, Guid activationId, ModelToolCall call,
+        public ValueTask<Result<string>> ExecuteAsync(string sessionId, Guid activationId, ModelToolCall call,
+            CancellationToken cancellationToken) =>
+            new(InvokeAsync("session.send_message", () => ExecuteCoreAsync(sessionId, activationId, call, cancellationToken)));
+
+        private async Task<Result<string>> ExecuteCoreAsync(string sessionId, Guid activationId, ModelToolCall call,
             CancellationToken cancellationToken)
         {
             if (call.Name != "send_message")
@@ -311,7 +343,10 @@ public sealed class GraphManager : IGraphRuntime
             { return Result<string>.Failure(new(ErrorCode.Unavailable, "Session send_message failed.", ex.Message)); }
         }
 
-        public async Task<string> CompleteModelAsync(string profileId, string requestJson, CancellationToken cancellationToken)
+        public Task<string> CompleteModelAsync(string profileId, string requestJson, CancellationToken cancellationToken) =>
+            InvokeAsync(ScriptCapabilities.ModelComplete, () => CompleteModelCoreAsync(profileId, requestJson, cancellationToken));
+
+        private async Task<string> CompleteModelCoreAsync(string profileId, string requestJson, CancellationToken cancellationToken)
         {
             await RequireCapabilityAsync(ScriptCapabilities.ModelComplete, cancellationToken).ConfigureAwait(false);
             if (models is null) throw new InvalidOperationException("Model manager is unavailable.");
@@ -355,7 +390,10 @@ public sealed class GraphManager : IGraphRuntime
             return JsonSerializer.Serialize(new { ok = successful, events }, JsonOptions);
         }
 
-        public async Task<string> SendSelfAsync(string json, CancellationToken cancellationToken)
+        public Task<string> SendSelfAsync(string json, CancellationToken cancellationToken) =>
+            InvokeAsync(ScriptCapabilities.SelfAdapterSend, () => SendSelfCoreAsync(json, cancellationToken));
+
+        private async Task<string> SendSelfCoreAsync(string json, CancellationToken cancellationToken)
         {
             await RequireCapabilityAsync(ScriptCapabilities.SelfAdapterSend, cancellationToken).ConfigureAwait(false);
             if (current.Name != EventNames.AdapterEnvelope || current.Source != mount.Target)
@@ -367,7 +405,10 @@ public sealed class GraphManager : IGraphRuntime
             return await SendAsync(envelope.EventId, current.Source, message, cancellationToken).ConfigureAwait(false);
         }
 
-        public async Task<string> AcceptIntoChannelAsync(CancellationToken cancellationToken)
+        public Task<string> AcceptIntoChannelAsync(CancellationToken cancellationToken) =>
+            InvokeAsync(ScriptCapabilities.ChannelAccept, () => AcceptIntoChannelCoreAsync(cancellationToken));
+
+        private async Task<string> AcceptIntoChannelCoreAsync(CancellationToken cancellationToken)
         {
             await RequireCapabilityAsync(ScriptCapabilities.ChannelAccept, cancellationToken).ConfigureAwait(false);
             if (current.Name != EventNames.AdapterEnvelope || current.Source != mount.Target)
@@ -382,7 +423,10 @@ public sealed class GraphManager : IGraphRuntime
             return JsonSerializer.Serialize(new { acceptedChannels = accepted.Value }, JsonOptions);
         }
 
-        public async Task<string> ReplyThroughChannelAsync(string json, CancellationToken cancellationToken)
+        public Task<string> ReplyThroughChannelAsync(string json, CancellationToken cancellationToken) =>
+            InvokeAsync(ScriptCapabilities.ChannelReply, () => ReplyThroughChannelCoreAsync(json, cancellationToken));
+
+        private async Task<string> ReplyThroughChannelCoreAsync(string json, CancellationToken cancellationToken)
         {
             await RequireCapabilityAsync(ScriptCapabilities.ChannelReply, cancellationToken).ConfigureAwait(false);
             if (current.Name != EventNames.ChannelMessageAccepted || current.Source != mount.Target)
@@ -396,7 +440,10 @@ public sealed class GraphManager : IGraphRuntime
             return await SendAsync(current.EventId, binding.Adapter, message, cancellationToken).ConfigureAwait(false);
         }
 
-        public async Task<string> PollSelfAsync(CancellationToken cancellationToken)
+        public Task<string> PollSelfAsync(CancellationToken cancellationToken) =>
+            InvokeAsync(ScriptCapabilities.SelfAdapterPoll, () => PollSelfCoreAsync(cancellationToken));
+
+        private async Task<string> PollSelfCoreAsync(CancellationToken cancellationToken)
         {
             await RequireCapabilityAsync(ScriptCapabilities.SelfAdapterPoll, cancellationToken).ConfigureAwait(false);
             if (current.Name != EventNames.ClockPulse || current.Source != clock.Address || current.Target != mount.Target)
@@ -414,6 +461,61 @@ public sealed class GraphManager : IGraphRuntime
             return JsonSerializer.Serialize(new { polled = true, accepted = polled.Value }, JsonOptions);
         }
 
+        private async Task<T> InvokeAsync<T>(string capability, Func<Task<T>> body)
+        {
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                var value = await body().ConfigureAwait(false);
+                if (value is Result<string> { Ok: false } failed)
+                    Record(capability, failed.Error?.Code == ErrorCode.Denied ? "denied" : "failed", started,
+                        SignalLevel.Warn, failed.Error?.Message);
+                else
+                    Record(capability, "ok", started, SignalLevel.Info, null);
+                return value;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // DenyAsync already recorded the denial together with its reason.
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                Record(capability, "timeout", started, SignalLevel.Warn, "Cancelled or timed out");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Record(capability, "failed", started, SignalLevel.Warn, ex.Message);
+                throw;
+            }
+        }
+
+        private void Record(string capability, string outcome, long started, SignalLevel level, string? detail)
+        {
+            signalLog.Write(new()
+            {
+                Group = "capability",
+                Name = capability,
+                StepId = current.EventId,
+                From = $"{mount.Package.Manifest.Id}@{mount.Target}",
+                To = CapabilityTarget(capability),
+                Mechanism = "call",
+                Outcome = outcome,
+                DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+                Level = level,
+                Detail = detail is null ? null : new Dictionary<string, string> { ["message"] = detail }
+            });
+        }
+
+        private string CapabilityTarget(string capability) => capability switch
+        {
+            ScriptCapabilities.ModelComplete => "model",
+            ScriptCapabilities.SessionRun => "session",
+            ScriptCapabilities.ChannelAccept or ScriptCapabilities.ChannelReply => current.Source.ToString(),
+            _ => mount.Target.ToString()
+        };
+
         private async ValueTask RequireCapabilityAsync(string capability, CancellationToken cancellationToken)
         {
             if (mount.Package.Manifest.Capabilities.Contains(capability, StringComparer.Ordinal)) return;
@@ -422,6 +524,18 @@ public sealed class GraphManager : IGraphRuntime
 
         private async Task DenyAsync(string action, string detail, CancellationToken cancellationToken)
         {
+            signalLog.Write(new()
+            {
+                Group = "capability",
+                Name = action,
+                StepId = current.EventId,
+                From = $"{mount.Package.Manifest.Id}@{mount.Target}",
+                To = CapabilityTarget(action),
+                Mechanism = "call",
+                Outcome = "denied",
+                Level = SignalLevel.Warn,
+                Detail = new Dictionary<string, string> { ["reason"] = detail }
+            });
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
                 mount.Target, action, "denied", detail), cancellationToken).ConfigureAwait(false);
             throw new UnauthorizedAccessException(detail);

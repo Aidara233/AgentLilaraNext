@@ -32,7 +32,11 @@ public sealed record SendResult(bool Sent, string AttemptId, string? Detail = nu
 public sealed record AdapterInfo(Address Address, AdapterDescriptor Descriptor, AdapterState State);
 public sealed record AdapterSpec(Address Address, AdapterDescriptor Descriptor);
 
-public sealed record RoutedEvent(string Name, Address Source, Guid EventId, string PayloadJson, Address? Target = null);
+public sealed record RoutedEvent(string Name, Address Source, Guid EventId, string PayloadJson, Address? Target = null)
+{
+    /// <summary>Set by the event queue on acceptance; lets the log measure queue backlog.</summary>
+    public DateTimeOffset? EnqueuedAt { get; init; }
+}
 public interface IEventSink
 {
     // Acceptance into a bounded queue, NOT durable processing acknowledgment.

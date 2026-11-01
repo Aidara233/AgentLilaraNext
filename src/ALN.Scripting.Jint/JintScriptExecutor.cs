@@ -6,10 +6,9 @@ using Jint;
 
 namespace ALN.Scripting.Jint;
 
-public sealed class JintScriptExecutor(IExecutionJournal journal) : IScriptExecutor
+public sealed class JintScriptExecutor : IScriptExecutor
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-    private readonly IExecutionJournal _journal = journal;
 
     public ValueTask<Result> ValidateAsync(ScriptPackage package, CancellationToken cancellationToken)
     {
@@ -31,8 +30,6 @@ public sealed class JintScriptExecutor(IExecutionJournal journal) : IScriptExecu
     public async ValueTask<Result> ExecuteAsync(ScriptPackage package, Address target, RoutedEvent routedEvent,
         IScriptApi api, CancellationToken cancellationToken)
     {
-        var started = DateTimeOffset.UtcNow;
-        var id = Guid.NewGuid();
         try
         {
             var engine = BuildEngine(package, cancellationToken);
@@ -68,20 +65,11 @@ public sealed class JintScriptExecutor(IExecutionJournal journal) : IScriptExecu
                 })()
                 """;
             await engine.EvaluateAsync(source, cancellationToken: cancellationToken).ConfigureAwait(false);
-            _journal.Record(new(id, package.Manifest.Id, target, routedEvent.Name, true, null, started, DateTimeOffset.UtcNow)
-            { EventId = routedEvent.EventId, Fingerprint = package.Fingerprint });
             return Result.Success();
         }
-        catch (OperationCanceledException)
-        {
-            _journal.Record(new(id, package.Manifest.Id, target, routedEvent.Name, false, "Cancelled or timed out", started, DateTimeOffset.UtcNow)
-            { EventId = routedEvent.EventId, Fingerprint = package.Fingerprint });
-            throw;
-        }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
-            _journal.Record(new(id, package.Manifest.Id, target, routedEvent.Name, false, ex.Message, started, DateTimeOffset.UtcNow)
-            { EventId = routedEvent.EventId, Fingerprint = package.Fingerprint });
             return Result.Failure(new(ErrorCode.Invalid, "Script execution failed.", ex.Message));
         }
     }

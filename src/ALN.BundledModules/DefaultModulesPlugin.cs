@@ -33,7 +33,7 @@ public sealed class DefaultModulesPlugin : IModulePlugin
             var events = HostService<IEventSink>(context);
             var types = HostService<IModuleTypeCatalog>(context);
             var bindings = HostService<IInstanceBindings>(context);
-            var journal = HostService<IExecutionJournal>(context);
+            var journal = HostService<ISignalLog>(context);
             var audit = HostService<IAuditSink>(context);
             var paths = HostService<ModuleHostPaths>(context);
             var models = HostService<IModelManager>(context);
@@ -41,8 +41,8 @@ public sealed class DefaultModulesPlugin : IModulePlugin
 
             var clock = new ClockSource(events);
             var channels = new ChannelManager(adapters, events, bindings);
-            var executor = new JintScriptExecutor(journal);
-            var graph = new GraphManager(adapters, channels, clock, types, executor, audit, models, sessions);
+            var executor = new JintScriptExecutor();
+            var graph = new GraphManager(adapters, channels, clock, types, executor, audit, journal, models, sessions);
             if (bindings is IInstanceBindingsProxy proxy) proxy.Bind(graph);
 
             foreach (var (id, service) in new (string, object)[]

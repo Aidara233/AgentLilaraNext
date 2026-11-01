@@ -17,10 +17,12 @@ public sealed class SessionManager : ISessionManager
     private readonly string _root;
     private readonly string _legacyRoot;
     private readonly IModelManager _models;
+    private readonly ISignalLog _signalLog;
     private readonly IRoundContextContributorRegistry _roundContextContributors;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
 
-    public SessionManager(string dataRoot, IModelManager models, IRoundContextContributorRegistry? roundContextContributors = null)
+    public SessionManager(string dataRoot, IModelManager models, IRoundContextContributorRegistry? roundContextContributors = null,
+        ISignalLog? signalLog = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         ArgumentNullException.ThrowIfNull(models);
@@ -28,9 +30,55 @@ public sealed class SessionManager : ISessionManager
         _legacyRoot = Path.Combine(_root, "chat");
         _models = models;
         _roundContextContributors = roundContextContributors ?? new RoundContextContributorRegistry();
+        _signalLog = signalLog ?? NullSignalLog.Instance;
     }
 
     public async ValueTask<Result<SessionTurnResult>> RunTurnAsync(
+        string sessionId, SessionSpec spec, Guid activationId, SessionTurnInput input,
+        ISessionToolExecutor? toolExecutor, CancellationToken cancellationToken)
+    {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            var result = await RunTurnCoreAsync(sessionId, spec, activationId, input, toolExecutor, cancellationToken).ConfigureAwait(false);
+            RecordTurn(sessionId, spec, activationId, result, started);
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            _signalLog.Write(new()
+            {
+                Group = "session", Name = sessionId, StepId = activationId,
+                From = "session", To = $"model:{spec.ModelProfileId}", Mechanism = "session.turn",
+                Outcome = "timeout", Level = SignalLevel.Warn,
+                DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds
+            });
+            throw;
+        }
+    }
+
+    private void RecordTurn(string sessionId, SessionSpec spec, Guid activationId,
+        Result<SessionTurnResult> result, long started)
+    {
+        var level = result.Ok ? SignalLevel.Info : SignalLevel.Warn;
+        _signalLog.Write(new()
+        {
+            Group = "session",
+            Name = sessionId,
+            StepId = activationId,
+            From = "session",
+            To = $"model:{spec.ModelProfileId}",
+            Mechanism = "session.turn",
+            Outcome = result.Ok ? "ok" : result.Error?.Code == ErrorCode.Conflict ? "denied" : "failed",
+            DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+            Level = level,
+            Detail = result.Ok
+                ? new Dictionary<string, string> { ["step"] = result.Value!.StepNumber.ToString() }
+                : new Dictionary<string, string> { ["message"] = result.Error?.Message ?? "" }
+        });
+    }
+
+    private async ValueTask<Result<SessionTurnResult>> RunTurnCoreAsync(
         string sessionId, SessionSpec spec, Guid activationId, SessionTurnInput input,
         ISessionToolExecutor? toolExecutor, CancellationToken cancellationToken)
     {
@@ -134,6 +182,7 @@ public sealed class SessionManager : ISessionManager
             var finalStopReason = StopReason.EndTurn;
             while (true)
             {
+                var modelStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
                 var modelStarted = await _models.CompleteAsync(session.Value.Spec.ModelProfileId,
                     new ModelRequest(messages, session.Value.Spec.Tools), cancellationToken).ConfigureAwait(false);
                 if (!modelStarted.Ok || modelStarted.Value is null)
@@ -173,6 +222,25 @@ public sealed class SessionManager : ISessionManager
                 }
                 if (terminalCount != 1)
                     return Result<SessionTurnResult>.Failure(new(ErrorCode.Unavailable, "Model provider ended without a terminal event."));
+                _signalLog.Write(new()
+                {
+                    Group = "model",
+                    Name = session.Value.Spec.ModelProfileId,
+                    StepId = activationId,
+                    From = "session",
+                    To = $"model:{session.Value.Spec.ModelProfileId}",
+                    Mechanism = "model.request",
+                    Outcome = modelError is null ? "ok" : "failed",
+                    DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(modelStartedAt).TotalMilliseconds,
+                    Level = modelError is null ? SignalLevel.Debug : SignalLevel.Warn,
+                    Detail = new Dictionary<string, string>
+                    {
+                        ["step"] = (state.StepNumber + 1).ToString(),
+                        ["stop"] = stopReason?.ToString() ?? "",
+                        ["promptTokens"] = (usage?.InputTokens ?? 0).ToString(),
+                        ["completionTokens"] = (usage?.OutputTokens ?? 0).ToString()
+                    }
+                });
                 if (modelError is not null) return Result<SessionTurnResult>.Failure(modelError);
 
                 var completedUsage = usage ?? new ModelUsage(0, 0);

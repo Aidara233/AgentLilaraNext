@@ -14,7 +14,7 @@ public sealed class GraphIntegrationTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-channel-tests-" + Guid.NewGuid().ToString("N"));
     private readonly JsonlAuditSink _audit;
-    private readonly ExecutionJournal _journal = new();
+    private readonly SignalLog _signals = SignalLog.Open(null);
     private readonly AdapterTypeCatalog _adapterTypes = new();
     private readonly IModuleTypeCatalog _types;
     private readonly EventQueue _events = new(32);
@@ -38,7 +38,7 @@ public sealed class GraphIntegrationTests : IDisposable
         _types = _adapterTypes;
         _adapters = new AdapterManager(_types, _bindings);
         _channels = new ChannelManager(_adapters, _events, _bindings);
-        _graph = new GraphManager(_adapters, _channels, _clock, _types, new JintScriptExecutor(_journal), _audit);
+        _graph = new GraphManager(_adapters, _channels, _clock, _types, new JintScriptExecutor(), _audit, _signals);
         _bindings.Bind(_graph);
         _mailbox = new FileMailbox(Path.Combine(_root, "adapters", "test-1"));
         _adapter = new FileAdapter(new(_adapterAddress, new("file", "test-account", AdapterDirection.Both)), _mailbox, _events, _clock);
@@ -46,6 +46,7 @@ public sealed class GraphIntegrationTests : IDisposable
 
     public void Dispose()
     {
+        _signals.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _audit.Dispose();
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
     }
@@ -75,7 +76,7 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.Equal("one", ReadOutbound(outOne).Text);
         Assert.Equal("two", ReadOutbound(outTwo).Text);
         Assert.Equal(2, _channels.List().Count);
-        Assert.Equal(5, _journal.Snapshot().Count(r => r.Succeeded));
+        Assert.Equal(5, _signals.Snapshot().Count(r => r.Group == "dispatch" && r.Outcome == "ok"));
     }
 
     [Fact]
@@ -92,7 +93,7 @@ public sealed class GraphIntegrationTests : IDisposable
         await DispatchOneAsync();
         await DispatchOneAsync();
         Assert.Empty(Directory.GetFiles(Path.Combine(_mailbox.Root, "outbox"), "*.json", SearchOption.AllDirectories));
-        Assert.Equal(2, _journal.Snapshot().Count);
+        Assert.Equal(2, _signals.Snapshot().Count(r => r.Group == "dispatch"));
     }
 
     [Fact]
