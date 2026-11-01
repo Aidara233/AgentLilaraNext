@@ -1,6 +1,7 @@
 using System.Text.Json;
 using ALN.Contracts;
 using ALN.Contracts.Models;
+using ALN.Graph.Contracts;
 
 namespace ALN.Runtime;
 
@@ -19,6 +20,9 @@ public static class CoreActions
     public const string ChannelsStart = "channels.start";
     public const string ChannelsStop = "channels.stop";
     public const string ChannelsSend = "channels.send";
+    public const string GraphList = "graph.list";
+    public const string GraphMount = "graph.mount";
+    public const string GraphUnmount = "graph.unmount";
     public const string ModelsList = "models.list";
     public const string SignalsRecent = "signals.recent";
 
@@ -27,7 +31,7 @@ public static class CoreActions
     private static JsonElement ToJson(object value) => JsonSerializer.SerializeToElement(value, JsonOptions);
 
     public static Result RegisterAll(ControlPlane plane, IAdapterManager adapters, IChannelManager channels,
-        IModelManager models, ISignalLog signals)
+        IModelManager models, ISignalLog signals, IGraphRuntime graph)
     {
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
@@ -79,6 +83,25 @@ public static class CoreActions
             (new(ChannelsStart, "Start one channel.", Capabilities.ChannelsControl, true), StartChannel),
             (new(ChannelsStop, "Stop one channel.", Capabilities.ChannelsControl, true), StopChannel),
             (new(ChannelsSend, "Send one text message through a channel's binding.", Capabilities.MessagesWrite, true), SendChannel),
+
+            (new(GraphList, "List mounted scripts and their targets.", Capabilities.GraphRead, false),
+                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+                {
+                    mounted = graph.Mounted.Select(m => new
+                    {
+                        script = m.Package.Manifest.Id,
+                        version = m.Package.Manifest.Version,
+                        targetType = m.Package.Manifest.TargetType,
+                        events = m.Package.Manifest.Events,
+                        trustDomain = m.Package.Manifest.TrustDomain.ToString(),
+                        target = m.Target.ToString()
+                    })
+                })))),
+
+            // Manual scripts are the per-instance policy switch: a script declared "mount": "manual" is
+            // not attached to anything by its lifecycle, so this is the only way it ever runs.
+            (new(GraphMount, "Mount a manual script onto one instance.", Capabilities.GraphControl, true), MountScript),
+            (new(GraphUnmount, "Unmount a script from one instance.", Capabilities.GraphControl, true), UnmountScript),
 
             (new(ModelsList, "List provider instances and profiles without configuration or keys.", Capabilities.ModelsRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
@@ -150,6 +173,32 @@ public static class CoreActions
         {
             var found = adapters.Get(address);
             return found.Ok ? found.Value as IAdapterHealth : null;
+        }
+
+        async ValueTask<Result<JsonElement>> MountScript(JsonElement arguments, CancellationToken ct)
+        {
+            var target = ReadAddress(arguments, "target");
+            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
+            if (!TryReadText(arguments, "script", out var scriptId) || scriptId.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.mount requires 'script' (the script id)."));
+
+            var mounted = await graph.MountAsync(scriptId.Trim(), target.Value, ct).ConfigureAwait(false);
+            return mounted.Ok
+                ? Result<JsonElement>.Success(ToJson(new { script = scriptId.Trim(), target = target.Value.ToString(), mounted = true }))
+                : Result<JsonElement>.Failure(mounted.Error!);
+        }
+
+        async ValueTask<Result<JsonElement>> UnmountScript(JsonElement arguments, CancellationToken ct)
+        {
+            var target = ReadAddress(arguments, "target");
+            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
+            if (!TryReadText(arguments, "script", out var scriptId) || scriptId.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.unmount requires 'script' (the script id)."));
+
+            var unmounted = await graph.UnmountAsync(scriptId.Trim(), target.Value, ct).ConfigureAwait(false);
+            return unmounted.Ok
+                ? Result<JsonElement>.Success(ToJson(new { script = scriptId.Trim(), target = target.Value.ToString(), mounted = false }))
+                : Result<JsonElement>.Failure(unmounted.Error!);
         }
 
         IAdapterIdentity? Identity(Address address)

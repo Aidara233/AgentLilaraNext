@@ -2,6 +2,7 @@ using System.Text.Json;
 using ALN.Api;
 using ALN.Contracts;
 using ALN.Contracts.Models;
+using ALN.Graph.Contracts;
 using ALN.Runtime;
 
 namespace ALN.Tests;
@@ -85,7 +86,7 @@ public sealed class ControlPlaneTests : IDisposable
         var models = new FakeModels(new ModelProviderInfo(new Address("model", "openai-chat", "one"),
             new ModelProviderDescriptor("chat", "openai-chat", "OpenAI", ModelCapabilities.Streaming), 0));
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
-        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), models, _signals).Ok);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), models, _signals, new FakeGraph()).Ok);
 
         var result = await plane.InvokeAsync(User("models.read"), CoreActions.ModelsList, default, default);
 
@@ -135,6 +136,18 @@ public sealed class ControlPlaneTests : IDisposable
             records.Add(record);
             return ValueTask.CompletedTask;
         }
+    }
+
+    /// <summary>Just enough graph to keep the action catalogue registrable; mounting has its own tests.</summary>
+    private sealed class FakeGraph : IGraphRuntime
+    {
+        public ValueTask<Result> LoadAsync(IEnumerable<ScriptPackage> packages, CancellationToken ct) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken ct) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> UnmountAsync(string scriptId, Address target, CancellationToken ct) => ValueTask.FromResult(Result.Success());
+        public IReadOnlyList<MountedScript> Mounted => [];
+        public ValueTask<Result> DispatchAsync(RoutedEvent routedEvent, CancellationToken ct) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> AttachAsync(Address target, CancellationToken ct) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> DetachAsync(Address target, CancellationToken ct) => ValueTask.FromResult(Result.Success());
     }
 
     private sealed class FakeAdapters : IAdapterManager

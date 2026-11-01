@@ -52,6 +52,57 @@ public sealed class GraphIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task A_manual_script_runs_only_on_the_instance_it_was_mounted_on()
+    {
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), ChannelReply(), ManualTagger("channel.tagger", "tagged")], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        var channelOne = new Address("channel", "conversation", "chat-1");
+        var channelTwo = new Address("channel", "conversation", "chat-2");
+        await AddChannelAsync(channelOne, "chat-1");
+        await AddChannelAsync(channelTwo, "chat-2");
+
+        // A manual script is attached to nothing by loading; only an explicit mount makes it run.
+        Assert.DoesNotContain(_graph.Mounted, m => m.Package.Manifest.Id == "channel.tagger");
+        Assert.True((await _graph.MountAsync("channel.tagger", channelOne, default)).Ok);
+        Assert.False((await _graph.MountAsync("channel.tagger", channelOne, default)).Ok);
+        // A default script cannot be mounted by hand: its lifecycle already owns it.
+        Assert.False((await _graph.MountAsync("channel.bound-reply", channelOne, default)).Ok);
+
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+        await WriteInputAsync("chat-1", "hello-1");
+        await WriteInputAsync("chat-2", "hello-2");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+
+        // chat-1 has two responders (the default one plus the mounted one); chat-2 has one.
+        var outOne = Directory.GetFiles(Path.Combine(_mailbox.Root, "outbox", "chat-1"), "*.json")
+            .Select(ReadOutbound).Select(m => m.Text).Order().ToArray();
+        var outTwo = Directory.GetFiles(Path.Combine(_mailbox.Root, "outbox", "chat-2"), "*.json")
+            .Select(ReadOutbound).Select(m => m.Text).ToArray();
+        Assert.Equal(["hello-1", "tagged"], outOne);
+        Assert.Equal(["hello-2"], outTwo);
+
+        // Unmounting is equally per-instance: chat-1 loses the tagger, chat-2 never had it.
+        Assert.True((await _graph.UnmountAsync("channel.tagger", channelOne, default)).Ok);
+        Assert.False((await _graph.UnmountAsync("channel.tagger", channelOne, default)).Ok);
+        await WriteInputAsync("chat-1", "hello-3");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+        var afterUnmount = Directory.GetFiles(Path.Combine(_mailbox.Root, "outbox", "chat-1"), "*.json")
+            .Select(ReadOutbound).Select(m => m.Text).Order().ToArray();
+        Assert.Equal(["hello-1", "hello-3", "tagged"], afterUnmount);
+    }
+
+    private async Task DrainAsync()
+    {
+        while (_events.TryRead(out var queued))
+        {
+            var dispatched = await _graph.DispatchAsync(queued, default);
+            Assert.True(dispatched.Ok, dispatched.Error?.Detail ?? dispatched.Error?.Message);
+        }
+    }
+
+    [Fact]
     public async Task Two_conversation_folders_route_through_their_channels_and_back_to_matching_outboxes()
     {
         Assert.True((await _graph.LoadAsync([AdapterIntake(), ChannelReply()], default)).Ok);
@@ -317,6 +368,12 @@ public sealed class GraphIntegrationTests : IDisposable
         new("adapter.channel-intake", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope, EventNames.ClockPulse], "onEvent",
             [ScriptCapabilities.ChannelAccept, ScriptCapabilities.SelfAdapterPoll], TrustDomain.Builtin),
         "async function onEvent(event, ctx) { if (ctx.eventName === 'clock.pulse') { await ctx.self.adapter.poll(); return; } await ctx.channel.accept(); }");
+
+    /// <summary>A manual script: nothing attaches it, so it only runs once somebody mounts it by instance.</summary>
+    private static ScriptPackage ManualTagger(string id, string text) => new(
+        new(id, 1, "channel", MountMode.Manual, [EventNames.ChannelMessageAccepted], "onEvent",
+            [ScriptCapabilities.ChannelReply], TrustDomain.Trusted),
+        $"async function onEvent(event, ctx) {{ await ctx.channel.reply({{ platformConversationId: event.binding.platformConversationId, text: '{text}' }}); }}");
 
     private ScriptPackage ChannelReply() => new(
         new("channel.bound-reply", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",

@@ -2,6 +2,11 @@
 
   <ItemGroup>
     <ProjectReference Include="..\ALN.Contracts\ALN.Contracts.csproj" />
+    <!--
+      Contracts only, not the implementation: the action catalogue exposes script mounting, and
+      IGraphRuntime is the contract it talks to. No cycle — Graph.Contracts depends on Contracts alone.
+    -->
+    <ProjectReference Include="..\ALN.Graph.Contracts\ALN.Graph.Contracts.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
