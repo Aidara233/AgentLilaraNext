@@ -23,17 +23,24 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity
     private readonly IModuleLogger _log;
     private readonly Uri _endpoint;
     private readonly OneBotConnection _connection;
+    private readonly InboundJournal _journal;
+    private readonly IInboundAcks? _acks;
     private readonly HashSet<string> _seen = new(StringComparer.Ordinal);
     private readonly Queue<string> _seenOrder = new();
     private readonly object _seenGate = new();
     private CancellationTokenSource? _run;
     private Task? _loop;
+    private Task? _replayLoop;
     private volatile string? _detail;
 
-    public QqAdapter(AdapterSpec spec, IEventSink sink, IModuleLogger log) : base(spec.Address, spec.Descriptor)
+    public QqAdapter(AdapterSpec spec, IEventSink sink, IModuleLogger log, IStateStore? state = null, IInboundAcks? acks = null)
+        : base(spec.Address, spec.Descriptor)
     {
         _sink = sink ?? throw new ArgumentNullException(nameof(sink));
         _log = log ?? throw new ArgumentNullException(nameof(log));
+        _acks = acks;
+        // Namespaced per instance: two QQ accounts on one host must not share a journal.
+        _journal = new InboundJournal(state, _log, StateName.Encode(Address.ToString()));
 
         var settings = spec.Settings ?? new Dictionary<string, string>();
         if (!settings.TryGetValue("endpoint", out var endpoint) || string.IsNullOrWhiteSpace(endpoint))
@@ -67,6 +74,10 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity
         _run = new CancellationTokenSource();
         var token = _run.Token;
         _loop = Task.Run(() => _connection.RunAsync(PublishAsync, token), CancellationToken.None);
+        // Anything the previous process received but never handed over is replayed once the socket is up.
+        // Earlier would be worse than late: the reply those messages provoke needs a socket to leave through,
+        // and a failed reply is exactly what the mailbox will not bring back.
+        _replayLoop = Task.Run(() => ReplayWhenConnectedAsync(token), CancellationToken.None);
         _log.Info("QQ adapter started", new Dictionary<string, string>
         {
             ["account"] = Descriptor.AccountId,
@@ -131,8 +142,8 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity
     }
 
     /// <summary>
-    /// Pushed event → envelope → event sink. Returning without publishing is the normal path for
-    /// anything that is not a group message from somebody else.
+    /// Pushed event → journal → envelope → event sink. The journal comes first because the socket cannot
+    /// replay: a message that arrived exists only in this process until it is written down.
     /// </summary>
     private async Task PublishAsync(JsonElement root)
     {
@@ -144,13 +155,94 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity
 
         var envelope = new AdapterEnvelope(Address, Descriptor.PlatformId, inbound.ConversationId,
             inbound.MessageId, inbound.Text, inbound.At, inbound.SenderId, inbound.MentionsSelf);
+        // A failed journal must not swallow the message: it is still worth publishing, just without the
+        // promise that a crash would bring it back.
+        var journaled = await _journal.RememberAsync(envelope, CancellationToken.None).ConfigureAwait(false);
+        if (!journaled.Ok)
+            _log.Warn("inbound message could not be journaled", new Dictionary<string, string>
+            {
+                ["conversation"] = envelope.PlatformConversationId,
+                ["error"] = journaled.Error?.Message ?? string.Empty
+            });
+        _acks?.Expect(envelope.EventId, settle => AcknowledgeJournalAsync(envelope.EventId, settle));
         var published = await _sink.PublishAsync(new RoutedEvent(EventNames.AdapterEnvelope, Address,
             envelope.EventId, JsonSerializer.Serialize(envelope, JsonOptions)), CancellationToken.None).ConfigureAwait(false);
         if (!published.Ok)
+        {
+            // It stays journaled: the next start tries again rather than pretending it was delivered.
+            _acks?.Forget(envelope.EventId);
             _log.Warn("inbound envelope was not queued", new Dictionary<string, string>
             {
                 ["conversation"] = envelope.PlatformConversationId,
                 ["error"] = published.Error?.Message ?? string.Empty
+            });
+        }
+    }
+
+    /// <summary>
+    /// Waits for the socket, then replays. Bounded: if the platform never answers, the journal simply stays
+    /// for the next start — the alternative is replaying into a socket that cannot send.
+    /// </summary>
+    private async Task ReplayWhenConnectedAsync(CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddMinutes(5);
+        while (!_connection.IsConnected && !cancellationToken.IsCancellationRequested)
+        {
+            if (DateTimeOffset.UtcNow > deadline)
+            {
+                _log.Warn("inbound journal was not replayed: the platform did not connect", null);
+                return;
+            }
+            try { await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+        }
+        if (cancellationToken.IsCancellationRequested) return;
+        var replayed = await ReplayJournalAsync(cancellationToken).ConfigureAwait(false);
+        if (!replayed.Ok)
+            _log.Warn("undelivered inbound messages could not be replayed", new Dictionary<string, string>
+            {
+                ["error"] = replayed.Error?.Message ?? string.Empty
+            });
+    }
+
+    /// <summary>
+    /// Re-publishes whatever was received but never acknowledged, keeping the original event id so the
+    /// acknowledgement that follows is the same one the first delivery would have produced.
+    /// </summary>
+    private async ValueTask<Result<int>> ReplayJournalAsync(CancellationToken cancellationToken)
+    {
+        var entries = await _journal.ReadAsync(cancellationToken).ConfigureAwait(false);
+        if (entries.Error is { } readError) return Result<int>.Failure(readError);
+        var replayed = 0;
+        foreach (var envelope in entries.Value!)
+        {
+            _acks?.Expect(envelope.EventId, settle => AcknowledgeJournalAsync(envelope.EventId, settle));
+            var published = await _sink.PublishAsync(new RoutedEvent(EventNames.AdapterEnvelope, Address,
+                envelope.EventId, JsonSerializer.Serialize(envelope, JsonOptions)), cancellationToken).ConfigureAwait(false);
+            if (!published.Ok)
+            {
+                _acks?.Forget(envelope.EventId);
+                // Queue full or closed: stop here. These stay journaled for the next attempt.
+                return Result<int>.Failure(published.Error!);
+            }
+            replayed++;
+        }
+        if (replayed > 0)
+            _log.Info("replayed inbound messages that were never delivered", new Dictionary<string, string>
+            {
+                ["count"] = replayed.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            });
+        return Result<int>.Success(replayed);
+    }
+
+    private async ValueTask AcknowledgeJournalAsync(Guid eventId, CancellationToken cancellationToken)
+    {
+        var forgotten = await _journal.ForgetAsync(eventId, cancellationToken).ConfigureAwait(false);
+        if (!forgotten.Ok)
+            _log.Warn("a delivered inbound message could not be removed from the journal", new Dictionary<string, string>
+            {
+                ["event"] = eventId.ToString("D"),
+                ["error"] = forgotten.Error?.Message ?? string.Empty
             });
     }
 

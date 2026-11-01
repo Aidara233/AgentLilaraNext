@@ -7,7 +7,8 @@ async function onEvent(event, ctx) {
   if (ctx.eventName !== "channel.message.accepted") return;
 
   const spec = {
-    modelProfileId: "default",
+    // No modelProfileId: the engine resolves it (the "default" profile if one exists, otherwise the first
+    // registered one) and says which it used. Pinning a provider belongs in configuration, not in a script.
     objective: "在群聊或私聊里和对方对话",
     formatVersion: "1",
     systemPrompt: [

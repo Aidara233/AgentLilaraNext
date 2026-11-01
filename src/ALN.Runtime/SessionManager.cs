@@ -40,6 +40,15 @@ public sealed class SessionManager : ISessionManager
         var recordId = Guid.NewGuid();
         var parentId = SignalScope.CurrentId;
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (spec is null) return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Session specification is incomplete."));
+        // A spec that names no profile is not incomplete: it means "whatever the host has". Deciding it here
+        // keeps the choice visible — the signal log, the stored session and the error all show the real id.
+        if (string.IsNullOrWhiteSpace(spec.ModelProfileId))
+        {
+            var resolved = ResolveProfile(spec);
+            if (!resolved.Ok) return Result<SessionTurnResult>.Failure(resolved.Error!);
+            spec = resolved.Value!;
+        }
         try
         {
             Result<SessionTurnResult> result;
@@ -60,6 +69,37 @@ public sealed class SessionManager : ISessionManager
             });
             throw;
         }
+    }
+
+    /// <summary>
+    /// Picks the profile a spec left open: "default" when it exists, otherwise the first by id. Deterministic
+    /// on purpose — the same data root must resolve to the same provider every time, and the guess is said
+    /// out loud in the signal log rather than buried.
+    /// </summary>
+    private Result<SessionSpec> ResolveProfile(SessionSpec spec)
+    {
+        var profiles = _models.ListProfiles();
+        if (profiles.Count == 0)
+            return Result<SessionSpec>.Failure(new(ErrorCode.Unavailable,
+                "Session spec names no model profile and no profile is registered."));
+        var chosen = profiles.FirstOrDefault(profile => string.Equals(profile.Id, "default", StringComparison.Ordinal))
+                     ?? profiles.OrderBy(profile => profile.Id, StringComparer.Ordinal).First();
+        if (profiles.Count > 1)
+            _signalLog.Write(new()
+            {
+                Id = Guid.NewGuid(),
+                Group = "session",
+                Name = "profile",
+                Mechanism = "session.resolve",
+                Outcome = "guessed",
+                Level = SignalLevel.Warn,
+                Detail = new Dictionary<string, string>
+                {
+                    ["chosen"] = chosen.Id,
+                    ["available"] = string.Join(",", profiles.Select(profile => profile.Id))
+                }
+            });
+        return Result<SessionSpec>.Success(spec with { ModelProfileId = chosen.Id });
     }
 
     private void RecordTurn(string sessionId, SessionSpec spec, Guid activationId,
@@ -91,7 +131,7 @@ public sealed class SessionManager : ISessionManager
     {
         if (!IsValidSessionId(sessionId))
             return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Session id must use 1-128 ASCII letters, digits, '-' or '_'."));
-        if (spec is null || string.IsNullOrWhiteSpace(spec.ModelProfileId) || string.IsNullOrWhiteSpace(spec.Objective) ||
+        if (spec is null || string.IsNullOrWhiteSpace(spec.Objective) ||
             string.IsNullOrWhiteSpace(spec.SystemPrompt) || string.IsNullOrWhiteSpace(spec.FormatVersion))
             return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Session specification is incomplete."));
         if (spec.Tools is { } declaredTools && (declaredTools.Any(t => string.IsNullOrWhiteSpace(t.Name) ||
