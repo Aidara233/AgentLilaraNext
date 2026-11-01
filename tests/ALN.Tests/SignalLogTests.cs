@@ -6,6 +6,7 @@ using ALN.Graph.Contracts;
 using ALN.Runtime;
 using ALN.Runtime.Hosting;
 using ALN.Scripting.Jint;
+using ALN.Storage.Sqlite;
 
 namespace ALN.Tests;
 
@@ -59,7 +60,7 @@ public sealed class SignalLogTests : IDisposable
     public async Task Maximum_level_never_suppresses_an_audit_entry()
     {
         var signals = SignalLog.Open(null, new SignalLogOptions(SignalLevel.Error));
-        using var audit = new JsonlAuditSink(Path.Combine(_root, "audit", "test.jsonl"));
+        using var audit = new SqliteStore(Path.Combine(_root, "aln.db"));
         var types = new AdapterTypeCatalog();
         Assert.True(types.RegisterPackageTypes("test.adapter.file", [new("adapter.file", "adapter")]).Ok);
         var bindings = new GraphBindingProxy();
@@ -91,8 +92,8 @@ public sealed class SignalLogTests : IDisposable
         // Signal log is filtered to Error, so no denial record survives there...
         Assert.DoesNotContain(signals.Snapshot(), r => r.Outcome == "denied");
         // ...while the audit trail keeps the accountability record.
-        var auditLines = File.ReadAllLines(Path.Combine(_root, "audit", "test.jsonl"));
-        Assert.Contains(auditLines, line => line.Contains("denied", StringComparison.Ordinal));
+        var auditEntries = audit.ReadAudit();
+        Assert.Contains(auditEntries, entry => entry.Outcome == "denied");
         await signals.DisposeAsync();
     }
 

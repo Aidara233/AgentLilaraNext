@@ -7,13 +7,14 @@ using ALN.Graph.Contracts;
 using ALN.Runtime;
 using ALN.Runtime.Hosting;
 using ALN.Scripting.Jint;
+using ALN.Storage.Sqlite;
 
 namespace ALN.Tests;
 
 public sealed class GraphIntegrationTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-channel-tests-" + Guid.NewGuid().ToString("N"));
-    private readonly JsonlAuditSink _audit;
+    private readonly SqliteStore _audit;
     private readonly SignalLog _signals = SignalLog.Open(null);
     private readonly AdapterTypeCatalog _adapterTypes = new();
     private readonly IModuleTypeCatalog _types;
@@ -32,7 +33,7 @@ public sealed class GraphIntegrationTests : IDisposable
         _events = new(32);
         _clock = new ALN.Clock.ClockSource(_events);
         _bindings = new();
-        _audit = new JsonlAuditSink(Path.Combine(_root, "audit", "test.jsonl"));
+        _audit = new SqliteStore(Path.Combine(_root, "aln.db"));
         Assert.True(_adapterTypes.RegisterPackageTypes("test.adapter.file", [new("adapter.file", "adapter")]).Ok);
         Assert.True(_adapterTypes.RegisterPackageTypes("test.channel", [new("channel.conversation", "channel")]).Ok);
         _types = _adapterTypes;
@@ -162,8 +163,8 @@ public sealed class GraphIntegrationTests : IDisposable
         await DispatchOneAsync();
         var replyResult = await DispatchOneResultAsync();
         Assert.False(replyResult.Ok);
-        var auditEntries = File.ReadAllLines(Path.Combine(_root, "audit", "test.jsonl"));
-        Assert.Contains(auditEntries, line => line.Contains("denied", StringComparison.Ordinal));
+        var auditEntries = _audit.ReadAudit();
+        Assert.Contains(auditEntries, entry => entry.Outcome == "denied");
         Assert.Empty(Directory.GetFiles(Path.Combine(_mailbox.Root, "outbox"), "*.json", SearchOption.AllDirectories));
     }
 

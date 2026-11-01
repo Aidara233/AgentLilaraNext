@@ -8,6 +8,7 @@ using ALN.Graph.Contracts;
 using ALN.Runtime;
 using ALN.Runtime.Hosting;
 using ALN.Scripting.Jint;
+using ALN.Storage.Sqlite;
 
 namespace ALN.Tests;
 
@@ -61,9 +62,9 @@ public sealed class StateContinuityTests : IDisposable
         await second.AddChannelAsync("chat-2");
         Assert.Contains(second.Graph.Mounted, m => m.RuleId == ruleId && m.Target == ChatTwo);
 
-        // ... and the rule itself is a file a person can read.
-        var stored = await File.ReadAllTextAsync(Path.Combine(_root, "state", "graph", "mounts.json"));
-        Assert.Contains("channel.tagger", stored, StringComparison.Ordinal);
+        // ... and the rule is a row a person can find, keyed by scope rather than scattered over files.
+        var stored = await second.Storage.ReadAsync(GraphManager.StateScope, GraphManager.StateKey, default);
+        Assert.Contains("channel.tagger", stored.Value ?? string.Empty, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -238,7 +239,9 @@ public sealed class StateContinuityTests : IDisposable
             Assert.True(await first.StepAsync());   // adapter.envelope → the Channel accepts, the answer is queued
             // Accepted, unanswered, and the process goes away before the round that would answer it.
             Assert.Empty(first.OutboxTexts("chat-1"));
-            Assert.NotEmpty(Directory.GetFiles(Path.Combine(_root, "state", "channel.pending"), "*.json"));
+            var pending = await first.Storage.ReadAsync(ChannelManager.PendingScope,
+                ALN.Contracts.StateName.Encode(ChatOne.ToString()), default);
+            Assert.NotNull(pending.Value);
         }
 
         using var second = new Node(_root);
@@ -340,20 +343,20 @@ public sealed class StateContinuityTests : IDisposable
         {
             Root = root;
             Signals = SignalLog.Open(null);
-            Audit = new JsonlAuditSink(Path.Combine(root, "audit", "test.jsonl"));
-            State = new FileStateStore(Path.Combine(root, "state"));
+            // Each Node is one "process": its own connection to the same file. Disposing it and building
+            // another is what a restart looks like to the storage layer.
+            Storage = new SqliteStore(Path.Combine(root, "aln.db"));
             Report = new RestoreReport();
-            Parameters = new ParameterRegistry(State);
-            Messages = new FileMessageStore(Path.Combine(root, "messages"));
+            Parameters = new ParameterRegistry(Storage);
             Events = new EventQueue(64);
             Clock = new ClockSource(Events);
             Assert.True(_types.RegisterPackageTypes("test.adapter.file", [new("adapter.file", "adapter")]).Ok);
             Assert.True(_types.RegisterPackageTypes("test.channel", [new("channel.conversation", "channel")]).Ok);
             Adapters = new AdapterManager(_types, _bindings);
             Channels = new ChannelManager(Adapters, Events, _bindings,
-                new FileChannelSpecStore(Path.Combine(root, "channels")), Messages, Parameters, State, Report);
-            Graph = new GraphManager(Adapters, Channels, Clock, _types, new JintScriptExecutor(), Audit, Signals,
-                state: State, report: Report);
+                new FileChannelSpecStore(Path.Combine(root, "channels")), Storage, Parameters, Storage, Report, Storage);
+            Graph = new GraphManager(Adapters, Channels, Clock, _types, new JintScriptExecutor(), Storage, Signals,
+                state: Storage, report: Report);
             _bindings.Bind(Graph);
             Settlers = new EventSettlers(new ChannelAcceptSettler(Channels), new InboundAckSettler(Acks));
             Mailbox = new FileMailbox(Path.Combine(root, "io", "file", "file-1"));
@@ -362,11 +365,11 @@ public sealed class StateContinuityTests : IDisposable
 
         public string Root { get; }
         public SignalLog Signals { get; }
-        public JsonlAuditSink Audit { get; }
-        public FileStateStore State { get; }
+        public SqliteStore Storage { get; }
+        public IStateStore State => Storage;
         public RestoreReport Report { get; }
         public ParameterRegistry Parameters { get; }
-        public FileMessageStore Messages { get; }
+        public IMessageStore Messages => Storage;
         public EventQueue Events { get; }
         public ClockSource Clock { get; }
         public AdapterManager Adapters { get; }
@@ -455,7 +458,7 @@ public sealed class StateContinuityTests : IDisposable
         public void Dispose()
         {
             Signals.DisposeAsync().AsTask().GetAwaiter().GetResult();
-            Audit.Dispose();
+            Storage.Dispose();
         }
     }
 

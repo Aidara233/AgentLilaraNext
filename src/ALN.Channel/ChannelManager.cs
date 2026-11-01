@@ -5,7 +5,7 @@ namespace ALN.Channel;
 
 public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, IInstanceBindings bindings,
     IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
-    IStateStore? state = null, IRestoreReporter? report = null)
+    IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null)
     : IChannelManager, ILifecycleParticipant
 {
     /// <summary>Where the wish "this Channel should be running" is kept, so a stop survives a restart.</summary>
@@ -22,6 +22,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     private readonly IParameterRegistry? _parameters = parameters;
     private readonly IStateStore? _state = state;
     private readonly IRestoreReporter _report = report ?? NullRestoreReporter.Instance;
+    private readonly IAtomicWork? _atomic = atomic;
     private readonly Dictionary<Address, ChannelInstance> _channels = new();
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
@@ -249,31 +250,32 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                     $"Bound Adapter is not available, message not delivered: {binding.Adapter}"));
             var message = new ChannelMessage(envelope.EventId, channel.Address, binding, envelope.PlatformMessageId,
                 envelope.Text, envelope.At, envelope.Sender, envelope.MentionsSelf);
-            // Idempotent acceptance: one platform message is one row of history however many times the
-            // transport hands it over. A duplicate publishes nothing on purpose — the wake-up for a first
-            // delivery belongs to the pending marker, so there is nothing here worth waking twice.
-            if (!string.IsNullOrWhiteSpace(envelope.PlatformMessageId) && _messages is not null)
+            // One fact, one transaction: the history row and the "accepted but unfinished" marker are written
+            // together. Half of them is either a message nobody will look at or a marker naming nothing.
+            var duplicate = false;
+            var written = await AtomicallyAsync(async token =>
             {
-                var history = await _messages.ReadAsync(channel.Address, cancellationToken).ConfigureAwait(false);
-                if (history.Error is { } readError) return Result<int>.Failure(readError);
-                if (history.Value?.Any(stored => stored.Direction == MessageDirection.Inbound &&
-                                                 stored.PlatformMessageId == envelope.PlatformMessageId) == true)
-                    continue;
-            }
-            if (_messages is not null)
-            {
-                // The channel keeps its own history; the mailbox folder is transport, not storage.
-                var recorded = await _messages.AppendAsync(new StoredMessage(envelope.EventId.ToString("N"), channel.Address,
-                    envelope.PlatformConversationId, envelope.PlatformMessageId, envelope.Sender, envelope.Text,
-                    envelope.At), cancellationToken).ConfigureAwait(false);
-                if (!recorded.Ok) return Result<int>.Failure(recorded.Error!);
-            }
-            // Written before the event is queued: from this moment "accepted but unfinished" is durable, so a
-            // crash before the round ends gets replayed instead of leaving a message nobody ever looks at.
-            var pending = await AddPendingAsync(channel.Address, new PendingAccept(envelope.EventId.ToString("D"),
-                envelope.PlatformMessageId, binding.Adapter.ToString(), binding.PlatformConversationId,
-                envelope.Text, envelope.At, envelope.Sender), cancellationToken).ConfigureAwait(false);
-            if (!pending.Ok) return Result<int>.Failure(pending.Error!);
+                if (_messages is not null)
+                {
+                    // The channel keeps its own history; the mailbox folder is transport, not storage.
+                    var recorded = await _messages.AppendAsync(new StoredMessage(envelope.EventId.ToString("N"),
+                        channel.Address, envelope.PlatformConversationId, envelope.PlatformMessageId,
+                        envelope.Sender, envelope.Text, envelope.At), token).ConfigureAwait(false);
+                    if (recorded.Error?.Code == ErrorCode.Conflict)
+                    {
+                        // The same platform message, already recorded. The wake-up for a first delivery
+                        // belongs to the pending marker, so there is nothing here worth waking twice.
+                        duplicate = true;
+                        return Result.Success();
+                    }
+                    if (!recorded.Ok) return recorded;
+                }
+                return await AddPendingAsync(channel.Address, new PendingAccept(envelope.EventId.ToString("D"),
+                    envelope.PlatformMessageId, binding.Adapter.ToString(), binding.PlatformConversationId,
+                    envelope.Text, envelope.At, envelope.Sender), token).ConfigureAwait(false);
+            }, cancellationToken).ConfigureAwait(false);
+            if (!written.Ok) return Result<int>.Failure(written.Error!);
+            if (duplicate) continue;
             var routed = new RoutedEvent("channel.message.accepted", channel.Address, envelope.EventId,
                 JsonSerializer.Serialize(message, JsonOptions));
             var queued = await _events.PublishAsync(routed, cancellationToken).ConfigureAwait(false);
@@ -327,6 +329,10 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         if (replayed > 0) _report.Note("channels", $"{replayed} accepted message(s) replayed: they were never finished");
         return Result<int>.Success(replayed);
     }
+
+    /// <summary>Runs the body as one unit when the storage backend can promise it; sequential otherwise.</summary>
+    private ValueTask<Result> AtomicallyAsync(Func<CancellationToken, ValueTask<Result>> body, CancellationToken cancellationToken) =>
+        _atomic is null ? body(cancellationToken) : _atomic.AtomicallyAsync(body, cancellationToken);
 
     private async ValueTask<Result<IReadOnlyList<PendingAccept>>> ReadPendingAsync(Address channel, CancellationToken cancellationToken)
     {

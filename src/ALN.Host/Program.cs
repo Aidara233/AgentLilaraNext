@@ -5,6 +5,7 @@ using ALN.Contracts.Sessions;
 using ALN.Graph.Contracts;
 using ALN.Runtime;
 using ALN.Runtime.Hosting;
+using ALN.Storage.Sqlite;
 
 var dataArg = Array.FindIndex(args, a => a == "--data-dir");
 if (dataArg < 0)
@@ -22,11 +23,19 @@ var data = DataDirectory.Open(args[dataArg + 1]);
 // type and instance, mirroring the spec tree under adapters/.
 var mailboxRoot = Path.Combine(data.Root, "io", "file", "file-1");
 var mailbox = new FileMailbox(mailboxRoot);
-await using var auditStream = new AsyncDisposeAdapter(new JsonlAuditSink(Path.Combine(data.Root, "audit", "capabilities.jsonl")));
+// One file for everything a program writes down: component state, message history, audit records. The
+// spec tree stays files — those a person writes and reads.
+using var storage = new SqliteStore(Path.Combine(data.Root, "aln.db"));
+IStateStore stateStore = storage;
+IMessageStore messageStore = storage;
+IAuditSink auditSink = storage;
+// Nothing reads the old file layout any more; say so instead of silently ignoring what is there.
+foreach (var legacy in new[] { "state", "messages", "audit" })
+    if (Directory.Exists(Path.Combine(data.Root, legacy)))
+        Console.Error.WriteLine($"note: {legacy}/ is left over from file storage and is ignored; aln.db is the source of truth now.");
 await using var signalLog = SignalLog.Open(Path.Combine(data.Root, "logs"));
 var moduleLoggers = new SignalModuleLoggerFactory(signalLog);
 var queue = new EventQueue(capacity: 256);
-var messageStore = new FileMessageStore(Path.Combine(data.Root, "messages"));
 var adapterSpecs = new FileAdapterSpecStore(Path.Combine(data.Root, "adapters"));
 var channelSpecs = new FileChannelSpecStore(Path.Combine(data.Root, "channels"));
 var adapterTypes = new AdapterTypeCatalog();
@@ -43,9 +52,10 @@ if (!channelContributor.Ok) { Console.Error.WriteLine(channelContributor.Error?.
 // The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.
-var stateStore = new FileStateStore(Path.Combine(data.Root, "state"));
 // The startup receipt: whoever restores something says what it restored, and the host prints it once.
 var restore = new RestoreReport();
+restore.Note("storage", $"sqlite {Path.GetFileName(storage.Path)}: {storage.CountMessages()} message(s), " +
+                        $"{storage.CountStateKeys()} state key(s), {storage.CountAuditRecords()} audit record(s)");
 // Acknowledgements owed to Adapters: published is not handled, so the mailbox file is only settled after
 // the event round it produced is over.
 var acks = new InboundAckRegistry();
@@ -63,6 +73,7 @@ var hostServices = new HostServiceProvider(
     (typeof(IEventSink), new RecordingEventSink(queue, messageStore)),
     (typeof(IMessageStore), messageStore),
     (typeof(IStateStore), stateStore),
+    (typeof(IAtomicWork), storage),
     (typeof(IRestoreReporter), restore),
     (typeof(IInboundAcks), acks),
     (typeof(IParameterRegistry), parameters),
@@ -73,7 +84,7 @@ var hostServices = new HostServiceProvider(
     (typeof(IInstanceBindings), bindings),
     (typeof(ISignalLog), signalLog),
     (typeof(IModuleLoggerFactory), moduleLoggers),
-    (typeof(IAuditSink), auditStream.Sink),
+    (typeof(IAuditSink), auditSink),
     (typeof(IModuleReloadStateStore), reloadState),
     (typeof(ModuleHostPaths), new ModuleHostPaths(AppContext.BaseDirectory, data.Root)));
 var moduleServices = new ModuleServiceRegistry(hostServices);
@@ -224,7 +235,7 @@ if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
 
 // The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
 // WebUI itself — it exposes actions, and a separate project consumes them.
-var controlPlane = new ControlPlane(auditStream.Sink, signalLog);
+var controlPlane = new ControlPlane(auditSink, signalLog);
 var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters);
 if (!actionsRegistered.Ok)
 {
@@ -315,12 +326,6 @@ sealed class HostServiceProvider(params (Type Type, object Service)[] services) 
 {
     private readonly IReadOnlyDictionary<Type, object> _services = services.ToDictionary(x => x.Type, x => x.Service);
     public object? GetService(Type serviceType) => _services.GetValueOrDefault(serviceType);
-}
-
-sealed class AsyncDisposeAdapter(JsonlAuditSink sink) : IAsyncDisposable
-{
-    public IAuditSink Sink => sink;
-    public ValueTask DisposeAsync() { sink.Dispose(); return ValueTask.CompletedTask; }
 }
 
 sealed record ModelInstanceConfiguration(

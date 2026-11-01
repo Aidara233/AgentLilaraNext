@@ -1,6 +1,7 @@
 using System.Text.Json;
 using ALN.Contracts;
 using ALN.Runtime;
+using ALN.Storage.Sqlite;
 
 namespace ALN.Tests;
 
@@ -9,16 +10,25 @@ public sealed class PersistenceTests : IDisposable
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-persist-" + Guid.NewGuid().ToString("N"));
     private static readonly Address Adapter = new("adapter", "file", "file-1");
     private static readonly Address Channel = new("channel", "conversation", "chat-1");
+    private readonly List<SqliteStore> _stores = [];
 
     public void Dispose()
     {
+        foreach (var store in _stores) store.Dispose();
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
+    }
+
+    private SqliteStore OpenStore()
+    {
+        var store = new SqliteStore(Path.Combine(_root, "aln.db"));
+        _stores.Add(store);
+        return store;
     }
 
     [Fact]
     public async Task Message_history_is_kept_per_owner_and_ordered()
     {
-        var store = new FileMessageStore(Path.Combine(_root, "messages"));
+        IMessageStore store = OpenStore();
         Assert.True((await store.AppendAsync(new("a1", Adapter, "chat-1", "p1", "alice", "first", new(2026, 1, 2, 3, 4, 5, TimeSpan.Zero)), default)).Ok);
         Assert.True((await store.AppendAsync(new("c1", Channel, "chat-1", "p1", "alice", "first", new(2026, 1, 2, 3, 4, 6, TimeSpan.Zero)), default)).Ok);
         Assert.True((await store.AppendAsync(new("a2", Adapter, "chat-1", "p2", "bob", "second", new(2026, 1, 2, 3, 4, 7, TimeSpan.Zero)), default)).Ok);
@@ -29,8 +39,9 @@ public sealed class PersistenceTests : IDisposable
         Assert.True(adapterMessages.Ok);
         Assert.Equal(["first", "second"], adapterMessages.Value!.Select(m => m.Text));
         Assert.Equal(["first"], channelMessages.Value!.Select(m => m.Text));
-        Assert.True(File.Exists(Path.Combine(_root, "messages", "file", "file-1", "20260102.jsonl")));
-        Assert.True(File.Exists(Path.Combine(_root, "messages", "conversation", "chat-1", "20260102.jsonl")));
+        // One row set per owner, both in the same place: no per-day, per-conversation files to count.
+        Assert.Equal(2, (await store.ReadAsync(Adapter, default)).Value!.Count);
+        Assert.Single((await store.ReadAsync(Channel, default)).Value!);
     }
 
     [Fact]
@@ -204,7 +215,7 @@ public sealed class PersistenceTests : IDisposable
     [Fact]
     public async Task Adapter_messages_are_recorded_once_at_the_publish_boundary()
     {
-        var messages = new FileMessageStore(Path.Combine(_root, "messages"));
+        var messages = OpenStore();
         var inner = new EventQueue(capacity: 8);
         var sink = new RecordingEventSink(inner, messages);
         var envelope = new AdapterEnvelope(Adapter, "file", "chat-1", "p1", "hello", DateTimeOffset.UtcNow, "alice");

@@ -300,52 +300,6 @@ public sealed class FileMailbox : IFileMailbox
     }
 }
 
-/// <summary>Serialized, append-only JSON Lines audit output owned by the host.</summary>
-public sealed class JsonlAuditSink : IAuditSink, IDisposable
-{
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-    private readonly string _path;
-    private readonly SemaphoreSlim _appendLock = new(1, 1);
-    private bool _disposed;
-
-    public JsonlAuditSink(string path)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(path);
-        _path = Path.GetFullPath(path, Environment.CurrentDirectory);
-        var parent = Path.GetDirectoryName(_path) ?? throw new ArgumentException("Audit path must have a parent directory.", nameof(path));
-        SafeFileSystem.EnsureDirectory(parent);
-        SafeFileSystem.VerifyNewOrRegularFile(_path, parent);
-    }
-
-    public async ValueTask AppendAsync(AuditRecord record, CancellationToken cancellationToken)
-    {
-        ArgumentNullException.ThrowIfNull(record);
-        await _appendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            var parent = Path.GetDirectoryName(_path)!;
-            SafeFileSystem.VerifyDirectory(parent);
-            SafeFileSystem.VerifyNewOrRegularFile(_path, parent);
-            var json = JsonSerializer.SerializeToUtf8Bytes(record, JsonOptions);
-            var line = new byte[json.Length + 1];
-            json.CopyTo(line, 0);
-            line[^1] = (byte)'\n';
-            await using var stream = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.Read,
-                4096, FileOptions.Asynchronous | FileOptions.WriteThrough);
-            await stream.WriteAsync(line, cancellationToken).ConfigureAwait(false);
-            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-        }
-        finally { _appendLock.Release(); }
-    }
-
-    public void Dispose()
-    {
-        _disposed = true;
-        _appendLock.Dispose();
-    }
-}
-
 internal static class SafeFileSystem
 {
     internal static void EnsureDirectory(string path)

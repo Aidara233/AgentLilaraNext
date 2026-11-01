@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using ALN.Adapter.Qq;
 using ALN.Contracts;
 using ALN.Contracts.Models;
+using ALN.Storage.Sqlite;
 using ALN.Contracts.Sessions;
 using ALN.Runtime;
 
@@ -14,16 +15,26 @@ namespace ALN.Tests;
 public sealed class InboundContinuityTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-inbound-" + Guid.NewGuid().ToString("N"));
+    private readonly List<SqliteStore> _stores = [];
 
     public void Dispose()
     {
+        foreach (var store in _stores) store.Dispose();
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
+    }
+
+    /// <summary>A fresh connection each time: two of them in one test is what "before and after a restart" is.</summary>
+    private SqliteStore OpenStore()
+    {
+        var store = new SqliteStore(Path.Combine(_root, "aln.db"));
+        _stores.Add(store);
+        return store;
     }
 
     [Fact]
     public async Task A_journaled_message_can_be_read_back_and_forgetting_it_removes_it()
     {
-        var journal = NewJournal(new FileStateStore(Path.Combine(_root, "state")), out _);
+        var journal = NewJournal(OpenStore(), out _);
         var envelope = Envelope("m-1", "朋友来了");
 
         Assert.True((await journal.RememberAsync(envelope, default)).Ok);
@@ -39,7 +50,7 @@ public sealed class InboundContinuityTests : IDisposable
     [Fact]
     public async Task The_journal_is_bounded_and_gives_up_on_the_oldest_first()
     {
-        var journal = new InboundJournal(new FileStateStore(Path.Combine(_root, "state")), new CollectingLogger(), "test", capacity: 3);
+        var journal = new InboundJournal(OpenStore(), new CollectingLogger(), "test", capacity: 3);
         for (var index = 0; index < 5; index++)
             Assert.True((await journal.RememberAsync(Envelope($"m-{index}", "x"), default)).Ok);
 
@@ -51,7 +62,7 @@ public sealed class InboundContinuityTests : IDisposable
     [Fact]
     public async Task An_unreadable_journal_starts_over_instead_of_refusing_to_boot()
     {
-        var store = new FileStateStore(Path.Combine(_root, "state"));
+        var store = OpenStore();
         var written = await store.WriteAsync(InboundJournal.Scope, "test", "{ this is not json", default);
         Assert.True(written.Ok);
         var logger = new CollectingLogger();

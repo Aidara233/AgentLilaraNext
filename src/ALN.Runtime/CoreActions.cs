@@ -108,12 +108,12 @@ public static class CoreActions
                         {
                             id = rule.Id,
                             script = rule.ScriptId,
-                            scope = rule.Scope.Kind.ToString(),
+                            scope = JsonNamingPolicy.CamelCase.ConvertName(rule.Scope.Kind.ToString()),
                             selector = rule.Scope.Selector,
                             source = rule.Source,
                             budget = rule.Budget,
                             remaining = rule.Remaining,
-                            stateScope = rule.StateScope.ToString(),
+                            stateScope = JsonNamingPolicy.CamelCase.ConvertName(rule.StateScope.ToString()),
                             pending = pending.Contains(rule.Id)
                         })
                     })));
@@ -274,10 +274,10 @@ public static class CoreActions
             {
                 rule = rule.Id,
                 script = rule.ScriptId,
-                scope = rule.Scope.Kind.ToString(),
+                scope = JsonNamingPolicy.CamelCase.ConvertName(rule.Scope.Kind.ToString()),
                 selector = rule.Scope.Selector,
                 budget = rule.Budget,
-                stateScope = rule.StateScope.ToString(),
+                stateScope = JsonNamingPolicy.CamelCase.ConvertName(rule.StateScope.ToString()),
                 // Empty means the rule is waiting: the instance it names does not exist yet.
                 targets = graph.Mounted.Where(m => m.RuleId == rule.Id).Select(m => m.Target.ToString()).ToArray()
             }));

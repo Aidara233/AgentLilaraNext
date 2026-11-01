@@ -3,6 +3,7 @@ using ALN.Contracts;
 using ALN.Contracts.Models;
 using ALN.Contracts.Sessions;
 using ALN.Runtime;
+using ALN.Storage.Sqlite;
 
 namespace ALN.Tests;
 
@@ -17,16 +18,25 @@ public sealed class ChannelDeltaTests : IDisposable
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-delta-" + Guid.NewGuid().ToString("N"));
     private static readonly Address Channel = new("channel", "conversation", "my-group");
 
+    private readonly List<SqliteStore> _stores = [];
+
     public void Dispose()
     {
+        foreach (var store in _stores) store.Dispose();
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
     }
 
-    private (FileMessageStore Store, FileChannelDeltaSource Delta) Create()
+    private SqliteStore OpenStore()
     {
-        var store = new FileMessageStore(Path.Combine(_root, "messages"));
-        var state = new FileStateStore(Path.Combine(_root, "state"));
-        return (store, new FileChannelDeltaSource(store, state));
+        var store = new SqliteStore(Path.Combine(_root, "aln.db"));
+        _stores.Add(store);
+        return store;
+    }
+
+    private (SqliteStore Store, FileChannelDeltaSource Delta) Create()
+    {
+        var store = OpenStore();
+        return (store, new FileChannelDeltaSource(store, store));
     }
 
     private static StoredMessage Message(string id, string text) =>
@@ -62,7 +72,7 @@ public sealed class ChannelDeltaTests : IDisposable
         Assert.Single((await delta.TakeDeltaAsync(Channel, null, default)).Value!.Messages);
 
         // A fresh instance on the same root is what a restart looks like.
-        var restarted = new FileChannelDeltaSource(store, new FileStateStore(Path.Combine(_root, "state")));
+        var restarted = new FileChannelDeltaSource(store, OpenStore());
         var afterRestart = await restarted.TakeDeltaAsync(Channel, null, default);
         Assert.True(afterRestart.Ok);
         Assert.True(afterRestart.Value!.IsEmpty);
@@ -77,8 +87,8 @@ public sealed class ChannelDeltaTests : IDisposable
 
         // Replaying is visible and the Session timeline deduplicates by message id; skipping would silently
         // lose what people said, which is worse.
-        var cursorPath = Path.Combine(_root, "state", "channel.delta", "my-group.json");
-        await File.WriteAllTextAsync(cursorPath, "{ not json");
+        var corrupt = await store.WriteAsync("channel.delta", Channel.Instance!, "{ not json", default);
+        Assert.True(corrupt.Ok, corrupt.Error?.Message);
         var replayed = await delta.TakeDeltaAsync(Channel, null, default);
         Assert.True(replayed.Ok);
         Assert.Equal(["hello"], replayed.Value!.Messages.Select(m => m.Text));

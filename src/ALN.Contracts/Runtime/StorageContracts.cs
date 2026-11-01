@@ -16,11 +16,27 @@ public sealed record StoredMessage(
     DateTimeOffset At,
     MessageDirection Direction = MessageDirection.Inbound);
 
-/// <summary>Per-owner message history, append-only JSONL under the data root.</summary>
+/// <summary>Per-owner message history, append-only.</summary>
 public interface IMessageStore
 {
+    /// <summary>
+    /// Records one message. A second message with the same owner and platform id fails with
+    /// <see cref="ErrorCode.Conflict"/> — that is what makes redelivery idempotent without a read first.
+    /// </summary>
     ValueTask<Result> AppendAsync(StoredMessage message, CancellationToken cancellationToken);
     ValueTask<Result<IReadOnlyList<StoredMessage>>> ReadAsync(Address owner, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// Runs several storage writes as one unit when the backend can (the SQLite store does; a file-per-key
+/// backend cannot honestly promise it). Callers fall back to running the body sequentially.
+///
+/// The reason it exists: "append the message, then write the pending marker" is one fact. Half of it is a
+/// message that will never be answered, or a marker that names a message nobody has.
+/// </summary>
+public interface IAtomicWork
+{
+    ValueTask<Result> AtomicallyAsync(Func<CancellationToken, ValueTask<Result>> body, CancellationToken cancellationToken);
 }
 
 /// <summary>

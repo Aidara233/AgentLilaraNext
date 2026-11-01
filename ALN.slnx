@@ -13,6 +13,7 @@
     <Project Path="src/ALN.Model.OpenAIChat/ALN.Model.OpenAIChat.csproj" />
     <Project Path="src/ALN.Runtime/ALN.Runtime.csproj" />
     <Project Path="src/ALN.Scripting.Jint/ALN.Scripting.Jint.csproj" />
+    <Project Path="src/ALN.Storage.Sqlite/ALN.Storage.Sqlite.csproj" />
     <Project Path="src/ALN.WebUi/ALN.WebUi.csproj" />
   </Folder>
   <Folder Name="/src/dev/">

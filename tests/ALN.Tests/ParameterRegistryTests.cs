@@ -1,5 +1,6 @@
 using ALN.Contracts;
 using ALN.Runtime;
+using ALN.Storage.Sqlite;
 
 namespace ALN.Tests;
 
@@ -10,12 +11,13 @@ namespace ALN.Tests;
 public sealed class ParameterRegistryTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-params-" + Guid.NewGuid().ToString("N"));
-    private readonly FileStateStore _state;
+    private readonly SqliteStore _state;
 
-    public ParameterRegistryTests() => _state = new FileStateStore(Path.Combine(_root, "state"));
+    public ParameterRegistryTests() => _state = new SqliteStore(Path.Combine(_root, "aln.db"));
 
     public void Dispose()
     {
+        _state.Dispose();
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
     }
 
