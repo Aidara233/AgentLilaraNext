@@ -373,6 +373,53 @@ public sealed class StateContinuityTests : IDisposable
         Assert.Equal("fast", second.Channels.Get(ChatOne).Value!.ModelProfile);
     }
 
+    [Fact]
+    public async Task Switching_a_library_off_unmounts_its_scripts_and_switching_it_back_on_restores_them()
+    {
+        string scriptId;
+        using (var first = new Node(_root))
+        {
+            await first.StartAsync([Intake(), Echo("channel.toggled", "on")]);
+            await first.AddChannelAsync("chat-1");
+            var added = await first.Graph.AddRuleAsync(new("channel.toggled", MountScope.ForType("channel.conversation")), default);
+            Assert.True(added.Ok, added.Error?.Message);
+            scriptId = "channel.toggled";
+            Assert.Contains(first.Graph.Mounted, mount => mount.Package.Manifest.Id == scriptId);
+
+            // Off: gone from the graph, and not mountable again while it stays off.
+            Assert.True((await first.Graph.SetScriptEnabledAsync(scriptId, false, default)).Ok);
+            Assert.DoesNotContain(first.Graph.Mounted, mount => mount.Package.Manifest.Id == scriptId);
+            Assert.Equal(ErrorCode.Denied,
+                (await first.Graph.AddRuleAsync(new(scriptId, MountScope.ForType("channel.conversation")), default)).Error!.Code);
+
+            // The rule it had is kept, so switching back on restores exactly what was there.
+            Assert.True((await first.Graph.SetScriptEnabledAsync(scriptId, true, default)).Ok);
+            Assert.Contains(first.Graph.Mounted, mount => mount.Package.Manifest.Id == scriptId);
+        }
+
+        using var second = new Node(_root);
+        await second.StartAsync([Intake(), Echo("channel.toggled", "on")]);
+        Assert.Contains(second.Graph.Scripts, entry => entry.Package.Manifest.Id == "channel.toggled" && entry.Enabled);
+    }
+
+    [Fact]
+    public async Task A_switch_stays_off_across_a_restart()
+    {
+        using (var first = new Node(_root))
+        {
+            await first.StartAsync([Intake()]);
+            await first.AddChannelAsync("chat-1");
+            Assert.True((await first.Graph.SetScriptEnabledAsync("library:user", false, default)).Ok);
+        }
+
+        using var second = new Node(_root);
+        await second.StartAsync([Intake()]);
+        // The library is the operator's own tree; the intake script lives in it and must stay off.
+        Assert.Contains(second.Graph.Scripts, entry => entry.Package.Manifest.Id == "adapter.channel-intake" && !entry.Enabled);
+        Assert.DoesNotContain(second.Graph.Mounted, mount => mount.Package.Manifest.Id == "adapter.channel-intake");
+        Assert.Contains(second.Report.Snapshot(), note => note.Component == "graph" && note.Summary.Contains("switch(es) off"));
+    }
+
     /// <summary>Reads a shipped sample from disk, so a sample that stops being a valid script fails a test.</summary>
     private static ScriptPackage SamplePackage(string id)
     {

@@ -47,6 +47,12 @@ public interface IGraphRuntime : IInstanceBindings
     /// <summary>Rules that resolved to no target yet: the instance they are waiting for does not exist.</summary>
     IReadOnlyList<MountRule> PendingRules { get; }
 
+    /// <summary>Every catalogued script with its library and whether it is allowed to run.</summary>
+    IReadOnlyList<(ScriptPackage Package, bool Enabled)> Scripts { get; }
+
+    /// <summary>Switches one script (<c>id</c>) or one library (<c>bundled</c>, <c>user</c>, <c>plugin:<id></c>) on or off.</summary>
+    ValueTask<Result> SetScriptEnabledAsync(string target, bool enabled, CancellationToken cancellationToken);
+
     ValueTask<Result<MountRule>> AddRuleAsync(MountRequest request, CancellationToken cancellationToken);
     ValueTask<Result> RemoveRuleAsync(string ruleId, CancellationToken cancellationToken);
 

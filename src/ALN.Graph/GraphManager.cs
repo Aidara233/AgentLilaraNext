@@ -83,15 +83,10 @@ public sealed class GraphManager : IGraphRuntime
         {
             var restored = await RestoreRulesAsync(cancellationToken).ConfigureAwait(false);
             if (!restored.Ok) return restored;
-            var targets = Targets();
+            await RestoreDisabledAsync(cancellationToken).ConfigureAwait(false);
             _packages.Clear();
             foreach (var pair in candidate) _packages.Add(pair.Key, pair.Value);
-            _mounted.Clear();
-            // Two sources, one list: bundle scripts follow their package, rules follow a durable intent.
-            foreach (var package in incoming.Where(p => p.Manifest.Mount == MountMode.Default))
-            foreach (var target in targets)
-                if (IsCompatible(package.Manifest.TargetType, target)) _mounted.Add(new(package, target));
-            foreach (var target in targets) ApplyRulesTo(target);
+            RebuildMounts();
             _loaded = true;
             ReportRestore();
             return Result.Success();
@@ -132,6 +127,8 @@ public sealed class GraphManager : IGraphRuntime
                 return Result<MountRule>.Failure(new(ErrorCode.Invalid, $"Script not found: {request.ScriptId}"));
             if (package.Manifest.Mount != MountMode.Manual)
                 return Result<MountRule>.Failure(new(ErrorCode.Denied, "Default scripts are mounted by instance lifecycle."));
+            if (!IsEnabled(package))
+                return Result<MountRule>.Failure(new(ErrorCode.Denied, $"Script {request.ScriptId} is switched off."));
             if (request.Budget is < 1)
                 return Result<MountRule>.Failure(new(ErrorCode.Invalid, $"Budget must be at least 1 or absent: {request.Budget}"));
             if (CheckScope(request.Scope) is { } scopeError) return Result<MountRule>.Failure(scopeError);
@@ -235,6 +232,7 @@ public sealed class GraphManager : IGraphRuntime
         !rule.IsSpent(target) &&
         Matches(rule.Scope, target) &&
         _packages.TryGetValue(rule.ScriptId, out var package) &&
+        IsEnabled(package) &&
         IsCompatible(package.Manifest.TargetType, target);
 
     /// <summary>Call with the gate held: brings one target in line with every rule that names it.</summary>
@@ -246,6 +244,110 @@ public sealed class GraphManager : IGraphRuntime
             if (_mounted.Any(m => m.Package.Manifest.Id == rule.ScriptId && m.Target == target)) continue;
             _mounted.Add(new(_packages[rule.ScriptId], target, rule.Id, rule.RemainingFor(target)));
         }
+    }
+
+    /// <summary>
+    /// A script can be switched off, and so can a whole library — a plugin's scripts, the built-ins, or the
+    /// operator's own. Off means: not mounted, and not mountable. What is stored is the exception (the ids that
+    /// are off), so "everything the host ships" stays on without writing anything down.
+    /// </summary>
+    public const string DisabledScope = "scripts.disabled";
+    private const string DisabledKeyName = "off";
+
+    private readonly HashSet<string> _disabled = new(StringComparer.Ordinal);
+
+    /// <summary>Every catalogued script, with the library it came from and whether it is currently allowed to run.</summary>
+    public IReadOnlyList<(ScriptPackage Package, bool Enabled)> Scripts
+    {
+        get
+        {
+            _gate.Wait();
+            try { return _packages.Values.Select(package => (package, IsEnabled(package))).ToArray(); }
+            finally { _gate.Release(); }
+        }
+    }
+
+    /// <summary>Named after the package a script arrived in; the operator's own tree is simply "user".</summary>
+    private static string LibraryOf(ScriptPackage package) =>
+        string.IsNullOrWhiteSpace(package.Origin) ? "user" : package.Origin;
+
+    /// <summary>One namespace for both switches: <c>library:&lt;id&gt;</c> and <c>script:&lt;id&gt;</c>.</summary>
+    private static string SwitchKey(string target) =>
+        target.StartsWith("library:", StringComparison.Ordinal) || target.StartsWith("script:", StringComparison.Ordinal)
+            ? target
+            : target.Contains(':') || target is "user" or "bundled"
+                ? "library:" + target
+                : "script:" + target;
+
+    private bool IsEnabled(ScriptPackage package) =>
+        !_disabled.Contains("script:" + package.Manifest.Id) && !_disabled.Contains("library:" + LibraryOf(package));
+
+    public async ValueTask<Result> SetScriptEnabledAsync(string target, bool enabled, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(target)) return Result.Failure(new(ErrorCode.Invalid, "Which script or library?"));
+        var key = SwitchKey(target.Trim());
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var known = key.StartsWith("library:", StringComparison.Ordinal)
+                ? _packages.Values.Select(LibraryOf).Distinct(StringComparer.Ordinal).Contains(key["library:".Length..])
+                : _packages.ContainsKey(key["script:".Length..]);
+            if (!known) return Result.Failure(new(ErrorCode.Invalid, $"Nothing in the catalog matches '{target}'."));
+
+            var changed = enabled ? _disabled.Remove(key) : _disabled.Add(key);
+            var stored = changed ? await PersistDisabledAsync(cancellationToken).ConfigureAwait(false) : Result.Success();
+            // Off means unmounted; on means the defaults apply again. Rules are kept either way, so switching a
+            // library back on restores exactly what was there.
+            if (_loaded) RebuildMounts();
+            return stored.Ok
+                ? Result.Success()
+                : Result.Failure(new(ErrorCode.Unavailable,
+                    $"{target} was switched {(enabled ? "on" : "off")} in memory but the switch could not be persisted; a restart will undo it.",
+                    stored.Error?.Message));
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>Call with the gate held: bundle defaults for whatever is enabled, then every rule.</summary>
+    private void RebuildMounts()
+    {
+        _mounted.Clear();
+        // Two sources, one list: bundle scripts follow their package, rules follow a durable intent.
+        foreach (var package in _packages.Values.Where(package => package.Manifest.Mount == MountMode.Default && IsEnabled(package)))
+        foreach (var target in Targets())
+            if (IsCompatible(package.Manifest.TargetType, target)) _mounted.Add(new(package, target));
+        foreach (var target in Targets()) ApplyRulesTo(target);
+    }
+
+    private async ValueTask<Result> PersistDisabledAsync(CancellationToken cancellationToken)
+    {
+        if (_state is null) return Result.Success();
+        if (_disabled.Count == 0) return await _state.DeleteAsync(DisabledScope, DisabledKeyName, cancellationToken).ConfigureAwait(false);
+        var json = JsonSerializer.Serialize(_disabled.Order(StringComparer.Ordinal).ToArray(), JsonOptions);
+        return await _state.WriteAsync(DisabledScope, DisabledKeyName, json, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask RestoreDisabledAsync(CancellationToken cancellationToken)
+    {
+        if (_state is null) return;
+        var stored = await _state.ReadAsync(DisabledScope, DisabledKeyName, cancellationToken).ConfigureAwait(false);
+        if (stored.Error is { } readError)
+        {
+            _report.Note("graph", $"script switches could not be read ({readError.Message}); everything stays on");
+            return;
+        }
+        if (stored.Value is null) return;
+        try
+        {
+            foreach (var key in JsonSerializer.Deserialize<string[]>(stored.Value, JsonOptions) ?? []) _disabled.Add(key);
+        }
+        catch (JsonException)
+        {
+            _report.Note("graph", "stored script switches were unreadable; everything stays on");
+            return;
+        }
+        if (_disabled.Count > 0)
+            _report.Note("graph", $"{_disabled.Count} script switch(es) off: {string.Join(", ", _disabled.Order(StringComparer.Ordinal))}");
     }
 
     private void ReportRestore()
@@ -349,7 +451,7 @@ public sealed class GraphManager : IGraphRuntime
             if (!_types.IsConcrete(target.TypeId)) return Result.Failure(new(ErrorCode.Invalid, "Mount target must be a concrete module instance."));
             if (!TargetExists(target)) return Result.Failure(new(ErrorCode.Invalid, $"Mount target not found: {target}"));
             _drainingTargets.Remove(target);
-            foreach (var package in _packages.Values.Where(p => p.Manifest.Mount == MountMode.Default && IsCompatible(p.Manifest.TargetType, target)))
+            foreach (var package in _packages.Values.Where(p => p.Manifest.Mount == MountMode.Default && IsEnabled(p) && IsCompatible(p.Manifest.TargetType, target)))
                 if (!_mounted.Any(m => m.Package.Manifest.Id == package.Manifest.Id && m.Target == target)) _mounted.Add(new(package, target));
             // A target that appears now is also a target that some rule was already waiting for.
             var beforeRules = _mounted.Count(m => m.RuleId is not null);
@@ -1146,13 +1248,13 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
         {
             var roots = new[]
             {
-                (Path.Combine(programRoot, "resources", "scripts", "builtin"), TrustDomain.Builtin, (string?)null),
-                (Path.Combine(dataRoot, "scripts", "trusted"), TrustDomain.Trusted, null),
-                (Path.Combine(dataRoot, "scripts", "restricted"), TrustDomain.Restricted, null)
+                (Path.Combine(programRoot, "resources", "scripts", "builtin"), TrustDomain.Builtin, (string?)"bundled"),
+                (Path.Combine(dataRoot, "scripts", "trusted"), TrustDomain.Trusted, (string?)"user"),
+                (Path.Combine(dataRoot, "scripts", "restricted"), TrustDomain.Restricted, (string?)"user")
             };
-            foreach (var (root, expectedDomain, pluginId) in roots)
+            foreach (var (root, expectedDomain, origin) in roots)
             {
-                var failure = await LoadRootAsync(root, expectedDomain, pluginId, packages, seen, cancellationToken).ConfigureAwait(false);
+                var failure = await LoadRootAsync(root, expectedDomain, origin, packages, seen, cancellationToken).ConfigureAwait(false);
                 if (failure is not null) return Result<IReadOnlyList<ScriptPackage>>.Failure(failure);
             }
 
@@ -1167,7 +1269,7 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
                     cancellationToken.ThrowIfCancellationRequested();
                     var scriptsRoot = Path.Combine(plugin, "scripts");
                     if (!Directory.Exists(scriptsRoot)) continue;
-                    if (await LoadRootAsync(scriptsRoot, TrustDomain.Trusted, Path.GetFileName(plugin), packages, seen, cancellationToken)
+                    if (await LoadRootAsync(scriptsRoot, TrustDomain.Trusted, "plugin:" + Path.GetFileName(plugin), packages, seen, cancellationToken)
                         .ConfigureAwait(false) is { } failure) return Result<IReadOnlyList<ScriptPackage>>.Failure(failure);
                 }
             }
@@ -1178,7 +1280,7 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
     }
 
     /// <summary>One source of script packages. Returns a failure to stop the whole catalog, null when fine.</summary>
-    private static async ValueTask<Error?> LoadRootAsync(string root, TrustDomain expectedDomain, string? pluginId,
+    private static async ValueTask<Error?> LoadRootAsync(string root, TrustDomain expectedDomain, string? origin,
         List<ScriptPackage> packages, Dictionary<string, string> seen, CancellationToken cancellationToken)
     {
         if (!Directory.Exists(root)) return null;
@@ -1201,7 +1303,7 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
             packages.Add(new(new(manifest.Id, manifest.Version, manifest.TargetType, manifest.Mount, manifest.Events,
                 manifest.EntryPoint, manifest.Capabilities, manifest.TrustDomain, manifest.MaxStatements,
                 manifest.TimeoutMilliseconds, manifest.MemoryLimitBytes), source, fingerprint,
-                pluginId is null ? null : $"plugin:{pluginId}"));
+                origin));
         }
         return null;
     }

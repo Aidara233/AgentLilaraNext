@@ -156,6 +156,8 @@ public sealed class ControlPlaneTests : IDisposable
         public IReadOnlyList<MountedScript> Mounted => [];
         public IReadOnlyList<MountRule> Rules => [];
         public IReadOnlyList<MountRule> PendingRules => [];
+        public IReadOnlyList<(ScriptPackage Package, bool Enabled)> Scripts => [];
+        public ValueTask<Result> SetScriptEnabledAsync(string target, bool enabled, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result<MountRule>> AddRuleAsync(MountRequest request, CancellationToken ct) =>
             ValueTask.FromResult(Result<MountRule>.Failure(new(ErrorCode.Invalid, "Fake graph does not keep rules.")));
         public ValueTask<Result> RemoveRuleAsync(string ruleId, CancellationToken ct) => ValueTask.FromResult(Result.Success());

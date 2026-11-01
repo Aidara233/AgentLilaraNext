@@ -27,6 +27,8 @@ public static class CoreActions
     public const string GraphUnmount = "graph.unmount";
     public const string ModelsList = "models.list";
     public const string ModulesList = "modules.list";
+    public const string ScriptsList = "scripts.list";
+    public const string ScriptsSet = "scripts.set";
     public const string SignalsRecent = "signals.recent";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -153,6 +155,32 @@ public static class CoreActions
                     }));
                 }),
 
+            (new(ScriptsList, "Scripts in the catalog, with their library and whether they are switched on.", Capabilities.GraphRead, false),
+                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+                {
+                    libraries = graph.Scripts.GroupBy(entry => string.IsNullOrWhiteSpace(entry.Package.Origin) ? "user" : entry.Package.Origin)
+                        .Select(group => new { library = group.Key, scripts = group.Count(), enabled = group.Count(entry => entry.Enabled) }),
+                    scripts = graph.Scripts.Select(entry => new
+                    {
+                        id = entry.Package.Manifest.Id,
+                        library = string.IsNullOrWhiteSpace(entry.Package.Origin) ? "user" : entry.Package.Origin,
+                        mount = JsonNamingPolicy.CamelCase.ConvertName(entry.Package.Manifest.Mount.ToString()),
+                        trust = JsonNamingPolicy.CamelCase.ConvertName(entry.Package.Manifest.TrustDomain.ToString()),
+                        enabled = entry.Enabled,
+                        mounted = graph.Mounted.Count(mounted => mounted.Package.Manifest.Id == entry.Package.Manifest.Id)
+                    })
+                })))),
+            (new(ScriptsSet, "Switch one script or a whole library on or off. target: a script id, or bundled / user / plugin:<id>.", Capabilities.GraphControl, false),
+                async (arguments, ct) =>
+                {
+                    if (!TryReadText(arguments, "target", out var target) || target.Trim().Length == 0)
+                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "scripts.set requires 'target'."));
+                    var enabled = !arguments.TryGetProperty("enabled", out var flag) || flag.ValueKind != JsonValueKind.False;
+                    var switched = await graph.SetScriptEnabledAsync(target.Trim(), enabled, ct).ConfigureAwait(false);
+                    return switched.Ok
+                        ? Result<JsonElement>.Success(ToJson(new { target = target.Trim(), enabled, mounted = graph.Mounted.Count }))
+                        : Result<JsonElement>.Failure(switched.Error!);
+                }),
             (new(ModulesList, "Module packages loaded into this process, with what each provides.", Capabilities.SystemRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
                 {
