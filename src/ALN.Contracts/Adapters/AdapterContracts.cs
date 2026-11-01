@@ -51,7 +51,9 @@ public sealed record AdapterEnvelope(Address Adapter, string PlatformId, string 
     public Guid EventId { get; init; } = Guid.NewGuid();
 }
 public sealed record OutboundMessage(string PlatformConversationId, string Text, string? ReplyTo = null);
-public sealed record SendResult(bool Sent, string AttemptId, string? Detail = null);
+public sealed record SendResult(bool Sent, string AttemptId, string? Detail = null,
+    /// <summary>The platform's own id for what was just sent, when the transport has one.</summary>
+    string? PlatformMessageId = null);
 public sealed record AdapterInfo(Address Address, AdapterDescriptor Descriptor, AdapterState State);
 
 /// <summary>

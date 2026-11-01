@@ -38,9 +38,9 @@ public sealed class QqAdapterModule : IModulePlugin
         // Optional on purpose: without them the adapter still works, it just cannot promise a message that
         // arrived will survive a crash, and nothing acknowledges on its behalf.
         var acks = context.HostServices.GetService(typeof(IInboundAcks)) as IInboundAcks;
-        var entries = context.HostServices.GetService(typeof(IEntryStore)) as IEntryStore;
+        var queue = context.HostServices.GetService(typeof(IQueuedMessageStore)) as IQueuedMessageStore;
 
-        var registered = _factories.Register(PackageId, new QqAdapterFactory(events, logger, acks, entries));
+        var registered = _factories.Register(PackageId, new QqAdapterFactory(events, logger, acks, queue));
         if (!registered.Ok) return ValueTask.FromResult(registered);
         _started = true;
         return ValueTask.FromResult(Result.Success());
@@ -81,7 +81,7 @@ public sealed class QqAdapterModule : IModulePlugin
         return service as T ?? throw new InvalidOperationException($"Required host service is missing: {typeof(T).FullName}");
     }
 
-    private sealed class QqAdapterFactory(IEventSink events, IModuleLogger logger, IInboundAcks? acks, IEntryStore? entries) : IAdapterFactory
+    private sealed class QqAdapterFactory(IEventSink events, IModuleLogger logger, IInboundAcks? acks, IQueuedMessageStore? queue) : IAdapterFactory
     {
         public string TypeId => "adapter.qq";
 
@@ -89,5 +89,5 @@ public sealed class QqAdapterModule : IModulePlugin
         /// Creation reads the instance settings, so a spec with a missing or malformed endpoint fails
         /// here — at startup, with a message naming the file — instead of at first send.
         /// </summary>
-        public IChatAdapter Create(AdapterSpec spec) => new QqAdapter(spec, events, logger, acks, entries);
+        public IChatAdapter Create(AdapterSpec spec) => new QqAdapter(spec, events, logger, acks, queue);
     }}

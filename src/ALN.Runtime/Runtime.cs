@@ -104,10 +104,12 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant
     private TimeSpan _pollInterval = TimeSpan.FromSeconds(1);
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
+    // Adapters that declare tunables register themselves here, the same way Channels do.
+    private readonly IParameterRegistry? _parameters;
 
     public AdapterManager(IModuleTypeCatalog types, IInstanceBindings bindings, IAdapterFactoryRegistry? factories = null,
         IAdapterSpecStore? specs = null, IEventSink? events = null, IClockManager? clock = null,
-        TimeSpan? pollInterval = null)
+        TimeSpan? pollInterval = null, IParameterRegistry? parameters = null)
     {
         _types = types;
         _bindings = bindings;
@@ -116,6 +118,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant
         _events = events;
         _clock = clock;
         _pollInterval = pollInterval ?? TimeSpan.FromSeconds(1);
+        _parameters = parameters;
     }
 
     /// <summary>
@@ -170,6 +173,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant
             if (adapter.Address != spec.Address || adapter.Descriptor != spec.Descriptor)
                 return Result<IChatAdapter>.Failure(new(ErrorCode.Invalid, "Factory output does not match its AdapterSpec."));
             lock (_gate) _adapters.Add(spec.Address, adapter);
+            if (_parameters is not null && adapter is IParameterTarget tunable) _parameters.Register(tunable);
             var attached = await _bindings.AttachAsync(spec.Address, cancellationToken).ConfigureAwait(false);
             if (!attached.Ok)
             {
@@ -330,6 +334,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant
                     : await _bindings.DetachAsync(address, cancellationToken).ConfigureAwait(false);
                 if (!detached.Ok) return detached;
                 lock (_gate) _adapters.Remove(address);
+                _parameters?.Unregister(address.ToString());
             }
             return Result.Success();
         }
@@ -356,6 +361,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant
                     return stopped;
                 }
                 lock (_gate) _adapters.Remove(address);
+                _parameters?.Unregister(address.ToString());
                 if (_specs is not null)
                 {
                     var removed = await _specs.DeleteAsync(address, cancellationToken).ConfigureAwait(false);

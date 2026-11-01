@@ -309,9 +309,10 @@ public sealed class StateContinuityTests : IDisposable
                 at = DateTimeOffset.UtcNow,
                 sender = (string?)null
             };
-            var seeded = await first.Storage.PutAsync(ChannelManager.PendingScope, ChatOne, answeredMessageId,
-                System.Text.Json.JsonSerializer.Serialize(marker, new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web)),
-                null, default);
+            var payload = System.Text.Json.JsonSerializer.Serialize(marker,
+                new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web));
+            var seeded = await first.Storage.EnqueueAsync(ChannelManager.PendingScope, ChatOne,
+                new QueuedMessage(answeredMessageId, "platform-2", "chat-1", null, "你在吗", marker.at, payload), null, default);
             Assert.True(seeded.Ok, seeded.Error?.Message);
         }
 
@@ -354,6 +355,25 @@ public sealed class StateContinuityTests : IDisposable
     }
 
 
+    [Fact]
+    public async Task A_channel_remembers_which_model_profile_it_was_told_to_use()
+    {
+        using (var first = new Node(_root))
+        {
+            await first.StartAsync([Intake()]);
+            await first.AddChannelAsync("chat-1");
+            var set = await first.Parameters.SetAsync(ChatOne.ToString(), "modelProfile", "fast", default);
+            Assert.True(set.Ok, set.Error?.Message);
+            Assert.Equal("fast", first.Channels.Get(ChatOne).Value!.ModelProfile);
+        }
+
+        using var second = new Node(_root);
+        await second.StartAsync([Intake()]);
+        // Persisted with the rest of the tunables: a restart does not silently fall back to the global profile.
+        Assert.Equal("fast", second.Channels.Get(ChatOne).Value!.ModelProfile);
+    }
+
+    /// <summary>Reads a shipped sample from disk, so a sample that stops being a valid script fails a test.</summary>
     private static ScriptPackage SamplePackage(string id)
     {
         var directory = Path.Combine(RepositoryRoot(), "samples", "scripts", "trusted", id);

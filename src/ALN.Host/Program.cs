@@ -41,7 +41,9 @@ var channelSpecs = new FileChannelSpecStore(Path.Combine(data.Root, "channels"))
 var adapterTypes = new AdapterTypeCatalog();
 var bindings = new InstanceBindingsProxy();
 var adapterFactories = new AdapterFactoryRegistry();
-var adapters = new AdapterManager(adapterTypes, bindings, adapterFactories, adapterSpecs);
+// One registry for every tunable: components register themselves, the registry validates, applies, persists.
+var parameters = new ParameterRegistry(stateStore);
+var adapters = new AdapterManager(adapterTypes, bindings, adapterFactories, adapterSpecs, parameters: parameters);
 var artifacts = new FileArtifactStore(Path.Combine(data.Root, "artifacts"));
 var modelManager = new ModelManager(artifacts, signalLog);
 var roundContextContributors = new RoundContextContributorRegistry();
@@ -59,8 +61,6 @@ restore.Note("storage", $"sqlite {Path.GetFileName(storage.Path)}: {storage.Coun
 // Acknowledgements owed to Adapters: published is not handled, so the mailbox file is only settled after
 // the event round it produced is over.
 var acks = new InboundAckRegistry();
-// One registry for every tunable: components register themselves, the registry validates, applies, persists.
-var parameters = new ParameterRegistry(stateStore);
 var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, roundContextContributors, signalLog);
 var reloadState = new ModuleReloadStateStore();
 var hostServices = new HostServiceProvider(
@@ -74,7 +74,7 @@ var hostServices = new HostServiceProvider(
     (typeof(IMessageStore), messageStore),
     (typeof(IStateStore), stateStore),
     (typeof(IAtomicWork), storage),
-    (typeof(IEntryStore), storage),
+    (typeof(IQueuedMessageStore), storage),
     (typeof(IRestoreReporter), restore),
     (typeof(IInboundAcks), acks),
     (typeof(IParameterRegistry), parameters),

@@ -5,7 +5,7 @@ namespace ALN.Channel;
 
 public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, IInstanceBindings bindings,
     IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
-    IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IEntryStore? entries = null)
+    IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IQueuedMessageStore? queue = null)
     : IChannelManager, ILifecycleParticipant
 {
     /// <summary>Where the wish "this Channel should be running" is kept, so a stop survives a restart.</summary>
@@ -24,7 +24,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     private readonly IRestoreReporter _report = report ?? NullRestoreReporter.Instance;
     private readonly IAtomicWork? _atomic = atomic;
     // Accepted-but-unfinished markers are their own rows: one per message, not a list rewritten per message.
-    private readonly IEntryStore? _entries = entries;
+    private readonly IQueuedMessageStore? _queue = queue;
     private readonly Dictionary<Address, ChannelInstance> _channels = new();
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
@@ -224,7 +224,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             // with the same address would inherit them from one that no longer exists.
             if (_state is not null)
                 await _state.DeleteAsync(DesiredScope, StateName.Encode(address.ToString()), cancellationToken).ConfigureAwait(false);
-            if (_entries is not null) await _entries.RemoveAllAsync(PendingScope, address, cancellationToken).ConfigureAwait(false);
+            if (_queue is not null) await _queue.ClearAsync(PendingScope, address, cancellationToken).ConfigureAwait(false);
             return Result.Success();
         }
         catch (OperationCanceledException) { throw; }
@@ -286,7 +286,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     }
 
     public async ValueTask<Result> RecordReplyAsync(Address channel, Guid answeredMessageId, string platformConversationId,
-        string text, CancellationToken cancellationToken)
+        string text, string? platformMessageId, CancellationToken cancellationToken)
     {
         if (_messages is null) return Result.Success();
         var instance = Get(channel);
@@ -295,7 +295,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         // One row per reply, pointing at the message it answers. That row is what makes "already answered"
         // answerable, which is what keeps a replayed round from replying a second time.
         return await _messages.AppendAsync(new StoredMessage(Guid.NewGuid().ToString("N"), channel, platformConversationId,
-            null, null, text, DateTimeOffset.UtcNow, MessageDirection.Outbound, answeredMessageId.ToString("D")),
+            platformMessageId, null, text, DateTimeOffset.UtcNow, MessageDirection.Outbound, answeredMessageId.ToString("D")),
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -303,8 +303,8 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     {
         // Removing a marker that is not there is the normal case for a message that never became pending
         // (a stopped Channel, a duplicate delivery), so it is not an error.
-        if (_entries is null) return Result.Success();
-        return await _entries.RemoveAsync(PendingScope, channel, messageId.ToString("D"), cancellationToken).ConfigureAwait(false);
+        if (_queue is null) return Result.Success();
+        return await _queue.AcknowledgeAsync(PendingScope, channel, messageId.ToString("D"), cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask<Result<int>> ReplayPendingAsync(CancellationToken cancellationToken)
@@ -361,15 +361,15 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
 
     private async ValueTask<Result<IReadOnlyList<PendingAccept>>> ReadPendingAsync(Address channel, CancellationToken cancellationToken)
     {
-        if (_entries is null) return Result<IReadOnlyList<PendingAccept>>.Success([]);
-        var stored = await _entries.ListAsync(PendingScope, channel, cancellationToken).ConfigureAwait(false);
+        if (_queue is null) return Result<IReadOnlyList<PendingAccept>>.Success([]);
+        var stored = await _queue.ListAsync(PendingScope, channel, cancellationToken).ConfigureAwait(false);
         if (stored.Error is { } readError) return Result<IReadOnlyList<PendingAccept>>.Failure(readError);
         var pending = new List<PendingAccept>(stored.Value!.Count);
         foreach (var entry in stored.Value!)
         {
             try
             {
-                var parsed = JsonSerializer.Deserialize<PendingAccept>(entry.Value, JsonOptions);
+                var parsed = JsonSerializer.Deserialize<PendingAccept>(entry.Payload, JsonOptions);
                 if (parsed is not null) pending.Add(parsed);
             }
             catch (JsonException ex)
@@ -377,7 +377,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                 // A marker we cannot read would replay forever otherwise. The message is still in history, so
                 // the honest move is to drop this one and say so.
                 _report.Note("channels", $"a pending marker for {channel} was unreadable ({ex.Message}); dropped");
-                await _entries.RemoveAsync(PendingScope, channel, entry.Key, cancellationToken).ConfigureAwait(false);
+                await _queue.AcknowledgeAsync(PendingScope, channel, entry.EventId, cancellationToken).ConfigureAwait(false);
             }
         }
         return Result<IReadOnlyList<PendingAccept>>.Success(pending);
@@ -385,10 +385,11 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
 
     private async ValueTask<Result> AddPendingAsync(Address channel, PendingAccept entry, CancellationToken cancellationToken)
     {
-        if (_entries is null) return Result.Success();
-        var json = JsonSerializer.Serialize(entry, JsonOptions);
+        if (_queue is null) return Result.Success();
         // One row, one insert. The marker is keyed by event id, so a retried accept replaces rather than adds.
-        return await _entries.PutAsync(PendingScope, channel, entry.MessageId, json, null, cancellationToken).ConfigureAwait(false);
+        var queued = new QueuedMessage(entry.MessageId, entry.PlatformMessageId, entry.Conversation, entry.Sender,
+            entry.Text, entry.At, JsonSerializer.Serialize(entry, JsonOptions));
+        return await _queue.EnqueueAsync(PendingScope, channel, queued, null, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>An accepted message whose round never finished. Enough to rebuild the wake-up without the history.</summary>
@@ -453,9 +454,10 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         public IReadOnlyList<ChannelBinding> Bindings { get; } = Array.AsReadOnly(spec.Bindings.ToArray());
         /// <summary>Spec value unless overridden at runtime; the window is read on every activation.</summary>
         public int? MaxMessages { get; set; } = spec.MaxMessages;
+        public string? ModelProfile { get; set; }
         public bool Running { get; set; }
         public bool Draining { get; set; }
-        public ChannelInfo ToInfo() => new(Address, Name, Bindings, Running, MaxMessages);
+        public ChannelInfo ToInfo() => new(Address, Name, Bindings, Running, MaxMessages, ModelProfile);
 
         public IParameterTarget Parameters(ChannelManager owner) => new ChannelParameters(this, owner);
     }
@@ -467,6 +469,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     private sealed class ChannelParameters(ChannelInstance channel, ChannelManager owner) : IParameterTarget
     {
         public const string MaxMessagesName = "maxMessages";
+        public const string ModelProfileName = "modelProfile";
 
         public string ParameterScope => channel.Address.ToString();
 
@@ -474,17 +477,26 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         [
             new(MaxMessagesName, ParameterKind.Integer, null,
                 "一轮最多携带多少条频道消息；更早的折叠成“省略更早的 N 条”。留空表示不限。",
-                ParameterApply.Immediate, Secret: false, Minimum: 1, Maximum: 100_000)
+                ParameterApply.Immediate, Secret: false, Minimum: 1, Maximum: 100_000),
+            new(ModelProfileName, ParameterKind.Text, null,
+                "这个频道用哪个模型 profile；留空表示由宿主解析（default 优先，否则 id 序第一个）。下一轮生效。",
+                ParameterApply.Immediate, Secret: false)
         ];
 
         public string? ReadParameter(string name) =>
             string.Equals(name, MaxMessagesName, StringComparison.Ordinal)
                 ? channel.MaxMessages?.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                : null;
+                : string.Equals(name, ModelProfileName, StringComparison.Ordinal) ? channel.ModelProfile : null;
 
         public ValueTask<Result> ApplyParameterAsync(string name, string value, CancellationToken cancellationToken)
         {
             _ = owner;
+            if (string.Equals(name, ModelProfileName, StringComparison.Ordinal))
+            {
+                // Empty is a real value here: it means "stop naming one and let the host resolve".
+                channel.ModelProfile = string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+                return ValueTask.FromResult(Result.Success());
+            }
             if (!string.Equals(name, MaxMessagesName, StringComparison.Ordinal))
                 return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, $"Unknown parameter: {name}")));
             if (string.IsNullOrWhiteSpace(value))

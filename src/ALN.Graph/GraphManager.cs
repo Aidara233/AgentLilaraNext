@@ -646,6 +646,11 @@ public sealed class GraphManager : IGraphRuntime
                 await DenyAsync(ScriptCapabilities.SessionActivate, "Channel message does not match routed event.", cancellationToken).ConfigureAwait(false);
 
             var spec = Parse<SessionSpec>(sessionSpecJson);
+            // The Channel may name the profile it wants; a spec that names none inherits it. Leftovers fall to
+            // the host's own resolution (SessionManager), which says out loud what it picked.
+            if (string.IsNullOrWhiteSpace(spec.ModelProfileId) &&
+                channels.Get(channelMessage.Channel).Value is { ModelProfile: { Length: > 0 } channelProfile })
+                spec = spec with { ModelProfileId = channelProfile };
             if (spec.Tools?.Any(tool => tool.Name != "send_message") == true)
                 return JsonSerializer.Serialize(new { ok = false, error = new { message = "Unknown Session tool binding." } }, JsonOptions);
             if (spec.Tools?.Any(tool => tool.Name == "send_message") == true &&
@@ -684,6 +689,9 @@ public sealed class GraphManager : IGraphRuntime
                 !StringComparer.Ordinal.Equals(channelMessage.Text, userInput))
                 await DenyAsync(ScriptCapabilities.SessionRun, "Channel message does not match routed event.", cancellationToken).ConfigureAwait(false);
             var spec = Parse<SessionSpec>(sessionSpecJson);
+            if (string.IsNullOrWhiteSpace(spec.ModelProfileId) &&
+                channels.Get(channelMessage.Channel).Value is { ModelProfile: { Length: > 0 } channelProfile })
+                spec = spec with { ModelProfileId = channelProfile };
             if (spec.Tools?.Any(tool => tool.Name != "send_message") == true)
                 return JsonSerializer.Serialize(new { ok = false, error = new { message = "Unknown Session tool binding." } }, JsonOptions);
             if (spec.Tools?.Any(tool => tool.Name == "send_message") == true &&
@@ -1093,7 +1101,8 @@ public sealed class GraphManager : IGraphRuntime
             {
                 // Written down after the send, never before: the reply is already out, so a failed row costs at
                 // most one duplicate on a later replay, while a row without a reply would cost a silence.
-                var recorded = await channels.RecordReplyAsync(answeredChannel, eventId, message.PlatformConversationId, message.Text, cancellationToken)
+                var recorded = await channels.RecordReplyAsync(answeredChannel, eventId, message.PlatformConversationId, message.Text,
+                    result.Value.PlatformMessageId, cancellationToken)
                     .ConfigureAwait(false);
                 if (!recorded.Ok)
                     signalLog.Write(new()

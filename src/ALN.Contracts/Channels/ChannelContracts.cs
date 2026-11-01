@@ -85,7 +85,9 @@ public sealed record ParameterView(
     string Description);
 public sealed record ChannelSpec(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, int? MaxMessages = null);
 public sealed record ChannelInfo(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, bool Running,
-    int? MaxMessages = null);
+    int? MaxMessages = null,
+    /// <summary>Which model profile this Channel talks with; null means "whatever the host resolves".</summary>
+    string? ModelProfile = null);
 public sealed record ChannelMessage(Guid MessageId, Address Channel, ChannelBinding Binding,
     string? PlatformMessageId, string Text, DateTimeOffset At, string? Sender = null, bool MentionsSelf = false);
 
@@ -135,7 +137,7 @@ public interface IChannelManager
     /// into a second reply attempt.
     /// </summary>
     ValueTask<Result> RecordReplyAsync(Address channel, Guid answeredMessageId, string platformConversationId,
-        string text, CancellationToken cancellationToken);
+        string text, string? platformMessageId, CancellationToken cancellationToken);
 
     /// <summary>
     /// Clears the "accepted but not finished" marker for one message. Called once the event round for that

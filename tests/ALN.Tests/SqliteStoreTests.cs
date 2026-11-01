@@ -136,39 +136,53 @@ public sealed class SqliteStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task Journal_entries_are_their_own_rows_and_capacity_drops_the_oldest()
+    public async Task Queued_messages_are_their_own_rows_and_capacity_drops_the_oldest()
     {
         var store = OpenStore();
         var owner = new Address("adapter", "qq", "1");
         for (var index = 0; index < 4; index++)
-            Assert.True((await store.PutAsync(InboundScope, owner, $"k{index}", $"v{index}", capacity: 3, default)).Ok);
+            Assert.True((await store.EnqueueAsync(InboundScope, owner, Queued($"k{index}", $"v{index}"), capacity: 3, default)).Ok);
 
-        // One row per item; the oldest fell off because the caller said "at most three".
-        Assert.Equal(["k1", "k2", "k3"], (await store.ListAsync(InboundScope, owner, default)).Value!.Select(entry => entry.Key));
+        // One row per message; the oldest fell off because the caller said "at most three".
+        Assert.Equal(["k1", "k2", "k3"], (await store.ListAsync(InboundScope, owner, default)).Value!.Select(entry => entry.EventId));
         Assert.Equal(3, (await store.CountAsync(InboundScope, default)).Value);
 
-        // Rewriting the same key replaces the row rather than adding one.
-        Assert.True((await store.PutAsync(InboundScope, owner, "k3", "v3-again", null, default)).Ok);
-        Assert.Equal("v3-again", (await store.ListAsync(InboundScope, owner, default)).Value!.Last().Value);
+        // Rewriting the same event id replaces the row rather than adding one.
+        Assert.True((await store.EnqueueAsync(InboundScope, owner, Queued("k3", "v3-again"), null, default)).Ok);
+        Assert.Equal("v3-again", (await store.ListAsync(InboundScope, owner, default)).Value!.Last().Payload);
 
-        Assert.True((await store.RemoveAsync(InboundScope, owner, "k2", default)).Ok);
+        Assert.True((await store.AcknowledgeAsync(InboundScope, owner, "k2", default)).Ok);
         Assert.Equal(2, (await store.CountAsync(InboundScope, default)).Value);
-        Assert.Equal(2, (await store.RemoveAllAsync(InboundScope, owner, default)).Value);
+        Assert.Equal(2, (await store.ClearAsync(InboundScope, owner, default)).Value);
         Assert.Empty((await store.ListAsync(InboundScope, owner, default)).Value!);
     }
 
     [Fact]
-    public async Task Journal_entries_belong_to_one_owner()
+    public async Task Queued_messages_can_be_queried_by_field_and_belong_to_one_owner()
     {
         var store = OpenStore();
         var mine = new Address("adapter", "qq", "1");
         var theirs = new Address("adapter", "qq", "2");
-        Assert.True((await store.PutAsync(InboundScope, mine, "k", """{"a":1}""", null, default)).Ok);
-        Assert.True((await store.PutAsync(InboundScope, theirs, "k", """{"a":2}""", null, default)).Ok);
+        Assert.True((await store.EnqueueAsync(InboundScope, mine, Queued("k", """{"a":1}""", platformMessageId: "p1"), null, default)).Ok);
+        Assert.True((await store.EnqueueAsync(InboundScope, theirs, Queued("k", """{"a":2}"""), null, default)).Ok);
 
-        Assert.Equal("""{"a":1}""", Assert.Single((await store.ListAsync(InboundScope, mine, default)).Value!).Value);
-        Assert.Equal("""{"a":2}""", Assert.Single((await store.ListAsync(InboundScope, theirs, default)).Value!).Value);
+        Assert.Equal("""{"a":1}""", Assert.Single((await store.ListAsync(InboundScope, mine, default)).Value!).Payload);
+        Assert.Equal("""{"a":2}""", Assert.Single((await store.ListAsync(InboundScope, theirs, default)).Value!).Payload);
+
+        // The point of the columns: these questions are answered by the database, not by parsing payloads in code.
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={store.Path};Pooling=False");
+        connection.Open();
+        using var query = connection.CreateCommand();
+        query.CommandText = "SELECT text, conversation FROM queued_message WHERE queue=$queue AND platform_message_id='p1';";
+        query.Parameters.AddWithValue("$queue", InboundScope);
+        using var reader = query.ExecuteReader();
+        Assert.True(reader.Read());
+        Assert.Equal("first words", reader.GetString(0));
+        Assert.Equal("group-1", reader.GetString(1));
     }
+
+    private static QueuedMessage Queued(string eventId, string payload, string? platformMessageId = null) =>
+        new(eventId, platformMessageId, "group-1", "alice", "first words", DateTimeOffset.UtcNow, payload);
 
     private const string InboundScope = "qq.inbound";
 

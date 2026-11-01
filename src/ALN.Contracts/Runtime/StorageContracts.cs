@@ -36,29 +36,42 @@ public interface IMessageStore
 }
 
 /// <summary>
-/// A bag of small records one owner is accumulating — a journal, a to-do list — where each record is its own
-/// row and its own write.
+/// One message waiting to be handled: received but not yet acknowledged (an Adapter journal entry), or accepted
+/// but not yet finished (a Channel's pending marker).
+///
+/// The columns are the answers people actually ask of this table — which conversation, who said it, when — and
+/// <paramref name="Payload"/> keeps the original record verbatim so a replay is exact rather than reconstructed.
+/// </summary>
+public sealed record QueuedMessage(
+    string EventId,
+    string? PlatformMessageId,
+    string Conversation,
+    string? Sender,
+    string Text,
+    DateTimeOffset At,
+    string Payload);
+
+/// <summary>
+/// Queues of messages an owner is accumulating, where each message is its own row and its own write.
 ///
 /// Deliberately not <see cref="IStateStore"/>: a state key holds one blob, so "append one message" there means
-/// read the whole list, add to it, write it back. These lists are exactly the ones that grow with traffic, so
-/// they get one row per item, a delete per acknowledgement, and a query that can be read by a person.
+/// read the whole list, add to it, write it back. These queues grow with traffic, so they get one row per
+/// message, a delete per acknowledgement, and a query a person can run.
 /// </summary>
-public interface IEntryStore
+public interface IQueuedMessageStore
 {
-    /// <summary>Adds or replaces one record. Inserting past <paramref name="capacity"/> drops the oldest.</summary>
-    ValueTask<Result> PutAsync(string scope, Address owner, string key, string value, int? capacity, CancellationToken cancellationToken);
+    /// <summary>Adds or replaces one message. Inserting past <paramref name="capacity"/> drops the oldest.</summary>
+    ValueTask<Result> EnqueueAsync(string queue, Address owner, QueuedMessage message, int? capacity, CancellationToken cancellationToken);
 
-    ValueTask<Result> RemoveAsync(string scope, Address owner, string key, CancellationToken cancellationToken);
+    ValueTask<Result> AcknowledgeAsync(string queue, Address owner, string eventId, CancellationToken cancellationToken);
 
     /// <summary>Oldest first — the order they arrived in.</summary>
-    ValueTask<Result<IReadOnlyList<EntryRecord>>> ListAsync(string scope, Address owner, CancellationToken cancellationToken);
+    ValueTask<Result<IReadOnlyList<QueuedMessage>>> ListAsync(string queue, Address owner, CancellationToken cancellationToken);
 
-    ValueTask<Result<int>> RemoveAllAsync(string scope, Address owner, CancellationToken cancellationToken);
+    ValueTask<Result<int>> ClearAsync(string queue, Address owner, CancellationToken cancellationToken);
 
-    ValueTask<Result<int>> CountAsync(string scope, CancellationToken cancellationToken);
+    ValueTask<Result<int>> CountAsync(string queue, CancellationToken cancellationToken);
 }
-
-public sealed record EntryRecord(string Key, string Value, DateTimeOffset At);
 
 /// <summary>
 /// Runs several storage writes as one unit when the backend can (the SQLite store does; a file-per-key

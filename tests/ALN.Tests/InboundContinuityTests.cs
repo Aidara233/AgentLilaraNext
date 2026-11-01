@@ -63,7 +63,7 @@ public sealed class InboundContinuityTests : IDisposable
     public async Task An_unreadable_journal_starts_over_instead_of_refusing_to_boot()
     {
         var store = OpenStore();
-        var written = await store.PutAsync(InboundJournal.Scope, Owner, "bad-row", "{ this is not json", null, default);
+        var written = await store.EnqueueAsync(InboundJournal.QueueName, Owner, new QueuedMessage("bad-row", null, "group-1", null, "x", DateTimeOffset.UtcNow, "{ this is not json"), null, default);
         Assert.True(written.Ok, written.Error?.Message);
         var logger = new CollectingLogger();
         var journal = new InboundJournal(store, logger, Owner);
@@ -122,7 +122,22 @@ public sealed class InboundContinuityTests : IDisposable
         Assert.Contains("no profile", turn.Error!.Message, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static InboundJournal NewJournal(IEntryStore store, out CollectingLogger logger)
+    [Fact]
+    public async Task The_qq_request_timeout_is_a_runtime_parameter()
+    {
+        var settings = new Dictionary<string, string> { ["endpoint"] = "ws://127.0.0.1:1" };
+        var adapter = new QqAdapter(new(new("adapter", "qq", "1"), new("qq", "acc", AdapterDirection.Both), settings),
+            new EventQueue(8), new CollectingLogger());
+
+        Assert.Equal("10", adapter.ReadParameter(QqAdapter.TimeoutParameter));
+        Assert.True((await adapter.ApplyParameterAsync(QqAdapter.TimeoutParameter, "30", default)).Ok);
+        Assert.Equal("30", adapter.ReadParameter(QqAdapter.TimeoutParameter));
+        // Out of range is refused and the old value stays.
+        Assert.Equal(ErrorCode.Invalid, (await adapter.ApplyParameterAsync(QqAdapter.TimeoutParameter, "0", default)).Error!.Code);
+        Assert.Equal("30", adapter.ReadParameter(QqAdapter.TimeoutParameter));
+    }
+
+    private static InboundJournal NewJournal(IQueuedMessageStore store, out CollectingLogger logger)
     {
         logger = new CollectingLogger();
         return new InboundJournal(store, logger, Owner);

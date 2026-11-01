@@ -16,9 +16,9 @@ namespace ALN.Storage.Sqlite;
 /// Durability: <c>journal_mode=WAL</c> with <c>synchronous=NORMAL</c>, which survives a killed process (the
 /// case this whole state story is about) and can lose only the last commit on a power cut.
 /// </summary>
-public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomicWork, IEntryStore, IDisposable
+public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomicWork, IQueuedMessageStore, IDisposable
 {
-    private const int SchemaVersion = 2;
+    private const int SchemaVersion = 3;
     private const int SqliteConstraint = 19;
     private const int SqliteBusy = 5;
     private const int SqliteLocked = 6;
@@ -233,83 +233,97 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             return Result<IReadOnlyList<StoredMessage>>.Success(messages);
         });
 
-    // ---- IEntryStore: lists that grow with traffic ---------------------------------------------
+    // ---- IQueuedMessageStore: queues that grow with traffic -------------------------------------
 
-    public ValueTask<Result> PutAsync(string scope, Address owner, string key, string value, int? capacity, CancellationToken cancellationToken) =>
-        RunAsync(cancellationToken, Result.Failure, "Journal entry could not be written.", () =>
+    public ValueTask<Result> EnqueueAsync(string queue, Address owner, QueuedMessage message, int? capacity, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result.Failure, "Queued message could not be written.", () =>
         {
-            if (!IsToken(scope) || !IsToken(key) || !owner.IsInstance)
-                return Result.Failure(new(ErrorCode.Invalid, "Entry scope and key must be tokens, and the owner must be an instance."));
-            if (value is null) return Result.Failure(new(ErrorCode.Invalid, "Entry value must not be null."));
+            if (!IsToken(queue) || string.IsNullOrWhiteSpace(message.EventId) || message.Payload is null || !owner.IsInstance)
+                return Result.Failure(new(ErrorCode.Invalid,
+                    "Queue name and event id are required, the payload must not be null, and the owner must be an instance."));
             using var command = Command(
-                "INSERT INTO entry(scope, owner, key, value, at) VALUES($scope, $owner, $key, $value, $at) " +
-                "ON CONFLICT(scope, owner, key) DO UPDATE SET value=excluded.value, at=excluded.at;");
-            command.Parameters.AddWithValue("$scope", scope);
+                "INSERT INTO queued_message(queue, owner, event_id, platform_message_id, conversation, sender, text, at, payload) " +
+                "VALUES($queue, $owner, $event, $platform, $conversation, $sender, $text, $at, $payload) " +
+                "ON CONFLICT(queue, owner, event_id) DO UPDATE SET platform_message_id=excluded.platform_message_id, " +
+                "conversation=excluded.conversation, sender=excluded.sender, text=excluded.text, at=excluded.at, payload=excluded.payload;");
+            command.Parameters.AddWithValue("$queue", queue);
             command.Parameters.AddWithValue("$owner", owner.ToString());
-            command.Parameters.AddWithValue("$key", key);
-            command.Parameters.AddWithValue("$value", value);
-            command.Parameters.AddWithValue("$at", Now());
+            command.Parameters.AddWithValue("$event", message.EventId);
+            command.Parameters.AddWithValue("$platform", (object?)message.PlatformMessageId ?? DBNull.Value);
+            command.Parameters.AddWithValue("$conversation", message.Conversation);
+            command.Parameters.AddWithValue("$sender", (object?)message.Sender ?? DBNull.Value);
+            command.Parameters.AddWithValue("$text", message.Text);
+            command.Parameters.AddWithValue("$at", Timestamp(message.At));
+            command.Parameters.AddWithValue("$payload", message.Payload);
             command.ExecuteNonQuery();
             if (capacity is not > 0) return Result.Success();
 
-            // One statement instead of read-filter-write: a journal that only ever grows is a journal nobody
-            // drains, and the oldest entries are the ones waiting longest for an acknowledgement that is not
-            // coming. Callers pass the capacity; they get told when it bites (see the count below).
+            // One statement instead of read-filter-write. A queue that only grows is a queue nobody drains, and
+            // the oldest entries are the ones waiting longest for an acknowledgement that is not coming.
             using var trim = Command(
-                "DELETE FROM entry WHERE scope=$scope AND owner=$owner AND key IN (" +
-                "SELECT key FROM entry WHERE scope=$scope AND owner=$owner ORDER BY at DESC, key DESC LIMIT -1 OFFSET $capacity);");
-            trim.Parameters.AddWithValue("$scope", scope);
+                "DELETE FROM queued_message WHERE queue=$queue AND owner=$owner AND event_id IN (" +
+                "SELECT event_id FROM queued_message WHERE queue=$queue AND owner=$owner " +
+                "ORDER BY at DESC, event_id DESC LIMIT -1 OFFSET $capacity);");
+            trim.Parameters.AddWithValue("$queue", queue);
             trim.Parameters.AddWithValue("$owner", owner.ToString());
             trim.Parameters.AddWithValue("$capacity", capacity.Value);
             trim.ExecuteNonQuery();
             return Result.Success();
         });
 
-    public ValueTask<Result> RemoveAsync(string scope, Address owner, string key, CancellationToken cancellationToken) =>
-        RunAsync(cancellationToken, Result.Failure, "Journal entry could not be removed.", () =>
+    public ValueTask<Result> AcknowledgeAsync(string queue, Address owner, string eventId, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result.Failure, "Queued message could not be acknowledged.", () =>
         {
-            using var command = Command("DELETE FROM entry WHERE scope=$scope AND owner=$owner AND key=$key;");
-            command.Parameters.AddWithValue("$scope", scope);
+            using var command = Command("DELETE FROM queued_message WHERE queue=$queue AND owner=$owner AND event_id=$event;");
+            command.Parameters.AddWithValue("$queue", queue);
             command.Parameters.AddWithValue("$owner", owner.ToString());
-            command.Parameters.AddWithValue("$key", key);
+            command.Parameters.AddWithValue("$event", eventId);
             command.ExecuteNonQuery();
+            // Acknowledging something that is not there is the normal case for a redelivery, not an error.
             return Result.Success();
         });
 
-    public ValueTask<Result<IReadOnlyList<EntryRecord>>> ListAsync(string scope, Address owner, CancellationToken cancellationToken) =>
-        RunAsync(cancellationToken, Result<IReadOnlyList<EntryRecord>>.Failure, "Journal entries could not be read.", () =>
+    public ValueTask<Result<IReadOnlyList<QueuedMessage>>> ListAsync(string queue, Address owner, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<IReadOnlyList<QueuedMessage>>.Failure, "Queued messages could not be read.", () =>
         {
-            using var command = Command("SELECT key, value, at FROM entry WHERE scope=$scope AND owner=$owner ORDER BY at, key;");
-            command.Parameters.AddWithValue("$scope", scope);
+            using var command = Command(
+                "SELECT event_id, platform_message_id, conversation, sender, text, at, payload FROM queued_message " +
+                "WHERE queue=$queue AND owner=$owner ORDER BY at, event_id;");
+            command.Parameters.AddWithValue("$queue", queue);
             command.Parameters.AddWithValue("$owner", owner.ToString());
-            var entries = new List<EntryRecord>();
+            var messages = new List<QueuedMessage>();
             using var reader = command.ExecuteReader();
             while (reader.Read())
             {
-                entries.Add(new EntryRecord(reader.GetString(0), reader.GetString(1),
-                    DateTimeOffset.Parse(reader.GetString(2), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)));
+                messages.Add(new QueuedMessage(
+                    reader.GetString(0),
+                    reader.IsDBNull(1) ? null : reader.GetString(1),
+                    reader.GetString(2),
+                    reader.IsDBNull(3) ? null : reader.GetString(3),
+                    reader.GetString(4),
+                    DateTimeOffset.Parse(reader.GetString(5), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                    reader.GetString(6)));
             }
-            return Result<IReadOnlyList<EntryRecord>>.Success(entries);
+            return Result<IReadOnlyList<QueuedMessage>>.Success(messages);
         });
 
-    public ValueTask<Result<int>> RemoveAllAsync(string scope, Address owner, CancellationToken cancellationToken) =>
-        RunAsync(cancellationToken, Result<int>.Failure, "Journal entries could not be removed.", () =>
+    public ValueTask<Result<int>> ClearAsync(string queue, Address owner, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<int>.Failure, "Queued messages could not be cleared.", () =>
         {
-            using var command = Command("DELETE FROM entry WHERE scope=$scope AND owner=$owner;");
-            command.Parameters.AddWithValue("$scope", scope);
+            using var command = Command("DELETE FROM queued_message WHERE queue=$queue AND owner=$owner;");
+            command.Parameters.AddWithValue("$queue", queue);
             command.Parameters.AddWithValue("$owner", owner.ToString());
             return Result<int>.Success(command.ExecuteNonQuery());
         });
 
-    public ValueTask<Result<int>> CountAsync(string scope, CancellationToken cancellationToken) =>
-        RunAsync(cancellationToken, Result<int>.Failure, "Journal could not be counted.", () =>
+    public ValueTask<Result<int>> CountAsync(string queue, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<int>.Failure, "Queue could not be counted.", () =>
         {
-            using var command = Command("SELECT COUNT(*) FROM entry WHERE scope=$scope;");
-            command.Parameters.AddWithValue("$scope", scope);
+            using var command = Command("SELECT COUNT(*) FROM queued_message WHERE queue=$queue;");
+            command.Parameters.AddWithValue("$queue", queue);
             return Result<int>.Success(Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture));
         });
 
-    // ---- IAuditSink ----------------------------------------------------------------------------
 
     public ValueTask AppendAsync(AuditRecord record, CancellationToken cancellationToken) =>
         // IAuditSink cannot report failure, so this cannot either: an audit row that fails to land must not
@@ -438,6 +452,12 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             try { Execute("ALTER TABLE message ADD COLUMN reply_to TEXT NULL;"); }
             catch (SqliteException ex) when (ex.Message.Contains("duplicate column", StringComparison.OrdinalIgnoreCase)) { }
         }
+        if (current < 3)
+        {
+            // The journals moved from "one JSON blob per owner" to one row per message; the blob table has no
+            // readers left, so it goes rather than lingering as a trap for whoever looks next.
+            Execute("DROP TABLE IF EXISTS entry;");
+        }
         Execute($"PRAGMA user_version = {SchemaVersion};");
     }
 
@@ -483,15 +503,20 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             CREATE UNIQUE INDEX IF NOT EXISTS message_owner_platform
                 ON message(owner, platform_message_id) WHERE platform_message_id IS NOT NULL;
 
-            CREATE TABLE IF NOT EXISTS entry(
-                scope TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS queued_message(
+                queue TEXT NOT NULL,
                 owner TEXT NOT NULL,
-                key TEXT NOT NULL,
-                value TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                platform_message_id TEXT NULL,
+                conversation TEXT NOT NULL,
+                sender TEXT NULL,
+                text TEXT NOT NULL,
                 at TEXT NOT NULL,
-                PRIMARY KEY(scope, owner, key));
+                payload TEXT NOT NULL,
+                PRIMARY KEY(queue, owner, event_id));
 
-            CREATE INDEX IF NOT EXISTS entry_scope_owner_at ON entry(scope, owner, at);
+            CREATE INDEX IF NOT EXISTS queued_message_owner_at ON queued_message(queue, owner, at);
+            CREATE INDEX IF NOT EXISTS queued_message_platform ON queued_message(queue, platform_message_id);
 
             CREATE TABLE IF NOT EXISTS audit(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

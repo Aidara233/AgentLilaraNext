@@ -14,7 +14,7 @@ namespace ALN.Adapter.Qq;
 /// v1 scope: group text in, group text out. Private chats, images, mentions and rate-limit pacing are
 /// not implemented — see docs/16.
 /// </summary>
-public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity
+public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, IParameterTarget
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private const int SeenCapacity = 512;
@@ -33,14 +33,14 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity
     private Task? _replayLoop;
     private volatile string? _detail;
 
-    public QqAdapter(AdapterSpec spec, IEventSink sink, IModuleLogger log, IInboundAcks? acks = null, IEntryStore? entries = null)
+    public QqAdapter(AdapterSpec spec, IEventSink sink, IModuleLogger log, IInboundAcks? acks = null, IQueuedMessageStore? queue = null)
         : base(spec.Address, spec.Descriptor)
     {
         _sink = sink ?? throw new ArgumentNullException(nameof(sink));
         _log = log ?? throw new ArgumentNullException(nameof(log));
         _acks = acks;
         // One journal per instance: two QQ accounts on one host must not share one.
-        _journal = new InboundJournal(entries, _log, Address);
+        _journal = new InboundJournal(queue, _log, Address);
 
         var settings = spec.Settings ?? new Dictionary<string, string>();
         if (!settings.TryGetValue("endpoint", out var endpoint) || string.IsNullOrWhiteSpace(endpoint))
@@ -106,8 +106,38 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity
         return await base.StopAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public override async ValueTask<Result<SendResult>> SendAsync(OutboundMessage message, CancellationToken cancellationToken)
+    /// <summary>
+    /// The one thing worth turning at runtime: how long an action waits for the bridge's echo. Everything else
+    /// about the connection (endpoint, token) is a spec value, because changing it means reconnecting.
+    /// </summary>
+    public string ParameterScope => Address.ToString();
+
+    public IReadOnlyList<ParameterDescriptor> Parameters { get; } =
+    [
+        new(TimeoutParameter, ParameterKind.Integer, null,
+            "一次 OneBot 动作等应答最多多久（秒）。下一次动作生效，不必重连。",
+            ParameterApply.Immediate, Secret: false, Minimum: 1, Maximum: 300)
+    ];
+
+    public const string TimeoutParameter = "requestTimeoutSeconds";
+
+    public string? ReadParameter(string name) =>
+        string.Equals(name, TimeoutParameter, StringComparison.Ordinal)
+            ? ((int)_connection.RequestTimeout.TotalSeconds).ToString(System.Globalization.CultureInfo.InvariantCulture)
+            : null;
+
+    public ValueTask<Result> ApplyParameterAsync(string name, string value, CancellationToken cancellationToken)
     {
+        if (!string.Equals(name, TimeoutParameter, StringComparison.Ordinal))
+            return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, $"Unknown parameter: {name}")));
+        if (!int.TryParse(value, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var seconds) || seconds is < 1 or > 300)
+            return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, $"requestTimeoutSeconds must be 1..300: {value}")));
+        _connection.RequestTimeout = TimeSpan.FromSeconds(seconds);
+        return ValueTask.FromResult(Result.Success());
+    }
+
+    public override async ValueTask<Result<SendResult>> SendAsync(OutboundMessage message, CancellationToken cancellationToken)    {
         if (!IsRunning)
             return Result<SendResult>.Failure(new(ErrorCode.Unavailable, "QQ adapter is not running."));
         if (message is null || string.IsNullOrWhiteSpace(message.Text))
@@ -138,7 +168,7 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity
         }
 
         return Result<SendResult>.Success(new SendResult(true,
-            response.MessageId ?? message.PlatformConversationId));
+            response.MessageId ?? message.PlatformConversationId, PlatformMessageId: response.MessageId));
     }
 
     /// <summary>

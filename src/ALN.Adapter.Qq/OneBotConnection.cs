@@ -16,7 +16,9 @@ namespace ALN.Adapter.Qq;
 /// </summary>
 internal sealed class OneBotConnection(Uri endpoint, string? accessToken, IModuleLogger log)
 {
-    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(10);
+    /// <summary>How long one action waits for its echo. Settable: a slow bridge is a fact about the
+    /// deployment, not about the protocol.</summary>
+    public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan[] Backoff =
     [
         TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5),
