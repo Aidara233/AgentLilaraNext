@@ -12,7 +12,7 @@ namespace ALN.Graph;
 public sealed class GraphManager : IGraphRuntime
 {
     private static readonly HashSet<string> AllowedCapabilities = new(StringComparer.Ordinal)
-    { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelRoute, ScriptCapabilities.ChannelReply, ScriptCapabilities.ModelComplete, ScriptCapabilities.SessionRun };
+    { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelRoute, ScriptCapabilities.ChannelReply, ScriptCapabilities.ModelComplete, ScriptCapabilities.SessionRun, ScriptCapabilities.SessionActivate };
     private readonly IAdapterManager _adapters;
     private readonly IChannelManager _channels;
     private readonly IClockManager _clock;
@@ -297,6 +297,52 @@ public sealed class GraphManager : IGraphRuntime
     {
         public Task<string> RunSessionAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken) =>
             InvokeAsync(ScriptCapabilities.SessionRun, () => RunSessionCoreAsync(sessionSpecJson, userInput, cancellationToken));
+
+        public Task<string> ActivateSessionAsync(string sessionSpecJson, CancellationToken cancellationToken) =>
+            InvokeAsync(ScriptCapabilities.SessionActivate, () => ActivateSessionCoreAsync(sessionSpecJson, cancellationToken));
+
+        /// <summary>
+        /// The two-phase activation, first half: wake the Session, carry nothing. Whatever the Channel has
+        /// for it is pulled later, when the Session assembles the request (see ChannelDeltaContributor), so
+        /// the model sees everything up to "now" instead of only the message that happened to trigger this.
+        /// </summary>
+        private async Task<string> ActivateSessionCoreAsync(string sessionSpecJson, CancellationToken cancellationToken)
+        {
+            await RequireCapabilityAsync(ScriptCapabilities.SessionActivate, cancellationToken).ConfigureAwait(false);
+            if (sessions is null) throw new InvalidOperationException("Session manager is unavailable.");
+            if (current.Name != EventNames.ChannelMessageAccepted || current.Source != mount.Target)
+                await DenyAsync(ScriptCapabilities.SessionActivate, "Not the source Channel message event.", cancellationToken).ConfigureAwait(false);
+            var channelMessage = Parse<ChannelMessage>(current.PayloadJson);
+            if (channelMessage.Channel != current.Source || channelMessage.MessageId != current.EventId ||
+                !channels.IsBound(current.Source, channelMessage.Binding.Adapter, channelMessage.Binding.PlatformConversationId))
+                await DenyAsync(ScriptCapabilities.SessionActivate, "Channel message does not match routed event.", cancellationToken).ConfigureAwait(false);
+
+            var spec = Parse<SessionSpec>(sessionSpecJson);
+            if (spec.Tools?.Any(tool => tool.Name != "send_message") == true)
+                return JsonSerializer.Serialize(new { ok = false, error = new { message = "Unknown Session tool binding." } }, JsonOptions);
+            if (spec.Tools?.Any(tool => tool.Name == "send_message") == true &&
+                !mount.Package.Manifest.Capabilities.Contains(ScriptCapabilities.ChannelReply, StringComparer.Ordinal))
+                await DenyAsync(ScriptCapabilities.ChannelReply, "send_message requires channel.bound-send.", cancellationToken).ConfigureAwait(false);
+
+            var identity = $"{current.Source}\n{channelMessage.Channel}";
+            var sessionId = "s-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
+            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                mount.Target, ScriptCapabilities.SessionActivate, "allowed", sessionId), cancellationToken).ConfigureAwait(false);
+
+            // The trigger message is not handed over here on purpose: it is already in the Channel's history,
+            // and the delta pull will include it. Passing it twice is how a conversation gets answered twice.
+            var input = new SessionTurnInput([], channelMessage.Channel, channelMessage.Binding);
+            var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, input, this, cancellationToken).ConfigureAwait(false);
+            if (!result.Ok || result.Value is null)
+            {
+                await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                    mount.Target, ScriptCapabilities.SessionActivate, "failed", result.Error?.Message), cancellationToken).ConfigureAwait(false);
+                return JsonSerializer.Serialize(new { ok = false, error = result.Error }, JsonOptions);
+            }
+            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                mount.Target, ScriptCapabilities.SessionActivate, "completed", sessionId), cancellationToken).ConfigureAwait(false);
+            return JsonSerializer.Serialize(new { ok = true, result = result.Value }, JsonOptions);
+        }
 
         private async Task<string> RunSessionCoreAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken)
         {

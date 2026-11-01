@@ -30,6 +30,36 @@ public sealed class TimeContextContributor(TimeProvider? timeProvider = null) : 
 }
 
 /// <summary>
+/// Carries a Channel's unconsumed messages into the Session timeline at the moment the request is being
+/// assembled — this is the second half of the two-phase activation. It writes to the timeline rather than
+/// to the floating block because channel messages are durable facts: they belong in history, they render
+/// through the same <c>&lt;channel_messages&gt;</c> path as before, and the stable message id makes a
+/// replay idempotent.
+///
+/// An empty delta is normal, not an error: a signal can arrive for reasons that have nothing to do with
+/// channels (a timer, a script), and the Session decides whether a turn with no new messages is worth
+/// running.
+/// </summary>
+public sealed class ChannelDeltaContributor(IChannelDeltaSource source) : IRoundContextContributor
+{
+    public const string ContributorId = "channel.delta";
+
+    public string Id => ContributorId;
+
+    public async ValueTask ContributeAsync(RoundContextRequest request, ISessionTimelineWriter timeline,
+        IRoundContextWriter roundContext, CancellationToken cancellationToken)
+    {
+        if (request.Channel is not { } channel) return;
+        var delta = await source.TakeDeltaAsync(channel, cancellationToken).ConfigureAwait(false);
+        // A failed pull fails the round: silently sending the model a context that is missing what people
+        // just said is worse than not answering this time.
+        if (!delta.Ok) throw new InvalidOperationException(delta.Error!.Message);
+        foreach (var message in delta.Value!.Messages)
+            timeline.Add(new SessionTimelineContribution(message.Id, message.Sender, message.Text, message.At));
+    }
+}
+
+/// <summary>
 /// Channel identity is fixed for the life of a session, so it is injected once — as the first
 /// timeline entry, not as a per-round reminder. The stable contribution id makes the write
 /// idempotent: replaying the first turn cannot produce a second copy.

@@ -41,6 +41,12 @@ public interface IScriptExecutor
 public interface IScriptApi : ISessionToolExecutor
 {
     Task<string> RunSessionAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Wake the Session for this Channel without handing it content: what a turn carries is pulled when
+    /// the request is assembled, not when the signal is sent.
+    /// </summary>
+    Task<string> ActivateSessionAsync(string sessionSpecJson, CancellationToken cancellationToken);
     Task<string> CompleteModelAsync(string profileId, string requestJson, CancellationToken cancellationToken);
     Task<string> SendSelfAsync(string outboundMessageJson, CancellationToken cancellationToken);
     Task<string> AcceptIntoChannelAsync(CancellationToken cancellationToken);
@@ -70,6 +76,7 @@ public static class ScriptEvents
 public static class ScriptCapabilities
 {
     public const string SessionRun = "session.run";
+    public const string SessionActivate = "session.activate";
     public const string ModelComplete = "model.complete";
     public const string SelfAdapterSend = "self.adapter.send";
     public const string ChannelAccept = "channel.accept";

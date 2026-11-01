@@ -1,0 +1,13 @@
+{
+  "id": "group.mention-only",
+  "version": 1,
+  "targetType": "channel",
+  "mount": "manual",
+  "events": ["channel.message.accepted"],
+  "entryPoint": "onEvent",
+  "capabilities": ["session.activate", "channel.bound-send"],
+  "trustDomain": "trusted",
+  "maxStatements": 5000,
+  "timeoutMilliseconds": 60000,
+  "memoryLimitBytes": 33554432
+}

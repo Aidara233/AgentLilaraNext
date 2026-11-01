@@ -109,10 +109,15 @@ public sealed class SessionManager : ISessionManager
         }
         catch (JsonException ex)
         { return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Session tool schema is invalid JSON.", ex.Message)); }
-        if (activationId == Guid.Empty || input?.Messages is not { Count: > 0 } channelMessages ||
-            channelMessages.Any(m => string.IsNullOrWhiteSpace(m.Id) || string.IsNullOrWhiteSpace(m.Source) || m.Content is null) ||
+        if (activationId == Guid.Empty || input is null)
+            return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Activation id is required."));
+        // Content may legitimately be absent: activation is a signal, and what a turn carries is pulled by
+        // contributors at assembly time (a Channel's delta, a timer's nothing at all). Requiring messages
+        // here would make "wake up and look around" impossible.
+        var channelMessages = input.Messages ?? [];
+        if (channelMessages.Any(m => string.IsNullOrWhiteSpace(m.Id) || string.IsNullOrWhiteSpace(m.Source) || m.Content is null) ||
             channelMessages.Select(m => m.Id).Distinct(StringComparer.Ordinal).Count() != channelMessages.Count)
-            return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Activation id and unique channel messages are required."));
+            return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Channel messages must be unique and identifiable."));
         if (spec.Tools is { Count: > 0 } && toolExecutor is null)
             return Result<SessionTurnResult>.Failure(new(ErrorCode.Unavailable, "Session tools are declared but no tool executor is available."));
 
@@ -183,7 +188,8 @@ public sealed class SessionManager : ISessionManager
             history = persistedTimeline.Value.History;
 
             var channelTimeline = CollectChannelTimeline(history);
-            messages.Add(new ModelMessage("user", RenderChannelContext(channelTimeline, collected.Value.RoundContext)));
+            var channelContext = RenderChannelContext(channelTimeline, collected.Value.RoundContext);
+            if (channelContext.Length > 0) messages.Add(new ModelMessage("user", channelContext));
             var turnUsage = new ModelUsage(0, 0);
             var executedCalls = new List<ModelToolCall>();
             var finalText = "";
@@ -628,6 +634,9 @@ public sealed class SessionManager : ISessionManager
     private static string RenderChannelContext(IReadOnlyList<SessionChannelMessage> messages,
         IReadOnlyList<CollectedRoundContext> floating)
     {
+        // Nothing to say: an empty <channel_context> would be an empty user message, which some providers
+        // reject outright and others read as "the user said nothing".
+        if (messages.Count == 0 && floating.Count == 0) return string.Empty;
         var builder = new StringBuilder("<channel_context>\n");
         if (floating.Count > 0)
         {
