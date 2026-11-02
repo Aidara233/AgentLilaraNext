@@ -16,7 +16,10 @@ async function onEvent(event, ctx) {
     formatVersion: "1",
     // Shipped defaults, overridable file by file from the data root. "只在被点名时说话" is not here: that is
     // the policy of this script (mentionsSelf), and a prompt is not the right place to hide a decision.
-    prompts: { "人设": "标准人设", "安全": "标准安全" },
+    prompts: {
+        "1身份": "标准", "2风格": "标准", "3社交": "标准",
+        "4环境": "标准", "5安全": "标准",
+      },
   };
 
   const outcome = JSON.parse(await ctx.session.activate(spec));

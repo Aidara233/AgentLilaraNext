@@ -7,7 +7,7 @@ public enum SessionStatus { Running, Dormant }
 
 /// <summary>Immutable behavior and prompt snapshot created with one session.</summary>
 /// <param name="Prompts">
-/// Which prompt file answers each group, e.g. <c>{ "人设": "标准人设", "安全": "标准安全" }</c> — at most one
+/// Which prompt file answers each group, e.g. <c>{ "1身份": "标准", "5安全": "标准" }</c> — at most one
 /// file per group, because a dictionary cannot hold the same key twice. Empty or null means no system
 /// message at all, which is a legal choice (a script that only performs an action does not need a persona)
 /// and is said out loud in the signal log rather than left to be guessed.

@@ -13,7 +13,10 @@ async function onEvent(event, ctx) {
     formatVersion: "1",
     // The words live in <dataRoot>/prompts/<group>/<file>.md, not here: a prompt is something a person edits,
     // and an edit must not require touching a script (or restarting anything).
-    prompts: { "人设": "标准人设", "安全": "标准安全" },
+    prompts: {
+      "1身份": "标准", "2风格": "标准", "3社交": "标准",
+      "4环境": "标准", "5安全": "标准",
+    },
   };
 
   // No content is passed on purpose: the Session pulls what it has not seen yet.

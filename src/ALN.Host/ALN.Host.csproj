@@ -19,6 +19,12 @@
   <ItemGroup>
     <Content Include="resources/**/*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+  <!-- Content copying never deletes anything: a renamed or removed prompt fragment would sit in the output forever
+       and keep appearing in prompts.list as a group somebody can select. The shipped prompts are a whole tree, so
+       they are mirrored rather than merged. -->
+  <Target Name="MirrorPromptResources" BeforeTargets="PrepareForBuild">
+    <RemoveDir Directories="$(OutDir)resources/prompts" />
+  </Target>
   <Target Name="CopyModulePackages" AfterTargets="Build">
     <MakeDir Directories="$(OutDir)modules/adapter.file" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)/../ALN.Adapter.File/bin/$(Configuration)/net10.0/ALN.Adapter.File.dll;$(MSBuildProjectDirectory)/../ALN.Adapter.File/bin/$(Configuration)/net10.0/ALN.Adapter.File.deps.json;$(MSBuildProjectDirectory)/../ALN.Adapter.File/plugin.json"

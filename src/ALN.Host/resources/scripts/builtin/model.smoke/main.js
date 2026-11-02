@@ -39,7 +39,10 @@ async function onEvent(event, ctx) {
       objective: "Respond helpfully to messages in this conversation.",
       // Which prompt answers each group; the text itself lives in <dataRoot>/prompts (shipped defaults next
       // to the binary, the operator's copy on top). Editing a prompt must not mean editing a script.
-      prompts: { "人设": "标准人设", "安全": "标准安全" },
+      prompts: {
+        "1身份": "标准", "2风格": "标准", "3社交": "标准",
+        "4环境": "标准", "5安全": "标准",
+      },
       formatVersion: "1",
       tools: [{
         name: "send_message",
