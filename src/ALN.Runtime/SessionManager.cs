@@ -14,6 +14,13 @@ public sealed class SessionManager : ISessionManager
 {
     private const int StateSchemaVersion = 2;
     private const long MaxStoredHistoryBytes = 64 * 1024 * 1024;
+
+    /// <summary>
+    /// How many channel messages one request may carry. The channel timeline is re-rendered in full on every
+    /// turn, so without a window the cost of a conversation grows with the square of its length — and every
+    /// old message is re-stated, which invites the model to answer what was already answered.
+    /// </summary>
+    public const int RecentChannelMessages = 40;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _root;
     private readonly string _legacyRoot;
@@ -937,6 +944,18 @@ public sealed class SessionManager : ISessionManager
         }
     }
 
+    /// <summary>
+    /// Renders the channel side of the conversation as one block.
+    ///
+    /// Only the newest <see cref="RecentChannelMessages"/> messages are carried; the rest are replaced by one
+    /// line saying how many were left out, because a model handed a silent tail cannot tell that anything is
+    /// missing and will happily answer a question that was already settled three turns earlier.
+    ///
+    /// This is a different kind of omission from the one the Channel records when a pull hits its own window:
+    /// that one is a fact about the conversation (those messages never entered this session), so it stays in
+    /// history as a system message. This one is a property of the request — the messages are still in the
+    /// timeline and still counted here — so it is rendered as structure, not as someone speaking.
+    /// </summary>
     private static string RenderChannelContext(IReadOnlyList<SessionChannelMessage> messages,
         IReadOnlyList<CollectedRoundContext> floating)
     {
@@ -954,9 +973,15 @@ public sealed class SessionManager : ISessionManager
                     .AppendLine(EscapeXmlText(item.Content)).AppendLine("</section>");
             builder.AppendLine("</floating_context>");
         }
-        builder.AppendLine("<channel_messages>");
-        foreach (var message in messages)
+        var elided = Math.Max(0, messages.Count - RecentChannelMessages);
+        builder.Append("<channel_messages shown=\"").Append(messages.Count - elided)
+            .Append("\" total=\"").Append(messages.Count).AppendLine("\">");
+        if (elided > 0)
+            builder.Append("<omitted count=\"").Append(elided).Append("\">省略更早的 ").Append(elided)
+                .Append(" 条消息（本请求只带最近 ").Append(RecentChannelMessages).AppendLine(" 条）。</omitted>");
+        for (var index = elided; index < messages.Count; index++)
         {
+            var message = messages[index];
             builder.Append("<message id=\"").Append(EscapeXmlAttribute(message.Id))
                 .Append("\" source=\"").Append(EscapeXmlAttribute(message.Source)).Append('"');
             if (!string.IsNullOrEmpty(message.Sender))

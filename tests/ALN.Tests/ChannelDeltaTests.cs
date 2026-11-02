@@ -114,7 +114,7 @@ public sealed class ChannelDeltaTests : IDisposable
         var user = request.Messages.FirstOrDefault(m => m.Content?.Contains("<channel_context>", StringComparison.Ordinal) == true);
         Assert.NotNull(user);
         // Same XML shape as before: the delta did not invent a new format, it just arrived later.
-        Assert.Contains("<channel_messages>", user!.Content, StringComparison.Ordinal);
+        Assert.Contains("<channel_messages shown=", user!.Content, StringComparison.Ordinal);
         Assert.Contains("sender=\"alice\"", user.Content, StringComparison.Ordinal);
         Assert.Contains("在吗", user.Content, StringComparison.Ordinal);
 
@@ -143,6 +143,43 @@ public sealed class ChannelDeltaTests : IDisposable
         Assert.True(next.Ok);
         Assert.True(next.Value!.IsEmpty);
         Assert.Equal(0, next.Value.Omitted);
+    }
+
+    [Fact]
+    public async Task A_long_conversation_is_carried_as_its_recent_tail_and_says_how_much_it_left_out()
+    {
+        var (store, delta) = Create();
+        const int total = SessionManager.RecentChannelMessages + 5;
+        for (var index = 1; index <= total; index++)
+        {
+            // Distinct timestamps: the timeline is ordered by time, and equal ones fall back to id order.
+            var at = new DateTimeOffset(2026, 11, 1, 8, 0, 0, TimeSpan.Zero).AddMinutes(index);
+            Assert.True((await store.AppendAsync(new StoredMessage($"m{index}", Channel, "group-123456", $"m{index}",
+                "alice", index == 1 ? "the very first thing" : $"msg {index}", at), default)).Ok);
+        }
+
+        var contributors = new RoundContextContributorRegistry();
+        Assert.True(contributors.Register(new ChannelDeltaContributor(delta, new StubChannels(maxMessages: null))).Ok);
+        var model = new ScriptedModel();
+        var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
+        var spec = new SessionSpec("default", "Answer briefly.", "1");
+
+        var turn = await sessions.RunTurnAsync("s-1", spec, Guid.NewGuid(),
+            new SessionTurnInput([], Channel, new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456")), null, default);
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+
+        var user = Assert.Single(model.Requests).Messages
+            .First(m => m.Content?.Contains("<channel_messages", StringComparison.Ordinal) == true).Content!;
+        // The block states its own size, so the model can tell a short conversation from a trimmed one.
+        Assert.Contains($"shown=\"{SessionManager.RecentChannelMessages}\" total=\"{total}\"", user, StringComparison.Ordinal);
+        Assert.Contains("<omitted count=\"5\">", user, StringComparison.Ordinal);
+        Assert.Contains("msg 6", user, StringComparison.Ordinal);
+        Assert.DoesNotContain("the very first thing", user, StringComparison.Ordinal);
+        Assert.DoesNotContain("msg 5", user, StringComparison.Ordinal);
+
+        // The trimmed messages are still in the session: the window is a rendering choice, not a deletion.
+        Assert.Contains("the very first thing",
+            await File.ReadAllTextAsync(Path.Combine(_root, "sessions", "s-1", "history.jsonl")), StringComparison.Ordinal);
     }
 
     [Fact]
