@@ -29,6 +29,7 @@ public sealed class SessionManager : ISessionManager
     private readonly IRoundContextContributorRegistry _roundContextContributors;
     private readonly IPromptLibrary? _prompts;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SessionRecord> _loaded = new(StringComparer.Ordinal);
 
     public SessionManager(string dataRoot, IModelManager models, IRoundContextContributorRegistry? roundContextContributors = null,
         ISignalLog? signalLog = null, IPromptLibrary? prompts = null)
@@ -178,20 +179,15 @@ public sealed class SessionManager : ISessionManager
             var directory = ResolveSessionDirectory(sessionId);
             var channel = input.Channel?.ToString();
             Directory.CreateDirectory(directory);
-            var session = await LoadOrCreateAsync(directory, spec, channel, cancellationToken).ConfigureAwait(false);
-            if (!session.Ok || session.Value is null) return Result<SessionTurnResult>.Failure(session.Error!);
-            if (session.Value.State.Locked)
+            // One call: it loads from disk on the first turn of a Session's life (replaying a half-finished commit
+            // if there is one) and from memory after that. Everything below works on the record.
+            var loaded = await LoadSessionAsync(sessionId, directory, spec, channel, cancellationToken).ConfigureAwait(false);
+            if (!loaded.Ok || loaded.Value is null) return Result<SessionTurnResult>.Failure(loaded.Error!);
+            var record = loaded.Value;
+            if (record.State.Locked)
                 return Result<SessionTurnResult>.Failure(new(ErrorCode.Denied, "Session is locked."));
 
-            var recovered = await RecoverPendingAsync(directory, cancellationToken).ConfigureAwait(false);
-            if (!recovered.Ok) return Result<SessionTurnResult>.Failure(recovered.Error!);
-            session = await LoadOrCreateAsync(directory, spec, channel, cancellationToken).ConfigureAwait(false);
-            if (!session.Ok || session.Value is null) return Result<SessionTurnResult>.Failure(session.Error!);
-
-            var historyPath = Path.Combine(directory, "history.jsonl");
-            var historyResult = await ReadHistoryAsync(historyPath, repairTrailingLine: true, cancellationToken).ConfigureAwait(false);
-            if (!historyResult.Ok || historyResult.Value is null) return Result<SessionTurnResult>.Failure(historyResult.Error!);
-            var history = historyResult.Value;
+            var history = record.History;
             var activation = activationId.ToString("N");
             var activationEntries = history.Where(e => e.ActivationId == activation).ToArray();
             var priorTurn = activationEntries.LastOrDefault(e => e.Role == "assistant" && e.StopReason != StopReason.ToolUse);
@@ -207,38 +203,38 @@ public sealed class SessionManager : ISessionManager
             if (activationUser is not null && !SameChannelMessages(activationUser.ChannelMessages, input.Messages ?? []))
                 return Result<SessionTurnResult>.Failure(new(ErrorCode.Conflict, "Activation id was reused with different channel messages."));
 
-            var state = session.Value.State;
+            var state = record.State;
             if (activationUser is null)
             {
                 activationUser = new SessionHistoryEntry($"{activation}:user", activation, state.StepNumber + 1,
                     "user", null, DateTimeOffset.UtcNow, ChannelMessages: input.Messages);
                 var timelineState = state with { Revision = state.Revision + 1 };
-                var timelineCommit = await CommitTurnAsync(directory,
+                var timelineCommit = await CommitAsync(record,
                     new SessionPendingCommit(timelineState, [activationUser]), cancellationToken).ConfigureAwait(false);
                 if (!timelineCommit.Ok) return Result<SessionTurnResult>.Failure(timelineCommit.Error!);
                 state = timelineState;
-                history = history.Append(activationUser).ToArray();
+                history = record.History;
             }
 
             var messages = new List<ModelMessage>();
             // The prompt is read here, every turn, from files a person edits. Only the names are part of the
             // immutable spec, so editing a prompt changes the next request instead of breaking the session.
-            var promptSet = await ResolvePromptsAsync(session.Value.Spec, activationId, cancellationToken).ConfigureAwait(false);
+            var promptSet = await ResolvePromptsAsync(record.Spec, activationId, cancellationToken).ConfigureAwait(false);
             if (!promptSet.Ok || promptSet.Value is null) return Result<SessionTurnResult>.Failure(promptSet.Error!);
             if (!promptSet.Value.IsEmpty) messages.Add(new ModelMessage("system", promptSet.Value.Text));
-            messages.Add(new ModelMessage("user", session.Value.Spec.Objective));
+            messages.Add(new ModelMessage("user", record.Spec.Objective));
             messages.AddRange(history.Where(entry => entry.ChannelMessages is null).Select(ToModelMessage));
             var collected = await CollectRoundContextAsync(
                 new RoundContextRequest(sessionId, activationId, state.StepNumber + 1, input.Channel, input.Binding),
                 cancellationToken).ConfigureAwait(false);
             if (!collected.Ok || collected.Value is null) return Result<SessionTurnResult>.Failure(collected.Error!);
 
-            var persistedTimeline = await PersistTimelineContributionsAsync(directory, activation, state, history,
+            var persistedTimeline = await PersistTimelineContributionsAsync(record, activation, state,
                 collected.Value.Timeline, cancellationToken).ConfigureAwait(false);
             if (!persistedTimeline.Ok || persistedTimeline.Value is null)
                 return Result<SessionTurnResult>.Failure(persistedTimeline.Error!);
             state = persistedTimeline.Value.State;
-            history = persistedTimeline.Value.History;
+            history = record.History;
 
             var channelTimeline = CollectChannelTimeline(history);
             var channelContext = RenderChannelContext(channelTimeline, collected.Value.RoundContext);
@@ -253,8 +249,8 @@ public sealed class SessionManager : ISessionManager
                 var modelRecordId = Guid.NewGuid();
                 var modelParentId = SignalScope.CurrentId;
                 using var modelScope = SignalScope.Enter(modelRecordId, activationId);
-                var modelStarted = await _models.CompleteAsync(session.Value.Spec.ModelProfileId,
-                    new ModelRequest(messages, session.Value.Spec.Tools), cancellationToken).ConfigureAwait(false);
+                var modelStarted = await _models.CompleteAsync(record.Spec.ModelProfileId,
+                    new ModelRequest(messages, record.Spec.Tools), cancellationToken).ConfigureAwait(false);
                 if (!modelStarted.Ok || modelStarted.Value is null)
                     return Result<SessionTurnResult>.Failure(modelStarted.Error ?? new(ErrorCode.Unavailable, "Model profile is unavailable."));
 
@@ -297,10 +293,10 @@ public sealed class SessionManager : ISessionManager
                     Id = modelRecordId,
                     ParentId = modelParentId,
                     Group = "model",
-                    Name = session.Value.Spec.ModelProfileId,
+                    Name = record.Spec.ModelProfileId,
                     StepId = activationId,
                     From = "session",
-                    To = $"model:{session.Value.Spec.ModelProfileId}",
+                    To = $"model:{record.Spec.ModelProfileId}",
                     Mechanism = "model.request",
                     Outcome = modelError is null ? "ok" : "failed",
                     DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(modelStartedAt).TotalMilliseconds,
@@ -318,7 +314,7 @@ public sealed class SessionManager : ISessionManager
                 var completedUsage = usage ?? new ModelUsage(0, 0);
                 turnUsage = AddUsage(turnUsage, completedUsage);
                 var completedCalls = toolCalls.Values.Select(c => c.ToModelToolCall()).ToArray();
-                if (completedCalls.Length > 0 && (toolExecutor is null || session.Value.Spec.Tools is not { Count: > 0 } declaredSchemas ||
+                if (completedCalls.Length > 0 && (toolExecutor is null || record.Spec.Tools is not { Count: > 0 } declaredSchemas ||
                     completedCalls.Any(c => !declaredSchemas.Any(t => t.Name == c.Name))))
                     return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Model returned a tool call that was not declared by the Session."));
 
@@ -340,7 +336,7 @@ public sealed class SessionManager : ISessionManager
                     Revision = revision,
                     Usage = state.Usage.Add(completedUsage)
                 };
-                var modelCommit = await CommitTurnAsync(directory, new SessionPendingCommit(modelState, modelEntries), cancellationToken)
+                var modelCommit = await CommitAsync(record, new SessionPendingCommit(modelState, modelEntries), cancellationToken)
                     .ConfigureAwait(false);
                 if (!modelCommit.Ok) return Result<SessionTurnResult>.Failure(modelCommit.Error!);
                 state = modelState;
@@ -368,7 +364,7 @@ public sealed class SessionManager : ISessionManager
                     var toolRevisionState = state with { Revision = state.Revision + 1 };
                     var toolEntry = new SessionHistoryEntry($"{activation}:tool:{stepNumber}:{call.Id}", activation, stepNumber,
                         "tool", toolContent, DateTimeOffset.UtcNow, ToolCallId: call.Id);
-                    var toolCommit = await CommitTurnAsync(directory,
+                    var toolCommit = await CommitAsync(record,
                         new SessionPendingCommit(toolRevisionState, [toolEntry]), cancellationToken).ConfigureAwait(false);
                     if (!toolCommit.Ok) return Result<SessionTurnResult>.Failure(toolCommit.Error!);
                     state = toolRevisionState;
@@ -381,6 +377,7 @@ public sealed class SessionManager : ISessionManager
             // Metadata only — the revision stays where the committed turn left it, so a pending commit written
             // earlier still recovers against exactly this file.
             state = state with { Channel = channel ?? state.Channel, LastActiveAt = DateTimeOffset.UtcNow, SupersededAt = null };
+            record.State = state;
             await WriteAtomicJsonAsync(Path.Combine(directory, "state.json"), state, cancellationToken).ConfigureAwait(false);
 
             return Result<SessionTurnResult>.Success(new(sessionId, state.StepNumber, finalText, executedCalls,
@@ -477,6 +474,7 @@ public sealed class SessionManager : ISessionManager
             if (Directory.Exists(destinationDirectory) || File.Exists(destinationDirectory))
                 return Result.Failure(new(ErrorCode.Conflict, $"Archive destination already exists: {destinationDirectory}"));
             Directory.Move(source, destinationDirectory);
+            _loaded.TryRemove(sessionId, out _);
             return Result.Success();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -504,6 +502,9 @@ public sealed class SessionManager : ISessionManager
                     $"A session with this id exists again; restoring would merge two histories: {sessionId}"));
             Directory.CreateDirectory(_root);
             Directory.Move(sourceDirectory, target);
+            // Whatever this process remembered about that id is now wrong: the directory it pointed at is gone and
+            // the one that just appeared was written by some other run.
+            _loaded.TryRemove(sessionId, out _);
             return Result.Success();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -542,6 +543,7 @@ public sealed class SessionManager : ISessionManager
         try
         {
             if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+            _loaded.TryRemove(id, out _);
             return Result.Success();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -583,6 +585,52 @@ public sealed class SessionManager : ISessionManager
             return File.Exists(path) ? JsonSerializer.Deserialize<SessionState>(File.ReadAllBytes(path), JsonOptions) : null;
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { return null; }
+    }
+
+    /// <summary>
+    /// The Session's context: from memory when this process already has it, from disk otherwise.
+    ///
+    /// A cached record still goes through the spec check, because "you asked for a different persona" has to be
+    /// refused the same way whether the timeline came from memory or from the file.
+    /// </summary>
+    private async ValueTask<Result<SessionRecord>> LoadSessionAsync(string sessionId, string directory,
+        SessionSpec requestedSpec, string? channel, CancellationToken cancellationToken)
+    {
+        if (_loaded.TryGetValue(sessionId, out var cached))
+        {
+            if (SameSpec(cached.Spec, requestedSpec)) return Result<SessionRecord>.Success(cached);
+            await MarkSupersededAsync(cached, cancellationToken).ConfigureAwait(false);
+            return Result<SessionRecord>.Failure(new(ErrorCode.Conflict,
+                "Session specification is immutable; create a new session id to change it."));
+        }
+
+        var loaded = await LoadOrCreateAsync(directory, requestedSpec, channel, cancellationToken).ConfigureAwait(false);
+        if (!loaded.Ok || loaded.Value is null) return Result<SessionRecord>.Failure(loaded.Error!);
+
+        var historyResult = await ReadHistoryAsync(Path.Combine(directory, "history.jsonl"), repairTrailingLine: true,
+            cancellationToken).ConfigureAwait(false);
+        if (!historyResult.Ok || historyResult.Value is null) return Result<SessionRecord>.Failure(historyResult.Error!);
+
+        var recovered = await RecoverPendingAsync(directory, loaded.Value.State, historyResult.Value, cancellationToken)
+            .ConfigureAwait(false);
+        if (!recovered.Ok || recovered.Value is null) return Result<SessionRecord>.Failure(recovered.Error!);
+
+        var record = new SessionRecord(loaded.Value.Spec, directory) { State = recovered.Value.State };
+        record.Adopt(recovered.Value.History);
+        _loaded[sessionId] = record;
+        return Result<SessionRecord>.Success(record);
+    }
+
+    /// <summary>
+    /// Notes that a stored Session can never serve the caller that just asked. Written where maintenance can see
+    /// it: the specs are immutable, so without the note a dead Session looks exactly like a live one.
+    /// </summary>
+    private async ValueTask MarkSupersededAsync(SessionRecord record, CancellationToken cancellationToken)
+    {
+        if (record.State.SupersededAt is not null) return;
+        var stale = record.State with { SupersededAt = DateTimeOffset.UtcNow };
+        await WriteAtomicJsonAsync(Path.Combine(record.Directory, "state.json"), stale, cancellationToken).ConfigureAwait(false);
+        record.State = stale;
     }
 
     private async ValueTask<Result<LoadedSession>> LoadOrCreateAsync(string directory, SessionSpec requestedSpec,
@@ -654,43 +702,62 @@ public sealed class SessionManager : ISessionManager
         return Result<LoadedSession>.Success(new(persistedSpec, state));
     }
 
-    private async ValueTask<Result> RecoverPendingAsync(string directory, CancellationToken cancellationToken)
+    /// <summary>
+    /// Replays a commit that the process died in the middle of, against the timeline as it was loaded.
+    ///
+    /// This is the only place that still reconciles with the file, and it only runs when the breadcrumb exists:
+    /// the breadcrumb is written before anything else in a commit, so its presence is the proof that "the last
+    /// commit may be half-done". Everything after the first successful load relies on the in-memory record.
+    /// </summary>
+    private async ValueTask<Result<LoadedRecovery>> RecoverPendingAsync(string directory, SessionState state,
+        IReadOnlyList<SessionHistoryEntry> history, CancellationToken cancellationToken)
     {
         var pendingPath = Path.Combine(directory, "commit.pending.json");
-        if (!File.Exists(pendingPath)) return Result.Success();
+        if (!File.Exists(pendingPath)) return Result<LoadedRecovery>.Success(new(state, history));
         var pending = JsonSerializer.Deserialize<SessionPendingCommit>(
             await File.ReadAllBytesAsync(pendingPath, cancellationToken).ConfigureAwait(false), JsonOptions);
-        if (pending is null) return Result.Failure(new(ErrorCode.Invalid, "Pending session commit is invalid."));
-        var statePath = Path.Combine(directory, "state.json");
-        var current = JsonSerializer.Deserialize<SessionState>(await File.ReadAllBytesAsync(statePath, cancellationToken).ConfigureAwait(false), JsonOptions);
-        if (current is null) return Result.Failure(new(ErrorCode.Invalid, "Session state is invalid during recovery."));
-        if (pending.State.Revision < current.Revision)
+        if (pending is null) return Result<LoadedRecovery>.Failure(new(ErrorCode.Invalid, "Pending session commit is invalid."));
+        if (pending.State.Revision < state.Revision)
         {
             File.Delete(pendingPath);
-            return Result.Success();
+            return Result<LoadedRecovery>.Success(new(state, history));
         }
-        if (pending.State.Revision > current.Revision + 1)
-            return Result.Failure(new(ErrorCode.Invalid, "Pending session commit is not the next revision."));
-        var historyPath = Path.Combine(directory, "history.jsonl");
-        var historyResult = await ReadHistoryAsync(historyPath, repairTrailingLine: true, cancellationToken).ConfigureAwait(false);
-        if (!historyResult.Ok || historyResult.Value is null) return Result.Failure(historyResult.Error!);
-        await AppendMissingEntriesAsync(historyPath, historyResult.Value, pending.Entries, cancellationToken).ConfigureAwait(false);
-        if (current.Revision < pending.State.Revision)
-            await WriteAtomicJsonAsync(statePath, pending.State, cancellationToken).ConfigureAwait(false);
+        if (pending.State.Revision > state.Revision + 1)
+            return Result<LoadedRecovery>.Failure(new(ErrorCode.Invalid, "Pending session commit is not the next revision."));
+        var known = history.Select(entry => entry.Id).ToHashSet(StringComparer.Ordinal);
+        var missing = pending.Entries.Where(entry => known.Add(entry.Id)).ToArray();
+        if (missing.Length > 0)
+            await AppendEntriesAsync(Path.Combine(directory, "history.jsonl"), missing, cancellationToken).ConfigureAwait(false);
+        var next = state;
+        if (state.Revision < pending.State.Revision)
+        {
+            next = pending.State;
+            await WriteAtomicJsonAsync(Path.Combine(directory, "state.json"), next, cancellationToken).ConfigureAwait(false);
+        }
         File.Delete(pendingPath);
-        return Result.Success();
+        return Result<LoadedRecovery>.Success(new(next, missing.Length == 0 ? history : [.. history, .. missing]));
     }
 
-    private async ValueTask<Result> CommitTurnAsync(string directory, SessionPendingCommit pending, CancellationToken cancellationToken)
+    /// <summary>
+    /// Writes one commit: the breadcrumb, the new timeline entries, the state — in that order, so a crash at any
+    /// point leaves something <see cref="RecoverPendingAsync"/> can finish.
+    ///
+    /// The ids to append are decided from memory. That is safe because this manager is the only writer of these
+    /// directories and it loads a Session before writing to it: what it remembers *is* the file.
+    /// </summary>
+    private async ValueTask<Result> CommitAsync(SessionRecord record, SessionPendingCommit pending, CancellationToken cancellationToken)
     {
+        var directory = record.Directory;
         var pendingPath = Path.Combine(directory, "commit.pending.json");
         await WriteAtomicJsonAsync(pendingPath, pending, cancellationToken).ConfigureAwait(false);
-        var historyPath = Path.Combine(directory, "history.jsonl");
-        var historyResult = await ReadHistoryAsync(historyPath, repairTrailingLine: true, cancellationToken).ConfigureAwait(false);
-        if (!historyResult.Ok || historyResult.Value is null) return Result.Failure(historyResult.Error!);
-        await AppendMissingEntriesAsync(historyPath, historyResult.Value, pending.Entries, cancellationToken).ConfigureAwait(false);
+        var missing = pending.Entries.Where(entry => !record.Knows(entry.Id)).ToArray();
+        await AppendEntriesAsync(Path.Combine(directory, "history.jsonl"), missing, cancellationToken).ConfigureAwait(false);
         await WriteAtomicJsonAsync(Path.Combine(directory, "state.json"), pending.State, cancellationToken).ConfigureAwait(false);
         File.Delete(pendingPath);
+        // Memory changes last: everything above can be undone by replaying the breadcrumb, and a commit that
+        // threw must not leave the record claiming entries the file does not have.
+        record.Adopt(missing);
+        record.State = pending.State;
         return Result.Success();
     }
 
@@ -729,15 +796,13 @@ public sealed class SessionManager : ISessionManager
         return Result<IReadOnlyList<SessionHistoryEntry>>.Success(entries);
     }
 
-    private static async ValueTask AppendMissingEntriesAsync(string historyPath, IReadOnlyList<SessionHistoryEntry> existing,
-        IReadOnlyList<SessionHistoryEntry> additions, CancellationToken cancellationToken)
+    private static async ValueTask AppendEntriesAsync(string historyPath, IReadOnlyList<SessionHistoryEntry> entries,
+        CancellationToken cancellationToken)
     {
-        var ids = existing.Select(e => e.Id).ToHashSet(StringComparer.Ordinal);
-        var missing = additions.Where(e => ids.Add(e.Id)).ToArray();
-        if (missing.Length == 0) return;
+        if (entries.Count == 0) return;
         await using var stream = new FileStream(historyPath, FileMode.Append, FileAccess.Write, FileShare.Read, 4096,
             FileOptions.Asynchronous | FileOptions.WriteThrough);
-        foreach (var entry in missing)
+        foreach (var entry in entries)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var bytes = JsonSerializer.SerializeToUtf8Bytes(entry, JsonOptions);
@@ -853,12 +918,12 @@ public sealed class SessionManager : ISessionManager
         (left.CacheReadTokens ?? 0) + (right.CacheReadTokens ?? 0),
         (left.CacheWriteTokens ?? 0) + (right.CacheWriteTokens ?? 0));
 
-    private async ValueTask<Result<PersistedTimeline>> PersistTimelineContributionsAsync(string directory, string activation,
-        SessionState state, IReadOnlyList<SessionHistoryEntry> history, IReadOnlyList<CollectedTimelineMessage> contributions,
+    private async ValueTask<Result<PersistedTimeline>> PersistTimelineContributionsAsync(SessionRecord record, string activation,
+        SessionState state, IReadOnlyList<CollectedTimelineMessage> contributions,
         CancellationToken cancellationToken)
     {
-        var existing = CollectChannelTimeline(history);
-        var byKey = existing.ToDictionary(message => TimelineKey(message.Source, message.Id), StringComparer.Ordinal);
+        var byKey = CollectChannelTimeline(record.History)
+            .ToDictionary(message => TimelineKey(message.Source, message.Id), StringComparer.Ordinal);
         var additions = new List<SessionHistoryEntry>();
         foreach (var item in contributions)
         {
@@ -877,13 +942,13 @@ public sealed class SessionManager : ISessionManager
                 "user", null, item.At, ChannelMessages: [message]));
         }
         if (additions.Count == 0)
-            return Result<PersistedTimeline>.Success(new(state, history));
+            return Result<PersistedTimeline>.Success(new(state, record.History));
 
         var nextState = state with { Revision = state.Revision + 1 };
-        var committed = await CommitTurnAsync(directory, new SessionPendingCommit(nextState, additions), cancellationToken)
+        var committed = await CommitAsync(record, new SessionPendingCommit(nextState, additions), cancellationToken)
             .ConfigureAwait(false);
         if (!committed.Ok) return Result<PersistedTimeline>.Failure(committed.Error!);
-        return Result<PersistedTimeline>.Success(new(nextState, history.Concat(additions).ToArray()));
+        return Result<PersistedTimeline>.Success(new(nextState, record.History));
     }
 
     private static string TimelineKey(string source, string id) => $"{source}\n{id}";
@@ -1092,7 +1157,41 @@ public sealed class SessionManager : ISessionManager
         c is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9' or '-' or '_');
 
     private sealed record LoadedSession(SessionSpec Spec, SessionState State);
+    private sealed record LoadedRecovery(SessionState State, IReadOnlyList<SessionHistoryEntry> History);
     private sealed record SessionPendingCommit(SessionState State, IReadOnlyList<SessionHistoryEntry> Entries);
+
+    /// <summary>
+    /// One Session's context, held in memory for as long as this process serves it: the spec, the state and the
+    /// timeline. Reading it back from disk on every write made the cost of a turn grow with the square of the
+    /// conversation — the file was re-read in full once per commit, and a turn commits several times.
+    ///
+    /// This is the same trade the rest of the system already makes: state belongs to the component that owns it.
+    /// The files stay exactly as they were (state.json and an append-only history.jsonl, both fsynced), so a crash
+    /// and a restart lose nothing; what is cached is the *reading*, not the writing.
+    ///
+    /// Only touched while the Session's gate is held, so no locking of its own.
+    /// </summary>
+    private sealed class SessionRecord(SessionSpec spec, string directory)
+    {
+        private readonly List<SessionHistoryEntry> _history = [];
+        private readonly HashSet<string> _ids = new(StringComparer.Ordinal);
+
+        public SessionSpec Spec { get; } = spec;
+        public string Directory { get; } = directory;
+        public SessionState State { get; set; } = null!;
+        public IReadOnlyList<SessionHistoryEntry> History => _history;
+
+        public bool Knows(string id) => _ids.Contains(id);
+
+        /// <summary>Takes entries the timeline does not have yet; an id already present is not added twice.</summary>
+        public IReadOnlyList<SessionHistoryEntry> Adopt(IEnumerable<SessionHistoryEntry> entries)
+        {
+            var added = new List<SessionHistoryEntry>();
+            foreach (var entry in entries)
+                if (_ids.Add(entry.Id)) { _history.Add(entry); added.Add(entry); }
+            return added;
+        }
+    }
 
     private sealed class ToolCallAccumulator
     {
