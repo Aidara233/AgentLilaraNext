@@ -96,6 +96,67 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.Equal(["hello-1", "hello-3", "tagged"], afterUnmount);
     }
 
+    /// <summary>
+    /// The reply mode decides how many messages one answer becomes; the Adapter still sends one message per
+    /// call. Segments is the default because a chat window is not a page.
+    /// </summary>
+    [Fact]
+    public async Task One_reply_arrives_as_several_messages_and_a_mode_that_does_not_exist_sends_nothing()
+    {
+        static ScriptPackage Replying(string id, string body) => new(
+            new(id, 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",
+                [ScriptCapabilities.ChannelReply], TrustDomain.Builtin),
+            $"async function onEvent(event, ctx) {{ {body} }}");
+
+        var defaultMode = Replying("channel.multi-default",
+            "await ctx.channel.reply({ platformConversationId: event.binding.platformConversationId, text: '一\\n\\n二\\n\\n三' });");
+        var verbatim = Replying("channel.multi-text",
+            "await ctx.channel.reply({ platformConversationId: event.binding.platformConversationId, text: '一\\n\\n二', mode: 'text' });");
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), defaultMode, verbatim], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+
+        await WriteInputAsync("chat-1", "in");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+        // Two scripts answered one message: the default mode sent three, mode=text sent one with the blank line
+        // still inside it — the Adapter is never asked to split anything.
+        var texts = Directory.GetFiles(Path.Combine(_mailbox.Root, "outbox", "chat-1"), "*.json")
+            .Select(ReadOutbound).Select(m => m.Text).Order(StringComparer.Ordinal).ToArray();
+        Assert.Equal(["一", "一\n\n二", "三", "二"], texts);
+    }
+
+    [Fact]
+    public async Task A_reply_mode_this_build_does_not_have_is_refused_instead_of_falling_back_to_text()
+    {
+        var unknown = new ScriptPackage(
+            new("channel.multi-unknown", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted],
+                "onEvent", [ScriptCapabilities.ChannelReply], TrustDomain.Builtin),
+            "async function onEvent(event, ctx) { await ctx.channel.reply({ " +
+            "platformConversationId: event.binding.platformConversationId, text: '不会发出去', mode: 'image' }); }");
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), unknown], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+
+        await WriteInputAsync("chat-1", "in");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        var failures = new List<Result>();
+        while (_events.TryRead(out var queued))
+        {
+            var dispatched = await _graph.DispatchAsync(queued, default);
+            if (!dispatched.Ok) { failures.Add(dispatched); break; }
+        }
+        Assert.Single(failures);
+        var outbox = Path.Combine(_mailbox.Root, "outbox");
+        Assert.Empty(Directory.Exists(outbox)
+            ? Directory.GetFiles(outbox, "*.json", SearchOption.AllDirectories)
+            : []);
+        Assert.Contains(_audit.ReadAudit(),
+            entry => entry.Outcome == "denied" && (entry.Detail ?? "").Contains("image", StringComparison.Ordinal));
+    }
+
     private async Task DrainAsync()
     {
         while (_events.TryRead(out var queued))

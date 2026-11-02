@@ -49,7 +49,16 @@ async function onEvent(event, ctx) {
         description: "Send a text message to the current conversation.",
         parametersJson: JSON.stringify({
           type: "object",
-          properties: { text: { type: "string", description: "Message text to send." } },
+          properties: {
+            text: { type: "string", description: "Message text to send." },
+            // The mode is a request, not a transport detail: "segments" sends each blank-line separated
+            // paragraph as its own message (what a chat window wants), "text" keeps the whole block in one.
+            mode: {
+              type: "string",
+              enum: ["segments", "text"],
+              description: "segments: one message per blank-line separated paragraph (default). text: the whole text as one message."
+            }
+          },
           required: ["text"],
           additionalProperties: false
         })

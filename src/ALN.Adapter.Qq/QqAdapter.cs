@@ -116,39 +116,18 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
     [
         new(TimeoutParameter, ParameterKind.Integer, null,
             "一次 OneBot 动作等应答最多多久（秒）。下一次动作生效，不必重连。",
-            ParameterApply.Immediate, Secret: false, Minimum: 1, Maximum: 300),
-        new(MaxMessagesParameter, ParameterKind.Integer, null,
-            "一次回复最多拆成几条平台消息。空行分段，超出的部分并进最后一条。",
-            ParameterApply.Immediate, Secret: false, Minimum: 1, Maximum: 10)
+            ParameterApply.Immediate, Secret: false, Minimum: 1, Maximum: 300)
     ];
 
     public const string TimeoutParameter = "requestTimeoutSeconds";
-    public const string MaxMessagesParameter = "maxMessagesPerReply";
-
-    /// <summary>
-    /// How many platform messages one reply may become. Bounded because the model cannot see the result of
-    /// its own verbosity: an unbounded split turns one paragraph into a burst of messages the people in the
-    /// conversation have to scroll through.
-    /// </summary>
-    private int _maxMessages = 3;
 
     public string? ReadParameter(string name) =>
         string.Equals(name, TimeoutParameter, StringComparison.Ordinal)
             ? ((int)_connection.RequestTimeout.TotalSeconds).ToString(System.Globalization.CultureInfo.InvariantCulture)
-            : string.Equals(name, MaxMessagesParameter, StringComparison.Ordinal)
-                ? _maxMessages.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                : null;
+            : null;
 
     public ValueTask<Result> ApplyParameterAsync(string name, string value, CancellationToken cancellationToken)
     {
-        if (string.Equals(name, MaxMessagesParameter, StringComparison.Ordinal))
-        {
-            if (!int.TryParse(value, System.Globalization.NumberStyles.Integer,
-                    System.Globalization.CultureInfo.InvariantCulture, out var count) || count is < 1 or > 10)
-                return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, $"maxMessagesPerReply must be 1..10: {value}")));
-            _maxMessages = count;
-            return ValueTask.FromResult(Result.Success());
-        }
         if (!string.Equals(name, TimeoutParameter, StringComparison.Ordinal))
             return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, $"Unknown parameter: {name}")));
         if (!int.TryParse(value, System.Globalization.NumberStyles.Integer,
@@ -167,63 +146,29 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
             return Result<SendResult>.Failure(new(ErrorCode.Invalid,
                 $"无法识别的会话 id（应为 {OneBotProtocol.GroupPrefix}<群号> 或 {OneBotProtocol.PrivatePrefix}<QQ号>）：{message.PlatformConversationId}"));
 
-        // One reply, several messages. A chat window is not a page: people here write two or three short
-        // messages in a row, and a model that keeps its paragraph in one blob reads like a memo in the middle
-        // of a conversation. The blank line is the model's way of saying "this is a second message"; the
-        // split itself belongs here, because only the Adapter knows how many messages the platform's style
-        // allows — the Session just writes text.
-        var parts = SplitIntoMessages(message.Text, Math.Max(1, _maxMessages));
-        string? firstId = null;
-        for (var index = 0; index < parts.Count; index++)
-        {
-            // The quoted reply goes on the first message only: the rest are the same answer continuing, and
-            // quoting every one of them would bury the conversation in arrows.
-            var replyTo = index == 0 ? message.ReplyTo : null;
-            var sent = await _connection.CallAsync(
-                echo => OneBotProtocol.BuildSend(echo, target, platform, parts[index], replyTo),
-                cancellationToken).ConfigureAwait(false);
-            if (!sent.Ok)
-                return Result<SendResult>.Failure(sent.Error ?? new(ErrorCode.Unavailable, "OneBot send failed."));
+        var sent = await _connection.CallAsync(
+            echo => OneBotProtocol.BuildSend(echo, target, platform, message.Text, message.ReplyTo),
+            cancellationToken).ConfigureAwait(false);
+        if (!sent.Ok)
+            return Result<SendResult>.Failure(sent.Error ?? new(ErrorCode.Unavailable, "OneBot send failed."));
 
-            var response = sent.Value.Response;
-            if (!response.Ok)
+        var response = sent.Value.Response;
+        if (!response.Ok)
+        {
+            // retcode from OneBot carries the platform's own reason (muted, not a member, rate limited).
+            _log.Warn("OneBot rejected a send", new Dictionary<string, string>
             {
-                // retcode from OneBot carries the platform's own reason (muted, not a member, rate limited).
-                _log.Warn("OneBot rejected a send", new Dictionary<string, string>
-                {
-                    ["platform"] = platform,
-                    ["target"] = target.ToString(),
-                    ["retcode"] = response.RetCode.ToString(),
-                    ["message"] = response.Message ?? string.Empty
-                });
-                return Result<SendResult>.Failure(new(ErrorCode.Unavailable,
-                    $"OneBot retcode {response.RetCode}: {response.Message ?? "no message"}", $"{platform}:{target}", true));
-            }
-            firstId ??= response.MessageId;
+                ["platform"] = platform,
+                ["target"] = target.ToString(),
+                ["retcode"] = response.RetCode.ToString(),
+                ["message"] = response.Message ?? string.Empty
+            });
+            return Result<SendResult>.Failure(new(ErrorCode.Unavailable,
+                $"OneBot retcode {response.RetCode}: {response.Message ?? "no message"}", $"{platform}:{target}", true));
         }
 
-        return Result<SendResult>.Success(new SendResult(true, firstId ?? message.PlatformConversationId,
-            PlatformMessageId: firstId));
-    }
-
-    /// <summary>
-    /// Blank lines are message boundaries; everything else is kept as written (a single newline is a line
-    /// break inside one message, which is how a list or a short code block survives).
-    ///
-    /// At most <paramref name="limit"/> messages: the tail is joined back into the last one rather than
-    /// dropped or sent as a burst. Losing the end of an answer is worse than a longer last message.
-    /// </summary>
-    public static IReadOnlyList<string> SplitIntoMessages(string text, int limit)
-    {
-        var parts = text.Replace("\r\n", "\n", StringComparison.Ordinal).Split("\n\n", StringSplitOptions.None)
-            .Select(part => part.Trim('\n', ' ', '\t'))
-            .Where(part => part.Length > 0)
-            .ToList();
-        if (parts.Count <= 1) return [text.Trim()];
-        if (parts.Count <= limit) return parts;
-        var kept = parts.Take(limit - 1).ToList();
-        kept.Add(string.Join("\n\n", parts.Skip(limit - 1)));
-        return kept;
+        return Result<SendResult>.Success(new SendResult(true,
+            response.MessageId ?? message.PlatformConversationId, PlatformMessageId: response.MessageId));
     }
 
     /// <summary>

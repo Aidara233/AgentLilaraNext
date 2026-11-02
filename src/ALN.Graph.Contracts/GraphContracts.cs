@@ -123,3 +123,33 @@ public static class ScriptCapabilities
     public const string ChannelReply = "channel.bound-send";
     public const string SelfAdapterPoll = "self.adapter.poll";
 }
+
+/// <summary>
+/// What a reply should arrive as. A mode is not a transport detail: the Adapter sends one message per call,
+/// always, and the mode decides how many messages one reply becomes — which is why it sits above the Adapter,
+/// where a longer answer can later become something else entirely (a picture, a file) without the Adapter
+/// growing a branch for each one.
+///
+/// The default is <see cref="Segments"/>: a chat window is not a page, and a model that keeps its answer in
+/// one blob reads like a memo dropped into a conversation.
+/// </summary>
+public static class ChannelReplyModes
+{
+    /// <summary>The whole text as one message, verbatim.</summary>
+    public const string Text = "text";
+
+    /// <summary>Blank line = the next message; a single newline stays a line break inside one message.</summary>
+    public const string Segments = "segments";
+
+    public const string Default = Segments;
+
+    public static bool IsKnown(string mode) =>
+        string.Equals(mode, Text, StringComparison.Ordinal) || string.Equals(mode, Segments, StringComparison.Ordinal);
+}
+
+/// <summary>
+/// The reply a script asks for. <paramref name="Mode"/> is the script's (or the model's, when a speak tool
+/// forwards it) choice; leaving it out means the default mode, which is the one chat wants.
+/// </summary>
+public sealed record ChannelReplyRequest(string PlatformConversationId, string Text, string? Mode = null,
+    string? ReplyTo = null);

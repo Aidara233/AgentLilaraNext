@@ -855,10 +855,10 @@ public sealed class GraphManager : IGraphRuntime
                 mount.Target, "session.tool.send_message", "allowed", call.Id), cancellationToken).ConfigureAwait(false);
             try
             {
-                var result = await SendAsync(current.EventId, channelMessage.Channel, binding.Adapter,
-                    new OutboundMessage(binding.PlatformConversationId, arguments.Text, channelMessage.PlatformMessageId), cancellationToken)
-                    .ConfigureAwait(false);
-                return Result<string>.Success(result);
+                var result = await DeliverAsync(current.EventId, channelMessage.Channel, binding.Adapter,
+                    binding.PlatformConversationId, arguments.Text, arguments.Mode ?? ChannelReplyModes.Default,
+                    channelMessage.PlatformMessageId, cancellationToken).ConfigureAwait(false);
+                return Result<string>.Success(JsonSerializer.Serialize(result, JsonOptions));
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch (Exception ex)
@@ -924,7 +924,8 @@ public sealed class GraphManager : IGraphRuntime
             var message = Parse<OutboundMessage>(json);
             if (envelope.Adapter != current.Source || message.PlatformConversationId != envelope.PlatformConversationId)
                 await DenyAsync(ScriptCapabilities.SelfAdapterSend, "Reply destination differs from source conversation.", cancellationToken).ConfigureAwait(false);
-            return await SendAsync(envelope.EventId, null, current.Source, message, cancellationToken).ConfigureAwait(false);
+            return JsonSerializer.Serialize(
+                await SendAsync(envelope.EventId, null, current.Source, message, cancellationToken).ConfigureAwait(false), JsonOptions);
         }
 
         public Task<string> RouteIntoChannelAsync(string json, CancellationToken cancellationToken) =>
@@ -1007,12 +1008,58 @@ public sealed class GraphManager : IGraphRuntime
             if (current.Name != EventNames.ChannelMessageAccepted || current.Source != mount.Target)
                 await DenyAsync(ScriptCapabilities.ChannelReply, "Not the mounted Channel event.", cancellationToken).ConfigureAwait(false);
             var routed = Parse<ChannelMessage>(current.PayloadJson);
-            var message = Parse<OutboundMessage>(json);
+            var request = Parse<ChannelReplyRequest>(json);
             var binding = routed.Binding;
             if (routed.Channel != current.Source || !channels.IsBound(current.Source, binding.Adapter, binding.PlatformConversationId) ||
-                message.PlatformConversationId != binding.PlatformConversationId)
+                request.PlatformConversationId != binding.PlatformConversationId)
                 await DenyAsync(ScriptCapabilities.ChannelReply, "Reply destination differs from Channel binding.", cancellationToken).ConfigureAwait(false);
-            return await SendAsync(current.EventId, routed.Channel, binding.Adapter, message, cancellationToken).ConfigureAwait(false);
+
+            // The mode decides how many messages this one reply becomes. Unknown modes are refused rather than
+            // treated as the default: a script asking for "image" today would otherwise send text and look like
+            // it worked.
+            var mode = string.IsNullOrWhiteSpace(request.Mode) ? ChannelReplyModes.Default : request.Mode;
+            if (!ChannelReplyModes.IsKnown(mode))
+                await DenyAsync(ScriptCapabilities.ChannelReply, $"Unknown reply mode: {mode}", cancellationToken).ConfigureAwait(false);
+            var sent = await DeliverAsync(current.EventId, routed.Channel, binding.Adapter, request.PlatformConversationId,
+                request.Text, mode, request.ReplyTo, cancellationToken).ConfigureAwait(false);
+            return JsonSerializer.Serialize(new { mode, sent = sent.TrueForAll(part => part.Sent), parts = sent }, JsonOptions);
+        }
+
+        /// <summary>
+        /// Turns one reply into the messages it should arrive as, and sends each of them the way an Adapter
+        /// expects: one call, one message. Everything above this line may grow more modes (a rendered picture
+        /// for a long answer, a file); nothing below it has to know.
+        /// </summary>
+        private async Task<List<SendResult>> DeliverAsync(Guid eventId, Address? channel, Address adapter,
+            string platformConversationId, string text, string mode, string? replyTo, CancellationToken cancellationToken)
+        {
+            var parts = string.Equals(mode, ChannelReplyModes.Segments, StringComparison.Ordinal)
+                ? SplitOnBlankLines(text)
+                : [text.Trim()];
+            var sent = new List<SendResult>(parts.Count);
+            for (var index = 0; index < parts.Count; index++)
+            {
+                // The quoted reply belongs on the first message: the rest are the same answer continuing, and a
+                // quote on each of them buries the conversation in arrows.
+                var piece = new OutboundMessage(platformConversationId, parts[index], index == 0 ? replyTo : null);
+                sent.Add(await SendAsync(eventId, channel, adapter, piece, cancellationToken).ConfigureAwait(false));
+            }
+            return sent;
+        }
+
+        /// <summary>
+        /// Blank line = the next message; a single newline stays a line break inside one message, which is how a
+        /// short list survives. No cap: how much a reply should say belongs in the prompt (asking for short
+        /// answers), and silently merging parts would make this mode stop meaning what it says.
+        /// </summary>
+        internal static IReadOnlyList<string> SplitOnBlankLines(string text)
+        {
+            var parts = text.Replace("\r\n", "\n", StringComparison.Ordinal)
+                .Split("\n\n", StringSplitOptions.None)
+                .Select(part => part.Trim('\n', ' ', '\t'))
+                .Where(part => part.Length > 0)
+                .ToArray();
+            return parts.Length == 0 ? [text.Trim()] : parts;
         }
 
         public Task<string> PollSelfAsync(CancellationToken cancellationToken) =>
@@ -1196,7 +1243,7 @@ public sealed class GraphManager : IGraphRuntime
             throw new UnauthorizedAccessException(detail);
         }
 
-        private async Task<string> SendAsync(Guid eventId, Address? channel, Address adapter, OutboundMessage message, CancellationToken cancellationToken)
+        private async Task<SendResult> SendAsync(Guid eventId, Address? channel, Address adapter, OutboundMessage message, CancellationToken cancellationToken)
         {
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, eventId, mount.Package.Manifest.Id, adapter, "adapter.send", "allowed", message.PlatformConversationId), cancellationToken).ConfigureAwait(false);
             ct.ThrowIfCancellationRequested();
@@ -1222,11 +1269,11 @@ public sealed class GraphManager : IGraphRuntime
                         }
                     });
             }
-            return JsonSerializer.Serialize(result.Value, JsonOptions);
+            return result.Value;
         }
 
         private static T Parse<T>(string json) => JsonSerializer.Deserialize<T>(json, JsonOptions) ?? throw new ArgumentException("Script API received invalid JSON.");
-        private sealed record SessionSendArguments(string Text);
+        private sealed record SessionSendArguments(string Text, string? Mode = null);
         private sealed record RouteOptions(string? ChannelId, string? Name);
         private const int MaxLogRecords = 200;
         private const int MaxLogMessageLength = 2_000;

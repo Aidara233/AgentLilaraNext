@@ -67,56 +67,16 @@ public sealed class OneBotConnectionTests
             var segments = action.GetProperty("params").GetProperty("message").EnumerateArray().ToArray();
             Assert.Equal("收到", segments[0].GetProperty("data").GetProperty("text").GetString());
 
-            // A blank line is the model's way of saying "next message": one reply, several platform messages,
-            // and the quoted reply stays on the first one only.
-            var split = await adapter.SendAsync(new OutboundMessage("group-123456", "第一段\n\n第二段\n\n第三段", ReplyTo: "4242"), default);
-            Assert.True(split.Ok, split.Error?.Message);
-            var first = await bot.NextSendAsync();
+            // The Adapter sends what it is given, as one message. "How many messages this becomes" is a decision
+            // made above it (the reply mode), because the Adapter is also the layer a caller reaches for when the
+            // whole text really does belong in one piece.
+            var verbatim = await adapter.SendAsync(new OutboundMessage("group-123456", "第一段\n\n第二段", ReplyTo: "4242"), default);
+            Assert.True(verbatim.Ok, verbatim.Error?.Message);
             var second = await bot.NextSendAsync();
-            var third = await bot.NextSendAsync();
-            // The quote is its own segment, so the text is what the text segments say.
-            static string TextOf(JsonElement action) => string.Concat(action.GetProperty("params").GetProperty("message")
-                .EnumerateArray()
-                .Where(segment => segment.GetProperty("type").GetString() == "text")
-                .Select(segment => segment.GetProperty("data").GetProperty("text").GetString()));
-            Assert.Equal(["第一段", "第二段", "第三段"], new[] { first, second, third }.Select(TextOf));
-            // The quote rides on the first message; the rest of the same answer would only add arrows.
-            Assert.Equal(2, first.GetProperty("params").GetProperty("message").GetArrayLength());
-            Assert.Equal(1, second.GetProperty("params").GetProperty("message").GetArrayLength());
-            Assert.Equal("9999", split.Value!.PlatformMessageId);
-        }
-        finally
-        {
-            await adapter.StopAsync(default);
-        }
-    }
-
-    [Fact]
-    public async Task One_reply_becomes_several_messages_but_never_more_than_the_platform_style_allows()
-    {
-        var sink = new RecordingSink();
-        var adapter = CreateAdapter(new Uri("ws://127.0.0.1:9"), sink);
-        var started = await adapter.StartAsync(default);
-        try
-        {
-            // The cap belongs to the Adapter, and the tail is joined back rather than dropped: losing the end of
-            // an answer is worse than a longer last message.
-            var parts = QqAdapter.SplitIntoMessages("一\n\n二\n\n三\n\n四\n\n五", limit: 3);
-            Assert.Equal(["一", "二", "三\n\n四\n\n五"], parts);
-
-            // A single newline is a line break inside one message, so a short list survives intact.
-            var listing = QqAdapter.SplitIntoMessages("清单：\n1. 甲\n2. 乙", limit: 3);
-            Assert.Equal(["清单：\n1. 甲\n2. 乙"], listing);
-
-            // Nothing to split is still exactly one message, and it is the same text.
-            Assert.Equal(["就一句"], QqAdapter.SplitIntoMessages("  就一句  ", limit: 3));
-
-            Assert.Equal("3", adapter.ReadParameter(QqAdapter.MaxMessagesParameter));
-            var capped = await adapter.ApplyParameterAsync(QqAdapter.MaxMessagesParameter, "11", default);
-            Assert.False(capped.Ok);
-            var set = await adapter.ApplyParameterAsync(QqAdapter.MaxMessagesParameter, "5", default);
-            Assert.True(set.Ok, set.Error?.Message);
-            Assert.Equal("5", adapter.ReadParameter(QqAdapter.MaxMessagesParameter));
+            var secondSegments = second.GetProperty("params").GetProperty("message").EnumerateArray().ToArray();
+            Assert.Equal(2, secondSegments.Length);
+            Assert.Equal("第一段\n\n第二段", secondSegments[1].GetProperty("data").GetProperty("text").GetString());
+            Assert.Equal("9999", verbatim.Value!.PlatformMessageId);
         }
         finally
         {
