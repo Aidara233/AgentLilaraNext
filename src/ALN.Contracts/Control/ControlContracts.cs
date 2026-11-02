@@ -77,4 +77,5 @@ public static class Capabilities
     public const string SessionsRead = "sessions.read";
     public const string ArchiveRead = "archive.read";
     public const string ArchiveControl = "archive.control";
+    public const string PromptsRead = "prompts.read";
 }

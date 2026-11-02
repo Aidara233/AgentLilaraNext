@@ -11,12 +11,9 @@ async function onEvent(event, ctx) {
     // registered one) and says which it used. Pinning a provider belongs in configuration, not in a script.
     objective: "在群聊或私聊里和对方对话",
     formatVersion: "1",
-    systemPrompt: [
-      "你在一个 QQ 会话里和对方对话。",
-      "回复会原样发出去：不要用 Markdown 标题、列表符号或代码块围栏，用适合聊天的短句。",
-      "消息里形如 [图片]、[表情]、[语音] 的方括号内容是你看不到的附件占位符，不要假装看懂了它。",
-      "不知道就说不确定，不要编造对方没说过的信息。",
-    ].join("\n"),
+    // The words live in <dataRoot>/prompts/<group>/<file>.md, not here: a prompt is something a person edits,
+    // and an edit must not require touching a script (or restarting anything).
+    prompts: { "人设": "标准人设", "安全": "标准安全" },
   };
 
   // No content is passed on purpose: the Session pulls what it has not seen yet.

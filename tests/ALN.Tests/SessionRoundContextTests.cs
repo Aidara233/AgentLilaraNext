@@ -30,7 +30,7 @@ public sealed class SessionRoundContextTests : IDisposable
     [Fact]
     public async Task Time_is_rendered_each_round_but_channel_info_enters_history_only_once()
     {
-        var spec = new SessionSpec("default", "Answer briefly.", "You are a test agent.", "1");
+        var spec = new SessionSpec("default", "Answer briefly.", "1");
         var first = await _sessions.RunTurnAsync("s-chat-1", spec, Guid.NewGuid(),
             new SessionTurnInput([new("m-1", "user", "alice", "hello", DateTimeOffset.UtcNow)], Channel, Binding),
             null, default);

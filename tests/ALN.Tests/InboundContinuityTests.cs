@@ -88,7 +88,7 @@ public sealed class InboundContinuityTests : IDisposable
     {
         var model = new ProfileAwareModel("alpha", "default", "beta");
         var sessions = new SessionManager(Path.Combine(_root, "sessions"), model);
-        var turn = await sessions.RunTurnAsync("s-chat-1", new SessionSpec("", "Answer briefly.", "You are a test agent.", "1"),
+        var turn = await sessions.RunTurnAsync("s-chat-1", new SessionSpec("", "Answer briefly.", "1"),
             Guid.NewGuid(), new SessionTurnInput([new("m-1", "user", "alice", "hello", DateTimeOffset.UtcNow)],
                 new("channel", "conversation", "chat-1"), new(new("adapter", "file", "file-1"), "chat-1")), null, default);
 
@@ -102,7 +102,7 @@ public sealed class InboundContinuityTests : IDisposable
     {
         var model = new ProfileAwareModel("beta", "alpha");
         var sessions = new SessionManager(Path.Combine(_root, "sessions"), model);
-        var turn = await sessions.RunTurnAsync("s-chat-2", new SessionSpec("", "Answer briefly.", "You are a test agent.", "1"),
+        var turn = await sessions.RunTurnAsync("s-chat-2", new SessionSpec("", "Answer briefly.", "1"),
             Guid.NewGuid(), new SessionTurnInput([new("m-1", "user", "alice", "hello", DateTimeOffset.UtcNow)],
                 new("channel", "conversation", "chat-2"), new(new("adapter", "file", "file-1"), "chat-2")), null, default);
 
@@ -114,7 +114,7 @@ public sealed class InboundContinuityTests : IDisposable
     public async Task A_spec_with_no_profile_and_no_profiles_configured_fails_with_a_reason()
     {
         var sessions = new SessionManager(Path.Combine(_root, "sessions"), new ProfileAwareModel());
-        var turn = await sessions.RunTurnAsync("s-chat-3", new SessionSpec("", "Answer briefly.", "You are a test agent.", "1"),
+        var turn = await sessions.RunTurnAsync("s-chat-3", new SessionSpec("", "Answer briefly.", "1"),
             Guid.NewGuid(), new SessionTurnInput([new("m-1", "user", "alice", "hello", DateTimeOffset.UtcNow)],
                 new("channel", "conversation", "chat-3"), new(new("adapter", "file", "file-1"), "chat-3")), null, default);
 

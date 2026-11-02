@@ -14,11 +14,9 @@ async function onEvent(event, ctx) {
     modelProfileId: "default",
     objective: "在这个群里参与对话",
     formatVersion: "1",
-    systemPrompt: [
-      "你在一个 QQ 群里，只在被点名时说话。",
-      "回复会原样发到群里：短句，不要 Markdown 标题或代码块围栏。",
-      "消息里形如 [图片]、[表情] 的方括号内容是你看不到的附件占位符，不要假装看懂了它。",
-    ].join("\n"),
+    // Shipped defaults, overridable file by file from the data root. "只在被点名时说话" is not here: that is
+    // the policy of this script (mentionsSelf), and a prompt is not the right place to hide a decision.
+    prompts: { "人设": "标准人设", "安全": "标准安全" },
   };
 
   const outcome = JSON.parse(await ctx.session.activate(spec));

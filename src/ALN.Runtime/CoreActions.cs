@@ -2,6 +2,7 @@ using System.Text.Json;
 using ALN.Contracts;
 using ALN.Contracts.Archive;
 using ALN.Contracts.Models;
+using ALN.Contracts.Prompts;
 using ALN.Contracts.Sessions;
 using ALN.Graph.Contracts;
 
@@ -36,6 +37,7 @@ public static class CoreActions
     public const string ArchiveList = "archive.list";
     public const string ArchiveMove = "archive.move";
     public const string ArchiveRestore = "archive.restore";
+    public const string PromptsList = "prompts.list";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -43,7 +45,8 @@ public static class CoreActions
 
     public static Result RegisterAll(ControlPlane plane, IAdapterManager adapters, IChannelManager channels,
         IModelManager models, ISignalLog signals, IGraphRuntime graph, IParameterRegistry parameters,
-        IModuleCatalog? modules = null, ISessionManager? sessions = null, IArchiveRegistry? archive = null)
+        IModuleCatalog? modules = null, ISessionManager? sessions = null, IArchiveRegistry? archive = null,
+        IPromptLibrary? prompts = null)
     {
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
@@ -245,7 +248,35 @@ public static class CoreActions
             (new(ArchiveMove, "Put candidates in the bin: one kind, all of it or the named ids. dryRun defaults to true.", Capabilities.ArchiveControl, true),
                 MoveToArchive),
             (new(ArchiveRestore, "Take items back out of the bin, by id. dryRun defaults to true.", Capabilities.ArchiveControl, true),
-                RestoreFromArchive)
+                RestoreFromArchive),
+
+            // Prompts are files; this is the "what do I have and where do I edit it" action. There is no write
+            // side on purpose: editing a prompt is editing a file, not calling an API.
+            (new(PromptsList, "Prompt groups and the files in them, with their origin and fingerprint.", Capabilities.PromptsRead, false),
+                (_, _) =>
+                {
+                    if (prompts is null) return ValueTask.FromResult(Result<JsonElement>.Failure(
+                        new(ErrorCode.Unavailable, "The prompt library is unavailable.")));
+                    var catalog = prompts.List();
+                    return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+                    {
+                        roots = prompts.Roots,
+                        groups = catalog.Groups.Select(group => new
+                        {
+                            group = group.Group,
+                            prompts = group.Entries.Select(entry => new
+                            {
+                                name = entry.Name,
+                                bytes = entry.Bytes,
+                                fingerprint = entry.Fingerprint,
+                                path = entry.Path
+                            })
+                        }),
+                        // Reported rather than swallowed: a prompt that cannot be read is a Session that would
+                        // answer as somebody else if nothing said so.
+                        warnings = catalog.Warnings
+                    })));
+                })
         };
 
         foreach (var (descriptor, handler) in registrations)

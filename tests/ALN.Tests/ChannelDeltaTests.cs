@@ -104,7 +104,7 @@ public sealed class ChannelDeltaTests : IDisposable
         var model = new ScriptedModel();
         var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
         var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
-        var spec = new SessionSpec("default", "Answer briefly.", "You are a test agent.", "1");
+        var spec = new SessionSpec("default", "Answer briefly.", "1");
 
         var turn = await sessions.RunTurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding),
             null, default);

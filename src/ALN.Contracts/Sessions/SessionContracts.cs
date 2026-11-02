@@ -1,15 +1,30 @@
 using ALN.Contracts.Models;
+using System.Text.Json.Serialization;
 
 namespace ALN.Contracts.Sessions;
 
 public enum SessionStatus { Running, Dormant }
 
 /// <summary>Immutable behavior and prompt snapshot created with one session.</summary>
+/// <param name="Prompts">
+/// Which prompt file answers each group, e.g. <c>{ "人设": "标准人设", "安全": "标准安全" }</c> — at most one
+/// file per group, because a dictionary cannot hold the same key twice. Empty or null means no system
+/// message at all, which is a legal choice (a script that only performs an action does not need a persona)
+/// and is said out loud in the signal log rather than left to be guessed.
+///
+/// Only the *names* are frozen here, never the text: prompts are files a person edits, and editing one must
+/// change the next turn rather than break the session. What stays immutable is which prompt was chosen.
+/// </param>
+/// <summary>
+/// Unknown members are refused rather than ignored: a spec that still says <c>systemPrompt</c> must fail loudly
+/// instead of running with no prompt at all, and a typo in a field name must not silently drop a requirement.
+/// </summary>
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record SessionSpec(
     string ModelProfileId,
     string Objective,
-    string SystemPrompt,
     string FormatVersion,
+    IReadOnlyDictionary<string, string>? Prompts = null,
     IReadOnlyList<ModelToolDefinition>? Tools = null);
 
 /// <summary>Persisted state. Phase is intentionally transient and is not stored here.</summary>

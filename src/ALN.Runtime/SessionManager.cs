@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using ALN.Contracts;
 using ALN.Contracts.Models;
+using ALN.Contracts.Prompts;
 using ALN.Contracts.Sessions;
 
 namespace ALN.Runtime;
@@ -19,10 +20,11 @@ public sealed class SessionManager : ISessionManager
     private readonly IModelManager _models;
     private readonly ISignalLog _signalLog;
     private readonly IRoundContextContributorRegistry _roundContextContributors;
+    private readonly IPromptLibrary? _prompts;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
 
     public SessionManager(string dataRoot, IModelManager models, IRoundContextContributorRegistry? roundContextContributors = null,
-        ISignalLog? signalLog = null)
+        ISignalLog? signalLog = null, IPromptLibrary? prompts = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         ArgumentNullException.ThrowIfNull(models);
@@ -31,6 +33,7 @@ public sealed class SessionManager : ISessionManager
         _models = models;
         _roundContextContributors = roundContextContributors ?? new RoundContextContributorRegistry();
         _signalLog = signalLog ?? NullSignalLog.Instance;
+        _prompts = prompts;
     }
 
     public async ValueTask<Result<SessionTurnResult>> RunTurnAsync(
@@ -132,7 +135,7 @@ public sealed class SessionManager : ISessionManager
         if (!IsValidSessionId(sessionId))
             return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Session id must use 1-128 ASCII letters, digits, '-' or '_'."));
         if (spec is null || string.IsNullOrWhiteSpace(spec.Objective) ||
-            string.IsNullOrWhiteSpace(spec.SystemPrompt) || string.IsNullOrWhiteSpace(spec.FormatVersion))
+            string.IsNullOrWhiteSpace(spec.FormatVersion))
             return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Session specification is incomplete."));
         if (spec.Tools is { } declaredTools && (declaredTools.Any(t => string.IsNullOrWhiteSpace(t.Name) ||
             string.IsNullOrWhiteSpace(t.Description) || string.IsNullOrWhiteSpace(t.ParametersJson)) ||
@@ -210,11 +213,13 @@ public sealed class SessionManager : ISessionManager
                 history = history.Append(activationUser).ToArray();
             }
 
-            var messages = new List<ModelMessage>
-            {
-                new("system", session.Value.Spec.SystemPrompt),
-                new("user", session.Value.Spec.Objective)
-            };
+            var messages = new List<ModelMessage>();
+            // The prompt is read here, every turn, from files a person edits. Only the names are part of the
+            // immutable spec, so editing a prompt changes the next request instead of breaking the session.
+            var promptSet = await ResolvePromptsAsync(session.Value.Spec, activationId, cancellationToken).ConfigureAwait(false);
+            if (!promptSet.Ok || promptSet.Value is null) return Result<SessionTurnResult>.Failure(promptSet.Error!);
+            if (!promptSet.Value.IsEmpty) messages.Add(new ModelMessage("system", promptSet.Value.Text));
+            messages.Add(new ModelMessage("user", session.Value.Spec.Objective));
             messages.AddRange(history.Where(entry => entry.ChannelMessages is null).Select(ToModelMessage));
             var collected = await CollectRoundContextAsync(
                 new RoundContextRequest(sessionId, activationId, state.StepNumber + 1, input.Channel, input.Binding),
@@ -584,7 +589,22 @@ public sealed class SessionManager : ISessionManager
         SessionSpec persistedSpec;
         if (File.Exists(specPath))
         {
-            var readSpec = JsonSerializer.Deserialize<SessionSpec>(await File.ReadAllBytesAsync(specPath, cancellationToken).ConfigureAwait(false), JsonOptions);
+            SessionSpec? readSpec;
+            try
+            {
+                readSpec = JsonSerializer.Deserialize<SessionSpec>(await File.ReadAllBytesAsync(specPath, cancellationToken).ConfigureAwait(false), JsonOptions);
+            }
+            catch (JsonException ex)
+            {
+                // A stored spec from an older build is not "some error": this session can never run again, and
+                // saying so (with the way out) is the only useful answer. Silence or a generic failure would leave
+                // somebody watching a chat that quietly stops answering.
+                return Result<LoadedSession>.Failure(new(ErrorCode.Invalid,
+                    $"Stored session spec cannot be read by this build: {ex.Message} " +
+                    $"Move the session out of the way (archive.move kind=session) or delete sessions/{Path.GetFileName(directory)}; " +
+                    "the next message will start a fresh one.",
+                    ex.Message));
+            }
             if (readSpec is null) return Result<LoadedSession>.Failure(new(ErrorCode.Invalid, "Session specification is invalid."));
             if (!SameSpec(readSpec, requestedSpec))
             {
@@ -749,11 +769,66 @@ public sealed class SessionManager : ISessionManager
         }
     }
 
+    /// <summary>
+    /// Turns the spec's selection into text. A missing prompt fails this turn with the list of what exists:
+    /// answering as somebody else because a file was renamed is the one outcome nobody can debug later.
+    /// </summary>
+    private async ValueTask<Result<PromptSet>> ResolvePromptsAsync(SessionSpec spec, Guid activationId,
+        CancellationToken cancellationToken)
+    {
+        var groups = spec.Prompts is { Count: > 0 } chosen
+            ? chosen.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal)
+            : [];
+        var selection = new PromptSelection(groups);
+        if (selection.IsEmpty)
+        {
+            // Legal, and said out loud: "no persona at all" is a fact somebody may need to notice.
+            _signalLog.Write(new()
+            {
+                Group = "prompt", Name = "resolve", StepId = activationId, From = "session", To = "prompt",
+                Mechanism = "prompt.resolve", Outcome = "empty", Level = SignalLevel.Info,
+                Detail = new Dictionary<string, string> { ["message"] = "no prompt group selected" }
+            });
+            return Result<PromptSet>.Success(new PromptSet(string.Empty, [], string.Empty));
+        }
+
+        if (_prompts is null)
+            return Result<PromptSet>.Failure(new(ErrorCode.Unavailable,
+                "The session names prompt groups but no prompt library is available."));
+
+        var resolved = await _prompts.ResolveAsync(selection, cancellationToken).ConfigureAwait(false);
+        _signalLog.Write(new()
+        {
+            Group = "prompt", Name = "resolve", StepId = activationId, From = "session", To = "prompt",
+            Mechanism = "prompt.resolve", Outcome = resolved.Ok ? "ok" : "failed",
+            Level = resolved.Ok ? SignalLevel.Info : SignalLevel.Warn,
+            Detail = resolved.Ok && resolved.Value is not null
+                ? new Dictionary<string, string>
+                {
+                    ["fingerprint"] = resolved.Value.Fingerprint,
+                    ["parts"] = string.Join(",", resolved.Value.Parts.Select(part => $"{part.Group}/{part.Name}"))
+                }
+                : new Dictionary<string, string> { ["message"] = resolved.Error?.Message ?? "prompt could not be resolved" }
+        });
+        return resolved;
+    }
+
+    private static bool SamePrompts(IReadOnlyDictionary<string, string>? left, IReadOnlyDictionary<string, string>? right)
+    {
+        var leftPairs = left ?? new Dictionary<string, string>();
+        var rightPairs = right ?? new Dictionary<string, string>();
+        if (leftPairs.Count != rightPairs.Count) return false;
+        foreach (var (group, name) in leftPairs)
+            if (!rightPairs.TryGetValue(group, out var other) || !string.Equals(name, other, StringComparison.Ordinal))
+                return false;
+        return true;
+    }
+
     private static bool SameSpec(SessionSpec left, SessionSpec right) =>
         StringComparer.Ordinal.Equals(left.ModelProfileId, right.ModelProfileId) &&
         StringComparer.Ordinal.Equals(left.Objective, right.Objective) &&
-        StringComparer.Ordinal.Equals(left.SystemPrompt, right.SystemPrompt) &&
         StringComparer.Ordinal.Equals(left.FormatVersion, right.FormatVersion) &&
+        SamePrompts(left.Prompts, right.Prompts) &&
         (left.Tools ?? []).SequenceEqual(right.Tools ?? []);
 
     private static bool HasUnresolvedToolCalls(IReadOnlyList<SessionHistoryEntry> history)

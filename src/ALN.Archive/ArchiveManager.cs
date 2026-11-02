@@ -114,12 +114,26 @@ public sealed class ArchiveManager : IArchiveRegistry, IArchiveSink
                     archived.Error?.Message ?? "Archive failed."));
         }
 
-        // Asked for something that was not on offer: say so instead of silently doing less.
+        // Explicit ids are an operator's decision, not a machine verdict: a bin you may only fill with what the
+        // system already considers garbage is not a bin. The source still decides whether it owns the id, and
+        // says so if it does not.
         if (wanted is not null)
         {
             var offered = candidates.Select(candidate => candidate.Id).ToHashSet(StringComparer.Ordinal);
-            outcomes.AddRange(wanted.Where(id => !offered.Contains(id))
-                .Select(id => new ArchiveOutcome(source.Kind, id, "archived", Done: false, 0, "Not offered by this source.")));
+            foreach (var id in wanted.Where(id => !offered.Contains(id)))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var requested = new ArchiveCandidate(source.Kind, id, 0, Reason: "requested");
+                if (dryRun)
+                {
+                    outcomes.Add(new(source.Kind, id, "archived", Done: false, 0, "Not offered by this source; would be taken on request."));
+                    continue;
+                }
+                var archived = await source.ArchiveAsync(requested, this, cancellationToken).ConfigureAwait(false);
+                outcomes.Add(archived.Ok && archived.Value is not null
+                    ? new(source.Kind, id, "archived", Done: true, archived.Value.Bytes)
+                    : new(source.Kind, id, "archived", Done: false, 0, archived.Error?.Message ?? "Archive failed."));
+            }
         }
         return Result<ArchiveReport>.Success(new(dryRun, outcomes));
     }

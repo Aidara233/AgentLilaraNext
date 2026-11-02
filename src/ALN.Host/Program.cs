@@ -2,6 +2,7 @@ using System.Text.Json;
 using ALN.Contracts;
 using ALN.Contracts.Archive;
 using ALN.Contracts.Models;
+using ALN.Contracts.Prompts;
 using ALN.Contracts.Sessions;
 using ALN.Graph.Contracts;
 using ALN.Runtime;
@@ -62,13 +63,23 @@ restore.Note("storage", $"sqlite {Path.GetFileName(storage.Path)}: {storage.Coun
 // Acknowledgements owed to Adapters: published is not handled, so the mailbox file is only settled after
 // the event round it produced is over.
 var acks = new InboundAckRegistry();
-var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, roundContextContributors, signalLog);
+// Prompts are files a person edits: <dataRoot>/prompts/<group>/<name>.md — shipped defaults live next to the
+// binary and the data root overrides them file by file, so an edit needed today is a file, not a release.
+var prompts = new PromptLibrary([
+    Path.Combine(AppContext.BaseDirectory, "resources", "prompts"),
+    Path.Combine(data.Root, "prompts")]);
+var catalog = prompts.List();
+if (catalog.Groups.Count > 0 || catalog.Warnings.Count > 0)
+    restore.Note("prompts", $"{catalog.Groups.Count} group(s), {catalog.Groups.Sum(group => group.Entries.Count)} prompt(s)" +
+        (catalog.Warnings.Count == 0 ? "" : $"; skipped {catalog.Warnings.Count}: {string.Join("; ", catalog.Warnings)}"));
+var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, roundContextContributors, signalLog, prompts);
 var reloadState = new ModuleReloadStateStore();
 var hostServices = new HostServiceProvider(
     (typeof(IAdapterManager), adapters),
     (typeof(IAdapterFactoryRegistry), adapterFactories),
     (typeof(IModelManager), modelManager),
     (typeof(ISessionManager), sessions),
+    (typeof(IPromptLibrary), prompts),
     (typeof(IRoundContextContributorRegistry), roundContextContributors),
     (typeof(IFileMailbox), mailbox),
     (typeof(IEventSink), new RecordingEventSink(queue, messageStore)),
@@ -263,7 +274,7 @@ if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
 // The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
 // WebUI itself — it exposes actions, and a separate project consumes them.
 var controlPlane = new ControlPlane(auditSink, signalLog);
-var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive);
+var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts);
 if (!actionsRegistered.Ok)
 {
     Console.Error.WriteLine(actionsRegistered.Error?.Message ?? "Action registration failed.");

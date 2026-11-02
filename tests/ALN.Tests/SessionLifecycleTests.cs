@@ -23,7 +23,7 @@ public sealed class SessionLifecycleTests : IDisposable
     private static readonly Address Chat = new("channel", "conversation", "chat-1");
     private static readonly Address Ghost = new("channel", "conversation", "ghost");
     private static readonly ChannelBinding FileBinding = new(new("adapter", "file", "file-1"), "chat-1");
-    private static readonly SessionSpec Spec = new("default", "Answer briefly.", "You are a test agent.", "1");
+    private static readonly SessionSpec Spec = new("default", "Answer briefly.", "1");
 
     public void Dispose()
     {
@@ -152,7 +152,7 @@ public sealed class SessionLifecycleTests : IDisposable
         Assert.All(candidates.Value!, candidate => Assert.True(candidate.Bytes > 0));
 
         // A spec that changed can never match again: the refusal leaves a note, and the note is a reason.
-        var changed = Spec with { SystemPrompt = "You are a different agent." };
+        var changed = Spec with { Objective = "Answer differently." };
         var refused = await sessions.RunTurnAsync("s-live", changed, Guid.NewGuid(), Input(Chat, "again"), null, default);
         Assert.Equal(ErrorCode.Conflict, refused.Error!.Code);
         var afterRefusal = await bin.CandidatesAsync(ArchiveKinds.Session, default);
@@ -246,6 +246,33 @@ public sealed class SessionLifecycleTests : IDisposable
         var directories = Directory.GetDirectories(Path.Combine(_root, "sessions"));
         Assert.Equal(ghosts.Length + 1, directories.Length);
         Assert.Equal("channel.conversation#chat-1", StoredState("s-fresh").Channel);
+    }
+
+    [Fact]
+    public async Task An_explicit_id_can_be_archived_even_when_the_source_did_not_offer_it()
+    {
+        // A conversation that is broken (its stored spec no longer reads) is not "garbage" by any checkable rule,
+        // yet putting it away is exactly what an operator needs. A bin that refuses that is only a garbage list.
+        var sessions = Sessions();
+        Assert.True((await sessions.RunTurnAsync("s-live", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
+        var bin = Bin();
+        var channels = await ChannelsServing(sessions, bin, Chat);
+        Assert.True(bin.Register(new SessionArchiveSource(sessions, channels)).Ok);
+
+        // Offered by nobody: the Channel exists and the Session is fresh.
+        Assert.Empty((await bin.CandidatesAsync(ArchiveKinds.Session, default)).Value!);
+
+        var taken = await bin.ArchiveAsync(ArchiveKinds.Session, ["s-live"], dryRun: false, default);
+        Assert.True(taken.Ok, taken.Error?.Detail ?? taken.Error?.Message);
+        Assert.True(Assert.Single(taken.Value!.Items).Done);
+        Assert.False(Directory.Exists(SessionPath("s-live")));
+        Assert.Equal("requested", Assert.Single((await bin.ArchivedAsync(ArchiveKinds.Session, default)).Value!).Reason);
+
+        // An id the source does not own is refused by the source, and the outcome says so.
+        var missing = await bin.ArchiveAsync(ArchiveKinds.Session, ["s-not-mine"], dryRun: false, default);
+        var outcome = Assert.Single(missing.Value!.Items);
+        Assert.False(outcome.Done);
+        Assert.False(string.IsNullOrWhiteSpace(outcome.Message));
     }
 
     /// <summary>A Session directory as an older run would have left it: real files, a recorded Channel.</summary>
