@@ -75,5 +75,6 @@ public static class Capabilities
     public const string ModelsRead = "models.read";
     public const string SignalsRead = "signals.read";
     public const string SessionsRead = "sessions.read";
-    public const string SessionsControl = "sessions.control";
+    public const string ArchiveRead = "archive.read";
+    public const string ArchiveControl = "archive.control";
 }

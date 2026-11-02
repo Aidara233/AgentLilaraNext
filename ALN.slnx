@@ -3,6 +3,7 @@
     <Project Path="src/ALN.Adapter.File/ALN.Adapter.File.csproj" />
     <Project Path="src/ALN.Adapter.Qq/ALN.Adapter.Qq.csproj" />
     <Project Path="src/ALN.Api/ALN.Api.csproj" />
+    <Project Path="src/ALN.Archive/ALN.Archive.csproj" />
     <Project Path="src/ALN.BundledModules/ALN.BundledModules.csproj" />
     <Project Path="src/ALN.Channel/ALN.Channel.csproj" />
     <Project Path="src/ALN.Clock/ALN.Clock.csproj" />

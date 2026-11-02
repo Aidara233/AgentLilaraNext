@@ -1,0 +1,10 @@
+{
+  "id": "aln.archive",
+  "version": "1.0.0",
+  "kind": "bundled",
+  "entryAssembly": "ALN.Archive.dll",
+  "entryType": "ALN.Archive.ArchiveModule",
+  "provides": [],
+  "dependencies": [],
+  "reloadPolicy": "none"
+}

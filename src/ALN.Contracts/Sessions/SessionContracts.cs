@@ -145,15 +145,21 @@ public interface ISessionManager
     ValueTask<Result<int>> DeleteChannelAsync(string channel, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Every Session on disk, with the facts a keep-or-delete decision needs. Reads the session directory —
+    /// Every Session on disk, with the facts a keep-or-archive decision needs. Reads the session directory —
     /// deliberately not done at startup: an instance nobody talks to should cost nothing.
     /// </summary>
     ValueTask<Result<IReadOnlyList<SessionSummary>>> ListAsync(CancellationToken cancellationToken);
 
     /// <summary>
-    /// Offers — and, when the request says so, performs — the deletion of Sessions nothing will ever use again.
-    /// The decision rules live in the store because it is the only thing that knows what a Session is; what it
-    /// cannot know (which Channels exist) is handed in.
+    /// Moves one Session's data out of its living place into <paramref name="destinationDirectory"/>, holding
+    /// its turn gate meanwhile. The layout stays the manager's business — a caller says "take it away", not
+    /// "here are the files".
     /// </summary>
-    ValueTask<Result<SessionPruneResult>> PruneAsync(SessionPruneRequest request, CancellationToken cancellationToken);
+    ValueTask<Result> ArchiveAsync(string sessionId, string destinationDirectory, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Moves archived data back into place. Refuses when that place is occupied: restoring into a Session that
+    /// was rebuilt since would splice two different conversations into one.
+    /// </summary>
+    ValueTask<Result> RestoreAsync(string sessionId, string sourceDirectory, CancellationToken cancellationToken);
 }

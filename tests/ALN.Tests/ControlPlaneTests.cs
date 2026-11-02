@@ -130,7 +130,7 @@ public sealed class ControlPlaneTests : IDisposable
     }
 
     [Fact]
-    public async Task Session_maintenance_is_in_the_catalogue_and_needs_more_than_read()
+    public async Task Archive_actions_are_in_the_catalogue_and_need_more_than_read()
     {
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
         var provider = new ModelProviderInfo(new Address("model", "openai-chat", "one"),
@@ -138,14 +138,19 @@ public sealed class ControlPlaneTests : IDisposable
         Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(provider),
             _signals, new FakeGraph(), new FakeParameters()).Ok);
 
-        var sweep = Assert.Single(plane.Catalog, action => action.Id == CoreActions.SessionsGc);
-        // Deleting a conversation must not be a read: a "*.read" viewer may look, not sweep.
-        Assert.Equal(Capabilities.SessionsControl, sweep.Capability);
-        Assert.True(sweep.Mutating);
-        Assert.False(User("*.read").Allows(sweep.Capability));
+        foreach (var id in new[] { CoreActions.ArchiveMove, CoreActions.ArchiveRestore })
+        {
+            var action = Assert.Single(plane.Catalog, candidate => candidate.Id == id);
+            // Taking a conversation out of service must not be a read: a "*.read" viewer may look, not sweep.
+            Assert.Equal(Capabilities.ArchiveControl, action.Capability);
+            Assert.True(action.Mutating);
+            Assert.False(User("*.read").Allows(action.Capability));
+        }
+        Assert.Equal(Capabilities.ArchiveRead, Assert.Single(plane.Catalog, action => action.Id == CoreActions.ArchiveList).Capability);
+        Assert.DoesNotContain(plane.Catalog, action => action.Id == "sessions.gc");
 
-        // Without a Session manager the action is registered but honest about being unavailable.
-        var refused = await plane.InvokeAsync(Actor.System, CoreActions.SessionsGc, default, default);
+        // Without an archive module the actions are registered but honest about being unavailable.
+        var refused = await plane.InvokeAsync(Actor.System, CoreActions.ArchiveList, default, default);
         Assert.Equal(ErrorCode.Unavailable, refused.Error?.Code);
     }
 

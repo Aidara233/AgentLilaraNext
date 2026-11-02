@@ -1,7 +1,9 @@
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using ALN.Archive;
 using ALN.Channel;
 using ALN.Contracts;
+using ALN.Contracts.Archive;
 using ALN.Contracts.Models;
 using ALN.Contracts.Sessions;
 using ALN.Runtime;
@@ -9,10 +11,10 @@ using ALN.Runtime;
 namespace ALN.Tests;
 
 /// <summary>
-/// A Session is the only thing in the data root that the host mints by itself — a Channel's script asks for
-/// one and a hash becomes a directory. So it is also the only thing that can pile up unseen, and these tests
-/// pin the four facts that make that pile manageable: who a directory belongs to, when it last spoke, that a
-/// destroyed Channel takes its own with it, and that none of it is looked at until somebody asks.
+/// A Session is the only thing the host mints by itself — a Channel's script asks for one and a hash becomes a
+/// directory — so it is also the only thing that can pile up unseen. These tests pin what makes that pile
+/// manageable: a directory says whose it is and when it last spoke, and the bin can take it away and give it
+/// back without either operation ever overwriting or merging anything.
 /// </summary>
 public sealed class SessionLifecycleTests : IDisposable
 {
@@ -30,13 +32,17 @@ public sealed class SessionLifecycleTests : IDisposable
 
     private SessionManager Sessions() => new(Path.Combine(_root, "sessions"), new ScriptedModel());
 
+    private ArchiveManager Bin() => new(_root);
+
+    private string SessionPath(string sessionId) => Path.Combine(_root, "sessions", sessionId);
+
     private static SessionTurnInput Input(Address? channel, string text) => new(
         channel is null ? [] : [new($"m-{Guid.NewGuid():N}", "user", "alice", text, DateTimeOffset.UtcNow)],
         channel,
         channel is null ? null : FileBinding);
 
     private SessionState StoredState(string sessionId) => JsonSerializer.Deserialize<SessionState>(
-        File.ReadAllBytes(Path.Combine(_root, "sessions", sessionId, "state.json")), Json)!;
+        File.ReadAllBytes(Path.Combine(SessionPath(sessionId), "state.json")), Json)!;
 
     [Fact]
     public async Task A_session_records_which_channel_it_serves_and_when_it_last_spoke()
@@ -62,87 +68,163 @@ public sealed class SessionLifecycleTests : IDisposable
         Assert.True(afterSecond.LastActiveAt > spokeAt, "a completed turn must move lastActiveAt forward");
     }
 
+    /// <summary>
+    /// Both halves of "the engine and the bin agree on what an id means": the bin's entry name is its own, and
+    /// the source's id travels with it so a restore still knows where it belongs.
+    /// </summary>
     [Fact]
-    public async Task A_destroyed_channel_takes_its_own_sessions_and_leaves_the_rest()
+    public async Task The_bin_takes_a_session_away_and_gives_it_back()
     {
         var sessions = Sessions();
-        Assert.True((await sessions.RunTurnAsync("s-chat", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
-        Assert.True((await sessions.RunTurnAsync("s-ghost", Spec, Guid.NewGuid(), Input(Ghost, "hi"), null, default)).Ok);
+        // Ghost's Channel does not exist here, so the Session is offered for the real reason (channel-gone)
+        // rather than because a test wanted it to be.
+        Assert.True((await sessions.RunTurnAsync("s-one", Spec, Guid.NewGuid(), Input(Ghost, "hello"), null, default)).Ok);
+        var before = StoredState("s-one");
+        var bin = Bin();
+        var channels = await ChannelsServing(sessions, bin, Chat);
+        Assert.True(bin.Register(new SessionArchiveSource(sessions, channels)).Ok);
 
-        var channels = await ChannelsServing(sessions, Chat);
-        var destroyed = await channels.DestroyAsync(Chat, default);
-        Assert.True(destroyed.Ok, destroyed.Error?.Detail ?? destroyed.Error?.Message);
+        // Dry run first: it says what would happen and does nothing.
+        var dry = await bin.ArchiveAsync(ArchiveKinds.Session, null, dryRun: true, default);
+        Assert.True(dry.Ok, dry.Error?.Detail ?? dry.Error?.Message);
+        var offered = Assert.Single(dry.Value!.Items);
+        Assert.Equal("s-one", offered.Id);
+        Assert.False(offered.Done);
+        Assert.True(Directory.Exists(SessionPath("s-one")));
 
-        Assert.False(Directory.Exists(Path.Combine(_root, "sessions", "s-chat")));
-        // Somebody else's conversation is not collateral.
-        Assert.True(Directory.Exists(Path.Combine(_root, "sessions", "s-ghost")));
+        var moved = await bin.ArchiveAsync(ArchiveKinds.Session, null, dryRun: false, default);
+        Assert.True(moved.Ok, moved.Error?.Detail ?? moved.Error?.Message);
+        Assert.True(Assert.Single(moved.Value!.Items).Done);
+        // Gone from the living side: the engine's own list says so, and so does the filesystem.
+        Assert.Empty((await sessions.ListAsync(default)).Value!);
+        Assert.False(Directory.Exists(SessionPath("s-one")));
 
-        // And the Channel really is gone, so a re-created one starts from an empty session instead of a
-        // spec it can never match.
-        Assert.False(channels.Get(Chat).Ok);
+        var archived = Assert.Single((await bin.ArchivedAsync(ArchiveKinds.Session, default)).Value!);
+        Assert.Equal("s-one", archived.Id);
+        Assert.Equal("s-one", archived.SourceId);
+        Assert.True(archived.Bytes > 0);
+        // The material really moved: the archived copy has the history that was committed just before.
+        var archivedState = JsonSerializer.Deserialize<SessionState>(
+            File.ReadAllBytes(Path.Combine(archived.Path, ArchiveLayout.Payload, "state.json")), Json)!;
+        Assert.Equal(before.StepNumber, archivedState.StepNumber);
+        // The manifest says where it came from, so a person can put it back by hand if the database is gone.
+        Assert.Equal("sessions/s-one", archived.Note!["origin"]);
+
+        var restored = await bin.RestoreAsync(ArchiveKinds.Session, ["s-one"], dryRun: false, default);
+        Assert.True(restored.Ok, restored.Error?.Detail ?? restored.Error?.Message);
+        Assert.True(Assert.Single(restored.Value!.Items).Done);
+        Assert.True(Directory.Exists(SessionPath("s-one")));
+        Assert.Empty((await bin.ArchivedAsync(ArchiveKinds.Session, default)).Value!);
+        Assert.Equal("channel.conversation#ghost", Assert.Single((await sessions.ListAsync(default)).Value!).Channel);
+
+        // And it is a working Session again, not just a directory: the engine picks the history up where it was.
+        var resumed = await sessions.RunTurnAsync("s-one", Spec, Guid.NewGuid(), Input(Ghost, "back again"), null, default);
+        Assert.True(resumed.Ok, resumed.Error?.Detail ?? resumed.Error?.Message);
+        Assert.True(resumed.Value!.StepNumber > before.StepNumber);
     }
 
     [Fact]
-    public async Task Collection_offers_every_kind_of_dead_session_and_a_dry_run_deletes_nothing()
+    public async Task Candidates_cover_the_four_ways_a_session_stops_being_useful()
     {
         var sessions = Sessions();
         Assert.True((await sessions.RunTurnAsync("s-live", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
         Assert.True((await sessions.RunTurnAsync("s-orphan", Spec, Guid.NewGuid(), Input(Ghost, "hi"), null, default)).Ok);
-        // No Channel at all: written by a caller that walked a Session straight through the manager.
+        // No Channel at all: written by a caller that ran a Session straight through the manager.
         Assert.True((await sessions.RunTurnAsync("s-unowned", Spec, Guid.NewGuid(), Input(null, "hi"), null, default)).Ok);
         Assert.True((await sessions.RunTurnAsync("s-stale", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
 
         // Backdate one as "nobody has spoken to this since spring".
         var stale = StoredState("s-stale");
-        await File.WriteAllBytesAsync(Path.Combine(_root, "sessions", "s-stale", "state.json"),
+        await File.WriteAllBytesAsync(Path.Combine(SessionPath("s-stale"), "state.json"),
             JsonSerializer.SerializeToUtf8Bytes(stale with { LastActiveAt = DateTimeOffset.UtcNow.AddDays(-90) }, Json));
 
-        var dryRun = await sessions.PruneAsync(new([Chat.ToString()], DryRun: true, IdleDays: 30), default);
-        Assert.True(dryRun.Ok, dryRun.Error?.Detail ?? dryRun.Error?.Message);
-        var offered = dryRun.Value!.Items.ToDictionary(item => item.Id, item => item.Reason, StringComparer.Ordinal);
-        Assert.Equal(SessionPruneReasons.ChannelGone, offered["s-orphan"]);
-        Assert.Equal(SessionPruneReasons.ChannelUnknown, offered["s-unowned"]);
-        Assert.Equal(SessionPruneReasons.Idle, offered["s-stale"]);
+        var bin = Bin();
+        var channels = await ChannelsServing(sessions, bin, Chat);
+        Assert.True(bin.Register(new SessionArchiveSource(sessions, channels, idleDays: 30)).Ok);
+
+        var candidates = await bin.CandidatesAsync(ArchiveKinds.Session, default);
+        Assert.True(candidates.Ok, candidates.Error?.Detail ?? candidates.Error?.Message);
+        var offered = candidates.Value!.ToDictionary(candidate => candidate.Id, candidate => candidate.Reason, StringComparer.Ordinal);
+        Assert.Equal(SessionArchiveReasons.ChannelGone, offered["s-orphan"]);
+        Assert.Equal(SessionArchiveReasons.ChannelUnknown, offered["s-unowned"]);
+        Assert.Equal(SessionArchiveReasons.Idle, offered["s-stale"]);
         Assert.DoesNotContain("s-live", offered.Keys);
-        // Looking costs nothing: every directory is still there and every byte is accounted for.
-        Assert.Equal(0, dryRun.Value.Removed);
-        Assert.All(offered.Keys, id => Assert.True(Directory.Exists(Path.Combine(_root, "sessions", id))));
-        Assert.All(dryRun.Value.Items, item => Assert.True(item.Bytes > 0));
+        Assert.All(candidates.Value!, candidate => Assert.True(candidate.Bytes > 0));
 
-        var sweep = await sessions.PruneAsync(new([Chat.ToString()], DryRun: false, IdleDays: 30), default);
-        Assert.True(sweep.Ok, sweep.Error?.Detail ?? sweep.Error?.Message);
-        Assert.Equal(3, sweep.Value!.Removed);
-        Assert.True(Directory.Exists(Path.Combine(_root, "sessions", "s-live")));
-        Assert.Equal(["s-live"], (await sessions.ListAsync(default)).Value!.Select(session => session.Id));
-
-        // The listing says what a keep-or-delete decision needs, and nothing else.
-        var live = Assert.Single((await sessions.ListAsync(default)).Value!);
-        Assert.Equal("channel.conversation#chat-1", live.Channel);
-        Assert.NotNull(live.LastActiveAt);
-        Assert.True(live.Bytes > 0);
+        // A spec that changed can never match again: the refusal leaves a note, and the note is a reason.
+        var changed = Spec with { SystemPrompt = "You are a different agent." };
+        var refused = await sessions.RunTurnAsync("s-live", changed, Guid.NewGuid(), Input(Chat, "again"), null, default);
+        Assert.Equal(ErrorCode.Conflict, refused.Error!.Code);
+        var afterRefusal = await bin.CandidatesAsync(ArchiveKinds.Session, default);
+        Assert.Equal(SessionArchiveReasons.SpecSuperseded,
+            afterRefusal.Value!.Single(candidate => candidate.Id == "s-live").Reason);
     }
 
     [Fact]
-    public async Task A_spec_that_no_longer_matches_is_marked_instead_of_failing_forever_unexplained()
+    public async Task A_destroyed_channel_puts_its_own_sessions_in_the_bin()
     {
         var sessions = Sessions();
-        Assert.True((await sessions.RunTurnAsync("s-stuck", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
+        Assert.True((await sessions.RunTurnAsync("s-chat", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
+        Assert.True((await sessions.RunTurnAsync("s-ghost", Spec, Guid.NewGuid(), Input(Ghost, "hi"), null, default)).Ok);
 
-        // The script was edited: same Channel, same id, different spec. The stored spec is immutable, so this
-        // caller can never be served again — and now the directory says so.
-        var changed = Spec with { SystemPrompt = "You are a different agent." };
-        var refused = await sessions.RunTurnAsync("s-stuck", changed, Guid.NewGuid(), Input(Chat, "hello again"), null, default);
-        Assert.Equal(ErrorCode.Conflict, refused.Error!.Code);
+        var bin = Bin();
+        var channels = await ChannelsServing(sessions, bin, Chat);
+        Assert.True(bin.Register(new SessionArchiveSource(sessions, channels)).Ok);
 
-        var offered = await sessions.PruneAsync(new([Chat.ToString()], DryRun: true, IdleDays: 0), default);
-        var stuck = Assert.Single(offered.Value!.Items);
-        Assert.Equal("s-stuck", stuck.Id);
-        Assert.Equal(SessionPruneReasons.SpecSuperseded, stuck.Reason);
+        var destroyed = await channels.DestroyAsync(Chat, default);
+        Assert.True(destroyed.Ok, destroyed.Error?.Detail ?? destroyed.Error?.Message);
 
-        // Reverting the script revives it, and the first turn that works again clears the note: the marker is
-        // evidence of a failure, not a sentence.
-        Assert.True((await sessions.RunTurnAsync("s-stuck", Spec, Guid.NewGuid(), Input(Chat, "back"), null, default)).Ok);
-        Assert.Empty((await sessions.PruneAsync(new([Chat.ToString()], DryRun: true, IdleDays: 0), default)).Value!.Items);
+        // Out of service, not out of existence: the Channel's Session is in the bin...
+        Assert.False(Directory.Exists(SessionPath("s-chat")));
+        Assert.Equal("s-chat", Assert.Single((await bin.ArchivedAsync(ArchiveKinds.Session, default)).Value!).Id);
+        // ...and somebody else's conversation was never touched.
+        Assert.True(Directory.Exists(SessionPath("s-ghost")));
+        Assert.False(channels.Get(Chat).Ok);
+    }
+
+    [Fact]
+    public async Task Two_entries_for_one_id_never_overwrite_each_other()
+    {
+        var sessions = Sessions();
+        var bin = Bin();
+        var channels = await ChannelsServing(sessions, bin, Chat);
+        Assert.True(bin.Register(new SessionArchiveSource(sessions, channels)).Ok);
+
+        Assert.True((await sessions.RunTurnAsync("s-twice", Spec, Guid.NewGuid(), Input(Ghost, "first life"), null, default)).Ok);
+        var firstBytes = StoredState("s-twice").StepNumber;
+        Assert.True((await bin.ArchiveAsync(ArchiveKinds.Session, null, dryRun: false, default)).Ok);
+
+        // The same id exists again (a Channel's script does not know about the bin) and goes away again.
+        Assert.True((await sessions.RunTurnAsync("s-twice", Spec, Guid.NewGuid(), Input(Ghost, "second life"), null, default)).Ok);
+        Assert.True((await bin.ArchiveAsync(ArchiveKinds.Session, null, dryRun: false, default)).Ok);
+
+        var entries = (await bin.ArchivedAsync(ArchiveKinds.Session, default)).Value!;
+        Assert.Equal(2, entries.Count);
+        // Two addresses, one source id: the older entry is still there to be restored on its own.
+        Assert.Equal(2, entries.Select(entry => entry.Id).Distinct(StringComparer.Ordinal).Count());
+        Assert.All(entries, entry => Assert.Equal("s-twice", entry.SourceId));
+        Assert.Contains(entries, entry => entry.Id != "s-twice");
+        Assert.True(firstBytes > 0);
+    }
+
+    [Fact]
+    public async Task Restoring_into_a_rebuilt_session_is_refused_instead_of_merging_two_histories()
+    {
+        var sessions = Sessions();
+        var bin = Bin();
+        var channels = await ChannelsServing(sessions, bin, Chat);
+        Assert.True(bin.Register(new SessionArchiveSource(sessions, channels)).Ok);
+
+        Assert.True((await sessions.RunTurnAsync("s-twice", Spec, Guid.NewGuid(), Input(Ghost, "first life"), null, default)).Ok);
+        Assert.True((await bin.ArchiveAsync(ArchiveKinds.Session, null, dryRun: false, default)).Ok);
+        Assert.True((await sessions.RunTurnAsync("s-twice", Spec, Guid.NewGuid(), Input(Ghost, "second life"), null, default)).Ok);
+
+        var refused = await bin.RestoreAsync(ArchiveKinds.Session, ["s-twice"], dryRun: false, default);
+        var outcome = Assert.Single(refused.Value!.Items);
+        Assert.False(outcome.Done);
+        Assert.Contains("merge", outcome.Message, StringComparison.OrdinalIgnoreCase);
+        // The entry stays in the bin: a refused restore is not a lost one.
+        Assert.Single((await bin.ArchivedAsync(ArchiveKinds.Session, default)).Value!);
     }
 
     [Fact]
@@ -169,7 +251,7 @@ public sealed class SessionLifecycleTests : IDisposable
     /// <summary>A Session directory as an older run would have left it: real files, a recorded Channel.</summary>
     private string WriteGhostSession(int index)
     {
-        var directory = Path.Combine(_root, "sessions", $"s-ghost{index}");
+        var directory = SessionPath($"s-ghost{index}");
         Directory.CreateDirectory(directory);
         File.WriteAllText(Path.Combine(directory, "spec.json"), "{\"objective\":\"ghost\",\"formatVersion\":\"1\"}");
         File.WriteAllText(Path.Combine(directory, "state.json"),
@@ -189,9 +271,10 @@ public sealed class SessionLifecycleTests : IDisposable
     }
 
     /// <summary>A Channel that exists, so destroying it is a real destroy and not a "not found".</summary>
-    private static async Task<ChannelManager> ChannelsServing(ISessionManager sessions, Address channel)
+    private static async Task<ChannelManager> ChannelsServing(ISessionManager sessions, IArchiveRegistry archive, Address channel)
     {
-        var channels = new ChannelManager(new StubAdapters(), new EventQueue(8), new StubBindings(), sessions: sessions);
+        var channels = new ChannelManager(new StubAdapters(), new EventQueue(8), new StubBindings(), sessions: sessions,
+            archive: archive);
         var created = await channels.CreateAsync(new(channel, channel.Instance!, [FileBinding]), default);
         Assert.True(created.Ok, created.Error?.Detail ?? created.Error?.Message);
         return channels;

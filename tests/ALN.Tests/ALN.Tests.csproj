@@ -29,6 +29,7 @@
     <ProjectReference Include="..\..\src\ALN.Adapter.Qq\ALN.Adapter.Qq.csproj" />
     <ProjectReference Include="..\..\src\ALN.Clock\ALN.Clock.csproj" />
     <ProjectReference Include="..\..\src\ALN.Api\ALN.Api.csproj" />
+    <ProjectReference Include="..\..\src\ALN.Archive\ALN.Archive.csproj" />
     <ProjectReference Include="..\..\src\ALN.Model.OpenAIChat\ALN.Model.OpenAIChat.csproj" />
     <!-- The sample plugin is loaded by a test as a real package: the artifact that ships is the artifact tested. -->
     <ProjectReference Include="..\..\samples\plugins\sample.environment\SampleEnvironment.csproj" />

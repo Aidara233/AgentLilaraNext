@@ -1,5 +1,6 @@
 using System.Text.Json;
 using ALN.Contracts;
+using ALN.Contracts.Archive;
 using ALN.Contracts.Models;
 using ALN.Contracts.Sessions;
 using ALN.Graph.Contracts;
@@ -92,6 +93,22 @@ var moduleServices = new ModuleServiceRegistry(hostServices);
 var moduleUnloads = new ModuleUnloadCoordinator();
 await using var modulePackages = new ModulePackageLoader(moduleUnloads, moduleServices, adapterTypes, reloadState,
     [adapterFactories, modelManager], adapters, bindings);
+// The bin comes up first: the bundled runtime registers what it has to offer into it, and anything else that
+// piles up (model-call artifacts next, most likely) registers the same way, without knowing this package.
+var archivePackage = await modulePackages.LoadAsync(
+    Path.Combine(AppContext.BaseDirectory, "modules", "archive"), ModulePackageKind.Bundled, CancellationToken.None);
+if (!archivePackage.Ok)
+{
+    Console.Error.WriteLine(archivePackage.Error?.Message ?? "Archive module failed to load.");
+    return 1;
+}
+var archiveService = moduleServices.GetService<IArchiveRegistry>(ArchiveService.Registry);
+if (!archiveService.Ok || archiveService.Value is null)
+{
+    Console.Error.WriteLine("The archive module did not provide its registry.");
+    return 1;
+}
+var archive = archiveService.Value;
 var bundledPackage = await modulePackages.LoadAsync(
     Path.Combine(AppContext.BaseDirectory, "modules", "bundled.runtime"), ModulePackageKind.Bundled, CancellationToken.None);
 if (!bundledPackage.Ok)
@@ -246,7 +263,7 @@ if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
 // The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
 // WebUI itself — it exposes actions, and a separate project consumes them.
 var controlPlane = new ControlPlane(auditSink, signalLog);
-var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions);
+var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive);
 if (!actionsRegistered.Ok)
 {
     Console.Error.WriteLine(actionsRegistered.Error?.Message ?? "Action registration failed.");

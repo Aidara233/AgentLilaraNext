@@ -36,5 +36,8 @@
     <MakeDir Directories="$(OutDir)modules/model.openai-chat" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)/../ALN.Model.OpenAIChat/bin/$(Configuration)/net10.0/ALN.Model.OpenAIChat.dll;$(MSBuildProjectDirectory)/../ALN.Model.OpenAIChat/bin/$(Configuration)/net10.0/ALN.Model.OpenAIChat.deps.json;$(MSBuildProjectDirectory)/../ALN.Model.OpenAIChat/plugin.json"
           DestinationFolder="$(OutDir)modules/model.openai-chat" />
+    <MakeDir Directories="$(OutDir)modules/archive" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/../ALN.Archive/bin/$(Configuration)/net10.0/ALN.Archive.dll;$(MSBuildProjectDirectory)/../ALN.Archive/bin/$(Configuration)/net10.0/ALN.Archive.deps.json;$(MSBuildProjectDirectory)/../ALN.Archive/plugin.json"
+          DestinationFolder="$(OutDir)modules/archive" />
   </Target>
 </Project>

@@ -431,7 +431,11 @@ public sealed class SessionManager : ISessionManager
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var state = TryReadState(directory);
-                sessions.Add(new(id, state?.Channel, state?.LastActiveAt, state?.StepNumber ?? 0, DirectoryBytes(directory)));
+                // A Session from before the field existed gets its newest file as an answer. Null would read as
+                // "idle since forever", and that is a reason to give something away on the strength of a guess.
+                var lastActive = state?.LastActiveAt ?? LastWritten(directory);
+                sessions.Add(new(id, state?.Channel, lastActive, state?.StepNumber ?? 0, DirectoryBytes(directory),
+                    state?.SupersededAt));
             }
             return ValueTask.FromResult(Result<IReadOnlyList<SessionSummary>>.Success(sessions));
         }
@@ -439,36 +443,60 @@ public sealed class SessionManager : ISessionManager
         { return ValueTask.FromResult(Result<IReadOnlyList<SessionSummary>>.Failure(new(ErrorCode.Unavailable, "Sessions could not be listed.", ex.Message))); }
     }
 
-    public async ValueTask<Result<SessionPruneResult>> PruneAsync(SessionPruneRequest request, CancellationToken cancellationToken)
+    public async ValueTask<Result> ArchiveAsync(string sessionId, string destinationDirectory, CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(request);
-        var live = new HashSet<string>(request.LiveChannels ?? [], StringComparer.Ordinal);
-        var cutoff = request.IdleDays > 0 ? DateTimeOffset.UtcNow.AddDays(-request.IdleDays) : (DateTimeOffset?)null;
-        var items = new List<SessionPruneItem>();
-        foreach (var (id, directory) in EnumerateSessions())
+        if (!IsValidSessionId(sessionId))
+            return Result.Failure(new(ErrorCode.Invalid, "Session id is invalid."));
+        if (string.IsNullOrWhiteSpace(destinationDirectory))
+            return Result.Failure(new(ErrorCode.Invalid, "An archive destination is required."));
+        var gate = _sessionGates.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var state = TryReadState(directory);
-            // A directory whose state cannot be read is not judged: "unreadable" is not a reason to delete a
-            // conversation, it is a reason to look at it. It is left out so it does not look settled either.
-            if (state is null) continue;
-            var lastActive = state.LastActiveAt ?? LastWritten(directory);
-            var reason = state.Channel is null ? SessionPruneReasons.ChannelUnknown
-                : !live.Contains(state.Channel) ? SessionPruneReasons.ChannelGone
-                : state.SupersededAt is not null ? SessionPruneReasons.SpecSuperseded
-                : cutoff is not null && lastActive < cutoff ? SessionPruneReasons.Idle
-                : null;
-            if (reason is null) continue;
-            var bytes = DirectoryBytes(directory);
-            if (request.DryRun)
+            // Resolve once more inside the gate: a turn may have finished while this call was waiting, and the
+            // directory it is about to move has to be the one on disk right now.
+            var source = Path.Combine(_root, sessionId);
+            if (!Directory.Exists(source))
             {
-                items.Add(new(id, reason, state.Channel, lastActive, bytes, Removed: false));
-                continue;
+                if (!Directory.Exists(Path.Combine(_legacyRoot, sessionId)))
+                    return Result.Failure(new(ErrorCode.Invalid, $"Session not found: {sessionId}"));
+                source = ResolveSessionDirectory(sessionId);
             }
-            var deleted = await DeleteSessionAsync(id, directory, cancellationToken).ConfigureAwait(false);
-            items.Add(new(id, reason, state.Channel, lastActive, bytes, deleted.Ok, deleted.Error?.Message));
+            if (Directory.Exists(destinationDirectory) || File.Exists(destinationDirectory))
+                return Result.Failure(new(ErrorCode.Conflict, $"Archive destination already exists: {destinationDirectory}"));
+            Directory.Move(source, destinationDirectory);
+            return Result.Success();
         }
-        return Result<SessionPruneResult>.Success(new(request.DryRun, items));
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        { return Result.Failure(new(ErrorCode.Unavailable, "Session could not be archived.", ex.Message)); }
+        finally { gate.Release(); }
+    }
+
+    public async ValueTask<Result> RestoreAsync(string sessionId, string sourceDirectory, CancellationToken cancellationToken)
+    {
+        if (!IsValidSessionId(sessionId))
+            return Result.Failure(new(ErrorCode.Invalid, "Session id is invalid."));
+        if (string.IsNullOrWhiteSpace(sourceDirectory))
+            return Result.Failure(new(ErrorCode.Invalid, "An archived session path is required."));
+        var gate = _sessionGates.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!Directory.Exists(sourceDirectory))
+                return Result.Failure(new(ErrorCode.Invalid, $"Archived session data is missing: {sourceDirectory}"));
+            var target = Path.Combine(_root, sessionId);
+            // Two conversations must never become one: if the id has been rebuilt since, the restore is refused
+            // and somebody decides what the older history is worth.
+            if (Directory.Exists(target) || Directory.Exists(Path.Combine(_legacyRoot, sessionId)))
+                return Result.Failure(new(ErrorCode.Conflict,
+                    $"A session with this id exists again; restoring would merge two histories: {sessionId}"));
+            Directory.CreateDirectory(_root);
+            Directory.Move(sourceDirectory, target);
+            return Result.Success();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        { return Result.Failure(new(ErrorCode.Unavailable, "Session could not be restored.", ex.Message)); }
+        finally { gate.Release(); }
     }
 
     /// <summary>

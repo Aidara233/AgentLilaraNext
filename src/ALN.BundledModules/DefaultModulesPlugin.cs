@@ -1,10 +1,12 @@
 using ALN.Channel;
 using ALN.Clock;
 using ALN.Contracts;
+using ALN.Contracts.Archive;
 using ALN.Contracts.Models;
 using ALN.Contracts.Sessions;
 using ALN.Graph;
 using ALN.Graph.Contracts;
+using ALN.Runtime;
 using ALN.Scripting.Jint;
 
 namespace ALN.BundledModules;
@@ -40,6 +42,10 @@ public sealed class DefaultModulesPlugin : IModulePlugin
             var sessions = HostService<ISessionManager>(context);
 
             var clock = new ClockSource(events);
+            // The bin, if this host loaded one. Everything that can pile up registers here; the archive package
+            // owns the path and the naming, this code only says what it has to offer.
+            var archive = context.GetService<IArchiveRegistry>(ArchiveService.Registry);
+            var registry = archive.Ok ? archive.Value : null;
             // Both managers own state that has to survive a restart: the Channel's wish to run, and the
             // graph's mount rules. Neither invents a path — the host says where, they say what.
             var state = context.HostServices.GetService(typeof(IStateStore)) as IStateStore;
@@ -50,10 +56,18 @@ public sealed class DefaultModulesPlugin : IModulePlugin
                 context.HostServices.GetService(typeof(IChannelSpecStore)) as IChannelSpecStore,
                 context.HostServices.GetService(typeof(IMessageStore)) as IMessageStore,
                 context.HostServices.GetService(typeof(IParameterRegistry)) as IParameterRegistry,
-                state, report, atomic, queue, sessions);
+                state, report, atomic, queue, sessions, registry);
             var executor = new JintScriptExecutor();
             var graph = new GraphManager(adapters, channels, clock, types, executor, audit, journal, models, sessions, state, report);
             if (bindings is IInstanceBindingsProxy proxy) proxy.Bind(graph);
+
+            // Sessions know better than anyone which of their directories stopped being useful; the archive
+            // only knows how to take things away. That is the whole point of a source.
+            if (registry is not null)
+            {
+                var source = registry.Register(new SessionArchiveSource(sessions, channels));
+                if (!source.Ok) return ValueTask.FromResult(source);
+            }
 
             foreach (var (id, service) in new (string, object)[]
             {

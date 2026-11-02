@@ -5,6 +5,7 @@
     <ProjectReference Include="..\ALN.Channel\ALN.Channel.csproj" />
     <ProjectReference Include="..\ALN.Clock\ALN.Clock.csproj" />
     <ProjectReference Include="..\ALN.Graph\ALN.Graph.csproj" />
+    <ProjectReference Include="..\ALN.Runtime\ALN.Runtime.csproj" />
     <ProjectReference Include="..\ALN.Scripting.Jint\ALN.Scripting.Jint.csproj" />
   </ItemGroup>
   <PropertyGroup>

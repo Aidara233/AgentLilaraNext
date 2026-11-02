@@ -1,5 +1,6 @@
 using System.Text.Json;
 using ALN.Contracts;
+using ALN.Contracts.Archive;
 using ALN.Contracts.Models;
 using ALN.Contracts.Sessions;
 using ALN.Graph.Contracts;
@@ -32,7 +33,9 @@ public static class CoreActions
     public const string ScriptsSet = "scripts.set";
     public const string SignalsRecent = "signals.recent";
     public const string SessionsList = "sessions.list";
-    public const string SessionsGc = "sessions.gc";
+    public const string ArchiveList = "archive.list";
+    public const string ArchiveMove = "archive.move";
+    public const string ArchiveRestore = "archive.restore";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -40,7 +43,7 @@ public static class CoreActions
 
     public static Result RegisterAll(ControlPlane plane, IAdapterManager adapters, IChannelManager channels,
         IModelManager models, ISignalLog signals, IGraphRuntime graph, IParameterRegistry parameters,
-        IModuleCatalog? modules = null, ISessionManager? sessions = null)
+        IModuleCatalog? modules = null, ISessionManager? sessions = null, IArchiveRegistry? archive = null)
     {
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
@@ -234,8 +237,15 @@ public static class CoreActions
                         })
                     }));
                 }),
-            (new(SessionsGc, "Offer, and with dryRun=false delete, Sessions nothing will use again. Looks only; dryRun defaults to true.", Capabilities.SessionsControl, true),
-                GcSessions)
+            // The bin: what could go in, what is in it, and putting things back. Same two verbs for every kind,
+            // so a script or an operator learns it once — an action that only ever did Sessions would have to be
+            // relearned for model-call artifacts next.
+            (new(ArchiveList, "What could be put away, and what is already in the bin. Read-only.", Capabilities.ArchiveRead, false),
+                ListArchive),
+            (new(ArchiveMove, "Put candidates in the bin: one kind, all of it or the named ids. dryRun defaults to true.", Capabilities.ArchiveControl, true),
+                MoveToArchive),
+            (new(ArchiveRestore, "Take items back out of the bin, by id. dryRun defaults to true.", Capabilities.ArchiveControl, true),
+                RestoreFromArchive)
         };
 
         foreach (var (descriptor, handler) in registrations)
@@ -375,47 +385,107 @@ public static class CoreActions
                 : Result<JsonElement>.Failure(unmounted.Error!);
         }
 
-        /// <summary>
-        /// Collection, not a schedule: it runs when somebody asks, and it only offers until told otherwise.
-        /// The three things it can find are the three ways a Session stops being useful — its Channel is gone,
-        /// its spec can never match again, or nobody has spoken to it for a long time.
-        /// </summary>
-        async ValueTask<Result<JsonElement>> GcSessions(JsonElement arguments, CancellationToken ct)
+        async ValueTask<Result<JsonElement>> ListArchive(JsonElement arguments, CancellationToken ct)
         {
-            if (sessions is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "Session manager is unavailable."));
-            // Dry run unless the caller says otherwise: a missing flag must never be what deleted a conversation.
-            var dryRun = !(arguments.ValueKind == JsonValueKind.Object &&
-                           arguments.TryGetProperty("dryRun", out var dryRunElement) && dryRunElement.ValueKind == JsonValueKind.False);
-            var idleDays = 30;
-            if (arguments.ValueKind == JsonValueKind.Object && arguments.TryGetProperty("idleDays", out var daysElement) &&
-                daysElement.ValueKind == JsonValueKind.Number)
-            {
-                if (!daysElement.TryGetInt32(out var requested) || requested < 0)
-                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "sessions.gc 'idleDays' must be zero or a positive integer."));
-                idleDays = requested;
-            }
-
-            // Which Channels still exist is the one fact the Session store cannot know by itself; the caller has it.
-            var live = channels.List().Select(channel => channel.Address.ToString()).ToArray();
-            var pruned = await sessions.PruneAsync(new(live, dryRun, idleDays), ct).ConfigureAwait(false);
-            if (!pruned.Ok || pruned.Value is null) return Result<JsonElement>.Failure(pruned.Error!);
+            if (archive is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "The archive module is not loaded."));
+            var kind = TryReadText(arguments, "kind", out var requestedKind) ? requestedKind.Trim() : null;
+            var candidates = await archive.CandidatesAsync(kind, ct).ConfigureAwait(false);
+            if (!candidates.Ok || candidates.Value is null) return Result<JsonElement>.Failure(candidates.Error!);
+            var archived = await archive.ArchivedAsync(kind, ct).ConfigureAwait(false);
+            if (!archived.Ok || archived.Value is null) return Result<JsonElement>.Failure(archived.Error!);
             return Result<JsonElement>.Success(ToJson(new
             {
-                dryRun = pruned.Value.DryRun,
-                candidates = pruned.Value.Items.Count,
-                removed = pruned.Value.Removed,
-                bytes = pruned.Value.Bytes,
-                items = pruned.Value.Items.Select(item => new
-                {
-                    id = item.Id,
-                    reason = item.Reason,
-                    channel = item.Channel,
-                    lastActiveAt = item.LastActiveAt,
-                    bytes = item.Bytes,
-                    removed = item.Removed,
-                    error = item.Error
-                })
+                kinds = archive.Kinds,
+                candidates = ToJson(CandidatesOf(candidates.Value)),
+                archived = ToJson(archived.Value.Select(ItemOf).ToArray()),
+                bin = new { items = archived.Value.Count, bytes = archived.Value.Sum(item => item.Bytes) }
             }));
+        }
+
+        async ValueTask<Result<JsonElement>> MoveToArchive(JsonElement arguments, CancellationToken ct)
+        {
+            if (archive is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "The archive module is not loaded."));
+            if (!TryReadText(arguments, "kind", out var kind) || kind.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
+                    $"archive.move requires 'kind' ({string.Join(", ", archive.Kinds)})."));
+            var ids = ReadIds(arguments);
+            // Dry run unless the caller says otherwise: a missing flag must never be what took a conversation out
+            // of service.
+            var moved = await archive.ArchiveAsync(kind.Trim(), ids, IsDryRun(arguments), ct).ConfigureAwait(false);
+            return moved.Ok && moved.Value is not null
+                ? Result<JsonElement>.Success(ToJson(ReportOf(moved.Value)))
+                : Result<JsonElement>.Failure(moved.Error!);
+        }
+
+        async ValueTask<Result<JsonElement>> RestoreFromArchive(JsonElement arguments, CancellationToken ct)
+        {
+            if (archive is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "The archive module is not loaded."));
+            if (!TryReadText(arguments, "kind", out var kind) || kind.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
+                    $"archive.restore requires 'kind' ({string.Join(", ", archive.Kinds)})."));
+            var ids = ReadIds(arguments);
+            if (ids is null)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
+                    "archive.restore requires 'ids': putting everything back at once is a decision, not a default."));
+            var restored = await archive.RestoreAsync(kind.Trim(), ids, IsDryRun(arguments), ct).ConfigureAwait(false);
+            return restored.Ok && restored.Value is not null
+                ? Result<JsonElement>.Success(ToJson(ReportOf(restored.Value)))
+                : Result<JsonElement>.Failure(restored.Error!);
+        }
+
+        static object[] CandidatesOf(IReadOnlyList<ArchiveCandidate> candidates) => candidates.Select(candidate => (object)new
+        {
+            kind = candidate.Kind,
+            id = candidate.Id,
+            bytes = candidate.Bytes,
+            lastActiveAt = candidate.LastUsedAt,
+            owner = candidate.Owner,
+            reason = candidate.Reason
+        }).ToArray();
+
+        static object ItemOf(ArchivedItem item) => new
+        {
+            kind = item.Kind,
+            id = item.Id,
+            bytes = item.Bytes,
+            archivedAt = item.ArchivedAt,
+            owner = item.Owner,
+            reason = item.Reason,
+            note = item.Note,
+            path = item.Path
+        };
+
+        static object ReportOf(ArchiveReport report) => new
+        {
+            dryRun = report.DryRun,
+            count = report.Count,
+            done = report.Done,
+            bytes = report.Bytes,
+            items = report.Items.Select(item => new
+            {
+                kind = item.Kind,
+                id = item.Id,
+                action = item.Action,
+                done = item.Done,
+                bytes = item.Bytes,
+                message = item.Message
+            })
+        };
+
+        static bool IsDryRun(JsonElement arguments) =>
+            !(arguments.ValueKind == JsonValueKind.Object && arguments.TryGetProperty("dryRun", out var flag) &&
+              flag.ValueKind == JsonValueKind.False);
+
+        static IReadOnlyList<string>? ReadIds(JsonElement arguments)
+        {
+            if (arguments.ValueKind != JsonValueKind.Object || !arguments.TryGetProperty("ids", out var ids) ||
+                ids.ValueKind != JsonValueKind.Array) return null;
+            var values = ids.EnumerateArray()
+                .Where(id => id.ValueKind == JsonValueKind.String)
+                .Select(id => id.GetString() ?? "")
+                .Where(id => id.Length > 0)
+                .ToArray();
+            return values.Length == 0 ? null : values;
         }
 
         IAdapterIdentity? Identity(Address address)
