@@ -46,7 +46,7 @@ public sealed class SessionManager : ISessionManager
 
     public async ValueTask<Result<SessionTurnResult>> RunTurnAsync(
         string sessionId, SessionSpec spec, Guid activationId, SessionTurnInput input,
-        ISessionToolExecutor? toolExecutor, CancellationToken cancellationToken)
+        ISessionToolbox? tools, CancellationToken cancellationToken)
     {
         var recordId = Guid.NewGuid();
         var parentId = SignalScope.CurrentId;
@@ -64,7 +64,7 @@ public sealed class SessionManager : ISessionManager
         {
             Result<SessionTurnResult> result;
             using (SignalScope.Enter(recordId, activationId))
-                result = await RunTurnCoreAsync(sessionId, spec, activationId, input, toolExecutor, cancellationToken).ConfigureAwait(false);
+                result = await RunTurnCoreAsync(sessionId, spec, activationId, input, tools, cancellationToken).ConfigureAwait(false);
             RecordTurn(sessionId, spec, activationId, result, started, recordId, parentId);
             return result;
         }
@@ -136,9 +136,88 @@ public sealed class SessionManager : ISessionManager
         });
     }
 
+    /// <summary>
+    /// How many consecutive tool-less steps a turn tolerates before giving up. Not a cap on work: a turn may run
+    /// as many tool rounds as it needs. This only catches the other failure mode — a model that keeps talking to
+    /// nobody — where looping forever would spend money every round with nothing to show for it.
+    /// </summary>
+    public const int TextOnlyNudgeLimit = 3;
+
+    /// <summary>What the model is told after a step that reached no one. Request-only: never written to history.</summary>
+    public const string ToolkitNudge =
+        "<framework>这一步没有调用任何工具，所以对方什么也没收到。要说的话用 speak 发出去；" +
+        "做完了、或者要停下来等下一次，就调用 wait。</framework>";
+
+    /// <summary>
+    /// The one tool every Session has: going quiet. Stopping is an action the model takes, not something the
+    /// framework infers from a step that happened to end without a tool call — otherwise a model that forgot to
+    /// act looks exactly like a model that is done.
+    /// </summary>
+    private sealed class WaitTool : ISessionTool
+    {
+        public const string ToolName = "wait";
+        public static readonly ISessionTool Instance = new WaitTool();
+        private static readonly ModelToolDefinition Shape = new(ToolName,
+            "Yield this turn and stop until something wakes the conversation again. Call it when there is nothing "
+            + "more to say or do — this is the only way a turn ends.", """{"type":"object","properties":{}}""");
+        public static ModelToolDefinition Definition => Shape;
+        public string Name => ToolName;
+        public bool EndsTurn => true;
+        public ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken) =>
+            ValueTask.FromResult(Result<SessionToolResult>.Success(new SessionToolResult("""{"waited":true}""")));
+    }
+
+    /// <summary>
+    /// What the model may call this turn: the built-in stop, plus every declared tool that something in the host
+    /// can actually run.
+    ///
+    /// A declared tool with no implementation fails the turn. Offering a tool nobody can run only buys a wasted
+    /// round, and quietly dropping it would run a Session with a different toolset than its spec names — the
+    /// assembly mistake would then only ever show up as the model behaving oddly.
+    /// </summary>
+    private Result<List<ModelToolDefinition>> ResolveTools(SessionSpec spec, ISessionToolbox? toolbox)
+    {
+        var visible = new List<ModelToolDefinition> { WaitTool.Definition };
+        var missing = new List<string>();
+        foreach (var declared in spec.Tools ?? [])
+        {
+            if (string.Equals(declared.Name, WaitTool.ToolName, StringComparison.Ordinal)) continue;
+            if (toolbox is not null && toolbox.Names.Contains(declared.Name, StringComparer.Ordinal))
+            {
+                visible.Add(declared);
+                continue;
+            }
+            missing.Add(declared.Name);
+        }
+        if (missing.Count == 0) return Result<List<ModelToolDefinition>>.Success(visible);
+        return Result<List<ModelToolDefinition>>.Failure(new(ErrorCode.Unavailable,
+            $"Session declares tools nothing in this host provides: {string.Join(", ", missing)}. " +
+            $"Available: {(toolbox is null || toolbox.Names.Count == 0 ? WaitTool.ToolName : string.Join(", ", toolbox.Names.Append(WaitTool.ToolName)))}."));
+    }
+
+    private void WriteSignal(Guid stepId, string outcome, SignalLevel level, params (string Key, string Value)[] detail)
+    {
+        var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (key, value) in detail) values[key] = value;
+        _signalLog.Write(new()
+        {
+            Id = Guid.NewGuid(),
+            ParentId = SignalScope.CurrentId,
+            Group = "session",
+            Name = "tool",
+            StepId = stepId,
+            From = "session",
+            To = "tools",
+            Mechanism = "session.tools",
+            Outcome = outcome,
+            Level = level,
+            Detail = values
+        });
+    }
+
     private async ValueTask<Result<SessionTurnResult>> RunTurnCoreAsync(
         string sessionId, SessionSpec spec, Guid activationId, SessionTurnInput input,
-        ISessionToolExecutor? toolExecutor, CancellationToken cancellationToken)
+        ISessionToolbox? tools, CancellationToken cancellationToken)
     {
         if (!IsValidSessionId(sessionId))
             return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Session id must use 1-128 ASCII letters, digits, '-' or '_'."));
@@ -169,8 +248,9 @@ public sealed class SessionManager : ISessionManager
         if (channelMessages.Any(m => string.IsNullOrWhiteSpace(m.Id) || string.IsNullOrWhiteSpace(m.Source) || m.Content is null) ||
             channelMessages.Select(m => m.Id).Distinct(StringComparer.Ordinal).Count() != channelMessages.Count)
             return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Channel messages must be unique and identifiable."));
-        if (spec.Tools is { Count: > 0 } && toolExecutor is null)
-            return Result<SessionTurnResult>.Failure(new(ErrorCode.Unavailable, "Session tools are declared but no tool executor is available."));
+        // A declared tool with no implementation is not fatal: it is dropped from what the model is offered and
+        // recorded, so a script naming a tool this build lacks shows up as "that tool never existed here"
+        // instead of a turn that dies for reasons the model cannot see.
 
         var gate = _sessionGates.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -195,8 +275,11 @@ public sealed class SessionManager : ISessionManager
                 return Result<SessionTurnResult>.Success(new(sessionId, priorTurn.StepNumber, priorTurn.Content ?? "",
                     priorTurn.ToolCalls ?? [], priorTurn.StopReason ?? StopReason.EndTurn,
                     priorTurn.Usage ?? new ModelUsage(0, 0), DuplicateActivation: true));
-            if (HasUnresolvedToolCalls(history))
-                return Result<SessionTurnResult>.Failure(new(ErrorCode.Conflict, "Session contains an unresolved tool call that requires recovery."));
+            // A tool round is committed as one piece, so a call without a result can only come from an older build
+            // that wrote each step separately. Repairing it here — an "interrupted" result, in one commit — is what
+            // makes such a Session usable again instead of refusing every turn until somebody archives it.
+            var repaired = await RepairDanglingToolCallsAsync(record, cancellationToken).ConfigureAwait(false);
+            if (!repaired.Ok) return Result<SessionTurnResult>.Failure(repaired.Error!);
             var activationUser = activationEntries.FirstOrDefault(e => e.Role == "user");
             if (activationEntries.Length > 0 && activationUser is null)
                 return Result<SessionTurnResult>.Failure(new(ErrorCode.Conflict, "Session activation is incomplete and cannot be resumed safely."));
@@ -243,6 +326,13 @@ public sealed class SessionManager : ISessionManager
             var executedCalls = new List<ModelToolCall>();
             var finalText = "";
             var finalStopReason = StopReason.EndTurn;
+            // What the model is offered this turn: the built-in stop, plus every declared tool something in the
+            // host can actually run. Assembly mistakes fail here, before a single token is spent.
+            var resolved = ResolveTools(record.Spec, tools);
+            if (!resolved.Ok || resolved.Value is null) return Result<SessionTurnResult>.Failure(resolved.Error!);
+            var visible = resolved.Value;
+            var actingTools = visible.Count(definition => !string.Equals(definition.Name, WaitTool.ToolName, StringComparison.Ordinal));
+            var nudges = 0;
             while (true)
             {
                 var modelStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -250,7 +340,7 @@ public sealed class SessionManager : ISessionManager
                 var modelParentId = SignalScope.CurrentId;
                 using var modelScope = SignalScope.Enter(modelRecordId, activationId);
                 var modelStarted = await _models.CompleteAsync(record.Spec.ModelProfileId,
-                    new ModelRequest(messages, record.Spec.Tools), cancellationToken).ConfigureAwait(false);
+                    new ModelRequest(messages, visible.Count > 0 ? visible : null), cancellationToken).ConfigureAwait(false);
                 if (!modelStarted.Ok || modelStarted.Value is null)
                     return Result<SessionTurnResult>.Failure(modelStarted.Error ?? new(ErrorCode.Unavailable, "Model profile is unavailable."));
 
@@ -314,60 +404,131 @@ public sealed class SessionManager : ISessionManager
                 var completedUsage = usage ?? new ModelUsage(0, 0);
                 turnUsage = AddUsage(turnUsage, completedUsage);
                 var completedCalls = toolCalls.Values.Select(c => c.ToModelToolCall()).ToArray();
-                if (completedCalls.Length > 0 && (toolExecutor is null || record.Spec.Tools is not { Count: > 0 } declaredSchemas ||
-                    completedCalls.Any(c => !declaredSchemas.Any(t => t.Name == c.Name))))
-                    return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Model returned a tool call that was not declared by the Session."));
+                if (completedCalls.Any(call => !visible.Any(definition => string.Equals(definition.Name, call.Name, StringComparison.Ordinal))))
+                    return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Model returned a tool call that was not offered to the Session."));
 
                 var stepNumber = state.StepNumber + 1;
-                var revision = state.Revision + 1;
                 var now = DateTimeOffset.UtcNow;
-                var assistantStopReason = completedCalls.Length > 0 ? StopReason.ToolUse : stopReason ?? StopReason.EndTurn;
-                IReadOnlyList<SessionChannelMessage>? assistantChannelMessage = completedCalls.Length == 0
-                    ? [new SessionChannelMessage($"{activation}:assistant:{stepNumber}", "assistant", "ALN", text.ToString(), now)]
-                    : null;
+                var isToolRound = completedCalls.Length > 0;
+                var assistantStopReason = isToolRound ? StopReason.ToolUse : stopReason ?? StopReason.EndTurn;
+                // A step with no tool call speaks to nobody: its text is reasoning, kept in the timeline as the
+                // assistant's own record but never shown to the conversation as something it said. Only a tool
+                // can reach the other side, which is the whole point of making speaking one.
+                var spokeDirectly = !isToolRound && actingTools == 0;
                 var assistantEntry = new SessionHistoryEntry($"{activation}:assistant:{stepNumber}", activation, stepNumber,
                     "assistant", text.ToString(), now, completedCalls, Usage: completedUsage, StopReason: assistantStopReason,
-                    ChannelMessages: assistantChannelMessage);
-                var modelEntries = new List<SessionHistoryEntry> { assistantEntry };
-                var modelState = state with
-                {
-                    Status = SessionStatus.Dormant,
-                    StepNumber = stepNumber,
-                    Revision = revision,
-                    Usage = state.Usage.Add(completedUsage)
-                };
-                var modelCommit = await CommitAsync(record, new SessionPendingCommit(modelState, modelEntries), cancellationToken)
-                    .ConfigureAwait(false);
-                if (!modelCommit.Ok) return Result<SessionTurnResult>.Failure(modelCommit.Error!);
-                state = modelState;
-                messages.Add(new ModelMessage("assistant", text.ToString(), completedCalls.Length > 0 ? completedCalls : null));
+                    ChannelMessages: spokeDirectly
+                        ? [new SessionChannelMessage($"{activation}:assistant:{stepNumber}", "assistant", "ALN", text.ToString(), now)]
+                        : null);
+                messages.Add(new ModelMessage("assistant", text.ToString(), isToolRound ? completedCalls : null));
                 executedCalls.AddRange(completedCalls);
 
-                if (completedCalls.Length == 0)
+                if (!isToolRound)
                 {
+                    if (!spokeDirectly)
+                    {
+                        // Nobody has seen this text, and the turn is not over: it is nudged towards acting. The
+                        // nudge is request-only — writing it down as if a person had said it would poison the
+                        // timeline with instructions nobody gave.
+                        var committed = state with
+                        {
+                            Status = SessionStatus.Dormant,
+                            StepNumber = stepNumber,
+                            Revision = state.Revision + 1,
+                            Usage = state.Usage.Add(completedUsage)
+                        };
+                        var textOnly = await CommitAsync(record, new SessionPendingCommit(committed, [assistantEntry]), cancellationToken)
+                            .ConfigureAwait(false);
+                        if (!textOnly.Ok) return Result<SessionTurnResult>.Failure(textOnly.Error!);
+                        state = committed;
+                        nudges++;
+                        if (nudges > TextOnlyNudgeLimit)
+                        {
+                            WriteSignal(activationId, "stalled", SignalLevel.Warn,
+                                ("texts", nudges.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                            finalText = text.ToString();
+                            finalStopReason = StopReason.EndTurn;
+                            break;
+                        }
+                        messages.Add(new ModelMessage("user", ToolkitNudge));
+                        continue;
+                    }
+                    var spoken = state with
+                    {
+                        Status = SessionStatus.Dormant,
+                        StepNumber = stepNumber,
+                        Revision = state.Revision + 1,
+                        Usage = state.Usage.Add(completedUsage)
+                    };
+                    var direct = await CommitAsync(record, new SessionPendingCommit(spoken, [assistantEntry]), cancellationToken)
+                        .ConfigureAwait(false);
+                    if (!direct.Ok) return Result<SessionTurnResult>.Failure(direct.Error!);
+                    state = spoken;
                     finalText = text.ToString();
                     finalStopReason = stopReason ?? StopReason.EndTurn;
                     break;
                 }
 
+                // A tool round is one commit: the step and every result it produced. Half a round — a call with no
+                // result — is a state nothing can act on, so it must never exist on disk, not even between two
+                // writes.
+                var entries = new List<SessionHistoryEntry> { assistantEntry };
+                var spokenTexts = new List<string>();
+                var endsTurn = false;
                 foreach (var call in completedCalls)
                 {
-                    Result<string> execution;
-                    try { execution = await toolExecutor!.ExecuteAsync(sessionId, activationId, call, cancellationToken).ConfigureAwait(false); }
+                    // "wait" is the loop's own tool, so it resolves even when the host handed over nothing.
+                    var found = tools?.Find(call.Name);
+                    ISessionTool? tool = string.Equals(call.Name, WaitTool.ToolName, StringComparison.Ordinal)
+                        ? WaitTool.Instance
+                        : found is { Ok: true, Value: { } implementation } ? implementation : null;
+                    Result<SessionToolResult> execution;
+                    try
+                    {
+                        execution = tool is not null
+                            ? await tool.ExecuteAsync(call, cancellationToken).ConfigureAwait(false)
+                            : Result<SessionToolResult>.Failure(new(ErrorCode.Denied,
+                                found?.Error?.Message ?? $"Tool is not available: {call.Name}"));
+                    }
                     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-                    catch (Exception ex) { execution = Result<string>.Failure(new(ErrorCode.Internal, "Session tool execution failed.", ex.Message)); }
-                    var toolContent = execution.Ok && execution.Value is not null
+                    catch (Exception ex)
+                    { execution = Result<SessionToolResult>.Failure(new(ErrorCode.Internal, "Session tool execution failed.", ex.Message)); }
+
+                    var outcome = execution.Ok && execution.Value is not null
                         ? execution.Value
-                        : JsonSerializer.Serialize(new { error = execution.Error?.Message ?? "Tool returned no result." }, JsonOptions);
-                    var toolMessage = new ModelMessage("tool", toolContent, ToolCallId: call.Id, Name: call.Name);
-                    messages.Add(toolMessage);
-                    var toolRevisionState = state with { Revision = state.Revision + 1 };
-                    var toolEntry = new SessionHistoryEntry($"{activation}:tool:{stepNumber}:{call.Id}", activation, stepNumber,
-                        "tool", toolContent, DateTimeOffset.UtcNow, ToolCallId: call.Id);
-                    var toolCommit = await CommitAsync(record,
-                        new SessionPendingCommit(toolRevisionState, [toolEntry]), cancellationToken).ConfigureAwait(false);
-                    if (!toolCommit.Ok) return Result<SessionTurnResult>.Failure(toolCommit.Error!);
-                    state = toolRevisionState;
+                        : new SessionToolResult(JsonSerializer.Serialize(
+                            new { error = execution.Error?.Message ?? "Tool returned no result." }, JsonOptions));
+                    if (!string.IsNullOrWhiteSpace(outcome.SpokenText)) spokenTexts.Add(outcome.SpokenText!);
+                    if (tool is not null && tool.EndsTurn) endsTurn = true;
+                    messages.Add(new ModelMessage("tool", outcome.Content, ToolCallId: call.Id, Name: call.Name));
+                    entries.Add(new SessionHistoryEntry($"{activation}:tool:{stepNumber}:{call.Id}", activation, stepNumber,
+                        "tool", outcome.Content, DateTimeOffset.UtcNow, ToolCallId: call.Id));
+                }
+                if (spokenTexts.Count > 0)
+                    assistantEntry = assistantEntry with
+                    {
+                        ChannelMessages = [new SessionChannelMessage($"{activation}:assistant:{stepNumber}", "assistant",
+                            "ALN", string.Join("\n\n", spokenTexts), now)]
+                    };
+                entries[0] = assistantEntry;
+
+                var roundState = state with
+                {
+                    Status = SessionStatus.Dormant,
+                    StepNumber = stepNumber,
+                    Revision = state.Revision + 1,
+                    Usage = state.Usage.Add(completedUsage)
+                };
+                var round = await CommitAsync(record, new SessionPendingCommit(roundState, entries), cancellationToken)
+                    .ConfigureAwait(false);
+                if (!round.Ok) return Result<SessionTurnResult>.Failure(round.Error!);
+                state = roundState;
+                if (endsTurn)
+                {
+                    // The turn ends because a tool said so, not because a step happened to be silent.
+                    finalText = "";
+                    finalStopReason = StopReason.EndTurn;
+                    break;
                 }
             }
 
@@ -903,13 +1064,30 @@ public sealed class SessionManager : ISessionManager
         SamePrompts(left.Prompts, right.Prompts) &&
         (left.Tools ?? []).SequenceEqual(right.Tools ?? []);
 
-    private static bool HasUnresolvedToolCalls(IReadOnlyList<SessionHistoryEntry> history)
+    /// <summary>
+    /// Finishes a tool round that an older build left half-written: every call that never got a result gets one
+    /// saying it was interrupted, in a single commit, so the timeline stops being something nothing can act on.
+    /// </summary>
+    private async ValueTask<Result> RepairDanglingToolCallsAsync(SessionRecord record, CancellationToken cancellationToken)
     {
-        var calls = history.Where(e => e.Role == "assistant").SelectMany(e => (e.ToolCalls ?? [])
-            .Select(call => $"{e.ActivationId}:{e.StepNumber}:{call.Id}")).ToHashSet(StringComparer.Ordinal);
+        var dangling = FindUnresolvedToolCalls(record.History);
+        if (dangling.Count == 0) return Result.Success();
+        var interrupted = JsonSerializer.Serialize(new { error = "interrupted" }, JsonOptions);
+        var entries = dangling.Select(item => new SessionHistoryEntry(
+            $"{item.ActivationId}:tool:{item.StepNumber}:{item.Call.Id}", item.ActivationId, item.StepNumber, "tool",
+            interrupted, DateTimeOffset.UtcNow, ToolCallId: item.Call.Id)).ToArray();
+        var next = record.State with { Revision = record.State.Revision + 1 };
+        return await CommitAsync(record, new SessionPendingCommit(next, entries), cancellationToken).ConfigureAwait(false);
+    }
+
+    private static IReadOnlyList<(string ActivationId, int StepNumber, ModelToolCall Call)> FindUnresolvedToolCalls(        IReadOnlyList<SessionHistoryEntry> history)
+    {
         var results = history.Where(e => e.Role == "tool" && e.ToolCallId is not null)
             .Select(e => $"{e.ActivationId}:{e.StepNumber}:{e.ToolCallId}").ToHashSet(StringComparer.Ordinal);
-        return calls.Except(results, StringComparer.Ordinal).Any();
+        return history.Where(e => e.Role == "assistant")
+            .SelectMany(e => (e.ToolCalls ?? []).Where(call => !results.Contains($"{e.ActivationId}:{e.StepNumber}:{call.Id}"))
+                .Select(call => (e.ActivationId, e.StepNumber, call)))
+            .ToArray();
     }
 
     private static ModelUsage AddUsage(ModelUsage left, ModelUsage right) => new(

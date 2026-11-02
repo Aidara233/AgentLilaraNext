@@ -17,6 +17,26 @@ async function onEvent(event, ctx) {
       "1身份": "标准", "2风格": "标准", "3社交": "标准",
       "4环境": "标准", "5安全": "标准",
     },
+    // Speaking is a tool, so the only text that reaches the conversation is text the model chose to send.
+    // A turn that ends without calling it has said nothing — that is the point, not an accident. `wait` is
+    // always available and is how a turn ends, so it is not declared here.
+    tools: [{
+      name: "speak",
+      description: "Send a message to this conversation. Nothing written outside a tool call reaches anyone.",
+      parametersJson: JSON.stringify({
+        type: "object",
+        properties: {
+          text: { type: "string", description: "What to say." },
+          mode: {
+            type: "string",
+            enum: ["segments", "text"],
+            description: "segments: one message per blank-line separated paragraph (default). text: the whole text as one message."
+          }
+        },
+        required: ["text"],
+        additionalProperties: false
+      })
+    }],
   };
 
   // No content is passed on purpose: the Session pulls what it has not seen yet.
@@ -25,12 +45,4 @@ async function onEvent(event, ctx) {
     ctx.log.error("session activation failed", { error: JSON.stringify(outcome.error ?? null) });
     return;
   }
-
-  const text = outcome.result && outcome.result.text;
-  if (!text) {
-    ctx.log.warn("turn produced no text; nothing to send", { sessionId: outcome.result?.sessionId ?? "" });
-    return;
-  }
-
-  await ctx.channel.reply({ platformConversationId: event.binding.platformConversationId, text });
 }

@@ -758,11 +758,6 @@ public sealed class GraphManager : IGraphRuntime
             if (string.IsNullOrWhiteSpace(spec.ModelProfileId) &&
                 channels.Get(channelMessage.Channel).Value is { ModelProfile: { Length: > 0 } channelProfile })
                 spec = spec with { ModelProfileId = channelProfile };
-            if (spec.Tools?.Any(tool => tool.Name != "send_message") == true)
-                return JsonSerializer.Serialize(new { ok = false, error = new { message = "Unknown Session tool binding." } }, JsonOptions);
-            if (spec.Tools?.Any(tool => tool.Name == "send_message") == true &&
-                !mount.Package.Manifest.Capabilities.Contains(ScriptCapabilities.ChannelReply, StringComparer.Ordinal))
-                await DenyAsync(ScriptCapabilities.ChannelReply, "send_message requires channel.bound-send.", cancellationToken).ConfigureAwait(false);
 
             var identity = $"{current.Source}\n{channelMessage.Channel}";
             var sessionId = "s-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
@@ -772,7 +767,8 @@ public sealed class GraphManager : IGraphRuntime
             // The trigger message is not handed over here on purpose: it is already in the Channel's history,
             // and the delta pull will include it. Passing it twice is how a conversation gets answered twice.
             var input = new SessionTurnInput([], channelMessage.Channel, channelMessage.Binding);
-            var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, input, this, cancellationToken).ConfigureAwait(false);
+            var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, input,
+                new TurnToolbox(new SpeakTool(this, current, mount, channels, audit)), cancellationToken).ConfigureAwait(false);
             if (!result.Ok || result.Value is null)
             {
                 await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
@@ -799,18 +795,14 @@ public sealed class GraphManager : IGraphRuntime
             if (string.IsNullOrWhiteSpace(spec.ModelProfileId) &&
                 channels.Get(channelMessage.Channel).Value is { ModelProfile: { Length: > 0 } channelProfile })
                 spec = spec with { ModelProfileId = channelProfile };
-            if (spec.Tools?.Any(tool => tool.Name != "send_message") == true)
-                return JsonSerializer.Serialize(new { ok = false, error = new { message = "Unknown Session tool binding." } }, JsonOptions);
-            if (spec.Tools?.Any(tool => tool.Name == "send_message") == true &&
-                !mount.Package.Manifest.Capabilities.Contains(ScriptCapabilities.ChannelReply, StringComparer.Ordinal))
-                await DenyAsync(ScriptCapabilities.ChannelReply, "send_message requires channel.bound-send.", cancellationToken).ConfigureAwait(false);
             var identity = $"{current.Source}\n{channelMessage.Channel}";
             var sessionId = "s-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
                 mount.Target, ScriptCapabilities.SessionRun, "allowed", sessionId), cancellationToken).ConfigureAwait(false);
             var input = new SessionTurnInput([new SessionChannelMessage(channelMessage.MessageId.ToString("N"), "user",
                 channelMessage.Sender, channelMessage.Text, channelMessage.At)], channelMessage.Channel, channelMessage.Binding);
-            var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, input, this, cancellationToken).ConfigureAwait(false);
+            var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, input,
+                new TurnToolbox(new SpeakTool(this, current, mount, channels, audit)), cancellationToken).ConfigureAwait(false);
             if (!result.Ok || result.Value is null)
             {
                 await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
@@ -822,47 +814,83 @@ public sealed class GraphManager : IGraphRuntime
             return JsonSerializer.Serialize(new { ok = true, result = result.Value }, JsonOptions);
         }
 
-        public ValueTask<Result<string>> ExecuteAsync(string sessionId, Guid activationId, ModelToolCall call,
-            CancellationToken cancellationToken) =>
-            new(InvokeAsync("session.send_message", () => ExecuteCoreAsync(sessionId, activationId, call, cancellationToken)));
-
-        private async Task<Result<string>> ExecuteCoreAsync(string sessionId, Guid activationId, ModelToolCall call,
-            CancellationToken cancellationToken)
+        /// <summary>
+        /// The tools one turn may use. Built per turn, because "speak" answers a specific Channel message: a tool
+        /// bound to that event cannot outlive it, so there is nothing long-lived to register and unregister.
+        /// </summary>
+        private sealed class TurnToolbox(ISessionTool speak) : ISessionToolbox
         {
-            if (call.Name != "send_message")
-                return Result<string>.Failure(new(ErrorCode.Denied, $"Session tool binding is not available: {call.Name}"));
-            try { await RequireCapabilityAsync(ScriptCapabilities.ChannelReply, cancellationToken).ConfigureAwait(false); }
-            catch (UnauthorizedAccessException ex)
-            { return Result<string>.Failure(new(ErrorCode.Denied, ex.Message)); }
-            if (current.Name != EventNames.ChannelMessageAccepted || current.Source != mount.Target)
-                return Result<string>.Failure(new(ErrorCode.Denied, "Session send_message requires the source Channel message event."));
+            public IReadOnlyList<string> Names { get; } = [SpeakTool.ToolName];
 
-            ChannelMessage channelMessage;
-            SessionSendArguments arguments;
-            try
-            {
-                channelMessage = Parse<ChannelMessage>(current.PayloadJson);
-                arguments = Parse<SessionSendArguments>(call.ArgumentsJson);
-            }
-            catch (Exception ex) when (ex is JsonException or ArgumentException)
-            { return Result<string>.Failure(new(ErrorCode.Invalid, "Session tool arguments are invalid.", ex.Message)); }
-            var binding = channelMessage.Binding;
-            if (channelMessage.Channel != current.Source || channelMessage.MessageId != current.EventId ||
-                !channels.IsBound(current.Source, binding.Adapter, binding.PlatformConversationId) || string.IsNullOrWhiteSpace(arguments.Text))
-                return Result<string>.Failure(new(ErrorCode.Invalid, "Session send_message requires non-empty text for the bound Channel."));
+            public Result<ISessionTool> Find(string name) =>
+                string.Equals(name, SpeakTool.ToolName, StringComparison.Ordinal)
+                    ? Result<ISessionTool>.Success(speak)
+                    : Result<ISessionTool>.Failure(new(ErrorCode.Denied, $"No tool named '{name}' in this turn."));
+        }
 
-            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
-                mount.Target, "session.tool.send_message", "allowed", call.Id), cancellationToken).ConfigureAwait(false);
-            try
+        /// <summary>
+        /// Speaking, as a tool. The only thing that reaches the other side: a step that produces text and no tool
+        /// call has said nothing, which is exactly why this is a tool and not "whatever the turn returned".
+        ///
+        /// Every precondition is checked per call rather than once per turn, because a refusal has to reach the
+        /// model as something it can read and route around — "you cannot speak here" is recoverable, a turn that
+        /// dies is not.
+        /// </summary>
+        private sealed class SpeakTool(ScriptApi api, RoutedEvent current, MountedScript mount, IChannelManager channels,
+            IAuditSink audit) : ISessionTool
+        {
+            public const string ToolName = "speak";
+
+            public string Name => ToolName;
+
+            public bool EndsTurn => false;
+
+            public async ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken)
             {
-                var result = await DeliverAsync(current.EventId, channelMessage.Channel, binding.Adapter,
-                    binding.PlatformConversationId, arguments.Text, arguments.Mode ?? ChannelReplyModes.Default,
-                    channelMessage.PlatformMessageId, cancellationToken).ConfigureAwait(false);
-                return Result<string>.Success(JsonSerializer.Serialize(result, JsonOptions));
+                try { await api.RequireCapabilityAsync(ScriptCapabilities.ChannelReply, cancellationToken).ConfigureAwait(false); }
+                catch (UnauthorizedAccessException ex)
+                { return Result<SessionToolResult>.Failure(new(ErrorCode.Denied, ex.Message)); }
+                if (current.Name != EventNames.ChannelMessageAccepted || current.Source != mount.Target)
+                    return Result<SessionToolResult>.Failure(new(ErrorCode.Denied,
+                        "speak requires the source Channel message event."));
+
+                ChannelMessage channelMessage;
+                SessionSpeakArguments arguments;
+                try
+                {
+                    channelMessage = Parse<ChannelMessage>(current.PayloadJson);
+                    arguments = Parse<SessionSpeakArguments>(call.ArgumentsJson);
+                }
+                catch (Exception ex) when (ex is JsonException or ArgumentException)
+                { return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid, "speak arguments are invalid.", ex.Message)); }
+
+                var binding = channelMessage.Binding;
+                if (channelMessage.Channel != current.Source || channelMessage.MessageId != current.EventId ||
+                    !channels.IsBound(current.Source, binding.Adapter, binding.PlatformConversationId) ||
+                    string.IsNullOrWhiteSpace(arguments.Text))
+                    return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid,
+                        "speak needs non-empty text for the bound Channel."));
+
+                var mode = string.IsNullOrWhiteSpace(arguments.Mode) ? ChannelReplyModes.Default : arguments.Mode;
+                if (!ChannelReplyModes.IsKnown(mode))
+                    return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid, $"Unknown reply mode: {mode}"));
+
+                await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                    mount.Target, "session.tool.speak", "allowed", call.Id), cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    var parts = await api.DeliverAsync(current.EventId, channelMessage.Channel, binding.Adapter,
+                        binding.PlatformConversationId, arguments.Text, mode, channelMessage.PlatformMessageId, cancellationToken)
+                        .ConfigureAwait(false);
+                    // SpokenText is how the Session learns what the conversation now has from its own side; without
+                    // it a reply sent through a tool would vanish from the model's view of its own words.
+                    return Result<SessionToolResult>.Success(new SessionToolResult(
+                        JsonSerializer.Serialize(parts, JsonOptions), arguments.Text));
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                catch (Exception ex)
+                { return Result<SessionToolResult>.Failure(new(ErrorCode.Unavailable, "speak failed.", ex.Message)); }
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-            catch (Exception ex)
-            { return Result<string>.Failure(new(ErrorCode.Unavailable, "Session send_message failed.", ex.Message)); }
         }
 
         public Task<string> CompleteModelAsync(string profileId, string requestJson, CancellationToken cancellationToken) =>
@@ -1273,7 +1301,7 @@ public sealed class GraphManager : IGraphRuntime
         }
 
         private static T Parse<T>(string json) => JsonSerializer.Deserialize<T>(json, JsonOptions) ?? throw new ArgumentException("Script API received invalid JSON.");
-        private sealed record SessionSendArguments(string Text, string? Mode = null);
+        private sealed record SessionSpeakArguments(string Text, string? Mode = null);
         private sealed record RouteOptions(string? ChannelId, string? Name);
         private const int MaxLogRecords = 200;
         private const int MaxLogMessageLength = 2_000;

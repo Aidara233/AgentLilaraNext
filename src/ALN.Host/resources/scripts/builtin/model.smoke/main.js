@@ -45,8 +45,8 @@ async function onEvent(event, ctx) {
       },
       formatVersion: "1",
       tools: [{
-        name: "send_message",
-        description: "Send a text message to the current conversation.",
+        name: "speak",
+        description: "Send a message to this conversation. Nothing written outside a tool call reaches anyone.",
         parametersJson: JSON.stringify({
           type: "object",
           properties: {
@@ -68,11 +68,20 @@ async function onEvent(event, ctx) {
     // into the prompt by the model seeing it, not by sending something different from what arrived.
     const raw = await ctx.session.run(spec, text);
     const response = JSON.parse(raw);
-    const reply = response.ok ? response.result.text : `Session failed: ${response.error?.message || "unknown error"}`;
-    await ctx.channel.reply({
-      platformConversationId: event.binding.platformConversationId,
-      text: reply || "The model returned no text.",
-      replyTo: event.platformMessageId
-    });
+    if (!response.ok) {
+      await ctx.channel.reply({
+        platformConversationId: event.binding.platformConversationId,
+        text: `Session failed: ${response.error?.message || "unknown error"}`,
+        replyTo: event.platformMessageId
+      });
+      return;
+    }
+    // The answer went out through the speak tool. Text left over here means the model talked to nobody:
+    // dropping it is the point of making speaking a tool, and the probe says so instead of quietly sending it.
+    if (response.result.text) {
+      ctx.log.warn("session produced text without calling speak; it was not sent", {
+        text: response.result.text.slice(0, 200)
+      });
+    }
   }
 }

@@ -134,20 +134,19 @@ public sealed record SessionTurnResult(
     ModelUsage Usage,
     bool DuplicateActivation = false);
 
-public interface ISessionToolExecutor
-{
-    ValueTask<Result<string>> ExecuteAsync(string sessionId, Guid activationId, ModelToolCall call, CancellationToken cancellationToken);
-}
-
 public interface ISessionManager
 {
-    /// <summary>Run one serialized model step and commit its completed turn to the session journal.</summary>
+    /// <summary>
+    /// Run one turn: model steps and tool rounds until a tool ends the turn. <paramref name="tools"/> is the
+    /// per-turn toolbox the host built (see <see cref="ISessionToolbox"/>); null means "this turn has only the
+    /// built-in tools".
+    /// </summary>
     ValueTask<Result<SessionTurnResult>> RunTurnAsync(
         string sessionId,
         SessionSpec spec,
         Guid activationId,
         SessionTurnInput input,
-        ISessionToolExecutor? toolExecutor,
+        ISessionToolbox? tools,
         CancellationToken cancellationToken);
 
     Result<SessionState> GetState(string sessionId);

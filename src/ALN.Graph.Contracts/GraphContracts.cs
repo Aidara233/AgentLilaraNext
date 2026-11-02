@@ -66,7 +66,7 @@ public interface IScriptExecutor
         IScriptApi api, CancellationToken cancellationToken);
 }
 
-public interface IScriptApi : ISessionToolExecutor
+public interface IScriptApi
 {
     Task<string> RunSessionAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken);
 

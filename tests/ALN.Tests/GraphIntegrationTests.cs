@@ -2,6 +2,8 @@ using System.Text.Json;
 using ALN.Adapter.File;
 using ALN.Channel;
 using ALN.Contracts;
+using ALN.Contracts.Models;
+using ALN.Contracts.Sessions;
 using ALN.Graph;
 using ALN.Graph.Contracts;
 using ALN.Runtime;
@@ -29,6 +31,8 @@ public sealed class GraphIntegrationTests : IDisposable
     private readonly FileMailbox _mailbox;
     private readonly FileAdapter _adapter;
     private readonly Address _adapterAddress = new("adapter", "file", "test-1");
+    private readonly QueueModel _model = new();
+    private readonly SessionManager _sessions;
 
     public GraphIntegrationTests()
     {
@@ -41,7 +45,9 @@ public sealed class GraphIntegrationTests : IDisposable
         _types = _adapterTypes;
         _adapters = new AdapterManager(_types, _bindings);
         _channels = new ChannelManager(_adapters, _events, _bindings);
-        _graph = new GraphManager(_adapters, _channels, _clock, _types, new JintScriptExecutor(), _audit, _signals);
+        _sessions = new SessionManager(Path.Combine(_root, "sessions"), _model);
+        _graph = new GraphManager(_adapters, _channels, _clock, _types, new JintScriptExecutor(), _audit, _signals,
+            _model, _sessions);
         _bindings.Bind(_graph);
         _mailbox = new FileMailbox(Path.Combine(_root, "adapters", "test-1"));
         _adapter = new FileAdapter(new(_adapterAddress, new("file", "test-account", AdapterDirection.Both)), _mailbox, _events, _clock);
@@ -155,6 +161,106 @@ public sealed class GraphIntegrationTests : IDisposable
             : []);
         Assert.Contains(_audit.ReadAudit(),
             entry => entry.Outcome == "denied" && (entry.Detail ?? "").Contains("image", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The whole path with speaking as a tool: script declares it, the model calls it, the reply leaves through
+    /// the Channel binding — and the turn ends because the model called `wait`, not because a step went quiet.
+    /// </summary>
+    [Fact]
+    public async Task A_session_speaks_through_its_tool_and_the_turn_ends_on_wait()
+    {
+        _model.Enqueue(
+            new ToolCallDelta(0, "call-1", "speak", """{"text":"在的\n\n有什么事？"}"""),
+            new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1)));
+        _model.Enqueue(
+            new ToolCallDelta(0, "call-2", "wait", "{}"),
+            new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1)));
+
+        var chat = new ScriptPackage(
+            new("channel.talk", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",
+                [ScriptCapabilities.SessionActivate, ScriptCapabilities.ChannelReply], TrustDomain.Builtin),
+            """
+            async function onEvent(event, ctx) {
+              const spec = {
+                modelProfileId: "default", objective: "聊两句", formatVersion: "1",
+                tools: [{
+                  name: "speak",
+                  description: "Say something.",
+                  parametersJson: JSON.stringify({
+                    type: "object",
+                    properties: { text: { type: "string" }, mode: { type: "string" } },
+                    required: ["text"], additionalProperties: false
+                  })
+                }]
+              };
+              const outcome = JSON.parse(await ctx.session.activate(spec));
+              if (!outcome.ok) throw new Error(JSON.stringify(outcome.error));
+            }
+            """);
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), chat], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+
+        await WriteInputAsync("chat-1", "在吗");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+
+        // segments is the default mode, so the two paragraphs arrived as two messages. The mailbox names files by
+        // attempt id, so the *set* is what the transport shows; the order the model wrote them in is what the
+        // Session's own record preserves.
+        var texts = Directory.GetFiles(Path.Combine(_mailbox.Root, "outbox", "chat-1"), "*.json")
+            .Select(ReadOutbound).Select(m => m.Text).Order(StringComparer.Ordinal).ToArray();
+        Assert.Equal(["在的", "有什么事？"], texts);
+        var spoken = Directory.GetFiles(Path.Combine(_root, "sessions"), "history.jsonl", SearchOption.AllDirectories)
+            .SelectMany(path => File.ReadAllLines(path))
+            .Select(line => JsonSerializer.Deserialize<SessionHistoryEntry>(line,
+                new JsonSerializerOptions(JsonSerializerDefaults.Web))!)
+            .SelectMany(entry => entry.ChannelMessages ?? [])
+            .ToArray();
+        Assert.Contains(spoken, message => message.Source == "assistant" && message.Content == "在的\n\n有什么事？");
+        Assert.Equal(2, _model.Requests);
+    }
+
+    /// <summary>A model whose steps the test scripts: one array of events per call.</summary>
+    private sealed class QueueModel : IModelManager
+    {
+        private readonly Queue<ModelEvent[]> _steps = new();
+        public int Requests { get; private set; }
+
+        public void Enqueue(params ModelEvent[] events) => _steps.Enqueue(events);
+
+        public ValueTask<Result<IAsyncEnumerable<ModelEvent>>> CompleteAsync(string profileId, ModelRequest request,
+            CancellationToken cancellationToken)
+        {
+            Requests++;
+            if (_steps.Count == 0)
+                throw new InvalidOperationException("The test did not script this model call.");
+            var step = _steps.Dequeue();
+            return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Success(Stream(step)));
+        }
+
+        private static async IAsyncEnumerable<ModelEvent> Stream(ModelEvent[] events,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.Yield();
+            foreach (var item in events) yield return item;
+        }
+
+        public Result RegisterFactory(string packageId, IModelProviderFactory factory) => Result.Success();
+        public Result RemovePackageFactories(string packageId) => Result.Success();
+        public IReadOnlyList<ModelProviderTypeInfo> ListTypes() => [];
+        public ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public ValueTask<Result<IModelProvider>> CreateAsync(string category, string instance, string configurationJson,
+            CancellationToken cancellationToken) => throw new NotSupportedException();
+        public ValueTask<Result> DestroyAsync(Address provider, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public Result<IModelProvider> Get(Address provider) => Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "No providers."));
+        public IReadOnlyList<ModelProviderInfo> List() => [];
+        public Result RegisterProfile(ModelProfile profile) => Result.Success();
+        public Result RemoveProfile(string profileId) => Result.Success();
+        public IReadOnlyList<ModelProfile> ListProfiles() => [];
     }
 
     private async Task DrainAsync()
