@@ -299,6 +299,13 @@ public sealed class SessionManager : ISessionManager
                 history = record.History;
             }
 
+            // What the model is offered this turn: the built-in stop, plus every declared tool something in the
+            // host can actually run. Assembly mistakes fail here, before a single token is spent.
+            var resolved = ResolveTools(record.Spec, tools);
+            if (!resolved.Ok || resolved.Value is null) return Result<SessionTurnResult>.Failure(resolved.Error!);
+            var visible = resolved.Value;
+            var actingTools = visible.Count(definition => !string.Equals(definition.Name, WaitTool.ToolName, StringComparison.Ordinal));
+
             var messages = new List<ModelMessage>();
             // The prompt is read here, every turn, from files a person edits. Only the names are part of the
             // immutable spec, so editing a prompt changes the next request instead of breaking the session.
@@ -306,7 +313,11 @@ public sealed class SessionManager : ISessionManager
             if (!promptSet.Ok || promptSet.Value is null) return Result<SessionTurnResult>.Failure(promptSet.Error!);
             if (!promptSet.Value.IsEmpty) messages.Add(new ModelMessage("system", promptSet.Value.Text));
             messages.Add(new ModelMessage("user", record.Spec.Objective));
-            messages.AddRange(history.Where(entry => entry.ChannelMessages is null).Select(ToModelMessage));
+            // Scratch is not conversation. A step that produced text and called no tool said nothing anyone saw,
+            // and replaying it would make the model re-read its own thinking every turn — and put two assistant
+            // turns back to back in the request. Which of the two meanings that text has depends on whether this
+            // Session has tools at all: without them, the text *was* the reply.
+            messages.AddRange(history.Where(entry => ShouldReplay(entry, actingTools > 0)).Select(ToModelMessage));
             var collected = await CollectRoundContextAsync(
                 new RoundContextRequest(sessionId, activationId, state.StepNumber + 1, input.Channel, input.Binding),
                 cancellationToken).ConfigureAwait(false);
@@ -326,12 +337,6 @@ public sealed class SessionManager : ISessionManager
             var executedCalls = new List<ModelToolCall>();
             var finalText = "";
             var finalStopReason = StopReason.EndTurn;
-            // What the model is offered this turn: the built-in stop, plus every declared tool something in the
-            // host can actually run. Assembly mistakes fail here, before a single token is spent.
-            var resolved = ResolveTools(record.Spec, tools);
-            if (!resolved.Ok || resolved.Value is null) return Result<SessionTurnResult>.Failure(resolved.Error!);
-            var visible = resolved.Value;
-            var actingTools = visible.Count(definition => !string.Equals(definition.Name, WaitTool.ToolName, StringComparison.Ordinal));
             var nudges = 0;
             while (true)
             {
@@ -504,13 +509,16 @@ public sealed class SessionManager : ISessionManager
                     entries.Add(new SessionHistoryEntry($"{activation}:tool:{stepNumber}:{call.Id}", activation, stepNumber,
                         "tool", outcome.Content, DateTimeOffset.UtcNow, ToolCallId: call.Id));
                 }
+                // What the tool said becomes its own entry. It cannot ride on the entry that carries the tool
+                // calls: entries with a channel view are not replayed into later requests, so attaching it there
+                // would leave the tool result orphaned — a request no provider accepts.
                 if (spokenTexts.Count > 0)
-                    assistantEntry = assistantEntry with
-                    {
-                        ChannelMessages = [new SessionChannelMessage($"{activation}:assistant:{stepNumber}", "assistant",
-                            "ALN", string.Join("\n\n", spokenTexts), now)]
-                    };
-                entries[0] = assistantEntry;
+                {
+                    var said = string.Join("\n\n", spokenTexts);
+                    var spokenId = $"{activation}:spoken:{stepNumber}";
+                    entries.Add(new SessionHistoryEntry(spokenId, activation, stepNumber, "assistant", said, now,
+                        ChannelMessages: [new SessionChannelMessage(spokenId, "assistant", "ALN", said, now)]));
+                }
 
                 var roundState = state with
                 {
@@ -1151,6 +1159,22 @@ public sealed class SessionManager : ISessionManager
 
     private static ModelMessage ToModelMessage(SessionHistoryEntry entry) =>
         new(entry.Role, entry.Content, entry.ToolCalls, entry.ToolCallId);
+
+    /// <summary>
+    /// Whether a timeline entry belongs in a later request.
+    ///
+    /// A step that carried tool calls is structural, not chat: its results are in the timeline, and a request
+    /// that leaves the call out answers a call nobody made — which every provider rejects outright. So those
+    /// entries always go in, even if an older build happened to attach a channel view to them.
+    ///
+    /// Everything else with a channel view is carried by the <c>&lt;channel_messages&gt;</c> block instead, so
+    /// replaying it would say the same thing twice. Pure-text assistant entries are scratch: nobody saw them,
+    /// and in a Session with tools the model already has its own words through that block. Sessions without
+    /// tools keep the old meaning — the text was the reply, so it must be replayed.
+    /// </summary>
+    private static bool ShouldReplay(SessionHistoryEntry entry, bool scratchIsNotConversation) =>
+        entry.ToolCalls is { Count: > 0 } ||
+        (entry.ChannelMessages is null && !(scratchIsNotConversation && entry.Role == "assistant"));
 
     private async ValueTask<Result<CollectedRoundContextSnapshot>> CollectRoundContextAsync(
         RoundContextRequest request, CancellationToken cancellationToken)

@@ -116,6 +116,44 @@ public sealed class SessionToolTests : IDisposable
     }
 
     [Fact]
+    public async Task A_second_turn_sends_a_request_where_every_tool_result_answers_a_call_it_contains()
+    {
+        var model = new ScriptedModel(
+            [new TextDelta("先想想怎么说。"), new ModelCompleted(StopReason.EndTurn, new ModelUsage(1, 1))],
+            [new ToolCallDelta(0, "call-1", "speak", """{"text":"在的"}"""),
+             new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))],
+            [new ToolCallDelta(0, "call-2", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
+        var speak = new RecordingTool("speak", endsTurn: false, spoken: "在的");
+        var sessions = Manager(model);
+        var spec = Spec(SpeakShape);
+
+        Assert.True((await sessions.RunTurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], null, null),
+            new Toolbox(speak), default)).Ok);
+        // A second turn is where the bug this pins showed up: the step that carried the tool call had been left out
+        // of the request, so its result arrived answering nothing — a 400 from every OpenAI-compatible provider.
+        Assert.True((await sessions.RunTurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], null, null),
+            new Toolbox(speak), default)).Ok);
+
+        var messages = model.Requests.Last().Messages;
+        var called = messages.SelectMany(message => message.ToolCalls ?? []).Select(call => call.Id).ToHashSet(StringComparer.Ordinal);
+        var answered = messages.Where(message => message.Role == "tool").Select(message => message.ToolCallId!).ToArray();
+        Assert.NotEmpty(answered);
+        Assert.All(answered, id => Assert.Contains(id, called));
+        // And each answer comes after the step that made the call, with nothing but results in between.
+        foreach (var (message, index) in messages.Select((message, index) => (message, index)))
+        {
+            if (message.Role != "tool") continue;
+            var owner = messages.Take(index).Select((candidate, at) => (candidate, at))
+                .Last(item => (item.candidate.ToolCalls ?? []).Any(call => call.Id == message.ToolCallId));
+            Assert.All(messages.Skip(owner.at + 1).Take(index - owner.at - 1),
+                inBetween => Assert.Equal("tool", inBetween.Role));
+        }
+        // The scratch step is not replayed, but the words the tool sent are still there — through the channel view.
+        Assert.DoesNotContain(messages, message => message.Content?.Contains("先想想怎么说", StringComparison.Ordinal) == true);
+        Assert.Contains(messages, message => message.Content?.Contains("在的", StringComparison.Ordinal) == true);
+    }
+
+    [Fact]
     public async Task A_turn_ends_because_wait_says_so_and_a_silent_model_says_nothing()
     {
         var model = new ScriptedModel(
