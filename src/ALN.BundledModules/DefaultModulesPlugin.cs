@@ -50,7 +50,7 @@ public sealed class DefaultModulesPlugin : IModulePlugin
                 context.HostServices.GetService(typeof(IChannelSpecStore)) as IChannelSpecStore,
                 context.HostServices.GetService(typeof(IMessageStore)) as IMessageStore,
                 context.HostServices.GetService(typeof(IParameterRegistry)) as IParameterRegistry,
-                state, report, atomic, queue);
+                state, report, atomic, queue, sessions);
             var executor = new JintScriptExecutor();
             var graph = new GraphManager(adapters, channels, clock, types, executor, audit, journal, models, sessions, state, report);
             if (bindings is IInstanceBindingsProxy proxy) proxy.Bind(graph);

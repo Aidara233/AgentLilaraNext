@@ -1,6 +1,7 @@
 using System.Text.Json;
 using ALN.Contracts;
 using ALN.Contracts.Models;
+using ALN.Contracts.Sessions;
 using ALN.Graph.Contracts;
 
 namespace ALN.Runtime;
@@ -30,6 +31,8 @@ public static class CoreActions
     public const string ScriptsList = "scripts.list";
     public const string ScriptsSet = "scripts.set";
     public const string SignalsRecent = "signals.recent";
+    public const string SessionsList = "sessions.list";
+    public const string SessionsGc = "sessions.gc";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -37,7 +40,7 @@ public static class CoreActions
 
     public static Result RegisterAll(ControlPlane plane, IAdapterManager adapters, IChannelManager channels,
         IModelManager models, ISignalLog signals, IGraphRuntime graph, IParameterRegistry parameters,
-        IModuleCatalog? modules = null)
+        IModuleCatalog? modules = null, ISessionManager? sessions = null)
     {
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
@@ -209,7 +212,30 @@ public static class CoreActions
                     })
                 })))),
 
-            (new(SignalsRecent, "Recent signal records, newest last.", Capabilities.SignalsRead, false), RecentSignals)
+            (new(SignalsRecent, "Recent signal records, newest last.", Capabilities.SignalsRead, false), RecentSignals),
+
+            // Sessions are the only thing in the data root that is created without a spec the operator ever
+            // wrote (a Channel's script mints them), so they are also the only thing that needs collecting.
+            (new(SessionsList, "Sessions on disk: whose they are, when they last spoke, how much room they take.", Capabilities.SessionsRead, false),
+                async (_, ct) =>
+                {
+                    if (sessions is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "Session manager is unavailable."));
+                    var listed = await sessions.ListAsync(ct).ConfigureAwait(false);
+                    if (!listed.Ok || listed.Value is null) return Result<JsonElement>.Failure(listed.Error!);
+                    return Result<JsonElement>.Success(ToJson(new
+                    {
+                        sessions = listed.Value.Select(session => new
+                        {
+                            id = session.Id,
+                            channel = session.Channel,
+                            lastActiveAt = session.LastActiveAt,
+                            steps = session.Steps,
+                            bytes = session.Bytes
+                        })
+                    }));
+                }),
+            (new(SessionsGc, "Offer, and with dryRun=false delete, Sessions nothing will use again. Looks only; dryRun defaults to true.", Capabilities.SessionsControl, true),
+                GcSessions)
         };
 
         foreach (var (descriptor, handler) in registrations)
@@ -347,6 +373,49 @@ public static class CoreActions
             return unmounted.Ok
                 ? Result<JsonElement>.Success(ToJson(new { script = scriptId.Trim(), target = target.Value.ToString(), mounted = false }))
                 : Result<JsonElement>.Failure(unmounted.Error!);
+        }
+
+        /// <summary>
+        /// Collection, not a schedule: it runs when somebody asks, and it only offers until told otherwise.
+        /// The three things it can find are the three ways a Session stops being useful — its Channel is gone,
+        /// its spec can never match again, or nobody has spoken to it for a long time.
+        /// </summary>
+        async ValueTask<Result<JsonElement>> GcSessions(JsonElement arguments, CancellationToken ct)
+        {
+            if (sessions is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "Session manager is unavailable."));
+            // Dry run unless the caller says otherwise: a missing flag must never be what deleted a conversation.
+            var dryRun = !(arguments.ValueKind == JsonValueKind.Object &&
+                           arguments.TryGetProperty("dryRun", out var dryRunElement) && dryRunElement.ValueKind == JsonValueKind.False);
+            var idleDays = 30;
+            if (arguments.ValueKind == JsonValueKind.Object && arguments.TryGetProperty("idleDays", out var daysElement) &&
+                daysElement.ValueKind == JsonValueKind.Number)
+            {
+                if (!daysElement.TryGetInt32(out var requested) || requested < 0)
+                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "sessions.gc 'idleDays' must be zero or a positive integer."));
+                idleDays = requested;
+            }
+
+            // Which Channels still exist is the one fact the Session store cannot know by itself; the caller has it.
+            var live = channels.List().Select(channel => channel.Address.ToString()).ToArray();
+            var pruned = await sessions.PruneAsync(new(live, dryRun, idleDays), ct).ConfigureAwait(false);
+            if (!pruned.Ok || pruned.Value is null) return Result<JsonElement>.Failure(pruned.Error!);
+            return Result<JsonElement>.Success(ToJson(new
+            {
+                dryRun = pruned.Value.DryRun,
+                candidates = pruned.Value.Items.Count,
+                removed = pruned.Value.Removed,
+                bytes = pruned.Value.Bytes,
+                items = pruned.Value.Items.Select(item => new
+                {
+                    id = item.Id,
+                    reason = item.Reason,
+                    channel = item.Channel,
+                    lastActiveAt = item.LastActiveAt,
+                    bytes = item.Bytes,
+                    removed = item.Removed,
+                    error = item.Error
+                })
+            }));
         }
 
         IAdapterIdentity? Identity(Address address)

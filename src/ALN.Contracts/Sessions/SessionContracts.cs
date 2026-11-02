@@ -19,7 +19,23 @@ public sealed record SessionState(
     long Revision,
     bool Locked,
     SessionUsage Usage,
-    int SchemaVersion);
+    int SchemaVersion,
+    /// <summary>
+    /// The Channel address this Session answers for, as text. The Session id is a hash, so this is the only
+    /// way anybody — an operator, a maintenance action — can tell which Channel a directory belongs to.
+    /// </summary>
+    string? Channel = null,
+    /// <summary>
+    /// When this Session last finished a turn. Absence of a turn is not evidence of disuse, so freshness has
+    /// to be recorded rather than guessed from file timestamps: a backup or a virus scanner rewrites those.
+    /// </summary>
+    DateTimeOffset? LastActiveAt = null,
+    /// <summary>
+    /// When a run was refused because the caller's spec no longer matches the stored one. The spec is immutable,
+    /// so this Session can only ever conflict again — the note is what turns "unexplained dead weight" into
+    /// "a stuck instance somebody can decide to drop".
+    /// </summary>
+    DateTimeOffset? SupersededAt = null);
 
 public sealed record SessionUsage(long InputTokens, long OutputTokens, long CacheReadTokens = 0, long CacheWriteTokens = 0)
 {
@@ -120,4 +136,24 @@ public interface ISessionManager
         CancellationToken cancellationToken);
 
     Result<SessionState> GetState(string sessionId);
+
+    /// <summary>
+    /// Deletes every Session that belongs to one Channel, and says how many went. A Channel's Sessions are
+    /// derived from it — the id is a hash of the Channel and the spec is immutable — so a Channel re-created
+    /// with the same address would otherwise inherit a Session built from a script that no longer exists.
+    /// </summary>
+    ValueTask<Result<int>> DeleteChannelAsync(string channel, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Every Session on disk, with the facts a keep-or-delete decision needs. Reads the session directory —
+    /// deliberately not done at startup: an instance nobody talks to should cost nothing.
+    /// </summary>
+    ValueTask<Result<IReadOnlyList<SessionSummary>>> ListAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Offers — and, when the request says so, performs — the deletion of Sessions nothing will ever use again.
+    /// The decision rules live in the store because it is the only thing that knows what a Session is; what it
+    /// cannot know (which Channels exist) is handed in.
+    /// </summary>
+    ValueTask<Result<SessionPruneResult>> PruneAsync(SessionPruneRequest request, CancellationToken cancellationToken);
 }

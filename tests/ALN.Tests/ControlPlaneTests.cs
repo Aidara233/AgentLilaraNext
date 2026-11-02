@@ -129,6 +129,26 @@ public sealed class ControlPlaneTests : IDisposable
         Assert.Null(ApiSettings.Load(_root));
     }
 
+    [Fact]
+    public async Task Session_maintenance_is_in_the_catalogue_and_needs_more_than_read()
+    {
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        var provider = new ModelProviderInfo(new Address("model", "openai-chat", "one"),
+            new ModelProviderDescriptor("chat", "openai-chat", "OpenAI", ModelCapabilities.Streaming), 0);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(provider),
+            _signals, new FakeGraph(), new FakeParameters()).Ok);
+
+        var sweep = Assert.Single(plane.Catalog, action => action.Id == CoreActions.SessionsGc);
+        // Deleting a conversation must not be a read: a "*.read" viewer may look, not sweep.
+        Assert.Equal(Capabilities.SessionsControl, sweep.Capability);
+        Assert.True(sweep.Mutating);
+        Assert.False(User("*.read").Allows(sweep.Capability));
+
+        // Without a Session manager the action is registered but honest about being unavailable.
+        var refused = await plane.InvokeAsync(Actor.System, CoreActions.SessionsGc, default, default);
+        Assert.Equal(ErrorCode.Unavailable, refused.Error?.Code);
+    }
+
     private sealed class CollectingAudit(List<AuditRecord> records) : IAuditSink
     {
         public ValueTask AppendAsync(AuditRecord record, CancellationToken cancellationToken)

@@ -166,15 +166,16 @@ public sealed class SessionManager : ISessionManager
         try
         {
             var directory = ResolveSessionDirectory(sessionId);
+            var channel = input.Channel?.ToString();
             Directory.CreateDirectory(directory);
-            var session = await LoadOrCreateAsync(directory, spec, cancellationToken).ConfigureAwait(false);
+            var session = await LoadOrCreateAsync(directory, spec, channel, cancellationToken).ConfigureAwait(false);
             if (!session.Ok || session.Value is null) return Result<SessionTurnResult>.Failure(session.Error!);
             if (session.Value.State.Locked)
                 return Result<SessionTurnResult>.Failure(new(ErrorCode.Denied, "Session is locked."));
 
             var recovered = await RecoverPendingAsync(directory, cancellationToken).ConfigureAwait(false);
             if (!recovered.Ok) return Result<SessionTurnResult>.Failure(recovered.Error!);
-            session = await LoadOrCreateAsync(directory, spec, cancellationToken).ConfigureAwait(false);
+            session = await LoadOrCreateAsync(directory, spec, channel, cancellationToken).ConfigureAwait(false);
             if (!session.Ok || session.Value is null) return Result<SessionTurnResult>.Failure(session.Error!);
 
             var historyPath = Path.Combine(directory, "history.jsonl");
@@ -362,6 +363,14 @@ public sealed class SessionManager : ISessionManager
                 }
             }
 
+            // "Last spoken to" is written after the turn, never before: a turn that died halfway must not make a
+            // forgotten Session look alive. A completed turn also clears the superseded note — a spec that
+            // conflicts today may be reverted tomorrow, and the evidence of "it works again" is this turn.
+            // Metadata only — the revision stays where the committed turn left it, so a pending commit written
+            // earlier still recovers against exactly this file.
+            state = state with { Channel = channel ?? state.Channel, LastActiveAt = DateTimeOffset.UtcNow, SupersededAt = null };
+            await WriteAtomicJsonAsync(Path.Combine(directory, "state.json"), state, cancellationToken).ConfigureAwait(false);
+
             return Result<SessionTurnResult>.Success(new(sessionId, state.StepNumber, finalText, executedCalls,
                 finalStopReason, turnUsage));
         }
@@ -391,7 +400,153 @@ public sealed class SessionManager : ISessionManager
         { return Result<SessionState>.Failure(new(ErrorCode.Unavailable, "Session state could not be read.", ex.Message)); }
     }
 
-    private async ValueTask<Result<LoadedSession>> LoadOrCreateAsync(string directory, SessionSpec requestedSpec, CancellationToken cancellationToken)
+    public async ValueTask<Result<int>> DeleteChannelAsync(string channel, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(channel);
+        var removed = 0;
+        var failed = new List<string>();
+        foreach (var (id, directory) in EnumerateSessions())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!string.Equals(TryReadState(directory)?.Channel, channel, StringComparison.Ordinal)) continue;
+            // The gate is re-checked inside the deletion: a turn that is running gets to finish (or fail) before
+            // its files vanish, and the state read above is repeated after the wait so it cannot be stale.
+            if (!string.Equals(TryReadState(directory)?.Channel, channel, StringComparison.Ordinal)) continue;
+            var deleted = await DeleteSessionAsync(id, directory, cancellationToken).ConfigureAwait(false);
+            if (deleted.Ok) removed++;
+            else failed.Add($"{id}: {deleted.Error?.Message}");
+        }
+        return failed.Count == 0
+            ? Result<int>.Success(removed)
+            : Result<int>.Failure(new(ErrorCode.Unavailable,
+                $"{removed} Session(s) of {channel} were removed, {failed.Count} could not be.", string.Join("; ", failed)));
+    }
+
+    public ValueTask<Result<IReadOnlyList<SessionSummary>>> ListAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var sessions = new List<SessionSummary>();
+            foreach (var (id, directory) in EnumerateSessions())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var state = TryReadState(directory);
+                sessions.Add(new(id, state?.Channel, state?.LastActiveAt, state?.StepNumber ?? 0, DirectoryBytes(directory)));
+            }
+            return ValueTask.FromResult(Result<IReadOnlyList<SessionSummary>>.Success(sessions));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        { return ValueTask.FromResult(Result<IReadOnlyList<SessionSummary>>.Failure(new(ErrorCode.Unavailable, "Sessions could not be listed.", ex.Message))); }
+    }
+
+    public async ValueTask<Result<SessionPruneResult>> PruneAsync(SessionPruneRequest request, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var live = new HashSet<string>(request.LiveChannels ?? [], StringComparer.Ordinal);
+        var cutoff = request.IdleDays > 0 ? DateTimeOffset.UtcNow.AddDays(-request.IdleDays) : (DateTimeOffset?)null;
+        var items = new List<SessionPruneItem>();
+        foreach (var (id, directory) in EnumerateSessions())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var state = TryReadState(directory);
+            // A directory whose state cannot be read is not judged: "unreadable" is not a reason to delete a
+            // conversation, it is a reason to look at it. It is left out so it does not look settled either.
+            if (state is null) continue;
+            var lastActive = state.LastActiveAt ?? LastWritten(directory);
+            var reason = state.Channel is null ? SessionPruneReasons.ChannelUnknown
+                : !live.Contains(state.Channel) ? SessionPruneReasons.ChannelGone
+                : state.SupersededAt is not null ? SessionPruneReasons.SpecSuperseded
+                : cutoff is not null && lastActive < cutoff ? SessionPruneReasons.Idle
+                : null;
+            if (reason is null) continue;
+            var bytes = DirectoryBytes(directory);
+            if (request.DryRun)
+            {
+                items.Add(new(id, reason, state.Channel, lastActive, bytes, Removed: false));
+                continue;
+            }
+            var deleted = await DeleteSessionAsync(id, directory, cancellationToken).ConfigureAwait(false);
+            items.Add(new(id, reason, state.Channel, lastActive, bytes, deleted.Ok, deleted.Error?.Message));
+        }
+        return Result<SessionPruneResult>.Success(new(request.DryRun, items));
+    }
+
+    /// <summary>
+    /// The directories this manager wrote: one per Session, current location first, the legacy one second.
+    /// Nothing walks them at startup — only deletion and maintenance do, so an instance with a thousand
+    /// forgotten Sessions still starts in the time it takes to read one row.
+    /// </summary>
+    private IReadOnlyList<(string Id, string Directory)> EnumerateSessions()
+    {
+        // Materialised, not lazy: callers delete the very directories this walk is sitting on, and a live
+        // enumeration handle over a folder being emptied is a platform-specific accident waiting to happen.
+        var sessions = new List<(string, string)>();
+        foreach (var root in new[] { _root, _legacyRoot })
+        {
+            if (!Directory.Exists(root)) continue;
+            foreach (var directory in Directory.EnumerateDirectories(root).Order(StringComparer.Ordinal))
+            {
+                // Only names this manager could have written: a stray folder in the data root is not ours.
+                var id = Path.GetFileName(directory);
+                if (IsValidSessionId(id)) sessions.Add((id, directory));
+            }
+        }
+        return sessions;
+    }
+
+    /// <summary>Deletes one Session directory with its gate held, so a turn in flight is not pulled apart.</summary>
+    private async ValueTask<Result> DeleteSessionAsync(string id, string directory, CancellationToken cancellationToken)
+    {
+        var gate = _sessionGates.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+            return Result.Success();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        { return Result.Failure(new(ErrorCode.Unavailable, $"Session {id} could not be deleted.", ex.Message)); }
+        finally { gate.Release(); }
+    }
+
+    private static long DirectoryBytes(string directory)
+    {
+        try { return Directory.EnumerateFiles(directory).Sum(file => new FileInfo(file).Length); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return 0; }
+    }
+
+    /// <summary>
+    /// Fallback activity for a Session that never recorded one: the newest file write. Conservative on
+    /// purpose — "now" when the directory is empty or unreadable, so a guess can never make something look idle.
+    /// </summary>
+    private static DateTimeOffset LastWritten(string directory)
+    {
+        try
+        {
+            var newest = Directory.EnumerateFiles(directory).Select(File.GetLastWriteTimeUtc).DefaultIfEmpty(DateTime.UtcNow).Max();
+            return new DateTimeOffset(newest, TimeSpan.Zero);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        { return DateTimeOffset.UtcNow; }
+    }
+
+    /// <summary>
+    /// Reads state.json, or null when it is missing or unreadable. Callers use it to recognise their own
+    /// sessions by attribute — an unreadable file proves nothing, so it is treated as "not mine" rather than
+    /// as a reason to delete something.
+    /// </summary>
+    private static SessionState? TryReadState(string directory)
+    {
+        var path = Path.Combine(directory, "state.json");
+        try
+        {
+            return File.Exists(path) ? JsonSerializer.Deserialize<SessionState>(File.ReadAllBytes(path), JsonOptions) : null;
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { return null; }
+    }
+
+    private async ValueTask<Result<LoadedSession>> LoadOrCreateAsync(string directory, SessionSpec requestedSpec,
+        string? channel, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         Directory.CreateDirectory(directory);
@@ -404,7 +559,15 @@ public sealed class SessionManager : ISessionManager
             var readSpec = JsonSerializer.Deserialize<SessionSpec>(await File.ReadAllBytesAsync(specPath, cancellationToken).ConfigureAwait(false), JsonOptions);
             if (readSpec is null) return Result<LoadedSession>.Failure(new(ErrorCode.Invalid, "Session specification is invalid."));
             if (!SameSpec(readSpec, requestedSpec))
+            {
+                // The refusal is written down where maintenance can see it: the stored spec is immutable, so this
+                // directory can never serve the caller that just asked. Without the note a dead Session looks
+                // exactly like a live one, and the operator's only clue is a Conflict repeated forever.
+                if (TryReadState(directory) is { SupersededAt: null } stale)
+                    await WriteAtomicJsonAsync(statePath, stale with { SupersededAt = DateTimeOffset.UtcNow }, cancellationToken)
+                        .ConfigureAwait(false);
                 return Result<LoadedSession>.Failure(new(ErrorCode.Conflict, "Session specification is immutable; create a new session id to change it."));
+            }
             persistedSpec = readSpec;
         }
         else
@@ -429,7 +592,7 @@ public sealed class SessionManager : ISessionManager
         }
         else
         {
-            state = new(SessionStatus.Dormant, 0, 0, false, new SessionUsage(0, 0), StateSchemaVersion);
+            state = new(SessionStatus.Dormant, 0, 0, false, new SessionUsage(0, 0), StateSchemaVersion, channel, DateTimeOffset.UtcNow);
             await WriteAtomicJsonAsync(statePath, state, cancellationToken).ConfigureAwait(false);
         }
         if (!File.Exists(historyPath)) await File.WriteAllTextAsync(historyPath, "", new UTF8Encoding(false), cancellationToken).ConfigureAwait(false);

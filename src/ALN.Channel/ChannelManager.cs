@@ -1,11 +1,13 @@
 using System.Text.Json;
 using ALN.Contracts;
+using ALN.Contracts.Sessions;
 
 namespace ALN.Channel;
 
 public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, IInstanceBindings bindings,
     IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
-    IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IQueuedMessageStore? queue = null)
+    IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IQueuedMessageStore? queue = null,
+    ISessionManager? sessions = null)
     : IChannelManager, ILifecycleParticipant
 {
     /// <summary>Where the wish "this Channel should be running" is kept, so a stop survives a restart.</summary>
@@ -25,6 +27,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     private readonly IAtomicWork? _atomic = atomic;
     // Accepted-but-unfinished markers are their own rows: one per message, not a list rewritten per message.
     private readonly IQueuedMessageStore? _queue = queue;
+    private readonly ISessionManager? _sessions = sessions;
     private readonly Dictionary<Address, ChannelInstance> _channels = new();
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
@@ -225,6 +228,11 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             if (_state is not null)
                 await _state.DeleteAsync(DesiredScope, StateName.Encode(address.ToString()), cancellationToken).ConfigureAwait(false);
             if (_queue is not null) await _queue.ClearAsync(PendingScope, address, cancellationToken).ConfigureAwait(false);
+            // The Channel's Sessions go with it: they answer for an address that no longer exists and cannot be
+            // reused (a Session's spec is immutable). Best effort on purpose — the Channel is already gone, so a
+            // failure here is not "the destroy failed"; the leftover is what sessions.gc exists to sweep up.
+            if (_sessions is not null)
+                await _sessions.DeleteChannelAsync(address.ToString(), cancellationToken).ConfigureAwait(false);
             return Result.Success();
         }
         catch (OperationCanceledException) { throw; }

@@ -246,7 +246,7 @@ if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
 // The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
 // WebUI itself — it exposes actions, and a separate project consumes them.
 var controlPlane = new ControlPlane(auditSink, signalLog);
-var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages);
+var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions);
 if (!actionsRegistered.Ok)
 {
     Console.Error.WriteLine(actionsRegistered.Error?.Message ?? "Action registration failed.");
