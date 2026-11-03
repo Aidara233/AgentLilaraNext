@@ -52,9 +52,13 @@ public sealed class FileAdapterModule : IModulePlugin
             catch (JsonException ex) { return Result.Failure(new(ErrorCode.Invalid, "Saved Adapter replacement state is invalid.", ex.Message)); }
             foreach (var snapshot in snapshots)
             {
+                // The type travels in the snapshot: after a reload the manager has forgotten the instance, so
+                // asking it would answer nothing, and reading the address would be guessing.
+                if (string.IsNullOrWhiteSpace(snapshot.TypeId))
+                    return Result.Failure(new(ErrorCode.Invalid, $"Saved Adapter replacement state has no type for {snapshot.Address}."));
                 var unregistered = await _clock.UnregisterTargetAsync(snapshot.Address, cancellationToken).ConfigureAwait(false);
                 if (!unregistered.Ok) return Result.Failure(unregistered.Error!);
-                var created = await _adapters.CreateAsync(new(snapshot.Address, snapshot.Descriptor), cancellationToken).ConfigureAwait(false);
+                var created = await _adapters.CreateAsync(new(snapshot.Address, snapshot.Descriptor, snapshot.TypeId), cancellationToken).ConfigureAwait(false);
                 if (!created.Ok) return Result.Failure(created.Error!);
                 if (snapshot.State == AdapterState.Running)
                 {

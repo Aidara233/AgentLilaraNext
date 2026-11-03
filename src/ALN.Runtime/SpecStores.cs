@@ -19,10 +19,7 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
     public ValueTask<Result> SaveAsync(AdapterSpec spec, CancellationToken cancellationToken) =>
         SpecTree.WriteAsync(root, new ModuleId(spec.Address.ToString()), new AdapterSpecDocument(
                 spec.Address.ToString(), spec.Descriptor.PlatformId, spec.Descriptor.AccountId,
-                spec.Descriptor.Direction.ToString(), spec.Settings,
-                // Transitional: callers do not all pass a type yet, so the address it is still shaped like fills
-                // in. That fallback has nothing to read once the address carries nothing, and dies with it.
-                spec.TypeId ?? spec.Address.TypeId), JsonOptions, cancellationToken);
+                spec.Descriptor.Direction.ToString(), spec.Settings, spec.TypeId), JsonOptions, cancellationToken);
 
     public ValueTask<Result> DeleteAsync(Address address, CancellationToken cancellationToken) =>
         SpecTree.DeleteAsync(root, new ModuleId(address.ToString()), cancellationToken);
@@ -45,7 +42,7 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
                     $"Stored Adapter direction is invalid: {entry.Document.Direction} ({entry.Path})"));
             specs.Add(new AdapterSpec(address,
                 new AdapterDescriptor(entry.Document.PlatformId, entry.Document.AccountId, direction),
-                entry.Document.Settings, entry.Document.Type));
+                entry.Document.Type!, entry.Document.Settings));
         }
         return Result<IReadOnlyList<AdapterSpec>>.Success(specs);
     }
@@ -68,7 +65,7 @@ public sealed class FileChannelSpecStore(string root) : IChannelSpecStore
         SpecTree.WriteAsync(root, new ModuleId(spec.Address.ToString()), new ChannelSpecDocument(
                 spec.Address.ToString(), spec.Name,
                 spec.Bindings.Select(b => new ChannelBindingDocument(b.Adapter.ToString(), b.PlatformConversationId)).ToArray(),
-                spec.MaxMessages, spec.TypeId ?? spec.Address.TypeId), JsonOptions, cancellationToken);
+                spec.MaxMessages, spec.TypeId), JsonOptions, cancellationToken);
 
     public ValueTask<Result> DeleteAsync(Address address, CancellationToken cancellationToken) =>
         SpecTree.DeleteAsync(root, new ModuleId(address.ToString()), cancellationToken);
@@ -95,7 +92,7 @@ public sealed class FileChannelSpecStore(string root) : IChannelSpecStore
                 bindings.Add(new ChannelBinding(adapter, binding.PlatformConversationId));
             }
             specs.Add(new ChannelSpec(address, entry.Document.Name,
-                bindings, entry.Document.MaxMessages, entry.Document.Type));
+                bindings, entry.Document.Type!, entry.Document.MaxMessages));
         }
         return Result<IReadOnlyList<ChannelSpec>>.Success(specs);
     }

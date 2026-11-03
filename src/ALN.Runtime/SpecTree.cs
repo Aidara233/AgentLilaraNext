@@ -95,7 +95,7 @@ internal static class SpecTree
                 var bytes = await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
 
                 var type = ReadType(bytes);
-                if (type is null)
+                if (string.IsNullOrWhiteSpace(type))
                     return Result<IReadOnlyList<Entry<T>>>.Failure(new(ErrorCode.Invalid,
                         $"Spec has no type: {path}"));
                 if (!belongs(type)) continue;

@@ -486,7 +486,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         public bool Draining { get; set; }
         public string? TypeId => spec.TypeId;
 
-        public ChannelInfo ToInfo() => new(Address, Name, Bindings, Running, MaxMessages, ModelProfile, spec.TypeId);
+        public ChannelInfo ToInfo() => new(Address, Name, Bindings, Running, spec.TypeId, MaxMessages, ModelProfile);
 
         public IParameterTarget Parameters(ChannelManager owner) => new ChannelParameters(this, owner);
     }

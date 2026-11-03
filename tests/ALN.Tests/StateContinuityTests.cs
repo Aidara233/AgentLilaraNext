@@ -475,7 +475,7 @@ public sealed class StateContinuityTests : IDisposable
             _bindings.Bind(Graph);
             Settlers = new EventSettlers(new ChannelAcceptSettler(Channels), new InboundAckSettler(Acks));
             Mailbox = new FileMailbox(Path.Combine(root, "io", "file", "file-1"));
-            Adapter = new FileAdapter(new(_adapterAddress, new("file", "acc", AdapterDirection.Both)), Mailbox, Events, Clock, Acks);
+            Adapter = new FileAdapter(new(_adapterAddress, new("file", "acc", AdapterDirection.Both), "adapter.file"), Mailbox, Events, Clock, Acks);
         }
 
         public string Root { get; }
@@ -504,7 +504,7 @@ public sealed class StateContinuityTests : IDisposable
         /// <summary>The part of startup that follows script loading: adapter, then Channels, then parameters.</summary>
         public async Task ReviveAsync()
         {
-            var created = await Adapters.CreateAsync(new(_adapterAddress, Adapter.Descriptor), _ => Adapter, default);
+            var created = await Adapters.CreateAsync(new(_adapterAddress, Adapter.Descriptor, "adapter.file"), _ => Adapter, default);
             Assert.True(created.Ok, created.Error?.Message);
             Assert.True((await Adapters.StartAsync(_adapterAddress, default)).Ok);
             var started = await Channels.StartAsync(new LifecycleSignal(LifecyclePhase.Start, DateTimeOffset.UtcNow), default);
@@ -526,7 +526,7 @@ public sealed class StateContinuityTests : IDisposable
         public async Task AddChannelAsync(string conversation)
         {
             var address = new Address("channel", "conversation", conversation);
-            var created = await Channels.CreateAsync(new(address, conversation, [new(_adapterAddress, conversation)]), default);
+            var created = await Channels.CreateAsync(new(address, conversation, [new(_adapterAddress, conversation)], "channel.conversation"), default);
             // After a restart the Channel is already there, revived by the manager: that is not a failure.
             if (!created.Ok && created.Error?.Code != ErrorCode.Conflict) Assert.Fail(created.Error?.Message ?? "channel creation failed");
             if (Channels.Get(address).Value is { Running: false })

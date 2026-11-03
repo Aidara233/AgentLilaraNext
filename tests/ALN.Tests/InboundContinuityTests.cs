@@ -126,7 +126,7 @@ public sealed class InboundContinuityTests : IDisposable
     public async Task The_qq_request_timeout_is_a_runtime_parameter()
     {
         var settings = new Dictionary<string, string> { ["endpoint"] = "ws://127.0.0.1:1" };
-        var adapter = new QqAdapter(new(new("adapter", "qq", "1"), new("qq", "acc", AdapterDirection.Both), settings),
+        var adapter = new QqAdapter(new(new("adapter", "qq", "1"), new("qq", "acc", AdapterDirection.Both), "adapter.qq", settings),
             new EventQueue(8), new CollectingLogger());
 
         Assert.Equal("10", adapter.ReadParameter(QqAdapter.TimeoutParameter));

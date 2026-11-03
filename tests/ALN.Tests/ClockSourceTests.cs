@@ -54,7 +54,7 @@ public sealed class ClockSourceTests : IDisposable
         var clock = new ClockSource(queue);
         var mailbox = new FileMailbox(Path.Combine(_root, "adapter"));
         var address = new Address("adapter", "file", "clocked");
-        var adapter = new FileAdapter(new(address, new("file", "clocked", AdapterDirection.Both)), mailbox, queue, clock);
+        var adapter = new FileAdapter(new(address, new("file", "clocked", AdapterDirection.Both), "adapter.file"), mailbox, queue, clock);
         Assert.True((await adapter.StartAsync(default)).Ok);
         Assert.Equal(1, (await clock.PulseDueAsync(DateTimeOffset.UtcNow.AddSeconds(1), default)).Value);
         await adapter.StopAsync(default);

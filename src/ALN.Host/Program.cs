@@ -236,8 +236,8 @@ if (!storedAdapters.Ok)
     Console.Error.WriteLine(storedAdapters.Error?.Message ?? "Stored Adapter specs could not be read.");
     return 1;
 }
-var adapterSpec = storedAdapters.Value!.FirstOrDefault(s => s.Address.TypeId == "adapter.file")
-    ?? new AdapterSpec(new Address("adapter", "file", "file-1"), new AdapterDescriptor("file", "file-1", AdapterDirection.Both));
+var adapterSpec = storedAdapters.Value!.FirstOrDefault(s => s.TypeId == "adapter.file")
+    ?? new AdapterSpec(new Address("adapter", "file", "file-1"), new AdapterDescriptor("file", "file-1", AdapterDirection.Both), "adapter.file");
 if (storedAdapters.Value!.Count == 0)
 {
     var seeded = await adapterSpecs.SaveAsync(adapterSpec, CancellationToken.None);

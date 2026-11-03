@@ -37,7 +37,7 @@ public sealed class OpenAiChatModule : IModulePlugin
         cancellationToken.ThrowIfCancellationRequested();
         var manager = _manager;
         if (manager is null) return ValueTask.FromResult(Result<ModuleUnloadReadiness>.Success(new(false, "Model manager is unavailable.")));
-        var providerAddresses = manager.List().Where(p => p.Address.TypeId == ProviderDescriptor.TypeId).Select(p => p.Address).ToHashSet();
+        var providerAddresses = manager.List().Where(p => p.Descriptor.TypeId == ProviderDescriptor.TypeId).Select(p => p.Address).ToHashSet();
         if (providerAddresses.Count > 0)
             return ValueTask.FromResult(Result<ModuleUnloadReadiness>.Success(new(false, "Destroy OpenAI Chat model profiles and instances before unloading the provider package.")));
         return ValueTask.FromResult(Result<ModuleUnloadReadiness>.Success(new(true)));
@@ -56,7 +56,7 @@ public sealed class OpenAiChatProviderFactory(ModelProviderDescriptor descriptor
     public ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (spec.Address.TypeId != TypeId || !spec.Address.IsInstance)
+        if (spec.TypeId != TypeId || !spec.Address.IsInstance)
             return ValueTask.FromResult(Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "OpenAI Chat provider requires a model.openai-chat instance address.")));
         OpenAiChatProviderOptions? options;
         try { options = JsonSerializer.Deserialize<OpenAiChatProviderOptions>(spec.ConfigurationJson, JsonOptions); }

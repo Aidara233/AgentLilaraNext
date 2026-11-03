@@ -62,7 +62,7 @@ public sealed class ArtifactStoreTests : IDisposable
         var models = new ModelManager(store, signals);
         Assert.True(models.RegisterFactory("test.models", new StubFactory()).Ok);
         var providerAddress = new Address("model", "stub", "one");
-        Assert.True((await models.CreateAsync(new(providerAddress, "{}"), default)).Ok);
+        Assert.True((await models.CreateAsync(new(providerAddress, "{}", "model.stub"), default)).Ok);
         Assert.True(models.RegisterProfile(new("chat", providerAddress, "stub-1")).Ok);
 
         var started = await models.CompleteAsync("chat",

@@ -992,7 +992,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
             {
                 channelAddress = new Address("channel", "conversation", channelId);
                 var spec = new ChannelSpec(channelAddress, string.IsNullOrWhiteSpace(options.Name) ? channelId : options.Name!,
-                    [new ChannelBinding(envelope.Adapter, envelope.PlatformConversationId)]);
+                    [new ChannelBinding(envelope.Adapter, envelope.PlatformConversationId)], ChannelTypes.Conversation);
                 var minted = await channels.CreateAsync(spec, cancellationToken).ConfigureAwait(false);
                 if (!minted.Ok) throw new InvalidOperationException(minted.Error?.Message ?? "Channel creation failed.");
                 var started = await channels.StartAsync(channelAddress, cancellationToken).ConfigureAwait(false);

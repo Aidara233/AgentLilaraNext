@@ -269,7 +269,7 @@ public sealed class ChannelDeltaTests : IDisposable
     private sealed class StubChannels(int? maxMessages) : IChannelManager
     {
         public Result<ChannelInfo> Get(Address address) => Result<ChannelInfo>.Success(
-            new ChannelInfo(address, "test", [new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456")], true, maxMessages));
+            new ChannelInfo(address, "test", [new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456")], true, ChannelTypes.Conversation, maxMessages));
 
         public IReadOnlyList<ChannelInfo> List() => [];
         public bool IsBound(Address channel, Address adapter, string platformConversationId) => true;

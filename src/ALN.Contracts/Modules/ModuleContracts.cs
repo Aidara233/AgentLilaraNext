@@ -14,7 +14,11 @@ namespace ALN.Contracts;
 [AttributeUsage(AttributeTargets.Class, Inherited = false)]
 public sealed class ModuleAttribute(string typeId) : Attribute
 {
-    public string TypeId { get; } = typeId;
+    /// <summary>
+    /// Shadows <see cref="Attribute.TypeId"/> on purpose: that one answers "which attribute class is this",
+    /// this one answers "which module type does the class implement", and the two are unrelated.
+    /// </summary>
+    public new string TypeId { get; } = typeId;
     public string Category { get; init; } = "";
     public ModuleRole Role { get; init; } = ModuleRole.Instance;
     public bool Singleton { get; init; }

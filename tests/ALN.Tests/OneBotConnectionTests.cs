@@ -110,7 +110,7 @@ public sealed class OneBotConnectionTests
     public void A_spec_without_an_endpoint_fails_to_create_instead_of_connecting_somewhere_random()
     {
         var spec = new AdapterSpec(new Address("adapter", "qq", "qq-1"),
-            new AdapterDescriptor("qq", "10000", AdapterDirection.Both), new Dictionary<string, string>());
+            new AdapterDescriptor("qq", "10000", AdapterDirection.Both), "adapter.qq", new Dictionary<string, string>());
 
         var error = Assert.Throws<ArgumentException>(() => new QqAdapter(spec, new RecordingSink(), new NullLogger()));
         Assert.Contains("endpoint", error.Message, StringComparison.Ordinal);
@@ -120,7 +120,7 @@ public sealed class OneBotConnectionTests
     public void A_spec_with_a_non_websocket_endpoint_is_refused()
     {
         var spec = new AdapterSpec(new Address("adapter", "qq", "qq-1"),
-            new AdapterDescriptor("qq", "10000", AdapterDirection.Both),
+            new AdapterDescriptor("qq", "10000", AdapterDirection.Both), "adapter.qq",
             new Dictionary<string, string> { ["endpoint"] = "http://127.0.0.1:3001" });
 
         Assert.Throws<ArgumentException>(() => new QqAdapter(spec, new RecordingSink(), new NullLogger()));
@@ -139,7 +139,7 @@ public sealed class OneBotConnectionTests
 
     private static QqAdapter CreateAdapter(Uri endpoint, RecordingSink sink, IModuleLogger? logger = null) =>
         new(new AdapterSpec(new Address("adapter", "qq", "qq-1"),
-                new AdapterDescriptor("qq", "10000", AdapterDirection.Both),
+                new AdapterDescriptor("qq", "10000", AdapterDirection.Both), "adapter.qq",
                 new Dictionary<string, string> { ["endpoint"] = endpoint.ToString() }),
             sink, logger ?? new NullLogger());
 

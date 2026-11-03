@@ -302,7 +302,7 @@ public sealed class SessionLifecycleTests : IDisposable
     {
         var channels = new ChannelManager(new StubAdapters(), new EventQueue(8), new StubBindings(), sessions: sessions,
             archive: archive);
-        var created = await channels.CreateAsync(new(channel, channel.Instance!, [FileBinding]), default);
+        var created = await channels.CreateAsync(new(channel, channel.Instance!, [FileBinding], "channel.conversation"), default);
         Assert.True(created.Ok, created.Error?.Detail ?? created.Error?.Message);
         return channels;
     }

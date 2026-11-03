@@ -70,6 +70,28 @@ public sealed class LifecycleTests : IDisposable
     }
 
     [Fact]
+    public async Task The_manager_answers_what_an_instance_is_from_its_spec_not_from_its_name()
+    {
+        // An address is a name. Here the name says "whatever" and the spec says "adapter.file"; the manager must
+        // answer the spec, because the moment it starts reading names, renaming an instance changes what it is.
+        var types = new AdapterTypeCatalog();
+        Assert.True(types.RegisterPackageTypes("test.adapter", [new("adapter.file", "adapter")]).Ok);
+        var factories = new AdapterFactoryRegistry();
+        Assert.True(factories.Register("test.adapter", new StubFactory()).Ok);
+        var address = new Address("adapter", "whatever", "one");
+        var manager = new AdapterManager(types, new StubBindings(), factories, new FileAdapterSpecStore(Path.Combine(_root, "adapters")));
+
+        var created = await manager.CreateAsync(new AdapterSpec(address, new("file", "file-1", AdapterDirection.Both), "adapter.file"), default);
+
+        Assert.True(created.Ok, created.Error?.Detail ?? created.Error?.Message);
+        Assert.Equal("adapter.file", manager.TypeOf(address));
+        Assert.Equal("adapter.file", Assert.Single(manager.List()).TypeId);
+        // Filtering by type keeps working: it asks the row, not the address.
+        Assert.Single((await manager.SnapshotByTypeAsync("adapter.file", default)).Value!);
+        Assert.Empty((await manager.SnapshotByTypeAsync("adapter.whatever", default)).Value!);
+    }
+
+    [Fact]
     public async Task Adapter_manager_starts_stored_adapters_and_hands_the_signal_down()
     {
         var types = new AdapterTypeCatalog();
@@ -81,7 +103,7 @@ public sealed class LifecycleTests : IDisposable
         var events = new EventQueue(16);
         var clock = new StubClock();
         var address = new Address("adapter", "file", "file-1");
-        Assert.True((await specs.SaveAsync(new AdapterSpec(address, new("file", "file-1", AdapterDirection.Both)), default)).Ok);
+        Assert.True((await specs.SaveAsync(new AdapterSpec(address, new("file", "file-1", AdapterDirection.Both), "adapter.file"), default)).Ok);
 
         var manager = new AdapterManager(types, bindings, factories, specs, events, clock);
         var started = await manager.StartAsync(new LifecycleSignal(LifecyclePhase.Start, DateTimeOffset.UtcNow), default);

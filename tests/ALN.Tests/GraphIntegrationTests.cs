@@ -50,7 +50,8 @@ public sealed class GraphIntegrationTests : IDisposable
             _model, _sessions);
         _bindings.Bind(_graph);
         _mailbox = new FileMailbox(Path.Combine(_root, "adapters", "test-1"));
-        _adapter = new FileAdapter(new(_adapterAddress, new("file", "test-account", AdapterDirection.Both)), _mailbox, _events, _clock);
+        _adapter = new FileAdapter(new(_adapterAddress, new("file", "test-account", AdapterDirection.Both), "adapter.file"),
+            _mailbox, _events, _clock);
     }
 
     public void Dispose()
@@ -64,7 +65,7 @@ public sealed class GraphIntegrationTests : IDisposable
     public async Task A_manual_script_runs_only_on_the_instance_it_was_mounted_on()
     {
         Assert.True((await _graph.LoadAsync([AdapterIntake(), ChannelReply(), ManualTagger("channel.tagger", "tagged")], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         var channelOne = new Address("channel", "conversation", "chat-1");
         var channelTwo = new Address("channel", "conversation", "chat-2");
         await AddChannelAsync(channelOne, "chat-1");
@@ -119,7 +120,7 @@ public sealed class GraphIntegrationTests : IDisposable
         var verbatim = Replying("channel.multi-text",
             "await ctx.channel.reply({ platformConversationId: event.binding.platformConversationId, text: '一\\n\\n二', mode: 'text' });");
         Assert.True((await _graph.LoadAsync([AdapterIntake(), defaultMode, verbatim], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
         Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
 
@@ -142,7 +143,7 @@ public sealed class GraphIntegrationTests : IDisposable
             "async function onEvent(event, ctx) { await ctx.channel.reply({ " +
             "platformConversationId: event.binding.platformConversationId, text: '不会发出去', mode: 'image' }); }");
         Assert.True((await _graph.LoadAsync([AdapterIntake(), unknown], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
         Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
 
@@ -199,7 +200,7 @@ public sealed class GraphIntegrationTests : IDisposable
             }
             """);
         Assert.True((await _graph.LoadAsync([AdapterIntake(), chat], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
         Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
 
@@ -276,7 +277,7 @@ public sealed class GraphIntegrationTests : IDisposable
     public async Task Two_conversation_folders_route_through_their_channels_and_back_to_matching_outboxes()
     {
         Assert.True((await _graph.LoadAsync([AdapterIntake(), ChannelReply()], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         var channelOne = new Address("channel", "conversation", "chat-1");
         var channelTwo = new Address("channel", "conversation", "chat-2");
         await AddChannelAsync(channelOne, "chat-1");
@@ -304,9 +305,9 @@ public sealed class GraphIntegrationTests : IDisposable
     public async Task Unbound_conversation_is_not_claimed_or_replied_to()
     {
         Assert.True((await _graph.LoadAsync([AdapterIntake(), ChannelReply()], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
-        var duplicate = await _channels.CreateAsync(new(new("channel", "conversation", "duplicate"), "duplicate", [new(_adapterAddress, "chat-1")]), default);
+        var duplicate = await _channels.CreateAsync(new(new("channel", "conversation", "duplicate"), "duplicate", [new(_adapterAddress, "chat-1")], "channel.conversation"), default);
         Assert.False(duplicate.Ok);
         await _adapters.StartAsync(_adapterAddress, default);
         await WriteInputAsync("chat-3", "nobody owns this room");
@@ -323,7 +324,7 @@ public sealed class GraphIntegrationTests : IDisposable
         var maliciousReply = new ScriptPackage(ChannelReply().Manifest,
             "async function onEvent(event, ctx) { await ctx.channel.reply({ platformConversationId: 'chat-2', text: event.text }); }");
         Assert.True((await _graph.LoadAsync([AdapterIntake(), maliciousReply], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
         await _adapters.StartAsync(_adapterAddress, default);
         await WriteInputAsync("chat-1", "restricted");
@@ -345,8 +346,8 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.False((await _graph.LoadAsync([badCapability], default)).Ok);
         var restricted = AdapterIntake() with { Manifest = AdapterIntake().Manifest with { TrustDomain = TrustDomain.Restricted } };
         Assert.False((await _graph.LoadAsync([restricted], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
-        var invalid = await _channels.CreateAsync(new(new("channel", "conversation", "bad"), "bad", [new(_adapterAddress, "../escape")]), default);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        var invalid = await _channels.CreateAsync(new(new("channel", "conversation", "bad"), "bad", [new(_adapterAddress, "../escape")], "channel.conversation"), default);
         Assert.False(invalid.Ok);
     }
 
@@ -358,7 +359,7 @@ public sealed class GraphIntegrationTests : IDisposable
                 [ScriptCapabilities.ChannelAccept], TrustDomain.Builtin),
             "async function onEvent(event, ctx) { ctx.log.info('saw message', { conversation: event.platformConversationId }); await ctx.channel.accept(); }");
         Assert.True((await _graph.LoadAsync([loggingIntake], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         var channel = new Address("channel", "conversation", "chat-1");
         await AddChannelAsync(channel, "chat-1");
         await _adapters.StartAsync(_adapterAddress, default);
@@ -390,7 +391,7 @@ public sealed class GraphIntegrationTests : IDisposable
                 TrustDomain.Builtin),
             "async function onEvent(event, ctx) { for (let i = 0; i < 500; i++) ctx.log.error('spam ' + i); }");
         Assert.True((await _graph.LoadAsync([chatty], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         await _adapters.StartAsync(_adapterAddress, default);
 
         var envelope = new AdapterEnvelope(_adapterAddress, "file", "chat-1", "m-1", "hello", DateTimeOffset.UtcNow);
@@ -417,7 +418,7 @@ public sealed class GraphIntegrationTests : IDisposable
                 TrustDomain.Builtin),
             "async function onEvent(event, ctx) { ctx.log.warn('b'); }");
         Assert.True((await _graph.LoadAsync([first, second], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         await _adapters.StartAsync(_adapterAddress, default);
 
         var envelope = new AdapterEnvelope(_adapterAddress, "file", "chat-1", "m-1", "hello", DateTimeOffset.UtcNow);
@@ -438,7 +439,7 @@ public sealed class GraphIntegrationTests : IDisposable
     public async Task Event_emitted_inside_a_handler_appears_as_a_branch_of_that_handler()
     {
         Assert.True((await _graph.LoadAsync([AdapterIntake(), ChannelReply()], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
         await _adapters.StartAsync(_adapterAddress, default);
         await WriteInputAsync("chat-1", "one");
@@ -464,7 +465,7 @@ public sealed class GraphIntegrationTests : IDisposable
             "async function onEvent(event, ctx) { return await ctx.channel.route({ channelId: event.platformConversationId }); }");
         var loaded = await _graph.LoadAsync([intake], default);
         Assert.True(loaded.Ok, loaded.Error?.Detail ?? loaded.Error?.Message);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         await _adapters.StartAsync(_adapterAddress, default);
 
         var first = new AdapterEnvelope(_adapterAddress, "file", "chat-9", "m-1", "hello", DateTimeOffset.UtcNow);
@@ -490,7 +491,7 @@ public sealed class GraphIntegrationTests : IDisposable
                 [ScriptCapabilities.SelfAdapterPoll], TrustDomain.Builtin),
             "async function onEvent(event, ctx) { await ctx.channel.route({ channelId: event.platformConversationId }); }");
         Assert.True((await _graph.LoadAsync([intake], default)).Ok);
-        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor), _ => _adapter, default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         await _adapters.StartAsync(_adapterAddress, default);
 
         var dispatched = await DispatchEnvelopeAsync(new(_adapterAddress, "file", "chat-9", "m-1", "hello", DateTimeOffset.UtcNow));
@@ -505,7 +506,7 @@ public sealed class GraphIntegrationTests : IDisposable
 
     private async Task AddChannelAsync(Address address, string conversation)
     {
-        var result = await _channels.CreateAsync(new(address, conversation, [new(_adapterAddress, conversation)]), default);
+        var result = await _channels.CreateAsync(new(address, conversation, [new(_adapterAddress, conversation)], "channel.conversation"), default);
         Assert.True(result.Ok, result.Error?.Detail ?? result.Error?.Message);
         Assert.True((await _channels.StartAsync(address, default)).Ok);
     }

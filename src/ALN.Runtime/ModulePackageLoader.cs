@@ -216,7 +216,7 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
         {
             foreach (var provision in manifest.Provides.Where(p => p.TypeId.StartsWith("adapter.", StringComparison.Ordinal)))
             {
-                var addresses = _adapters.List().Where(a => a.Address.TypeId == provision.TypeId).Select(a => a.Address).ToArray();
+                var addresses = _adapters.List().Where(a => a.TypeId == provision.TypeId).Select(a => a.Address).ToArray();
                 foreach (var address in addresses)
                 {
                     var clock = _services.GetService<IClockManager>("clock.manager");

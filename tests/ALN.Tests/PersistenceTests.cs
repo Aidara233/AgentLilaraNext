@@ -48,12 +48,14 @@ public sealed class PersistenceTests : IDisposable
     public async Task Adapter_specs_survive_a_round_trip()
     {
         var store = new FileAdapterSpecStore(Path.Combine(_root, "adapters"));
-        var spec = new AdapterSpec(Adapter, new AdapterDescriptor("file", "file-1", AdapterDirection.Both));
+        var spec = new AdapterSpec(Adapter, new AdapterDescriptor("file", "file-1", AdapterDirection.Both), "adapter.file");
         Assert.True((await store.SaveAsync(spec, default)).Ok);
 
         var loaded = Assert.Single((await store.LoadAllAsync(default)).Value!);
         Assert.Equal(spec.Address, loaded.Address);
         Assert.Equal(spec.Descriptor, loaded.Descriptor);
+        // The type makes the round trip too: it is what everything downstream classifies this by.
+        Assert.Equal("adapter.file", loaded.TypeId);
         // The spec is meant to be hand-editable, so it is stored as indented JSON, not a blob — under
         // adapters/<type>/<instance>/, mirroring the code's own nesting.
         Assert.Contains("\"platformId\": \"file\"", await File.ReadAllTextAsync(SpecPath("file", "file-1")));
@@ -79,7 +81,7 @@ public sealed class PersistenceTests : IDisposable
             ["accessToken"] = "onebot-token"
         };
         var spec = new AdapterSpec(new Address("adapter", "qq", "qq-1"),
-            new AdapterDescriptor("qq", "123456", AdapterDirection.Both), settings);
+            new AdapterDescriptor("qq", "123456", AdapterDirection.Both), "adapter.qq", settings);
         Assert.True((await store.SaveAsync(spec, default)).Ok);
 
         var loaded = Assert.Single((await store.LoadAllAsync(default)).Value!);
@@ -88,6 +90,39 @@ public sealed class PersistenceTests : IDisposable
         // Hand-editable, like every other spec: the whole point is that a human can write this file.
         var text = await File.ReadAllTextAsync(SpecPath("qq", "qq-1"));
         Assert.Contains("\"endpoint\": \"ws://127.0.0.1:3001\"", text);
+    }
+
+    [Fact]
+    public async Task A_spec_that_does_not_say_what_it_is_fails_loudly_instead_of_being_skipped()
+    {
+        // Without a type the store cannot even tell whether the file belongs to it. Skipping would read as
+        // "nothing configured" and the instance would silently not exist; guessing from the directory name is
+        // the thing this layout exists to avoid. So: an error that names the file.
+        Directory.CreateDirectory(Path.Combine(_root, "adapters", "adapter.file#file-1"));
+        await File.WriteAllTextAsync(SpecPath("file", "file-1"),
+            """
+            { "address": "adapter.file#file-1", "platformId": "file", "accountId": "file-1", "direction": "Both" }
+            """);
+
+        var store = new FileAdapterSpecStore(Path.Combine(_root, "adapters"));
+        var loaded = await store.LoadAllAsync(default);
+
+        Assert.False(loaded.Ok);
+        Assert.Contains("no type", loaded.Error!.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("spec.json", loaded.Error!.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_blank_type_counts_as_no_type_at_all()
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "adapters", "adapter.file#file-1"));
+        await File.WriteAllTextAsync(SpecPath("file", "file-1"),
+            """
+            { "address": "adapter.file#file-1", "type": "  ", "platformId": "file", "accountId": "file-1", "direction": "Both" }
+            """);
+
+        var store = new FileAdapterSpecStore(Path.Combine(_root, "adapters"));
+        Assert.False((await store.LoadAllAsync(default)).Ok);
     }
 
     [Fact]
@@ -157,7 +192,7 @@ public sealed class PersistenceTests : IDisposable
     {
         var store = new FileAdapterSpecStore(Path.Combine(_root, "adapters"));
         Assert.True((await store.SaveAsync(new AdapterSpec(Adapter,
-            new AdapterDescriptor("file", "file-1", AdapterDirection.Both)), default)).Ok);
+            new AdapterDescriptor("file", "file-1", AdapterDirection.Both), "adapter.file"), default)).Ok);
 
         var text = await File.ReadAllTextAsync(SpecPath("file", "file-1"));
         Assert.DoesNotContain("settings", text, StringComparison.OrdinalIgnoreCase);
@@ -167,7 +202,7 @@ public sealed class PersistenceTests : IDisposable
     public async Task Channel_specs_survive_a_round_trip_including_bindings()
     {
         var store = new FileChannelSpecStore(Path.Combine(_root, "channels"));
-        var spec = new ChannelSpec(Channel, "chat-1", [new ChannelBinding(Adapter, "chat-1")]);
+        var spec = new ChannelSpec(Channel, "chat-1", [new ChannelBinding(Adapter, "chat-1")], "channel.conversation");
         Assert.True((await store.SaveAsync(spec, default)).Ok);
 
         var loaded = Assert.Single((await store.LoadAllAsync(default)).Value!);
@@ -185,7 +220,8 @@ public sealed class PersistenceTests : IDisposable
         var events = new EventQueue(8);
         var channels = new ALN.Channel.ChannelManager(new AdapterManager(types, bindings), events, bindings);
         var adapter = new Address("adapter", "file", "later-1");
-        var spec = new ChannelSpec(new("channel", "conversation", "chat-1"), "chat-1", [new ChannelBinding(adapter, "chat-1")]);
+        var spec = new ChannelSpec(new("channel", "conversation", "chat-1"), "chat-1", [new ChannelBinding(adapter, "chat-1")],
+            "channel.conversation");
 
         // Creation must not depend on startup order: the Adapter is simply not there yet.
         var created = await channels.CreateAsync(spec, default);

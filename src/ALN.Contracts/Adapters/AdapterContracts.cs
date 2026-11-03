@@ -54,7 +54,10 @@ public sealed record OutboundMessage(string PlatformConversationId, string Text,
 public sealed record SendResult(bool Sent, string AttemptId, string? Detail = null,
     /// <summary>The platform's own id for what was just sent, when the transport has one.</summary>
     string? PlatformMessageId = null);
-public sealed record AdapterInfo(Address Address, AdapterDescriptor Descriptor, AdapterState State);
+public sealed record AdapterInfo(Address Address, AdapterDescriptor Descriptor, AdapterState State,
+    /// <summary>The type this instance implements, as declared in its spec — the only row of truth for "what is it".
+    /// Callers that filter by type read this, never the spelling of the address.</summary>
+    string TypeId);
 
 /// <summary>
 /// A stored Adapter instance. <paramref name="Settings"/> is opaque to the core: an endpoint, a token,
@@ -63,10 +66,12 @@ public sealed record AdapterInfo(Address Address, AdapterDescriptor Descriptor, 
 /// that the value never leaves the process through an action (the DTOs don't carry it).
 /// </summary>
 public sealed record AdapterSpec(Address Address, AdapterDescriptor Descriptor,
-    IReadOnlyDictionary<string, string>? Settings = null,
-    /// <summary>The type this instance implements, written into the spec instead of being read back out of the
-    /// address. Null only in files written before the field existed; loading one fills it in and rewrites it.</summary>
-    string? TypeId = null);
+    /// <summary>
+    /// The type this instance implements. A fact of the spec, stored in the file, never worked out from the
+    /// address: the address is a name, and a name whose spelling decides what the thing is cannot be changed.
+    /// </summary>
+    string TypeId,
+    IReadOnlyDictionary<string, string>? Settings = null);
 
 public sealed record RoutedEvent(string Name, Address Source, Guid EventId, string PayloadJson, Address? Target = null)
 {
@@ -147,9 +152,13 @@ public interface IModuleTypeCatalog
 }
 public interface IAdapterManager
 {
-    /// <summary>The type this instance implements, as declared in its spec. Null when nothing by that name exists.
+    /// <summary>The type this instance implements, as declared in its spec; null when no instance has that address.
     /// The alternative — reading it out of the address — is what the module contract forbids.</summary>
-    /// <summary>Stand-ins (test fakes) may legitimately know nothing; a real manager overrides this.</summary>
+    /// <remarks>
+    /// Defaulted so that the hand-written stand-ins in tests (and anything implementing only part of this
+    /// interface) still compile. A stand-in that answers null for an instance it does hold is lying, so this
+    /// default is a placeholder for "not implemented", not a legal answer.
+    /// </remarks>
     string? TypeOf(Address address) => null;
     Result<IChatAdapter> Get(Address address);
     IReadOnlyList<AdapterInfo> List();

@@ -14,7 +14,7 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
     private readonly object _gate = new();
     private readonly Dictionary<string, (string PackageId, IModelProviderFactory Factory)> _factories = new(StringComparer.Ordinal);
     private readonly Dictionary<Address, (string PackageId, IModelProvider Provider, int InFlight)> _providers = new();
-    private readonly Dictionary<Address, string?> _providerTypes = new();
+    private readonly Dictionary<Address, string> _providerTypes = new();
     private readonly Dictionary<string, ModelProfile> _profiles = new(StringComparer.Ordinal);
 
     public Result RegisterFactory(string packageId, IModelProviderFactory factory)
@@ -41,7 +41,9 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
         lock (_gate)
         {
             var ownedTypes = _factories.Where(x => x.Value.PackageId == packageId).Select(x => x.Key).ToHashSet(StringComparer.Ordinal);
-            var activeInstances = _providers.Values.Where(x => ownedTypes.Contains(x.Provider.Address.TypeId)).Select(x => x.Provider.Address).ToArray();
+            var activeInstances = _providers.Values
+                .Where(x => _providerTypes.TryGetValue(x.Provider.Address, out var type) && ownedTypes.Contains(type))
+                .Select(x => x.Provider.Address).ToArray();
             if (activeInstances.Length > 0)
                 return Result.Failure(new(ErrorCode.Conflict, $"Model provider instances must be destroyed before unloading their package: {string.Join(", ", activeInstances)}"));
             foreach (var type in ownedTypes) _factories.Remove(type);
@@ -76,8 +78,8 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
         {
             if (_providers.ContainsKey(spec.Address))
                 return Result<IModelProvider>.Failure(new(ErrorCode.Conflict, $"Model provider instance already exists: {spec.Address}"));
-            if (!_factories.TryGetValue(spec.Address.TypeId, out var registration))
-                return Result<IModelProvider>.Failure(new(ErrorCode.Unavailable, $"Model provider type is not registered: {spec.Address.TypeId}"));
+            if (!_factories.TryGetValue(spec.TypeId, out var registration))
+                return Result<IModelProvider>.Failure(new(ErrorCode.Unavailable, $"Model provider type is not registered: {spec.TypeId}"));
             (packageId, factory) = registration;
         }
 
@@ -109,16 +111,19 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
     {
         if (string.IsNullOrWhiteSpace(category) || string.IsNullOrWhiteSpace(instance))
             return ValueTask.FromResult(Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "Model category and instance name are required.")));
-        string? kind;
+        string typeId;
         lock (_gate)
         {
             var factory = _factories.Values.Select(x => x.Factory)
                 .SingleOrDefault(candidate => StringComparer.Ordinal.Equals(candidate.Describe.Category, category));
             if (factory is null)
                 return ValueTask.FromResult(Result<IModelProvider>.Failure(new(ErrorCode.Unavailable, $"Model category is not registered: {category}")));
-            kind = factory.TypeId["model.".Length..];
+            typeId = factory.TypeId;
         }
-        return CreateAsync(new ModelProviderSpec(new Address("model", kind, instance), configurationJson), cancellationToken);
+        // "model.chat" → the address names the instance of that kind; the type stays the whole string, and the
+        // spec carries it so nothing downstream has to put it back together.
+        var kind = typeId["model.".Length..];
+        return CreateAsync(new ModelProviderSpec(new Address("model", kind, instance), configurationJson, typeId), cancellationToken);
     }
 
     public async ValueTask<Result> DestroyAsync(Address provider, CancellationToken cancellationToken)

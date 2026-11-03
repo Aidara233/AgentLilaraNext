@@ -83,15 +83,26 @@ public sealed record ParameterView(
     double? Minimum,
     double? Maximum,
     string Description);
-public sealed record ChannelSpec(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, int? MaxMessages = null,
-    /// <summary>The type this instance implements. Null only in files written before the field existed.</summary>
-    string? TypeId = null);
+/// <summary>
+/// The one Channel implementation there is today. Named in one place so that a spec, a validation and a
+/// forwarder all agree on the string — and so that retiring an address-shape check later does not leave a
+/// copy of it behind.
+/// </summary>
+public static class ChannelTypes
+{
+    public const string Conversation = "channel.conversation";
+}
+
+public sealed record ChannelSpec(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings,
+    /// <summary>The type this instance implements. A fact of the spec, never read out of the address.</summary>
+    string TypeId,
+    int? MaxMessages = null);
 public sealed record ChannelInfo(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, bool Running,
+    /// <summary>The type this instance implements, as declared in its spec. Never read out of the address.</summary>
+    string TypeId,
     int? MaxMessages = null,
     /// <summary>Which model profile this Channel talks with; null means "whatever the host resolves".</summary>
-    string? ModelProfile = null,
-    /// <summary>The type this instance implements, as declared in its spec. Never read out of the address.</summary>
-    string? TypeId = null);
+    string? ModelProfile = null);
 public sealed record ChannelMessage(Guid MessageId, Address Channel, ChannelBinding Binding,
     string? PlatformMessageId, string Text, DateTimeOffset At, string? Sender = null, bool MentionsSelf = false);
 

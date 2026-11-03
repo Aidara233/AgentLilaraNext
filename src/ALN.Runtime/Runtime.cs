@@ -149,7 +149,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
     public ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, CancellationToken cancellationToken) =>
         _factories is null
             ? ValueTask.FromResult(Result<IChatAdapter>.Failure(new(ErrorCode.Unavailable, "No Adapter factory registry is configured.")))
-            : CreateCoreAsync(spec, s => _factories.Create(s.Address.TypeId, s), cancellationToken);
+            : CreateCoreAsync(spec, s => _factories.Create(s.TypeId, s), cancellationToken);
     public Result<IChatAdapter> Get(Address address)
     {
         lock (_gate)
@@ -158,7 +158,8 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
     }
     public IReadOnlyList<AdapterInfo> List()
     {
-        lock (_gate) return _adapters.Values.Select(a => new AdapterInfo(a.Address, a.Descriptor, a.State)).ToArray();
+        lock (_gate) return _adapters.Values.Select(a => new AdapterInfo(a.Address, a.Descriptor, a.State,
+            _adapterTypes.TryGetValue(a.Address, out var type) ? type : "")).ToArray();
     }
     public ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, Func<AdapterSpec, IChatAdapter> factory, CancellationToken cancellationToken) =>
         CreateCoreAsync(spec, s =>
@@ -170,7 +171,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
     private async ValueTask<Result<IChatAdapter>> CreateCoreAsync(AdapterSpec spec,
         Func<AdapterSpec, Result<IChatAdapter>> factory, CancellationToken cancellationToken)
     {
-        if (spec.Address.Module != "adapter" || spec.Address.Kind is null || spec.Address.Instance is null || !_types.IsConcrete(spec.Address.TypeId))
+        if (spec.Address.Module != "adapter" || spec.Address.Kind is null || spec.Address.Instance is null || !_types.IsConcrete(spec.TypeId))
             return Result<IChatAdapter>.Failure(new(ErrorCode.Invalid, "Only registered concrete Adapter types with an instance id can be created."));
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -189,7 +190,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
             lock (_gate)
             {
                 _adapters.Add(spec.Address, adapter);
-                _adapterTypes[spec.Address] = spec.TypeId!;
+                _adapterTypes[spec.Address] = spec.TypeId;
             }
             if (_parameters is not null && adapter is IParameterTarget tunable) _parameters.Register(tunable);
             var attached = await _bindings.AttachAsync(spec.Address, cancellationToken).ConfigureAwait(false);
@@ -300,7 +301,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
     public async ValueTask<Result<IReadOnlyList<AdapterInfo>>> SnapshotByTypeAsync(string concreteTypeId, CancellationToken cancellationToken)
     {
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try { return Result<IReadOnlyList<AdapterInfo>>.Success(List().Where(a => a.Address.TypeId == concreteTypeId).ToArray()); }
+        try { return Result<IReadOnlyList<AdapterInfo>>.Success(List().Where(a => a.TypeId == concreteTypeId).ToArray()); }
         finally { _lifecycle.Release(); }
     }
 
@@ -309,7 +310,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var addresses = List().Where(a => a.Address.TypeId == concreteTypeId).Select(a => a.Address).ToArray();
+            var addresses = List().Where(a => a.TypeId == concreteTypeId).Select(a => a.Address).ToArray();
             foreach (var address in addresses)
             {
                 var found = Get(address);
@@ -344,7 +345,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var addresses = List().Where(a => a.Address.TypeId == concreteTypeId).Select(a => a.Address).ToArray();
+            var addresses = List().Where(a => a.TypeId == concreteTypeId).Select(a => a.Address).ToArray();
             foreach (var address in addresses)
             {
                 var detached = _bindings is IForceInstanceBindings forceBindings
