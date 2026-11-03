@@ -88,7 +88,7 @@ public sealed class ChannelDeltaTests : IDisposable
 
         // Replaying is visible and the Session timeline deduplicates by message id; skipping would silently
         // lose what people said, which is worse.
-        var corrupt = await store.WriteAsync("channel.delta", Channel.Instance!, "{ not json", default);
+        var corrupt = await store.WriteAsync("channel.delta", Channel.ToString(), "{ not json", default);
         Assert.True(corrupt.Ok, corrupt.Error?.Message);
         var replayed = await delta.TakeDeltaAsync(Channel, null, default);
         Assert.True(replayed.Ok);

@@ -21,7 +21,9 @@ public sealed class ClockSource : IClockManager, IModule
         _events = events;
         _timeProvider = timeProvider ?? TimeProvider.System;
         Address = address ?? new Address("clock", "system", "1");
-        if (!Address.IsInstance || Address.Module != "clock") throw new ArgumentException("Clock source requires a concrete clock address.", nameof(address));
+        // No check against the name: an id is a name, and a name that happens to start with something else is
+        // still a legal clock address. What can be checked here is that it names something at all.
+        if (!Address.IsInstance) throw new ArgumentException("Clock source requires a concrete clock address.", nameof(address));
     }
     public Address Address { get; }
 

@@ -536,5 +536,5 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
         at.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
 
     private static bool IsToken(string? value) =>
-        value is { Length: > 0 and <= 128 } && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-');
+        value is { Length: > 0 and <= 128 } && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-' or '#');
 }

@@ -24,7 +24,9 @@ public sealed class FileChannelDeltaSource(IMessageStore messages, IStateStore s
     public async ValueTask<Result<ChannelDelta>> TakeDeltaAsync(Address channel, int? maxMessages,
         CancellationToken cancellationToken)
     {
-        if (!channel.IsInstance || channel.Module != "channel")
+        // Whatever it is called, this needs a concrete instance to read from. Deciding that it really is a channel
+        // is the catalog's job, not a string test on the name.
+        if (!channel.IsInstance)
             return Result<ChannelDelta>.Failure(new(ErrorCode.Invalid, $"Delta source needs a channel instance: {channel}"));
         if (maxMessages is <= 0)
             return Result<ChannelDelta>.Failure(new(ErrorCode.Invalid, $"Delta window must be positive: {maxMessages}"));
@@ -33,7 +35,9 @@ public sealed class FileChannelDeltaSource(IMessageStore messages, IStateStore s
         if (read.Error is { } readError) return Result<ChannelDelta>.Failure(readError);
         var all = (read.Value ?? []).Where(message => message.Direction == MessageDirection.Inbound).ToArray();
 
-        var key = channel.Instance!;
+        // The whole name is the cursor key: it is unique, and taking a piece of it apart to build a key is exactly
+        // what an opaque id forbids.
+        var key = channel.ToString();
         var consumed = await ReadCursorAsync(key, cancellationToken).ConfigureAwait(false);
         if (consumed.Error is { } cursorError) return Result<ChannelDelta>.Failure(cursorError);
         var already = Math.Min(consumed.Value, all.Length);
