@@ -62,11 +62,12 @@ public sealed class PersistenceTests : IDisposable
         Assert.Empty((await store.LoadAllAsync(default)).Value!);
         // Deleting the spec takes the now-empty instance directory with it; an empty tree that comes
         // back on every start is how a storage layout rots.
-        Assert.False(Directory.Exists(Path.Combine(_root, "adapters", "file")));
+        Assert.False(Directory.Exists(Path.Combine(_root, "adapters", "adapter.file#file-1")));
     }
 
+    // The path carries the name and nothing else: the type lives inside the file.
     private string SpecPath(string type, string instance) =>
-        Path.Combine(_root, "adapters", type, instance, FileAdapterSpecStore.FileName);
+        Path.Combine(_root, "adapters", "adapter." + type + "#" + instance, "spec.json");
 
     [Fact]
     public async Task Adapter_settings_round_trip_and_stay_out_of_the_plain_spec_file()
@@ -92,12 +93,15 @@ public sealed class PersistenceTests : IDisposable
     [Fact]
     public async Task A_spec_written_before_settings_existed_still_loads()
     {
-        Directory.CreateDirectory(Path.Combine(_root, "adapters", "file", "file-1"));
-        // Exactly what the previous version wrote, in the nested place: no settings key at all.
+        Directory.CreateDirectory(Path.Combine(_root, "adapters", "adapter.file#file-1"));
+        // Exactly what an older version wrote, in the new place: no settings key at all. The type has to be
+        // there — a spec that does not say what it is cannot be classified, and guessing from the name is the
+        // thing this layout exists to avoid.
         await File.WriteAllTextAsync(SpecPath("file", "file-1"),
             """
             {
               "address": "adapter.file#file-1",
+              "type": "adapter.file",
               "platformId": "file",
               "accountId": "file-1",
               "direction": "Both"
@@ -126,23 +130,26 @@ public sealed class PersistenceTests : IDisposable
         // No compatibility path: the layout is the contract, so a stray file is reported rather than
         // half-interpreted, and the message says where it belongs.
         Assert.False(loaded.Ok);
-        Assert.Contains("<type>/<instance>/adapter.json", loaded.Error!.Message, StringComparison.Ordinal);
+        Assert.Contains("<id>/spec.json", loaded.Error!.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task A_spec_in_the_wrong_directory_is_an_error_that_names_both_places()
+    public async Task A_spec_is_found_by_the_name_inside_it_not_by_the_directory_it_sits_in()
     {
-        Directory.CreateDirectory(Path.Combine(_root, "adapters", "qq", "qq-1"));
-        await File.WriteAllTextAsync(SpecPath("qq", "qq-1"),
+        // The path carries nothing about what the file is, so a directory that disagrees with the id inside is
+        // not a contradiction — the file is the authority, which is what lets one directory hold every kind of
+        // module without anyone keeping two naming schemes in step.
+        Directory.CreateDirectory(Path.Combine(_root, "adapters", "somewhere-else"));
+        await File.WriteAllTextAsync(Path.Combine(_root, "adapters", "somewhere-else", "spec.json"),
             """
-            { "address": "adapter.file#file-1", "platformId": "file", "accountId": "file-1", "direction": "Both" }
+            { "address": "adapter.file#file-1", "type": "adapter.file", "platformId": "file", "accountId": "file-1", "direction": "Both" }
             """);
 
         var store = new FileAdapterSpecStore(Path.Combine(_root, "adapters"));
-        var loaded = await store.LoadAllAsync(default);
+        var loaded = Assert.Single((await store.LoadAllAsync(default)).Value!);
 
-        Assert.False(loaded.Ok);
-        Assert.Contains("expected file/file-1", loaded.Error!.Message, StringComparison.Ordinal);
+        Assert.Equal("adapter.file#file-1", loaded.Address.ToString());
+        Assert.Equal("adapter.file", loaded.TypeId);
     }
 
     [Fact]
