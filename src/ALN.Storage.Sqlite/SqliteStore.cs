@@ -1,5 +1,6 @@
 using System.Globalization;
 using ALN.Contracts;
+using ALN.Contracts.Memory;
 using Microsoft.Data.Sqlite;
 
 namespace ALN.Storage.Sqlite;
@@ -16,9 +17,9 @@ namespace ALN.Storage.Sqlite;
 /// Durability: <c>journal_mode=WAL</c> with <c>synchronous=NORMAL</c>, which survives a killed process (the
 /// case this whole state story is about) and can lose only the last commit on a power cut.
 /// </summary>
-public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomicWork, IQueuedMessageStore, IDisposable
+public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomicWork, IQueuedMessageStore, IMemoryStore, IDisposable
 {
-    private const int SchemaVersion = 3;
+    private const int SchemaVersion = 4;
     private const int SqliteConstraint = 19;
     private const int SqliteBusy = 5;
     private const int SqliteLocked = 6;
@@ -381,11 +382,177 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
         finally { _gate.Release(); }
     }
 
+    // ---- IMemoryStore: what outlives one Session -----------------------------------------------
+
+    /// <summary>
+    /// Rows a search will look at. A scope is supposed to shrink as fragments are folded into notes, so reading
+    /// it whole is honest rather than clever; the cap is only there so a scope that was never consolidated cannot
+    /// turn one recall into an unbounded read.
+    /// </summary>
+    private const int SearchCeiling = 5000;
+
+    public ValueTask<Result<MemoryRecord>> AddAsync(MemoryDraft draft, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<MemoryRecord>.Failure, "Memory could not be written.", () =>
+        {
+            if (draft is null) return Result<MemoryRecord>.Failure(new(ErrorCode.Invalid, "Memory draft is required."));
+            var invalid = Validate(draft.Scope, draft.Text, draft.Evidence);
+            if (invalid is not null) return Result<MemoryRecord>.Failure(invalid);
+            if (!Enum.IsDefined(draft.Kind))
+                return Result<MemoryRecord>.Failure(new(ErrorCode.Invalid, $"Unknown memory kind: {(int)draft.Kind}"));
+
+            var at = draft.At ?? DateTimeOffset.UtcNow;
+            var record = new MemoryRecord(
+                "mem-" + Guid.NewGuid().ToString("N"),
+                draft.Scope,
+                draft.Kind,
+                draft.Text.Trim(),
+                string.IsNullOrWhiteSpace(draft.Evidence) ? null : draft.Evidence.Trim(),
+                string.IsNullOrWhiteSpace(draft.Source) ? null : draft.Source,
+                at);
+            using var command = Command(
+                "INSERT INTO memory(id, scope, kind, text, evidence, source, at) " +
+                "VALUES($id, $scope, $kind, $text, $evidence, $source, $at);");
+            command.Parameters.AddWithValue("$id", record.Id);
+            command.Parameters.AddWithValue("$scope", record.Scope);
+            command.Parameters.AddWithValue("$kind", (int)record.Kind);
+            command.Parameters.AddWithValue("$text", record.Text);
+            command.Parameters.AddWithValue("$evidence", (object?)record.Evidence ?? DBNull.Value);
+            command.Parameters.AddWithValue("$source", (object?)record.Source ?? DBNull.Value);
+            command.Parameters.AddWithValue("$at", Timestamp(record.At));
+            command.ExecuteNonQuery();
+            return Result<MemoryRecord>.Success(record);
+        });
+
+    public ValueTask<Result<IReadOnlyList<MemoryHit>>> SearchAsync(string scope, string query, int limit,
+        DateTimeOffset now, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<IReadOnlyList<MemoryHit>>.Failure, "Memory could not be read.", () =>
+        {
+            if (!IsScope(scope))
+                return Result<IReadOnlyList<MemoryHit>>.Failure(new(ErrorCode.Invalid, $"Not a memory scope: {scope}"));
+            var terms = MemoryRanking.Terms(query);
+            var hits = ReadScope(scope)
+                .Select(record => new MemoryHit(record, MemoryRanking.Score(record, terms, now)))
+                // A query that matches nothing gets an empty answer rather than the newest rows dressed up as a
+                // match. Only "no query at all" means "whatever is recent".
+                .Where(hit => terms.Count == 0 || hit.Score > 0)
+                .OrderByDescending(hit => hit.Score)
+                .ThenByDescending(hit => hit.Record.At)
+                .Take(Math.Clamp(limit, 1, 500))
+                .ToList();
+            return Result<IReadOnlyList<MemoryHit>>.Success(hits);
+        });
+
+    public ValueTask<Result<IReadOnlyList<MemoryRecord>>> RecentAsync(string scope, int limit, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<IReadOnlyList<MemoryRecord>>.Failure, "Memory could not be read.", () =>
+        {
+            if (!IsScope(scope))
+                return Result<IReadOnlyList<MemoryRecord>>.Failure(new(ErrorCode.Invalid, $"Not a memory scope: {scope}"));
+            using var command = Command(
+                "SELECT id, scope, kind, text, evidence, source, at FROM memory WHERE scope=$scope " +
+                "ORDER BY at DESC, id DESC LIMIT $limit;");
+            command.Parameters.AddWithValue("$scope", scope);
+            command.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 1000));
+            return Result<IReadOnlyList<MemoryRecord>>.Success(ReadRows(command));
+        });
+
+    public ValueTask<Result<MemoryRecord?>> ReadEntryAsync(string scope, string id, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<MemoryRecord?>.Failure, "Memory could not be read.", () =>
+        {
+            if (!IsScope(scope))
+                return Result<MemoryRecord?>.Failure(new(ErrorCode.Invalid, $"Not a memory scope: {scope}"));
+            using var command = Command(
+                "SELECT id, scope, kind, text, evidence, source, at FROM memory WHERE scope=$scope AND id=$id;");
+            command.Parameters.AddWithValue("$scope", scope);
+            command.Parameters.AddWithValue("$id", id);
+            var rows = ReadRows(command);
+            // Absent comes back as Ok with a null value — same shape as a state key that was never written.
+            return Result<MemoryRecord?>.Success(rows.Count == 0 ? null : rows[0]);
+        });
+
+    public ValueTask<Result> ForgetAsync(string scope, string id, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result.Failure, "Memory could not be deleted.", () =>
+        {
+            if (!IsScope(scope))
+                return Result.Failure(new(ErrorCode.Invalid, $"Not a memory scope: {scope}"));
+            using var command = Command("DELETE FROM memory WHERE scope=$scope AND id=$id;");
+            command.Parameters.AddWithValue("$scope", scope);
+            command.Parameters.AddWithValue("$id", id);
+            command.ExecuteNonQuery();
+            // Deleting a row that is not there is a success: "forget this" is a statement, not a request to check.
+            return Result.Success();
+        });
+
+    public ValueTask<Result<MemoryCounts>> CountEntriesAsync(string scope, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<MemoryCounts>.Failure, "Memory could not be counted.", () =>
+        {
+            if (!IsScope(scope))
+                return Result<MemoryCounts>.Failure(new(ErrorCode.Invalid, $"Not a memory scope: {scope}"));
+            using var command = Command("SELECT kind, COUNT(*) FROM memory WHERE scope=$scope GROUP BY kind;");
+            command.Parameters.AddWithValue("$scope", scope);
+            int fragments = 0, notes = 0;
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                var count = reader.GetInt32(1);
+                if ((MemoryKind)reader.GetInt32(0) == MemoryKind.Note) notes += count;
+                else fragments += count;
+            }
+            return Result<MemoryCounts>.Success(new MemoryCounts(fragments, notes));
+        });
+
+    /// <summary>Every row of one scope, newest first, capped. The caller ranks; this only fetches.</summary>
+    private List<MemoryRecord> ReadScope(string scope)
+    {
+        using var command = Command(
+            "SELECT id, scope, kind, text, evidence, source, at FROM memory WHERE scope=$scope " +
+            "ORDER BY at DESC, id DESC LIMIT $limit;");
+        command.Parameters.AddWithValue("$scope", scope);
+        command.Parameters.AddWithValue("$limit", SearchCeiling);
+        return ReadRows(command);
+    }
+
+    private static List<MemoryRecord> ReadRows(SqliteCommand command)
+    {
+        var rows = new List<MemoryRecord>();
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            rows.Add(new MemoryRecord(
+                reader.GetString(0),
+                reader.GetString(1),
+                (MemoryKind)reader.GetInt32(2),
+                reader.GetString(3),
+                reader.IsDBNull(4) ? null : reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                DateTimeOffset.Parse(reader.GetString(6), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)));
+        }
+        return rows;
+    }
+
+    private static Error? Validate(string? scope, string? text, string? evidence)
+    {
+        if (!IsScope(scope)) return new(ErrorCode.Invalid, $"Not a memory scope: {scope}");
+        if (string.IsNullOrWhiteSpace(text)) return new(ErrorCode.Invalid, "Memory text must not be empty.");
+        if (text.Trim().Length > IMemoryStore.MaxTextLength)
+            return new(ErrorCode.Invalid, $"Memory text is longer than {IMemoryStore.MaxTextLength} characters.");
+        if (evidence is not null && evidence.Length > IMemoryStore.MaxEvidenceLength)
+            return new(ErrorCode.Invalid, $"Memory evidence is longer than {IMemoryStore.MaxEvidenceLength} characters.");
+        return null;
+    }
+
+    /// <summary>
+    /// A scope is a key a person can read, not an address — it carries whatever separator the owner uses, so this
+    /// only rules out the empty and the absurd.
+    /// </summary>
+    private static bool IsScope(string? scope) =>
+        scope is { Length: > 0 and <= 200 } && !scope.Any(char.IsControl);
+
     // ---- counts for the startup receipt --------------------------------------------------------
 
     public long CountMessages() => Count("message");
     public long CountStateKeys() => Count("state");
     public long CountAuditRecords() => Count("audit");
+    public long CountMemoryEntries() => Count("memory");
 
     private long Count(string table)
     {
@@ -458,6 +625,23 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             // readers left, so it goes rather than lingering as a trap for whoever looks next.
             Execute("DROP TABLE IF EXISTS entry;");
         }
+        if (current < 4)
+        {
+            // Memory is additive: the table arrives empty and nothing that already exists changes shape. It is
+            // still a migration step rather than "whatever CreateSchema left behind", so a file written by this
+            // version and opened by an older one can be told apart instead of half-understood.
+            Execute("""
+                CREATE TABLE IF NOT EXISTS memory(
+                    id TEXT NOT NULL PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    kind INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    evidence TEXT NULL,
+                    source TEXT NULL,
+                    at TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS memory_scope_at ON memory(scope, at);
+                """);
+        }
         Execute($"PRAGMA user_version = {SchemaVersion};");
     }
 
@@ -517,6 +701,17 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
 
             CREATE INDEX IF NOT EXISTS queued_message_owner_at ON queued_message(queue, owner, at);
             CREATE INDEX IF NOT EXISTS queued_message_platform ON queued_message(queue, platform_message_id);
+
+            CREATE TABLE IF NOT EXISTS memory(
+                id TEXT NOT NULL PRIMARY KEY,
+                scope TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                evidence TEXT NULL,
+                source TEXT NULL,
+                at TEXT NOT NULL);
+
+            CREATE INDEX IF NOT EXISTS memory_scope_at ON memory(scope, at);
 
             CREATE TABLE IF NOT EXISTS audit(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

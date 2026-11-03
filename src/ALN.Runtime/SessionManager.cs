@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using ALN.Contracts;
+using ALN.Contracts.Memory;
 using ALN.Contracts.Models;
 using ALN.Contracts.Prompts;
 using ALN.Contracts.Sessions;
@@ -35,11 +36,12 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
     private readonly ISignalLog _signalLog;
     private readonly IRoundContextContributorRegistry _roundContextContributors;
     private readonly IPromptLibrary? _prompts;
+    private readonly IMemoryStore? _memory;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SessionRecord> _loaded = new(StringComparer.Ordinal);
 
     public SessionManager(string dataRoot, IModelManager models, IRoundContextContributorRegistry? roundContextContributors = null,
-        ISignalLog? signalLog = null, IPromptLibrary? prompts = null)
+        ISignalLog? signalLog = null, IPromptLibrary? prompts = null, IMemoryStore? memory = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         ArgumentNullException.ThrowIfNull(models);
@@ -49,6 +51,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
         _roundContextContributors = roundContextContributors ?? new RoundContextContributorRegistry();
         _signalLog = signalLog ?? NullSignalLog.Instance;
         _prompts = prompts;
+        _memory = memory;
     }
 
     /// <summary>
@@ -403,13 +406,14 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
     /// round, and quietly dropping it would run a Session with a different toolset than its spec names — the
     /// assembly mistake would then only ever show up as the model behaving oddly.
     /// </summary>
-    private Result<List<ModelToolDefinition>> ResolveTools(SessionSpec spec, ISessionToolbox? toolbox)
+    private Result<List<ModelToolDefinition>> ResolveTools(SessionSpec spec, ISessionToolbox? toolbox, SessionMemoryTools? memory)
     {
         var visible = new List<ModelToolDefinition> { WaitTool.Definition };
+        if (memory is not null) visible.AddRange(SessionMemoryTools.Definitions);
         var missing = new List<string>();
         foreach (var declared in spec.Tools ?? [])
         {
-            if (string.Equals(declared.Name, WaitTool.ToolName, StringComparison.Ordinal)) continue;
+            if (IsBuiltin(declared.Name)) continue;
             if (toolbox is not null && toolbox.Names.Contains(declared.Name, StringComparer.Ordinal))
             {
                 visible.Add(declared);
@@ -420,8 +424,27 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
         if (missing.Count == 0) return Result<List<ModelToolDefinition>>.Success(visible);
         return Result<List<ModelToolDefinition>>.Failure(new(ErrorCode.Unavailable,
             $"Session declares tools nothing in this host provides: {string.Join(", ", missing)}. " +
-            $"Available: {(toolbox is null || toolbox.Names.Count == 0 ? WaitTool.ToolName : string.Join(", ", toolbox.Names.Append(WaitTool.ToolName)))}."));
+            $"Available: {string.Join(", ", visible.Select(definition => definition.Name))}."));
     }
+
+    /// <summary>One of the loop's own tools by name, or null when it is not one.</summary>
+    private static ISessionTool? BuiltinTool(SessionMemoryTools? memory, string name) =>
+        memory is not null && IsBuiltin(name) ? memory.Find(name).Value : null;
+
+    private static ISessionTool? ResolveHosted(ISessionToolbox? toolbox, string name) =>
+        toolbox?.Find(name) is { Ok: true, Value: { } implementation } ? implementation : null;
+
+    /// <summary>
+    /// The tools the loop itself provides. Named in one place because two things depend on the same list: a spec
+    /// that declares one of them must not get a second copy, and a Session whose only tools are built-ins must not
+    /// look like a Session that can act — the two decide different behaviour (whether a text-only step was the
+    /// reply, or said nothing).
+    /// </summary>
+    private static bool IsBuiltin(string name) =>
+        string.Equals(name, WaitTool.ToolName, StringComparison.Ordinal) ||
+        string.Equals(name, SessionMemoryTools.RememberToolName, StringComparison.Ordinal) ||
+        string.Equals(name, SessionMemoryTools.RecallToolName, StringComparison.Ordinal) ||
+        string.Equals(name, SessionMemoryTools.ForgetToolName, StringComparison.Ordinal);
 
     private void WriteSignal(Guid stepId, string outcome, SignalLevel level, params (string Key, string Value)[] detail)
     {
@@ -556,12 +579,18 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
                 history = record.History;
             }
 
-            // What the model is offered this turn: the built-in stop, plus every declared tool something in the
-            // host can actually run. Assembly mistakes fail here, before a single token is spent.
-            var resolved = ResolveTools(record.Spec, tools);
+            // What the model is offered this turn: the built-in stop and memory, plus every declared tool something
+            // in the host can actually run. Assembly mistakes fail here, before a single token is spent.
+            //
+            // Memory is scoped to the conversation (the Channel address), never to the Session id: a Session is
+            // meant to be replaced, and memory that dies with it would not be memory.
+            var memory = _memory is null
+                ? null
+                : new SessionMemoryTools(_memory, state.Channel ?? sessionId, sessionId);
+            var resolved = ResolveTools(record.Spec, tools, memory);
             if (!resolved.Ok || resolved.Value is null) return Result<SessionTurnResult>.Failure(resolved.Error!);
             var visible = resolved.Value;
-            var actingTools = visible.Count(definition => !string.Equals(definition.Name, WaitTool.ToolName, StringComparison.Ordinal));
+            var actingTools = visible.Count(definition => !IsBuiltin(definition.Name));
 
             var messages = new List<ModelMessage>();
             // The prompt is read here, every turn, from files a person edits. Only the names are part of the
@@ -743,11 +772,12 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
                 var stop = new WaitTool();
                 foreach (var call in completedCalls)
                 {
-                    // "wait" is the loop's own tool, so it resolves even when the host handed over nothing.
-                    var found = tools?.Find(call.Name);
+                    // "wait" and memory are the loop's own tools, so they resolve even when the host handed over
+                    // nothing — a Session that woke itself up with nobody speaking still has to be able to recall.
                     ISessionTool? tool = string.Equals(call.Name, WaitTool.ToolName, StringComparison.Ordinal)
                         ? stop
-                        : found is { Ok: true, Value: { } implementation } ? implementation : null;
+                        : BuiltinTool(memory, call.Name) ?? ResolveHosted(tools, call.Name);
+                    var found = tools?.Find(call.Name);
                     Result<SessionToolResult> execution;
                     try
                     {
