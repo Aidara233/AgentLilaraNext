@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using ALN.Contracts;
 using ALN.Contracts.Models;
 using ALN.Contracts.Sessions;
@@ -27,11 +28,11 @@ public sealed class SessionToolTests : IDisposable
     private static ModelToolCall Wait() => new("call-2", "wait", "{}");
 
     /// <summary>A scripted model: one canned step per call, so the loop's decisions are the only variable.</summary>
-    private sealed class ScriptedModel(params ModelEvent[][] steps) : IModelManager
+    private class ScriptedModel(params ModelEvent[][] steps) : IModelManager
     {
         public List<ModelRequest> Requests { get; } = [];
 
-        public ValueTask<Result<IAsyncEnumerable<ModelEvent>>> CompleteAsync(string profileId, ModelRequest request,
+        public virtual ValueTask<Result<IAsyncEnumerable<ModelEvent>>> CompleteAsync(string profileId, ModelRequest request,
             CancellationToken cancellationToken)
         {
             Requests.Add(request);
@@ -365,6 +366,33 @@ public sealed class SessionToolTests : IDisposable
         }
     }
 
+    /// <summary>A model that stays inside its call until the test lets it go, so "the Session is busy" is a fact.</summary>
+    private sealed class HeldModel : ScriptedModel
+    {
+        private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public HeldModel() : base([]) { }
+
+        public Task Entered => _entered.Task;
+        public void Release() => _release.TrySetResult();
+
+        public override ValueTask<Result<IAsyncEnumerable<ModelEvent>>> CompleteAsync(string profileId,
+            ModelRequest request, CancellationToken cancellationToken)
+        {
+            _entered.TrySetResult();
+            return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Success(Stream(cancellationToken)));
+        }
+
+        private async IAsyncEnumerable<ModelEvent> Stream(
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await _release.Task.WaitAsync(cancellationToken);
+            await Task.Yield();
+            yield return new ModelCompleted(StopReason.EndTurn, new ModelUsage(1, 1), null);
+        }
+    }
+
     private async Task<SessionManager> WaitingAsync(ScriptedModel model, string sessionId)
     {
         var sessions = new SessionManager(Path.Combine(_root, "sweep-" + Guid.NewGuid().ToString("N")), model);
@@ -404,6 +432,52 @@ public sealed class SessionToolTests : IDisposable
         Assert.True(swept.Ok, swept.Error?.Message);
         Assert.Equal(0, swept.Value!.Due);
         Assert.Empty(handler.Released);
+    }
+
+    [Fact]
+    public async Task A_due_deadline_wakes_the_session_into_an_empty_room_and_says_so()
+    {
+        var model = new ScriptedModel([new TextDelta("ok"), new ModelCompleted(StopReason.EndTurn, new ModelUsage(1, 1))]);
+        var sessions = new SessionManager(Path.Combine(_root, "wake"), model);
+        Assert.True((await sessions.OpenAsync("s-wake", Spec(), default)).Ok);
+
+        var woken = await sessions.ActivateAsync("s-wake", ActivationReason.DeadlineDue,
+            DateTimeOffset.UtcNow.AddMinutes(-1), default);
+
+        Assert.True(woken.Ok, woken.Error?.Detail ?? woken.Error?.Message);
+        // The model was told the truth: nobody spoke, and this is the Session's own deadline. Without that note it
+        // invents a message to answer, and answers that.
+        var note = Assert.Single(model.Requests[^1].Messages, message => message.Content?.Contains("没有任何人说话") == true);
+        Assert.Equal("user", note.Role);
+        Assert.Contains("等待到期", note.Content!, StringComparison.Ordinal);
+        // On disk too: the turn after this one must still know why it happened.
+        var lines = await File.ReadAllLinesAsync(Path.Combine(_root, "wake", "s-wake", "history.jsonl"));
+        var firstTurn = JsonSerializer.Deserialize<SessionHistoryEntry>(lines[0], new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
+        Assert.Contains("没有任何人说话", firstTurn.Content!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_wake_up_that_arrives_while_the_session_is_busy_is_skipped_not_queued()
+    {
+        var model = new HeldModel();
+        var sessions = new SessionManager(Path.Combine(_root, "wake-busy"), model);
+        var opened = await sessions.OpenAsync("s-busy", Spec(), default);
+        Assert.True(opened.Ok, opened.Error?.Message);
+
+        // Start a turn and wait until it is inside the model call: it now holds the Session, gate and all.
+        var running = opened.Value!.RunTurnAsync(Guid.NewGuid(), new SessionTurnInput([], null, null), null, default);
+        await model.Entered;
+
+        var woken = await sessions.ActivateAsync("s-busy", ActivationReason.DeadlineDue, DateTimeOffset.UtcNow, default);
+
+        // Seven queued wake-ups become seven "you woke up" notes and nothing to say, so this one is dropped — and
+        // the caller can tell the difference between "dropped because busy" and "failed".
+        Assert.False(woken.Ok);
+        Assert.Equal(ErrorCode.Conflict, woken.Error!.Code);
+        Assert.True(woken.Error.Retryable);
+
+        model.Release();
+        Assert.True((await running).Ok);
     }
 
     [Fact]

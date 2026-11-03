@@ -123,7 +123,7 @@ if (!archiveService.Ok || archiveService.Value is null)
     return 1;
 }
 var archive = archiveService.Value;
-var deadlines = new SessionDeadlineHandler(archive);
+var deadlines = new SessionDeadlineHandler(archive, sessions);
 var bundledPackage = await modulePackages.LoadAsync(
     Path.Combine(AppContext.BaseDirectory, "modules", "bundled.runtime"), ModulePackageKind.Bundled, CancellationToken.None);
 if (!bundledPackage.Ok)

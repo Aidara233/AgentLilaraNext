@@ -167,8 +167,34 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
     }
 
     /// <summary>One turn of a loaded Session. Internal: callers hold an <see cref="ISession"/>, not a record.</summary>
+    /// <summary>
+    /// A turn nobody wrote to. The gate is taken with a zero timeout on purpose: a Session in the middle of a turn is
+    /// skipped, not queued — see the contract.
+    /// </summary>
+    public async ValueTask<Result<SessionTurnResult>> ActivateAsync(string sessionId, ActivationReason reason,
+        DateTimeOffset? at, CancellationToken cancellationToken)
+    {
+        var loaded = await LoadAsync(sessionId, requestedSpec: null, cancellationToken).ConfigureAwait(false);
+        if (!loaded.Ok || loaded.Value is null) return Result<SessionTurnResult>.Failure(loaded.Error!);
+
+        var input = reason switch
+        {
+            // Nobody spoke. That is the whole content of the turn, and saying so is what stops the model from
+            // inventing a message nobody sent.
+            ActivationReason.DeadlineDue => new SessionTurnInput([], WokenAt: at ?? DateTimeOffset.UtcNow),
+            _ => (SessionTurnInput?)null
+        };
+        if (input is null)
+            return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, $"Unknown activation reason: {reason}."));
+
+        // No pre-check of our own: the turn itself takes the gate with a zero timeout when skipIfBusy is set, so
+        // "busy" is decided once, by the thing that actually owns the gate.
+        return await RunTurnAsync(loaded.Value, Guid.NewGuid(), input, tools: null, cancellationToken,
+            skipIfBusy: true).ConfigureAwait(false);
+    }
+
     private async ValueTask<Result<SessionTurnResult>> RunTurnAsync(SessionRecord record, Guid activationId,
-        SessionTurnInput input, ISessionToolbox? tools, CancellationToken cancellationToken)
+        SessionTurnInput input, ISessionToolbox? tools, CancellationToken cancellationToken, bool skipIfBusy = false)
     {
         var sessionId = Path.GetFileName(record.Directory);
         var spec = record.Spec;
@@ -180,7 +206,8 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
         {
             Result<SessionTurnResult> result;
             using (SignalScope.Enter(recordId, activationId))
-                result = await RunTurnCoreAsync(record, activationId, input, tools, cancellationToken).ConfigureAwait(false);
+                result = await RunTurnCoreAsync(record, activationId, input, tools, cancellationToken, skipIfBusy)
+                    .ConfigureAwait(false);
             RecordTurn(sessionId, spec, activationId, result, started, recordId, parentId);
             return result;
         }
@@ -416,9 +443,21 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
         });
     }
 
+    /// <summary>
+    /// The one thing a turn with no messages has to say.
+    ///
+    /// A model that finds itself running with no new messages will otherwise invent a reason for it — "the user just
+    /// asked…" is the reason it invents — and then answer a message nobody sent. So the note states the three facts
+    /// the timeline does not carry: nobody spoke, this is its own deadline coming due, and here is when it asked.
+    /// </summary>
+    private static string? WakeNote(DateTimeOffset? wokenAt) => wokenAt is { } at
+        ? $"（系统）没有任何人说话。你自己在 {at.ToLocalTime():yyyy-MM-dd HH:mm:ss} 声明的等待到期了，因此你被叫醒了。" +
+          "没有人对你说过任何话，也没有人问你问题：要做的事就做，没话可说可以继续等。"
+        : null;
+
     private async ValueTask<Result<SessionTurnResult>> RunTurnCoreAsync(
         SessionRecord record, Guid activationId, SessionTurnInput input,
-        ISessionToolbox? tools, CancellationToken cancellationToken)
+        ISessionToolbox? tools, CancellationToken cancellationToken, bool skipIfBusy = false)
     {
         var sessionId = Path.GetFileName(record.Directory);
         var spec = record.Spec;
@@ -454,7 +493,15 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
         // instead of a turn that dies for reasons the model cannot see.
 
         var gate = _sessionGates.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        // A wake-up is refused rather than queued while the Session is busy: seven queued wake-ups become seven
+        // "you woke up" notes and nothing to say. A turn somebody asked for still waits its turn.
+        if (skipIfBusy)
+        {
+            if (!await gate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+                return Result<SessionTurnResult>.Failure(new(ErrorCode.Conflict,
+                    $"Session {sessionId} is busy; this activation was skipped rather than queued.", Retryable: true));
+        }
+        else await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             var directory = record.Directory;
@@ -486,7 +533,10 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
             if (activationUser is null)
             {
                 activationUser = new SessionHistoryEntry($"{activation}:user", activation, state.StepNumber + 1,
-                    "user", null, DateTimeOffset.UtcNow, ChannelMessages: input.Messages);
+                    // With no messages the note *is* the message, so it has to be replayed; an entry carrying a
+                    // channel view is not replayed, because the channel block carries that instead.
+                    "user", WakeNote(input.WokenAt), DateTimeOffset.UtcNow,
+                    ChannelMessages: input.Messages is { Count: > 0 } messages ? messages : null);
                 var timelineState = state with
                 {
                     Revision = state.Revision + 1,
@@ -1588,8 +1638,10 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
         return builder.AppendLine("</channel_messages>").Append("</channel_context>").ToString();
     }
 
+    // A null list and an empty one are the same fact — nothing was carried — so a retry of an activation that
+    // carried nothing is not "reused with different content".
     private static bool SameChannelMessages(IReadOnlyList<SessionChannelMessage>? left,
-        IReadOnlyList<SessionChannelMessage> right) => left is not null && left.SequenceEqual(right);
+        IReadOnlyList<SessionChannelMessage> right) => (left ?? []).SequenceEqual(right);
 
     private static string EscapeXmlText(string value) => value.Replace("&", "&amp;", StringComparison.Ordinal)
         .Replace("<", "&lt;", StringComparison.Ordinal).Replace(">", "&gt;", StringComparison.Ordinal);

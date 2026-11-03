@@ -92,7 +92,23 @@ public sealed record SessionChannelMessage(
 public sealed record SessionTurnInput(
     IReadOnlyList<SessionChannelMessage> Messages,
     Address? Channel = null,
-    ChannelBinding? Binding = null);
+    ChannelBinding? Binding = null,
+    /// <summary>
+    /// Set when nobody spoke and the Session is running because its own <c>wait</c> came due: the instant it asked
+    /// for. The turn then carries a note saying so — a model that finds itself running with no new messages will
+    /// otherwise invent a reason for it, and "the user just asked…" is the reason it invents.
+    /// </summary>
+    DateTimeOffset? WokenAt = null);
+
+/// <summary>
+/// Why a Session is being run without anybody writing to it. Named rather than passed as text: the reason decides
+/// what the turn carries, and a caller that can spell the reason cannot get the accompanying note wrong.
+/// </summary>
+public enum ActivationReason
+{
+    /// <summary>The deadline this Session declared with <c>wait</c> has passed.</summary>
+    DeadlineDue
+}
 
 public sealed record RoundContextRequest(
     string SessionId,
@@ -180,6 +196,17 @@ public interface ISessionManager
 
     /// <summary>An existing Session, or a failure when there is none. Never creates one.</summary>
     ValueTask<Result<ISession>> GetAsync(string sessionId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Runs a turn that nobody wrote to. <paramref name="reason"/> decides what the turn carries — for a due
+    /// deadline, an empty input plus a note saying exactly that.
+    ///
+    /// It does <b>not</b> queue: a Session that is already running a turn is left alone and the caller is told so
+    /// (<see cref="ErrorCode.Conflict"/>, retryable), because a Session that collected seven wake-ups while busy
+    /// would wake to seven notes and nothing to say.
+    /// </summary>
+    ValueTask<Result<SessionTurnResult>> ActivateAsync(string sessionId, ActivationReason reason,
+        DateTimeOffset? at, CancellationToken cancellationToken);
 
     Result<SessionState> GetState(string sessionId);
 

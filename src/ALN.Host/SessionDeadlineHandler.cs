@@ -8,7 +8,7 @@ using ALN.Contracts.Sessions;
 /// Releasing is archiving, never deleting: "release" is the model's own verdict that it is finished, and the
 /// model can be wrong. A wrong verdict should cost a move to the archive, not the conversation.
 /// </summary>
-internal sealed class SessionDeadlineHandler(IArchiveRegistry archive) : ISessionDeadlineHandler
+internal sealed class SessionDeadlineHandler(IArchiveRegistry archive, ISessionManager sessions) : ISessionDeadlineHandler
 {
     /// <summary>
     /// How often the sweep looks. Coarse on purpose: what it acts on is a promise measured in minutes and hours,
@@ -23,10 +23,15 @@ internal sealed class SessionDeadlineHandler(IArchiveRegistry archive) : ISessio
         return archived.Ok ? Result.Success() : Result.Failure(archived.Error!);
     }
 
-    public ValueTask<Result> WakeAsync(SessionSummary session, DateTimeOffset dueAt, CancellationToken cancellationToken) =>
-        // Nothing can wake a Session yet: activation still insists on a Channel message, so there is no second
-        // way in. Saying so every pass keeps the deadline visible instead of pretending the promise was kept —
-        // the sweep counts this as a failure, and the count is the point.
-        ValueTask.FromResult(Result.Failure(new(ErrorCode.Unavailable,
-            $"Session {session.Id} asked to be woken at {dueAt:O}, but this build has no non-Channel activation.")));
+    /// <summary>
+    /// Nobody came, so the Session runs a turn of its own: empty input and a note saying exactly that. The manager
+    /// refuses rather than queues when the Session is already busy, and a refused wake-up is a skipped one — the next
+    /// sweep tries again.
+    /// </summary>
+    public async ValueTask<Result> WakeAsync(SessionSummary session, DateTimeOffset dueAt, CancellationToken cancellationToken)
+    {
+        var woken = await sessions.ActivateAsync(session.Id, ActivationReason.DeadlineDue, dueAt, cancellationToken)
+            .ConfigureAwait(false);
+        return woken.Ok ? Result.Success() : Result.Failure(woken.Error!);
+    }
 }
