@@ -605,7 +605,8 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
             // Session has tools at all: without them, the text *was* the reply.
             messages.AddRange(history.Where(entry => ShouldReplay(entry, actingTools > 0)).Select(ToModelMessage));
             var collected = await CollectRoundContextAsync(
-                new RoundContextRequest(sessionId, activationId, state.StepNumber + 1, input.Channel, input.Binding),
+                new RoundContextRequest(sessionId, activationId, state.StepNumber + 1, input.Channel, input.Binding,
+                    memory?.Scope),
                 cancellationToken).ConfigureAwait(false);
             if (!collected.Ok || collected.Value is null) return Result<SessionTurnResult>.Failure(collected.Error!);
 

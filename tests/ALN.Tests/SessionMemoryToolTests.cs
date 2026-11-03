@@ -207,6 +207,45 @@ public sealed class SessionMemoryToolTests : IDisposable
     }
 
     [Fact]
+    public async Task The_floating_line_says_what_is_stored_even_when_the_model_never_asks()
+    {
+        // The hole this closes: memory as a tool only exists for a model that thinks to call it, so a model that
+        // never recalls cannot know there is anything to recall. One line per round makes the store visible.
+        var model = new ScriptedModel(Waiting());
+        var contributors = new RoundContextContributorRegistry();
+        Assert.True(contributors.Register(new MemoryContextContributor(_store)).Ok);
+        var sessions = new SessionManager(Path.Combine(_root, "sessions-floating"), model, contributors, memory: _store);
+        await _store.AddAsync(new MemoryDraft(Channel.ToString(), MemoryKind.Note, "周五下午部署",
+            Evidence: "他说：周五下午吧。", At: DateTimeOffset.UtcNow), default);
+
+        Turned(await sessions.TurnAsync("s-1", Spec(), Guid.NewGuid(), new SessionTurnInput([], Channel), null, default));
+
+        var block = model.Requests[0].Messages.Single(message => message.Role == "user" &&
+            message.Content?.Contains("<floating_context>", StringComparison.Ordinal) == true).Content!;
+        Assert.Contains("name=\"memory\"", block);
+        Assert.Contains("周五下午部署", block);
+        Assert.Contains("recall", block);
+        // The evidence is not repeated here: recall is where a conclusion is checked, and the floating line is a
+        // reminder that there is something to check, not the whole store.
+        Assert.DoesNotContain("他说：周五下午吧。", block);
+    }
+
+    [Fact]
+    public async Task An_empty_store_contributes_no_line_at_all()
+    {
+        var model = new ScriptedModel(Waiting());
+        var contributors = new RoundContextContributorRegistry();
+        Assert.True(contributors.Register(new MemoryContextContributor(_store)).Ok);
+        var sessions = new SessionManager(Path.Combine(_root, "sessions-empty"), model, contributors, memory: _store);
+
+        Turned(await sessions.TurnAsync("s-1", Spec(), Guid.NewGuid(), new SessionTurnInput([], Channel), null, default));
+
+        // "You remember nothing" on every round is noise, and noise is what makes a real reminder invisible.
+        var carriers = model.Requests[0].Messages.Where(message => message.Content?.Contains("<floating_context>", StringComparison.Ordinal) == true);
+        Assert.DoesNotContain(carriers, message => message.Content!.Contains("name=\"memory\"", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Forget_drops_one_entry_and_says_what_is_left()
     {
         var written = (await _store.AddAsync(new MemoryDraft(Channel.ToString(), MemoryKind.Fragment, "要丢掉的",

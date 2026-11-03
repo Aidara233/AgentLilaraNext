@@ -55,6 +55,8 @@ var timeContributor = roundContextContributors.Register(new TimeContextContribut
 if (!timeContributor.Ok) { Console.Error.WriteLine(timeContributor.Error?.Message); return 1; }
 var channelContributor = roundContextContributors.Register(new ChannelInfoContributor());
 if (!channelContributor.Ok) { Console.Error.WriteLine(channelContributor.Error?.Message); return 1; }
+var memoryContributor = roundContextContributors.Register(new MemoryContextContributor(storage));
+if (!memoryContributor.Ok) { Console.Error.WriteLine(memoryContributor.Error?.Message); return 1; }
 // The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.

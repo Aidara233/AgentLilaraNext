@@ -59,6 +59,32 @@ public sealed record MemoryCounts(int Fragments, int Notes)
 }
 
 /// <summary>
+/// When fragments have piled up and nobody folded them, and the sentence that says so.
+///
+/// In the contract because two callers must say the same thing: the <c>recall</c> tool (which is where the model
+/// can act on it) and the floating context line (which is where it finds out without asking). A threshold that
+/// lives in two places is a threshold that drifts, and the failure it guards against is invisible — the store just
+/// keeps growing while nothing ever says so.
+/// </summary>
+public static class MemoryGuidance
+{
+    /// <summary>Enough fragments that "recent" has stopped meaning anything.</summary>
+    public const int FragmentThreshold = 10;
+
+    /// <summary>...and enough fragments per note that the two are out of proportion.</summary>
+    public const int FragmentsPerNote = 5;
+
+    public static bool NeedsConsolidation(MemoryCounts counts) =>
+        counts.Fragments >= FragmentThreshold && counts.Fragments >= counts.Notes * FragmentsPerNote;
+
+    /// <summary>The nudge, or null when there is no gap worth naming.</summary>
+    public static string? ConsolidationHint(MemoryCounts counts) => NeedsConsolidation(counts)
+        ? $"碎片已经攒到 {counts.Fragments} 条、笔记还只有 {counts.Notes} 条。把反复出现的、互相印证的那些整理成一两条 note" +
+          "（附上原文证据），再用 forget 删掉被吸收的碎片——不整理的话，下次 recall 只会捞回一堆重复的碎片。"
+        : null;
+}
+
+/// <summary>
 /// Persistent memory: fragments and notes, written by sessions and read back by them.
 ///
 /// Deliberately a storage port and nothing more — no "consolidate the fragments" method, because that step needs

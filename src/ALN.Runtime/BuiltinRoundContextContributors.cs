@@ -1,4 +1,5 @@
 using ALN.Contracts;
+using ALN.Contracts.Memory;
 using ALN.Contracts.Sessions;
 
 namespace ALN.Runtime;
@@ -26,6 +27,61 @@ public sealed class TimeContextContributor(TimeProvider? timeProvider = null) : 
             $"当前时间：{now:yyyy-MM-dd HH:mm:ss zzz}（{_time.GetUtcNow():yyyy-MM-dd HH:mm:ss} UTC）",
             Order: -100));
         return ValueTask.CompletedTask;
+    }
+}
+
+/// <summary>
+/// The floating memory line: what this conversation has hung on to, in one glance.
+///
+/// It exists because memory as a tool has a hole: a model that never calls <c>recall</c> cannot know there is
+/// anything to recall, so "remember" quietly degrades into "store it and never look". One line per round closes
+/// that hole without putting the store into the request: the count, the latest conclusion, and the one thing the
+/// model can do about a store that has stopped being useful.
+///
+/// Deliberately not the entries themselves. Recall is a tool because choosing what to pull needs the model's own
+/// sense of the question; flooding every round with thirty memories would pay that cost on every step and make
+/// the useful three invisible.
+/// </summary>
+public sealed class MemoryContextContributor(IMemoryStore store) : IRoundContextContributor
+{
+    public const string ContributorId = "system.memory";
+
+    public string Id => ContributorId;
+
+    public async ValueTask ContributeAsync(RoundContextRequest request, ISessionTimelineWriter timeline,
+        IRoundContextWriter roundContext, CancellationToken cancellationToken)
+    {
+        if (request.MemoryScope is not { Length: > 0 } scope) return;
+        var counts = await store.CountEntriesAsync(scope, cancellationToken).ConfigureAwait(false);
+        // A store that cannot be read says nothing rather than failing the round: memory is an advantage, and one
+        // that is momentarily unavailable must not cost the conversation its answer.
+        if (!counts.Ok || counts.Value is null || counts.Value.Total == 0) return;
+
+        var lines = new List<string>
+        {
+            $"这个会话记住了 {counts.Value.Fragments} 条碎片、{counts.Value.Notes} 条笔记。要翻用 recall，要写用 remember。"
+        };
+        var recent = await store.RecentAsync(scope, IMemoryStore.DefaultLimit, cancellationToken).ConfigureAwait(false);
+        if (recent.Ok && recent.Value is { } entries)
+        {
+            // The newest note, not the newest row: a conclusion is what a reader can act on, and the fragments
+            // around it are chatter. When there is no note yet, saying so is the useful fact.
+            var note = entries.FirstOrDefault(entry => entry.Kind == MemoryKind.Note);
+            if (note is null) lines.Add("还没有笔记：碎片攒够了就整理成一两条（带原文证据），再 forget 掉被吸收的那些。");
+            else
+            {
+                var when = note.At.ToLocalTime().ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+                var text = note.Text.Trim().Replace('\n', ' ');
+                lines.Add($"最近一条笔记（{when}）：{(text.Length > 200 ? text[..200] + "…" : text)}");
+            }
+        }
+        if (MemoryGuidance.ConsolidationHint(counts.Value) is { } hint) lines.Add(hint);
+
+        roundContext.Add(new RoundContextContribution(
+            "memory",
+            "memory",
+            string.Join('\n', lines),
+            Order: -90));
     }
 }
 

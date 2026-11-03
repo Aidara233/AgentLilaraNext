@@ -115,7 +115,13 @@ public sealed record RoundContextRequest(
     Guid ActivationId,
     int StepNumber,
     Address? Channel = null,
-    ChannelBinding? Binding = null);
+    ChannelBinding? Binding = null,
+    /// <summary>
+    /// Whose memory this turn may read, when the host has memory at all. A string rather than the Channel,
+    /// because memory outlives Channels and Sessions both: it is keyed by the conversation, and a Session that
+    /// woke itself up still has one even when there is no Channel message behind the turn.
+    /// </summary>
+    string? MemoryScope = null);
 
 /// <summary>Ephemeral context to render into this model request; it is never persisted in Session history.</summary>
 public sealed record RoundContextContribution(string Id, string Section, string Content, int Order = 0);

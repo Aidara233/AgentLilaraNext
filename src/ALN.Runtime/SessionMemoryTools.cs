@@ -105,11 +105,7 @@ public sealed class SessionMemoryTools
     /// consolidation happens at all. Without it the store only grows: every fragment is written, nobody ever folds
     /// them, and recall keeps answering with thirty near-duplicates.
     /// </summary>
-    private static string? GapHint(MemoryCounts counts) =>
-        counts.Fragments >= 10 && counts.Fragments >= counts.Notes * 5
-            ? $"碎片已经攒到 {counts.Fragments} 条、笔记还只有 {counts.Notes} 条。把反复出现的、互相印证的那些整理成一两条 note" +
-              "（附上原文证据），再用 forget 删掉被吸收的碎片——不整理的话，下次 recall 只会捞回一堆重复的碎片。"
-            : null;
+    private static string? GapHint(MemoryCounts counts) => MemoryGuidance.ConsolidationHint(counts);
 
     private static string CountsLine(MemoryCounts counts) =>
         $"这个会话的记忆：碎片 {counts.Fragments} 条，笔记 {counts.Notes} 条。";
