@@ -39,6 +39,12 @@ public sealed record MemoryDraft(
     DateTimeOffset? At = null);
 
 /// <summary>One row as stored. <see cref="Id"/> is assigned by the store, not by the caller.</summary>
+/// <param name="Repeats">
+/// How many times this same thing has been written down. Not a score and not a weight: a repeat means "this came
+/// up again", which is what makes the row's time meaningful again. Kept as a count instead of a second row
+/// because thirty near-identical fragments are how a memory store stops being useful — the noise hides the
+/// signal, and the reader cannot tell "said once, a year ago" from "said every day this week".
+/// </param>
 public sealed record MemoryRecord(
     string Id,
     string Scope,
@@ -46,7 +52,16 @@ public sealed record MemoryRecord(
     string Text,
     string? Evidence,
     string? Source,
-    DateTimeOffset At);
+    DateTimeOffset At,
+    int Repeats = 1);
+
+/// <summary>
+/// What came of a write: the row as it now stands, and whether it is new.
+///
+/// The distinction is the caller's, not the store's: a tool has to be able to say "记下了" or "这条又提了一次",
+/// and those are different answers to the model, not two phrasings of one.
+/// </summary>
+public sealed record MemoryWrite(MemoryRecord Record, bool Created);
 
 /// <summary>A stored row together with why it came back. The score is what lets a caller cut a list without
 /// pretending the order was arbitrary.</summary>
@@ -101,8 +116,13 @@ public interface IMemoryStore
     /// <summary>Longest evidence a row may quote.</summary>
     const int MaxEvidenceLength = 20000;
 
-    /// <summary>Writes one row and hands back the assigned id.</summary>
-    ValueTask<Result<MemoryRecord>> AddAsync(MemoryDraft draft, CancellationToken cancellationToken);
+    /// <summary>
+    /// Writes one row — or, when this scope already says the same thing in the same kind, refreshes that row
+    /// instead: its time moves to now, its <see cref="MemoryRecord.Repeats"/> goes up, and its evidence becomes
+    /// the newest words. "He said it again" is information the store should keep; a second row is the same
+    /// information with the signal buried under it.
+    /// </summary>
+    ValueTask<Result<MemoryWrite>> AddAsync(MemoryDraft draft, CancellationToken cancellationToken);
 
     /// <summary>
     /// Best rows for <paramref name="query"/> in this scope, best first — at most <paramref name="limit"/> of
@@ -122,6 +142,37 @@ public interface IMemoryStore
     ValueTask<Result> ForgetAsync(string scope, string id, CancellationToken cancellationToken);
 
     ValueTask<Result<MemoryCounts>> CountEntriesAsync(string scope, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// How two pieces of text are decided to be the same thing.
+///
+/// In the contract because it decides what "already written down" means, and a backend that answered that
+/// question differently would either duplicate rows or swallow distinct ones. Deliberately blunt: case-folded,
+/// whitespace-collapsed, trimmed. Not fuzzy — "部署改到周五" and "部署改到周一" must stay two rows, and a rule
+/// clever enough to merge them is a rule that deletes facts.
+/// </summary>
+public static class MemoryText
+{
+    /// <summary>Trims and collapses every run of whitespace to one space, so formatting is not a difference.</summary>
+    public static string Normalize(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return "";
+        var builder = new StringBuilder(text.Length);
+        var space = false;
+        foreach (var c in text)
+        {
+            if (char.IsWhiteSpace(c))
+            {
+                space = true;
+                continue;
+            }
+            if (space && builder.Length > 0) builder.Append(' ');
+            space = false;
+            builder.Append(c);
+        }
+        return builder.ToString();
+    }
 }
 
 /// <summary>

@@ -246,10 +246,30 @@ public sealed class SessionMemoryToolTests : IDisposable
     }
 
     [Fact]
+    public async Task Repeating_a_fragment_tells_the_model_it_was_already_written()
+    {
+        var first = new ScriptedModel(Calling(Call("c1", "remember", new { text = "周五部署", kind = "fragment" })), Waiting());
+        Turned(await Manager(first, _store).TurnAsync("s-1", Spec(), Guid.NewGuid(), new SessionTurnInput([], Channel), null, default));
+        Assert.Contains("记下了", ToolResults(first, "remember").Single());
+
+        var second = new ScriptedModel(
+            Calling(Call("c1", "remember", new { text = "  周五部署 ", kind = "fragment" })),
+            Waiting());
+        Turned(await Manager(second, _store).TurnAsync("s-2", Spec(), Guid.NewGuid(), new SessionTurnInput([], Channel), null, default));
+
+        var answer = ToolResults(second, "remember").Single();
+        // The model is told it was a repeat: that is the only way "stop writing this every turn" can happen, and
+        // the only way "he has said this three times" survives.
+        Assert.Contains("已经记过了", answer);
+        Assert.Contains("第 2 次", answer);
+        Assert.Equal(1, (await _store.CountEntriesAsync(Channel.ToString(), default)).Value!.Total);
+    }
+
+    [Fact]
     public async Task Forget_drops_one_entry_and_says_what_is_left()
     {
         var written = (await _store.AddAsync(new MemoryDraft(Channel.ToString(), MemoryKind.Fragment, "要丢掉的",
-            At: DateTimeOffset.UtcNow), default)).Value!;
+            At: DateTimeOffset.UtcNow), default)).Value!.Record;
 
         var model = new ScriptedModel(
             Calling(Call("c1", "forget", new { id = written.Id })),

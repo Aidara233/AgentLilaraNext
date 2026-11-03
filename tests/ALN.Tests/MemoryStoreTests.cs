@@ -41,17 +41,19 @@ public sealed class MemoryStoreTests : IDisposable
             Evidence: "他说：那就周五吧，周四是客户冻结。", Source: "s-abc", At: Now), default);
 
         Assert.True(written.Ok);
-        Assert.StartsWith("mem-", written.Value!.Id);
+        Assert.StartsWith("mem-", written.Value!.Record.Id);
+        Assert.True(written.Value.Created);
 
-        var read = await store.ReadEntryAsync(Scope, written.Value.Id, default);
+        var read = await store.ReadEntryAsync(Scope, written.Value.Record.Id, default);
         Assert.Equal("部署改到周五了", read.Value!.Text);
         Assert.Equal("他说：那就周五吧，周四是客户冻结。", read.Value.Evidence);
+        Assert.Equal(1, read.Value.Repeats);   // first write: said once so far
         Assert.Equal("s-abc", read.Value.Source);
         Assert.Equal(MemoryKind.Fragment, read.Value.Kind);
         Assert.Equal(Now, read.Value.At);
 
         // A different conversation is a different memory even when the id is right.
-        Assert.Null((await store.ReadEntryAsync("adapter.qq/chat-99", written.Value.Id, default)).Value);
+        Assert.Null((await store.ReadEntryAsync("adapter.qq/chat-99", written.Value.Record.Id, default)).Value);
 
         // Absent is not an error — the caller reads Error, not an exception.
         var missing = await store.ReadEntryAsync(Scope, "mem-nope", default);
@@ -139,7 +141,7 @@ public sealed class MemoryStoreTests : IDisposable
     public async Task Forgetting_twice_is_fine_and_counting_separates_the_two_kinds()
     {
         var store = OpenStore();
-        var fragment = (await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Fragment, "碎片", At: Now), default)).Value!;
+        var fragment = (await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Fragment, "碎片", At: Now), default)).Value!.Record;
         await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Note, "条目", At: Now), default);
 
         var counts = (await store.CountEntriesAsync(Scope, default)).Value!;
@@ -149,6 +151,69 @@ public sealed class MemoryStoreTests : IDisposable
         Assert.True((await store.ForgetAsync(Scope, fragment.Id, default)).Ok);
         Assert.True((await store.ForgetAsync(Scope, fragment.Id, default)).Ok);
         Assert.Equal(0, (await store.CountEntriesAsync(Scope, default)).Value!.Fragments);
+    }
+
+    [Fact]
+    public async Task Saying_the_same_thing_again_refreshes_one_row_instead_of_adding_a_second()
+    {
+        var store = OpenStore();
+        var first = (await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Fragment, "部署改到周五了",
+            Evidence: "他说：那就周五吧。", At: Now.AddDays(-3)), default)).Value!;
+        var again = (await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Fragment, "部署改到周五了",
+            Evidence: "他又说：周五，定了。", At: Now), default)).Value!;
+
+        Assert.False(again.Created);
+        Assert.Equal(first.Record.Id, again.Record.Id);       // same row, so anything pointing at it still finds it
+        Assert.Equal(2, again.Record.Repeats);
+        Assert.Equal(Now, again.Record.At);                    // "said again" makes it current again
+        Assert.Equal("他又说：周五，定了。", again.Record.Evidence);  // the newest words are the ones to check
+
+        // One row, not two: a store that grows by a row per repetition is a store whose recall returns the same
+        // sentence five times with nothing to tell them apart.
+        Assert.Equal(1, (await store.CountEntriesAsync(Scope, default)).Value!.Total);
+    }
+
+    [Fact]
+    public async Task Whitespace_is_not_a_difference_but_a_different_word_is()
+    {
+        var store = OpenStore();
+        await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Fragment, "  部署   周五 ", At: Now.AddDays(-1)), default);
+        var same = (await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Fragment, "部署 周五", At: Now), default)).Value!;
+        Assert.False(same.Created);
+        Assert.Equal(2, same.Record.Repeats);
+        Assert.Equal("部署 周五", same.Record.Text);            // stored normalized, so the comparison keeps working
+
+        // A rule clever enough to merge "周一" into "周五" would be a rule that deletes facts.
+        var other = (await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Fragment, "部署 周一", At: Now), default)).Value!;
+        Assert.True(other.Created);
+        Assert.Equal(2, (await store.CountEntriesAsync(Scope, default)).Value!.Total);
+    }
+
+    [Fact]
+    public async Task The_same_words_as_a_fragment_and_as_a_note_are_two_different_things()
+    {
+        var store = OpenStore();
+        Assert.True((await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Fragment, "周五部署", At: Now), default)).Value!.Created);
+        Assert.True((await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Note, "周五部署", Evidence: "他说：周五。", At: Now), default)).Value!.Created);
+
+        var counts = (await store.CountEntriesAsync(Scope, default)).Value!;
+        Assert.Equal(1, counts.Fragments);
+        Assert.Equal(1, counts.Notes);
+    }
+
+    [Fact]
+    public async Task Repeats_do_not_change_the_ranking_beyond_the_refreshed_time()
+    {
+        var store = OpenStore();
+        for (var i = 0; i < 3; i++)
+            await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Fragment, "咖啡", At: Now.AddDays(-10 + i)), default);
+        await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Fragment, "咖啡机坏了", At: Now.AddDays(-1)), default);
+
+        // Both match "咖啡"; the more relevant row wins even though the other one was said three times. A repeat
+        // count used as a score would make the loudest thing win, which is not what a query asked for.
+        var hits = (await store.SearchAsync(Scope, "咖啡机", 20, Now, default)).Value!;
+        Assert.Equal("咖啡机坏了", hits[0].Record.Text);
+        Assert.Equal(3, hits[1].Record.Repeats);
     }
 
     [Fact]
@@ -164,8 +229,8 @@ public sealed class MemoryStoreTests : IDisposable
 
         // Blank evidence and blank source are "nobody claimed it", not empty strings in the table.
         var bare = (await store.AddAsync(new MemoryDraft(Scope, MemoryKind.Fragment, "有内容", Evidence: " ", Source: ""), default)).Value!;
-        Assert.Null(bare.Evidence);
-        Assert.Null(bare.Source);
+        Assert.Null(bare.Record.Evidence);
+        Assert.Null(bare.Record.Source);
     }
 }
 

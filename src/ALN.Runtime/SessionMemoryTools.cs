@@ -151,8 +151,15 @@ public sealed class SessionMemoryTools
                 return Result<SessionToolResult>.Failure(written.Error ?? new(ErrorCode.Unavailable, "remember could not write."));
 
             var counts = await owner._store.CountEntriesAsync(owner.Scope, cancellationToken).ConfigureAwait(false);
+            var record = written.Value.Record;
             var builder = new StringBuilder();
-            builder.Append("记下了 ").Append(written.Value.Id).Append("（").Append(Label(kind)).Append("）。");
+            // A repeat is answered differently on purpose: "already written" is the fact the model needs to stop
+            // writing the same thing every turn, and it is the one fact a silent upsert would hide.
+            if (written.Value.Created)
+                builder.Append("记下了 ").Append(record.Id).Append("（").Append(Label(record.Kind)).Append("）。");
+            else
+                builder.Append("这条 ").Append(record.Id).Append(" 已经记过了，时间刷新到现在（第 ")
+                    .Append(record.Repeats).Append(" 次）。重复不是新条目，我没有再写一行。");
             if (counts.Ok && counts.Value is not null)
             {
                 builder.Append(' ').Append(CountsLine(counts.Value));
@@ -234,6 +241,7 @@ public sealed class SessionMemoryTools
             builder.Append('[').Append(record.Id).Append("] ")
                 .Append(Label(record.Kind)).Append(" · ")
                 .Append(record.At.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture))
+                .Append(record.Repeats > 1 ? $" · 提过 {record.Repeats} 次" : "")
                 .Append(" · ")
                 .Append(record.Text.Trim());
             if (!string.IsNullOrWhiteSpace(record.Evidence))

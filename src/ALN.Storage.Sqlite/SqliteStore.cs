@@ -19,7 +19,7 @@ namespace ALN.Storage.Sqlite;
 /// </summary>
 public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomicWork, IQueuedMessageStore, IMemoryStore, IDisposable
 {
-    private const int SchemaVersion = 4;
+    private const int SchemaVersion = 5;
     private const int SqliteConstraint = 19;
     private const int SqliteBusy = 5;
     private const int SqliteLocked = 6;
@@ -391,27 +391,60 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
     /// </summary>
     private const int SearchCeiling = 5000;
 
-    public ValueTask<Result<MemoryRecord>> AddAsync(MemoryDraft draft, CancellationToken cancellationToken) =>
-        RunAsync(cancellationToken, Result<MemoryRecord>.Failure, "Memory could not be written.", () =>
+    public ValueTask<Result<MemoryWrite>> AddAsync(MemoryDraft draft, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, Result<MemoryWrite>.Failure, "Memory could not be written.", () =>
         {
-            if (draft is null) return Result<MemoryRecord>.Failure(new(ErrorCode.Invalid, "Memory draft is required."));
+            if (draft is null) return Result<MemoryWrite>.Failure(new(ErrorCode.Invalid, "Memory draft is required."));
             var invalid = Validate(draft.Scope, draft.Text, draft.Evidence);
-            if (invalid is not null) return Result<MemoryRecord>.Failure(invalid);
+            if (invalid is not null) return Result<MemoryWrite>.Failure(invalid);
             if (!Enum.IsDefined(draft.Kind))
-                return Result<MemoryRecord>.Failure(new(ErrorCode.Invalid, $"Unknown memory kind: {(int)draft.Kind}"));
+                return Result<MemoryWrite>.Failure(new(ErrorCode.Invalid, $"Unknown memory kind: {(int)draft.Kind}"));
 
             var at = draft.At ?? DateTimeOffset.UtcNow;
+            var text = MemoryText.Normalize(draft.Text);
+            var evidence = string.IsNullOrWhiteSpace(draft.Evidence) ? null : draft.Evidence.Trim();
+            var source = string.IsNullOrWhiteSpace(draft.Source) ? null : draft.Source;
+
+            // Same words, same kind, same conversation: this is the same thing said again, not a new thing. The
+            // row keeps its id (so a note that other rows point at stays pointed at) and gains a repeat, a newer
+            // time, and the newest words it was said with.
+            if (FindExact(draft.Scope, draft.Kind, text) is { } existing)
+            {
+                var repeated = existing with
+                {
+                    At = at,
+                    Repeats = existing.Repeats + 1,
+                    Evidence = evidence ?? existing.Evidence,
+                    Source = source ?? existing.Source
+                };
+                // The WHERE repeats=... makes the increment depend on what was read rather than on wall clock
+                // ordering: two turns writing the same thing at once must not both think they saw count one.
+                using var update = Command(
+                    "UPDATE memory SET at=$at, repeats=$repeats, evidence=$evidence, source=$source " +
+                    "WHERE id=$id AND repeats=$was AND at=$wasAt;");
+                update.Parameters.AddWithValue("$at", Timestamp(repeated.At));
+                update.Parameters.AddWithValue("$repeats", repeated.Repeats);
+                update.Parameters.AddWithValue("$evidence", (object?)repeated.Evidence ?? DBNull.Value);
+                update.Parameters.AddWithValue("$source", (object?)repeated.Source ?? DBNull.Value);
+                update.Parameters.AddWithValue("$id", existing.Id);
+                update.Parameters.AddWithValue("$was", existing.Repeats);
+                update.Parameters.AddWithValue("$wasAt", Timestamp(existing.At));
+                if (update.ExecuteNonQuery() == 1) return Result<MemoryWrite>.Success(new MemoryWrite(repeated, Created: false));
+                // Somebody else moved the row between the read and the write. Falling through to an insert keeps
+                // the write honest; a retry loop here would be a lock nobody needs.
+            }
+
             var record = new MemoryRecord(
                 "mem-" + Guid.NewGuid().ToString("N"),
                 draft.Scope,
                 draft.Kind,
-                draft.Text.Trim(),
-                string.IsNullOrWhiteSpace(draft.Evidence) ? null : draft.Evidence.Trim(),
-                string.IsNullOrWhiteSpace(draft.Source) ? null : draft.Source,
+                text,
+                evidence,
+                source,
                 at);
             using var command = Command(
-                "INSERT INTO memory(id, scope, kind, text, evidence, source, at) " +
-                "VALUES($id, $scope, $kind, $text, $evidence, $source, $at);");
+                "INSERT INTO memory(id, scope, kind, text, evidence, source, at, repeats) " +
+                "VALUES($id, $scope, $kind, $text, $evidence, $source, $at, 1);");
             command.Parameters.AddWithValue("$id", record.Id);
             command.Parameters.AddWithValue("$scope", record.Scope);
             command.Parameters.AddWithValue("$kind", (int)record.Kind);
@@ -420,8 +453,21 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             command.Parameters.AddWithValue("$source", (object?)record.Source ?? DBNull.Value);
             command.Parameters.AddWithValue("$at", Timestamp(record.At));
             command.ExecuteNonQuery();
-            return Result<MemoryRecord>.Success(record);
+            return Result<MemoryWrite>.Success(new MemoryWrite(record, Created: true));
         });
+
+    /// <summary>The row that already says exactly this, if there is one. Newest first, so a repeat folds into the most recent.</summary>
+    private MemoryRecord? FindExact(string scope, MemoryKind kind, string text)
+    {
+        using var command = Command(
+            "SELECT id, scope, kind, text, evidence, source, at, repeats FROM memory " +
+            "WHERE scope=$scope AND kind=$kind AND text=$text ORDER BY at DESC, id DESC LIMIT 1;");
+        command.Parameters.AddWithValue("$scope", scope);
+        command.Parameters.AddWithValue("$kind", (int)kind);
+        command.Parameters.AddWithValue("$text", text);
+        var rows = ReadRows(command);
+        return rows.Count == 0 ? null : rows[0];
+    }
 
     public ValueTask<Result<IReadOnlyList<MemoryHit>>> SearchAsync(string scope, string query, int limit,
         DateTimeOffset now, CancellationToken cancellationToken) =>
@@ -448,7 +494,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             if (!IsScope(scope))
                 return Result<IReadOnlyList<MemoryRecord>>.Failure(new(ErrorCode.Invalid, $"Not a memory scope: {scope}"));
             using var command = Command(
-                "SELECT id, scope, kind, text, evidence, source, at FROM memory WHERE scope=$scope " +
+                "SELECT id, scope, kind, text, evidence, source, at, repeats FROM memory WHERE scope=$scope " +
                 "ORDER BY at DESC, id DESC LIMIT $limit;");
             command.Parameters.AddWithValue("$scope", scope);
             command.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 1000));
@@ -461,7 +507,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             if (!IsScope(scope))
                 return Result<MemoryRecord?>.Failure(new(ErrorCode.Invalid, $"Not a memory scope: {scope}"));
             using var command = Command(
-                "SELECT id, scope, kind, text, evidence, source, at FROM memory WHERE scope=$scope AND id=$id;");
+                "SELECT id, scope, kind, text, evidence, source, at, repeats FROM memory WHERE scope=$scope AND id=$id;");
             command.Parameters.AddWithValue("$scope", scope);
             command.Parameters.AddWithValue("$id", id);
             var rows = ReadRows(command);
@@ -504,7 +550,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
     private List<MemoryRecord> ReadScope(string scope)
     {
         using var command = Command(
-            "SELECT id, scope, kind, text, evidence, source, at FROM memory WHERE scope=$scope " +
+            "SELECT id, scope, kind, text, evidence, source, at, repeats FROM memory WHERE scope=$scope " +
             "ORDER BY at DESC, id DESC LIMIT $limit;");
         command.Parameters.AddWithValue("$scope", scope);
         command.Parameters.AddWithValue("$limit", SearchCeiling);
@@ -524,7 +570,9 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                 reader.GetString(3),
                 reader.IsDBNull(4) ? null : reader.GetString(4),
                 reader.IsDBNull(5) ? null : reader.GetString(5),
-                DateTimeOffset.Parse(reader.GetString(6), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)));
+                DateTimeOffset.Parse(reader.GetString(6), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                // Rows written before repeats existed read as one: nothing has been repeated zero times.
+                reader.IsDBNull(7) ? 1 : reader.GetInt32(7)));
         }
         return rows;
     }
@@ -642,7 +690,27 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                 CREATE INDEX IF NOT EXISTS memory_scope_at ON memory(scope, at);
                 """);
         }
+        if (current < 5 && !HasColumn("memory", "repeats"))
+        {
+            // Repetition became a count instead of a second row. Existing rows are all "said once" as far as
+            // anyone knows, which is what 1 means here; nothing was merged retroactively, because merging old
+            // rows would be a decision about what two pieces of text mean, and this is not the place for it.
+            //
+            // Guarded by a column check rather than by the version alone: a brand-new file gets the column from
+            // CreateSchema and then still walks the migrations from zero, so "the version is old" does not mean
+            // "the shape is old".
+            Execute("ALTER TABLE memory ADD COLUMN repeats INTEGER NOT NULL DEFAULT 1;");
+        }
         Execute($"PRAGMA user_version = {SchemaVersion};");
+    }
+
+    private bool HasColumn(string table, string column)
+    {
+        using var command = Command($"PRAGMA table_info({table});");
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
     }
 
     private SqliteCommand Command(string sql)
@@ -709,7 +777,8 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                 text TEXT NOT NULL,
                 evidence TEXT NULL,
                 source TEXT NULL,
-                at TEXT NOT NULL);
+                at TEXT NOT NULL,
+                repeats INTEGER NOT NULL DEFAULT 1);
 
             CREATE INDEX IF NOT EXISTS memory_scope_at ON memory(scope, at);
 
