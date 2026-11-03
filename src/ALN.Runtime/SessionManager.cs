@@ -156,15 +156,100 @@ public sealed class SessionManager : ISessionManager
     private sealed class WaitTool : ISessionTool
     {
         public const string ToolName = "wait";
-        public static readonly ISessionTool Instance = new WaitTool();
-        private static readonly ModelToolDefinition Shape = new(ToolName,
+        private const int MaxWaitSeconds = 7 * 24 * 60 * 60;
+
+        public static readonly ModelToolDefinition Definition = new(ToolName,
             "Yield this turn and stop until something wakes the conversation again. Call it when there is nothing "
-            + "more to say or do — this is the only way a turn ends.", """{"type":"object","properties":{}}""");
-        public static ModelToolDefinition Definition => Shape;
+            + "more to say or do — this is the only way a turn ends. With timeout, you are asking to be woken on your "
+            + "own after that many seconds; with release as well, you are asking to be archived if the deadline passes "
+            + "and nobody has written — and nothing is released if somebody does.",
+            """
+            {"type":"object","properties":{
+              "timeout":{"type":"integer","minimum":1,"maximum":604800,
+                "description":"Seconds from now. Omit to wait for somebody to write, with no deadline of your own."},
+              "release":{"type":"boolean",
+                "description":"Only with timeout: when the deadline passes and nobody wrote, this session is archived. Any inbound message cancels it."}}}
+            """);
+
+        /// <summary>
+        /// What this turn's wait asked for. Held on the instance because one wait is resolved per turn: a static
+        /// tool would have nowhere to put it that two Sessions could not overwrite.
+        /// </summary>
+        public (DateTimeOffset? Until, bool Release)? Declaration { get; private set; }
+
         public string Name => ToolName;
         public bool EndsTurn => true;
-        public ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken) =>
-            ValueTask.FromResult(Result<SessionToolResult>.Success(new SessionToolResult("""{"waited":true}""")));
+
+        public ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken)
+        {
+            var declared = Parse(call.ArgumentsJson, DateTimeOffset.UtcNow, out var error);
+            if (declared is null) return ValueTask.FromResult(Result<SessionToolResult>.Failure(error!));
+            Declaration = declared;
+            return ValueTask.FromResult(Result<SessionToolResult>.Success(new SessionToolResult(
+                JsonSerializer.Serialize(new { waited = true, until = declared.Value.Until, release = declared.Value.Release },
+                    JsonOptions))));
+        }
+
+        /// <summary>
+        /// Refuses anything it does not understand rather than reading it as "no deadline": a typo in an argument
+        /// name would otherwise turn "release me in an hour" into "sleep forever", silently.
+        /// </summary>
+        private static (DateTimeOffset? Until, bool Release)? Parse(string argumentsJson, DateTimeOffset now, out Error? error)
+        {
+            error = null;
+            JsonDocument document;
+            try { document = JsonDocument.Parse(string.IsNullOrWhiteSpace(argumentsJson) ? "{}" : argumentsJson); }
+            catch (JsonException ex)
+            {
+                error = new(ErrorCode.Invalid, "wait arguments must be a JSON object.", ex.Message);
+                return null;
+            }
+            using (document)
+            {
+                var root = document.RootElement;
+                if (root.ValueKind != JsonValueKind.Object)
+                {
+                    error = new(ErrorCode.Invalid, "wait arguments must be a JSON object.");
+                    return null;
+                }
+                int? timeout = null;
+                var release = false;
+                foreach (var property in root.EnumerateObject())
+                {
+                    switch (property.Name)
+                    {
+                        case "timeout":
+                            if (property.Value.ValueKind != JsonValueKind.Number || !property.Value.TryGetInt32(out var seconds) ||
+                                seconds < 1 || seconds > MaxWaitSeconds)
+                            {
+                                error = new(ErrorCode.Invalid,
+                                    $"wait.timeout must be a whole number of seconds between 1 and {MaxWaitSeconds}.");
+                                return null;
+                            }
+                            timeout = seconds;
+                            break;
+                        case "release":
+                            if (property.Value.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                            {
+                                error = new(ErrorCode.Invalid, "wait.release must be true or false.");
+                                return null;
+                            }
+                            release = property.Value.GetBoolean();
+                            break;
+                        default:
+                            error = new(ErrorCode.Invalid, $"wait has no argument named {property.Name}.");
+                            return null;
+                    }
+                }
+                if (release && timeout is null)
+                {
+                    error = new(ErrorCode.Invalid,
+                        "wait.release needs a timeout: asking to be released with no deadline would never release anything.");
+                    return null;
+                }
+                return (timeout is { } value ? now.AddSeconds(value) : null, release);
+            }
+        }
     }
 
     /// <summary>
@@ -291,7 +376,15 @@ public sealed class SessionManager : ISessionManager
             {
                 activationUser = new SessionHistoryEntry($"{activation}:user", activation, state.StepNumber + 1,
                     "user", null, DateTimeOffset.UtcNow, ChannelMessages: input.Messages);
-                var timelineState = state with { Revision = state.Revision + 1 };
+                var timelineState = state with
+                {
+                    Revision = state.Revision + 1,
+                    // Somebody came. A declaration that said "release me if nobody does" is answered by this very
+                    // arrival, so it goes before the turn runs — and it goes even if the turn then fails, because
+                    // the arrival already happened.
+                    WaitUntil = null,
+                    WaitRelease = false
+                };
                 var timelineCommit = await CommitAsync(record,
                     new SessionPendingCommit(timelineState, [activationUser]), cancellationToken).ConfigureAwait(false);
                 if (!timelineCommit.Ok) return Result<SessionTurnResult>.Failure(timelineCommit.Error!);
@@ -338,6 +431,7 @@ public sealed class SessionManager : ISessionManager
             var finalText = "";
             var finalStopReason = StopReason.EndTurn;
             var nudges = 0;
+            var refusedRounds = 0;
             while (true)
             {
                 var modelStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -480,12 +574,15 @@ public sealed class SessionManager : ISessionManager
                 var entries = new List<SessionHistoryEntry> { assistantEntry };
                 var spokenTexts = new List<string>();
                 var endsTurn = false;
+                var anyEffect = false;
+                // One per turn: it is where this turn's wait declaration lives until the round is committed.
+                var stop = new WaitTool();
                 foreach (var call in completedCalls)
                 {
                     // "wait" is the loop's own tool, so it resolves even when the host handed over nothing.
                     var found = tools?.Find(call.Name);
                     ISessionTool? tool = string.Equals(call.Name, WaitTool.ToolName, StringComparison.Ordinal)
-                        ? WaitTool.Instance
+                        ? stop
                         : found is { Ok: true, Value: { } implementation } ? implementation : null;
                     Result<SessionToolResult> execution;
                     try
@@ -504,7 +601,10 @@ public sealed class SessionManager : ISessionManager
                         : new SessionToolResult(JsonSerializer.Serialize(
                             new { error = execution.Error?.Message ?? "Tool returned no result." }, JsonOptions));
                     if (!string.IsNullOrWhiteSpace(outcome.SpokenText)) spokenTexts.Add(outcome.SpokenText!);
-                    if (tool is not null && tool.EndsTurn) endsTurn = true;
+                    if (execution.Ok) anyEffect = true;
+                    // A refused call has no effect, so it must not produce the effect of ending the turn either —
+                    // otherwise "wait with a typo" would quietly become "wait forever", with the error never read.
+                    if (tool is not null && tool.EndsTurn && execution.Ok) endsTurn = true;
                     messages.Add(new ModelMessage("tool", outcome.Content, ToolCallId: call.Id, Name: call.Name));
                     entries.Add(new SessionHistoryEntry($"{activation}:tool:{stepNumber}:{call.Id}", activation, stepNumber,
                         "tool", outcome.Content, DateTimeOffset.UtcNow, ToolCallId: call.Id));
@@ -525,7 +625,12 @@ public sealed class SessionManager : ISessionManager
                     Status = SessionStatus.Dormant,
                     StepNumber = stepNumber,
                     Revision = state.Revision + 1,
-                    Usage = state.Usage.Add(completedUsage)
+                    Usage = state.Usage.Add(completedUsage),
+                    // The declaration outlives the turn — it is the only thing a sweep can act on later. An empty
+                    // wait clears it, which is how "I am fine to be woken by anyone, with no deadline of my own"
+                    // is expressed.
+                    WaitUntil = stop.Declaration?.Until,
+                    WaitRelease = stop.Declaration?.Release ?? false
                 };
                 var round = await CommitAsync(record, new SessionPendingCommit(roundState, entries), cancellationToken)
                     .ConfigureAwait(false);
@@ -534,6 +639,19 @@ public sealed class SessionManager : ISessionManager
                 if (endsTurn)
                 {
                     // The turn ends because a tool said so, not because a step happened to be silent.
+                    finalText = "";
+                    finalStopReason = StopReason.EndTurn;
+                    break;
+                }
+                // A round where every call was refused made no progress. Nothing here counts steps — a turn may run
+                // as long as it needs — but a model repeating a call that keeps being refused is a loop with a bill
+                // attached, so it gets the same brake as a model talking to nobody. Reset on any success: what is
+                // braked is "no progress", not "many calls".
+                refusedRounds = anyEffect ? 0 : refusedRounds + 1;
+                if (refusedRounds > TextOnlyNudgeLimit)
+                {
+                    WriteSignal(activationId, "stalled", SignalLevel.Warn,
+                        ("refused_tool_rounds", refusedRounds.ToString(System.Globalization.CultureInfo.InvariantCulture)));
                     finalText = "";
                     finalStopReason = StopReason.EndTurn;
                     break;

@@ -250,4 +250,96 @@ public sealed class SessionToolTests : IDisposable
         Assert.Contains("\"toolCallId\":\"call-9\"", history, StringComparison.Ordinal);
         Assert.Contains("interrupted", history, StringComparison.Ordinal);
     }
+
+    // ---- what "wait" declares -------------------------------------------------------------------
+
+    private async Task<System.Text.Json.JsonElement> StateAsync(string sessionId = "s-1")
+    {
+        using var document = System.Text.Json.JsonDocument.Parse(
+            await File.ReadAllTextAsync(Path.Combine(_root, "sessions", sessionId, "state.json")));
+        return document.RootElement.Clone();
+    }
+
+    [Fact]
+    public async Task Wait_with_a_deadline_records_when_to_wake_and_whether_to_release()
+    {
+        var model = new ScriptedModel(
+            [new ToolCallDelta(0, "call-2", "wait", """{"timeout":3600,"release":true}"""),
+             new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
+        var sessions = Manager(model);
+        var before = DateTimeOffset.UtcNow;
+
+        var turn = await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+            new SessionTurnInput([], null, null), null, default);
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+
+        // The declaration is state, not a timer: this is the only thing a sweep will ever read, so a restart
+        // cannot lose the promise.
+        var state = await StateAsync();
+        Assert.True(state.GetProperty("waitRelease").GetBoolean());
+        Assert.InRange(state.GetProperty("waitUntil").GetDateTimeOffset(),
+            before.AddSeconds(3595), DateTimeOffset.UtcNow.AddSeconds(3605));
+    }
+
+    [Fact]
+    public async Task Somebody_writing_cancels_a_pending_release()
+    {
+        var model = new ScriptedModel(
+            [new ToolCallDelta(0, "call-2", "wait", """{"timeout":3600,"release":true}"""),
+             new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))],
+            [new TextDelta("在的。"), new ModelCompleted(StopReason.EndTurn, new ModelUsage(1, 1))]);
+        var sessions = Manager(model);
+
+        Assert.True((await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+            new SessionTurnInput([], null, null), null, default)).Ok);
+        Assert.NotEqual(System.Text.Json.JsonValueKind.Null, (await StateAsync()).GetProperty("waitUntil").ValueKind);
+
+        // The declaration said "release me if nobody comes". A second activation is somebody coming.
+        Assert.True((await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+            new SessionTurnInput([], null, null), null, default)).Ok);
+
+        var state = await StateAsync();
+        Assert.True(!state.TryGetProperty("waitUntil", out var cleared) ||
+                    cleared.ValueKind == System.Text.Json.JsonValueKind.Null);
+        Assert.False(state.GetProperty("waitRelease").GetBoolean());
+    }
+
+    [Theory]
+    [InlineData("""{"release":true}""", "release needs a timeout")]
+    [InlineData("""{"timeout":0}""", "between 1 and")]
+    [InlineData("""{"timeout":60,"unit":"minutes"}""", "no argument named unit")]
+    public async Task Wait_refuses_arguments_it_does_not_understand_and_the_turn_carries_on(string arguments, string expected)
+    {
+        var model = new ScriptedModel(
+            [new ToolCallDelta(0, "call-2", "wait", arguments), new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))],
+            [new ToolCallDelta(0, "call-3", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
+        var sessions = Manager(model);
+
+        var turn = await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+            new SessionTurnInput([], null, null), null, default);
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+
+        // The refusal comes back as a tool result the model can read, and the turn does not end on it: a typo must
+        // not be recorded as a successful stop, with the error nobody reads.
+        Assert.Equal(2, model.Requests.Count);
+        Assert.Contains(model.Requests[1].Messages, message => message.Role == "tool" &&
+            message.Content?.Contains(expected, StringComparison.Ordinal) == true);
+    }
+
+    [Fact]
+    public async Task A_call_that_keeps_being_refused_stops_the_turn_instead_of_looping_forever()
+    {
+        // The scripted model repeats its last step, so this is a model that will never correct itself.
+        var model = new ScriptedModel(
+            [new ToolCallDelta(0, "call-2", "wait", """{"release":true}"""),
+             new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
+        var sessions = Manager(model);
+
+        var turn = await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+            new SessionTurnInput([], null, null), null, default);
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+
+        // Same brake as a model talking to nobody: what is counted is rounds without progress, not calls.
+        Assert.Equal(SessionManager.TextOnlyNudgeLimit + 1, model.Requests.Count);
+    }
 }

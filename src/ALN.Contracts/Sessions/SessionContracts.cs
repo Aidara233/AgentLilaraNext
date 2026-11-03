@@ -50,7 +50,19 @@ public sealed record SessionState(
     /// so this Session can only ever conflict again — the note is what turns "unexplained dead weight" into
     /// "a stuck instance somebody can decide to drop".
     /// </summary>
-    DateTimeOffset? SupersededAt = null);
+    DateTimeOffset? SupersededAt = null,
+    /// <summary>
+    /// When this Session asked to be woken on its own, or null when it is only waiting for somebody to write.
+    /// Stored rather than held in a timer so that a restart cannot lose the promise: the sweep reads this and
+    /// nothing else. Any inbound activation clears it — a declaration that says "release me if nobody comes"
+    /// is answered by somebody coming.
+    /// </summary>
+    DateTimeOffset? WaitUntil = null,
+    /// <summary>
+    /// Whether the deadline above ends with this Session being archived. Meaningless without a deadline, which
+    /// is why "release without a timeout" is refused instead of being treated as "release never".
+    /// </summary>
+    bool WaitRelease = false);
 
 public sealed record SessionUsage(long InputTokens, long OutputTokens, long CacheReadTokens = 0, long CacheWriteTokens = 0)
 {
