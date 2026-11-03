@@ -536,7 +536,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
                     // With no messages the note *is* the message, so it has to be replayed; an entry carrying a
                     // channel view is not replayed, because the channel block carries that instead.
                     "user", WakeNote(input.WokenAt), DateTimeOffset.UtcNow,
-                    ChannelMessages: input.Messages is { Count: > 0 } messages ? messages : null);
+                    ChannelMessages: input.Messages is { Count: > 0 } carried ? carried : null);
                 var timelineState = state with
                 {
                     Revision = state.Revision + 1,
