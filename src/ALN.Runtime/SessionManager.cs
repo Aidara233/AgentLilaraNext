@@ -10,9 +10,11 @@ using ALN.Contracts.Sessions;
 namespace ALN.Runtime;
 
 /// <summary>Runs one serialized model step per activation and persists completed turns.</summary>
+[Module(SessionManagerId, Category = "session", Role = ModuleRole.Manager, Singleton = true)]
 public sealed class SessionManager : ISessionManager, IModule
 {
-    public ModuleId Id { get; } = new(ModuleNames.SessionManager);
+    public const string SessionManagerId = "SessionManager";
+    public ModuleId Id { get; } = new(SessionManagerId);
 
     private const int StateSchemaVersion = 2;
     private const long MaxStoredHistoryBytes = 64 * 1024 * 1024;

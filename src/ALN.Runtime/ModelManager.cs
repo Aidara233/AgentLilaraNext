@@ -5,9 +5,11 @@ using ALN.Contracts.Models;
 namespace ALN.Runtime;
 
 /// <summary>Core registry and router for provider kinds, provider instances and model profiles.</summary>
+[Module(ModelManagerId, Category = "model", Role = ModuleRole.Manager, Singleton = true)]
 public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? signalLog = null) : IModelManager, IModulePackageResourceRegistry, IModule
 {
-    public ModuleId Id { get; } = new(ModuleNames.ModelManager);
+    public const string ModelManagerId = "ModelManager";
+    public ModuleId Id { get; } = new(ModelManagerId);
 
     private readonly object _gate = new();
     private readonly Dictionary<string, (string PackageId, IModelProviderFactory Factory)> _factories = new(StringComparer.Ordinal);

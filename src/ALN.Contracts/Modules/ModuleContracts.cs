@@ -1,6 +1,26 @@
 namespace ALN.Contracts;
 
 /// <summary>
+/// What a module class says about itself. Every module declares this — the host does not fill it in, because a
+/// registration form the caller fills is a second place the truth can be wrong.
+/// </summary>
+/// <param name="TypeId">The type this class implements, e.g. <c>AdapterManager</c> or <c>Adapter.QQ</c>.</param>
+/// <param name="Category">The namespace it lives in: <c>adapter</c>, <c>channel</c>, <c>session</c>, <c>model</c>.</param>
+/// <param name="Singleton">
+/// True when this class is brought up exactly once. A singleton's id <b>is</b> its type id, and that id is part
+/// of the contract — it is the one id anything is allowed to hard-code. Everything else gets a suffix and is
+/// found by type, never by name.
+/// </param>
+[AttributeUsage(AttributeTargets.Class, Inherited = false)]
+public sealed class ModuleAttribute(string typeId) : Attribute
+{
+    public string TypeId { get; } = typeId;
+    public string Category { get; init; } = "";
+    public ModuleRole Role { get; init; } = ModuleRole.Instance;
+    public bool Singleton { get; init; }
+}
+
+/// <summary>
 /// The only root in the system: a manager, an instance and a script instance are all of these. What a module
 /// can do comes from the interfaces it also implements (the adapter, channel, session and model contracts);
 /// this one only says it exists under a name.
@@ -38,23 +58,12 @@ public interface ICatalog
     /// </summary>
     IReadOnlyList<CatalogEntry> List(string? category = null, string? typeId = null);
 
-    /// <summary>Registers a module. Two modules may not share a name, compared case-insensitively.</summary>
-    Result Attach(IModule module, string typeId, string category, ModuleRole role);
+    /// <summary>
+    /// Registers a module by what its class declared. Two modules may not share a name, compared
+    /// case-insensitively, and a singleton must be named after its own type.
+    /// </summary>
+    Result Attach(IModule module);
 
     Result Detach(ModuleId id);
 }
 
-/// <summary>
-/// The names a person agreed on in advance. These are the only ids anything is allowed to hard-code: everything
-/// else is discovered through the catalog. The constant's name carries the meaning; the string is just a name.
-/// </summary>
-public static class ModuleNames
-{
-    public const string AdapterManager = "AdapterManager";
-    public const string ChannelManager = "ChannelManager";
-    public const string SessionManager = "SessionManager";
-    public const string ModelManager = "ModelManager";
-    public const string GraphManager = "GraphManager";
-    public const string Clock = "Clock";
-    public const string Store = "Store";
-}

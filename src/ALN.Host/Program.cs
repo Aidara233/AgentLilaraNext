@@ -159,17 +159,17 @@ var clock = clockResult.Value;
 // is a *singleton*: the type is the manager class itself — not the category it owns, which is why an adapter
 // lookup by type never returns the manager. The category is the namespace it manages.
 var registrationFailures = new List<string>();
-void Register(IModule module, string category, ModuleRole role)
+void Register(IModule module)
 {
-    var attached = modules.Attach(module, module.GetType().Name, category, role);
+    var attached = modules.Attach(module);
     if (!attached.Ok) registrationFailures.Add(attached.Error?.Message ?? $"Could not register {module.Id}.");
 }
-Register(adapters, "adapter", ModuleRole.Manager);
-Register(modelManager, "model", ModuleRole.Manager);
-Register(sessions, "session", ModuleRole.Manager);
-Register((IModule)channels!, "channel", ModuleRole.Manager);
-Register((IModule)graph!, "graph", ModuleRole.Manager);
-Register((IModule)clock!, "clock", ModuleRole.Manager);
+Register(adapters);
+Register(modelManager);
+Register(sessions);
+Register((IModule)channels!);
+Register((IModule)graph!);
+Register((IModule)clock!);
 if (registrationFailures.Count > 0)
 {
     foreach (var failure in registrationFailures) Console.Error.WriteLine(failure);

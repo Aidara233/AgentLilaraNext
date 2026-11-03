@@ -3,9 +3,11 @@ using ALN.Contracts;
 
 namespace ALN.Clock;
 
+[Module(ClockId, Category = "clock", Role = ModuleRole.Manager, Singleton = true)]
 public sealed class ClockSource : IClockManager, IModule
 {
-    public ModuleId Id { get; } = new(ModuleNames.Clock);
+    public const string ClockId = "Clock";
+    public ModuleId Id { get; } = new(ClockId);
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan SchedulerResolution = TimeSpan.FromMilliseconds(20);

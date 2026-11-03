@@ -1,3 +1,4 @@
+using System.Reflection;
 using ALN.Contracts;
 
 namespace ALN.Runtime;
@@ -40,13 +41,26 @@ public sealed class ModuleCatalog : ICatalog
                 .ToArray();
     }
 
-    public Result Attach(IModule module, string typeId, string category, ModuleRole role)
+    public Result Attach(IModule module)
     {
         ArgumentNullException.ThrowIfNull(module);
         if (module.Id.IsEmpty || !ModuleId.IsLegal(module.Id.Value))
             return Result.Failure(new(ErrorCode.Invalid, $"Not a legal module id: {module.Id.Value ?? "(null)"}"));
-        if (string.IsNullOrWhiteSpace(typeId) || string.IsNullOrWhiteSpace(category))
-            return Result.Failure(new(ErrorCode.Invalid, "A module needs both a type and a category."));
+
+        // What it is called, what type it is and which category it belongs to are the class's own business. The
+        // host used to pass them in, which made the registration call a second place the truth could be wrong.
+        var type = module.GetType();
+        var declared = type.GetCustomAttribute<ModuleAttribute>(inherit: false);
+        if (declared is null)
+            return Result.Failure(new(ErrorCode.Invalid,
+                $"{type.Name} does not declare [Module], so the catalog knows nothing about it."));
+        if (string.IsNullOrWhiteSpace(declared.TypeId) || string.IsNullOrWhiteSpace(declared.Category))
+            return Result.Failure(new(ErrorCode.Invalid, $"{type.Name} declares [Module] without a type or category."));
+        // A singleton's id is part of the contract, so it cannot be an arbitrary name: callers look it up by the
+        // type they agreed on. An instance id is a name and nothing else, which is why only singletons are checked.
+        if (declared.Singleton && !string.Equals(module.Id.Value, declared.TypeId, StringComparison.Ordinal))
+            return Result.Failure(new(ErrorCode.Invalid,
+                $"A singleton must be named after its own type: expected {declared.TypeId}, got {module.Id.Value}."));
 
         lock (_gate)
         {
@@ -56,7 +70,7 @@ public sealed class ModuleCatalog : ICatalog
                 return Result.Failure(new(ErrorCode.Conflict,
                     $"Another module is already registered as {existing.Module.Id}.",
                     existing.TypeId));
-            _byKey.Add(module.Id.Value, new Entry(module, typeId, category, role));
+            _byKey.Add(module.Id.Value, new Entry(module, declared.TypeId, declared.Category, declared.Role));
             return Result.Success();
         }
     }

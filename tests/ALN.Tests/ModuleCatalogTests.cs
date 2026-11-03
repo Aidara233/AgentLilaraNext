@@ -5,12 +5,26 @@ namespace ALN.Tests;
 
 public sealed class ModuleCatalogTests
 {
-    private sealed class Fake(ModuleId id) : IModule
+    [Module("Fake.Manager", Category = "fake", Role = ModuleRole.Manager, Singleton = true)]
+    private sealed class FakeManager(ModuleId id) : IModule
     {
         public ModuleId Id { get; } = id;
     }
 
-    private static Fake Module(string id) => new(new ModuleId(id));
+    [Module("Fake.Thing", Category = "fake")]
+    private sealed class FakeThing(ModuleId id) : IModule
+    {
+        public ModuleId Id { get; } = id;
+    }
+
+    /// <summary>A module that says nothing about itself. The catalog must refuse it rather than invent a type.</summary>
+    private sealed class Undeclared(ModuleId id) : IModule
+    {
+        public ModuleId Id { get; } = id;
+    }
+
+    private static IModule Manager(string id) => new FakeManager(new ModuleId(id));
+    private static IModule Thing(string id) => new FakeThing(new ModuleId(id));
 
     [Theory]
     [InlineData("AdapterManager")]
@@ -48,15 +62,56 @@ public sealed class ModuleCatalogTests
     }
 
     [Fact]
-    public void The_catalog_finds_by_name()
+    public void The_catalog_finds_a_singleton_by_name()
     {
         var catalog = new ModuleCatalog();
-        var manager = Module(ModuleNames.AdapterManager);
-        Assert.True(catalog.Attach(manager, "AdapterManager", "adapter", ModuleRole.Manager).Ok);
+        var manager = Manager("Fake.Manager");
+        Assert.True(catalog.Attach(manager).Ok);
 
-        Assert.Same(manager, catalog.Find(new ModuleId(ModuleNames.AdapterManager)));
-        Assert.True(catalog.Require(new ModuleId(ModuleNames.AdapterManager)).Ok);
+        Assert.Same(manager, catalog.Find(new ModuleId("Fake.Manager")));
+        Assert.True(catalog.Require(new ModuleId("Fake.Manager")).Ok);
         Assert.False(catalog.Require(new ModuleId("Nobody")).Ok);
+    }
+
+    [Fact]
+    public void What_a_module_is_comes_from_its_own_declaration()
+    {
+        // Not from the registration call: the host used to pass type, category and role, which made every call
+        // site a second place the truth could be wrong.
+        var catalog = new ModuleCatalog();
+        Assert.True(catalog.Attach(Manager("Fake.Manager")).Ok);
+        Assert.True(catalog.Attach(Thing("Fake.Thing#1")).Ok);
+
+        var manager = Assert.Single(catalog.List(category: "fake", typeId: "Fake.Manager"));
+        Assert.Equal(ModuleRole.Manager, manager.Role);
+        var thing = Assert.Single(catalog.List(typeId: "Fake.Thing"));
+        Assert.Equal(ModuleRole.Instance, thing.Role);
+    }
+
+    [Fact]
+    public void A_class_that_declares_nothing_is_refused()
+    {
+        var catalog = new ModuleCatalog();
+
+        var attached = catalog.Attach(new Undeclared(new ModuleId("Mystery")));
+
+        Assert.False(attached.Ok);
+        Assert.Equal(ErrorCode.Invalid, attached.Error!.Code);
+        Assert.Contains("[Module]", attached.Error.Message);
+    }
+
+    [Fact]
+    public void A_singleton_must_be_named_after_its_own_type()
+    {
+        // Its name is part of the contract, so it cannot be arbitrary; an instance name is just a name, so only
+        // singletons are checked.
+        var catalog = new ModuleCatalog();
+
+        var wrong = catalog.Attach(Manager("SomethingElse"));
+        Assert.False(wrong.Ok);
+        Assert.Contains("Fake.Manager", wrong.Error!.Message);
+
+        Assert.True(catalog.Attach(Thing("whatever-anyone-likes")).Ok);
     }
 
     [Fact]
@@ -65,9 +120,9 @@ public sealed class ModuleCatalogTests
         // The file system does not distinguish them, so neither may the catalog: otherwise the second one
         // quietly takes over the first one's row without anybody noticing.
         var catalog = new ModuleCatalog();
-        Assert.True(catalog.Attach(Module("Adapter.QQ#ABCDEF12"), "Adapter.QQ", "adapter", ModuleRole.Instance).Ok);
+        Assert.True(catalog.Attach(Thing("Fake.Thing#ABCDEF12")).Ok);
 
-        var again = catalog.Attach(Module("adapter.qq#abcdef12"), "Adapter.QQ", "adapter", ModuleRole.Instance);
+        var again = catalog.Attach(Thing("fake.thing#abcdef12"));
 
         Assert.False(again.Ok);
         Assert.Equal(ErrorCode.Conflict, again.Error!.Code);
@@ -78,7 +133,7 @@ public sealed class ModuleCatalogTests
     public void An_illegal_name_cannot_be_registered()
     {
         var catalog = new ModuleCatalog();
-        var attached = catalog.Attach(Module("a/b"), "Adapter.QQ", "adapter", ModuleRole.Instance);
+        var attached = catalog.Attach(Thing("a/b"));
 
         Assert.False(attached.Ok);
         Assert.Equal(ErrorCode.Invalid, attached.Error!.Code);
@@ -89,27 +144,24 @@ public sealed class ModuleCatalogTests
     {
         // An instance id cannot be guessed, so this is the only way to reach one: filtering, not id arithmetic.
         var catalog = new ModuleCatalog();
-        catalog.Attach(Module(ModuleNames.AdapterManager), "AdapterManager", "adapter", ModuleRole.Manager);
-        catalog.Attach(Module("Adapter.QQ#1"), "Adapter.QQ", "adapter", ModuleRole.Instance);
-        catalog.Attach(Module("Adapter.File#1"), "Adapter.File", "adapter", ModuleRole.Instance);
-        catalog.Attach(Module(ModuleNames.SessionManager), "SessionManager", "session", ModuleRole.Manager);
+        catalog.Attach(Manager("Fake.Manager"));
+        catalog.Attach(Thing("Fake.Thing#1"));
+        catalog.Attach(Thing("Fake.Thing#2"));
 
-        Assert.Equal(4, catalog.List().Count);
-        Assert.Equal(3, catalog.List(category: "adapter").Count);
-        // The manager is not an adapter: it has its own type, and a type lookup must not return it.
-        var qq = Assert.Single(catalog.List(typeId: "Adapter.QQ"));
-        Assert.Equal("Adapter.QQ#1", qq.Id.Value);
-        Assert.Equal(ModuleRole.Instance, qq.Role);
+        Assert.Equal(3, catalog.List().Count);
+        Assert.Equal(3, catalog.List(category: "fake").Count);
+        // The manager is not an instance of the thing: it has its own type, and a type lookup must not return it.
+        Assert.Equal(2, catalog.List(typeId: "Fake.Thing").Count);
     }
 
     [Fact]
     public void A_module_can_be_removed_by_name()
     {
         var catalog = new ModuleCatalog();
-        catalog.Attach(Module("Adapter.QQ#1"), "Adapter.QQ", "adapter", ModuleRole.Instance);
+        catalog.Attach(Thing("Fake.Thing#1"));
 
-        Assert.True(catalog.Detach(new ModuleId("Adapter.QQ#1")).Ok);
+        Assert.True(catalog.Detach(new ModuleId("Fake.Thing#1")).Ok);
         Assert.Empty(catalog.List());
-        Assert.False(catalog.Detach(new ModuleId("Adapter.QQ#1")).Ok);
+        Assert.False(catalog.Detach(new ModuleId("Fake.Thing#1")).Ok);
     }
 }

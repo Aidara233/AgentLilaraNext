@@ -92,9 +92,11 @@ public sealed class AdapterTypeCatalog : IModuleTypeRegistry
     }
 }
 
+[Module(AdapterManagerId, Category = "adapter", Role = ModuleRole.Manager, Singleton = true)]
 public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IModule
 {
-    public ModuleId Id { get; } = new(ModuleNames.AdapterManager);
+    public const string AdapterManagerId = "AdapterManager";
+    public ModuleId Id { get; } = new(AdapterManagerId);
 
     private readonly Dictionary<Address, IChatAdapter> _adapters = new();
     private readonly IModuleTypeCatalog _types;
