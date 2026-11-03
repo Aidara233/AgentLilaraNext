@@ -210,7 +210,7 @@ Runtime 核心 ──持有──▶ AdapterManager、事件队列、包注册�
 
 | 文档 | 说的 | 代码里的 | 后果 |
 |---|---|---|---|
-| [`01`](01-模块切分.md) / [`10 §5.1`](10-接口契约.md) | 会话是模块：`SessionManager` 是唯一模块，`Session.Chat#…` 是实例，`CreateAsync(spec) → ModuleId`；会话对外只有 `provideContext` / `complete` / `speak` / `turn.*` | `IModule`、`ModuleId`、目录都已就位，适配器/频道/模型实例也已能按名字查到（`IModuleIndex`）；**但会话还没接进来**：`SessionManager` 不回答任何实例、模块类型目录里没有 `session`（`Runtime.cs:12-19`）、图的目标只列 adapter 与 channel，会话只有 `RunTurnAsync(sessionId, spec, …)`，id 还是地址哈希算出来的（`GraphManager.cs:762`） | 会话不是可寻址实例：时钟的脉冲打不到它、脚本挂不上它、除 `session.activate` 外没有任何入口。**"非频道唤醒"因此无处着陆**，只能先用宿主级扫描代偿（[`20`](20-会话收尾.md) §4）。另：`01 §12` 列了六处"靠读 id 活着"的现存违规 |
+| [`01`](01-模块切分.md) / [`10 §5.1`](10-接口契约.md) | 会话是模块：`SessionManager` 是唯一模块，`Session.Chat#…` 是实例，`OpenAsync(name, spec)` 命名即创建；会话对外只有 `provideContext` / `complete` / `speak` / `turn.*` | 会话已是模块：`ISession` 句柄、`session.chat` 类型、按名字可查、启动收据里有 `session N`；spec 只在创建时定。**还差两件**：会话 id 仍由地址哈希派生（替身，等 [`19`](19-会话连接.md) 的 connection 解析）、会话对外的两个函数调用（`provideContext` / `complete`）还没变成模块接口，现在仍是图直接 `RunTurnAsync` | 会话能被找到、被叫醒、被挂载了，但"它只认识脚本实例"这一层还没落地：模型与上下文仍由宿主拉给它 |
 | [`08 §10.2 / §10.3`](08-会话与循环.md) | 系统块是"全局快照 + 全局重载" | 每会话每轮读盘（`11 §6.0` 已定，`SessionSpec.Prompts` 只存组名） | 按文档写会做出一个不存在的机制 |
 
 每一条都只有两个出口：**补实现，或者改文档**。在定下来之前，不要照着左列写代码。
