@@ -9,8 +9,10 @@ using ALN.Graph.Contracts;
 
 namespace ALN.Graph;
 
-public sealed class GraphManager : IGraphRuntime
+public sealed class GraphManager : IGraphRuntime, IModule
 {
+    public ModuleId Id { get; } = new(ModuleNames.GraphManager);
+
     private static readonly HashSet<string> AllowedCapabilities = new(StringComparer.Ordinal)
     { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelRoute, ScriptCapabilities.ChannelReply, ScriptCapabilities.ModelComplete, ScriptCapabilities.SessionRun, ScriptCapabilities.SessionActivate };
     private readonly IAdapterManager _adapters;

@@ -92,8 +92,10 @@ public sealed class AdapterTypeCatalog : IModuleTypeRegistry
     }
 }
 
-public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant
+public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IModule
 {
+    public ModuleId Id { get; } = new(ModuleNames.AdapterManager);
+
     private readonly Dictionary<Address, IChatAdapter> _adapters = new();
     private readonly IModuleTypeCatalog _types;
     private readonly IInstanceBindings _bindings;

@@ -3,8 +3,10 @@ using ALN.Contracts;
 
 namespace ALN.Clock;
 
-public sealed class ClockSource : IClockManager
+public sealed class ClockSource : IClockManager, IModule
 {
+    public ModuleId Id { get; } = new(ModuleNames.Clock);
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan SchedulerResolution = TimeSpan.FromMilliseconds(20);
     private readonly IEventSink _events;

@@ -9,8 +9,10 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
     IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IQueuedMessageStore? queue = null,
     ISessionManager? sessions = null, IArchiveRegistry? archive = null)
-    : IChannelManager, ILifecycleParticipant
+    : IChannelManager, ILifecycleParticipant, IModule
 {
+    public ModuleId Id { get; } = new(ModuleNames.ChannelManager);
+
     /// <summary>Where the wish "this Channel should be running" is kept, so a stop survives a restart.</summary>
     public const string DesiredScope = "channel.desired";
 

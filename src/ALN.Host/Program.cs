@@ -38,6 +38,8 @@ foreach (var legacy in new[] { "state", "messages", "audit" })
 await using var signalLog = SignalLog.Open(Path.Combine(data.Root, "logs"));
 var moduleLoggers = new SignalModuleLoggerFactory(signalLog);
 var queue = new EventQueue(capacity: 256);
+// The address book. Not a module itself: if it were, finding a module would require a module.
+var modules = new ModuleCatalog();
 var adapterSpecs = new FileAdapterSpecStore(Path.Combine(data.Root, "adapters"));
 var channelSpecs = new FileChannelSpecStore(Path.Combine(data.Root, "channels"));
 var adapterTypes = new AdapterTypeCatalog();
@@ -98,6 +100,7 @@ var hostServices = new HostServiceProvider(
     (typeof(ISignalLog), signalLog),
     (typeof(IModuleLoggerFactory), moduleLoggers),
     (typeof(IAuditSink), auditSink),
+    (typeof(ICatalog), modules),
     (typeof(IModuleReloadStateStore), reloadState),
     (typeof(ModuleHostPaths), new ModuleHostPaths(AppContext.BaseDirectory, data.Root)));
 var moduleServices = new ModuleServiceRegistry(hostServices);
@@ -151,10 +154,33 @@ if (!graphResult.Ok || graphResult.Value is null || !channelResult.Ok || channel
 }
 var graph = graphResult.Value;
 var channels = channelResult.Value;
+var clock = clockResult.Value;
+// The address book comes up before anything else and is filled in as modules appear. Every registration here
+// is a *singleton*: the type is the manager class itself — not the category it owns, which is why an adapter
+// lookup by type never returns the manager. The category is the namespace it manages.
+var registrationFailures = new List<string>();
+void Register(IModule module, string category, ModuleRole role)
+{
+    var attached = modules.Attach(module, module.GetType().Name, category, role);
+    if (!attached.Ok) registrationFailures.Add(attached.Error?.Message ?? $"Could not register {module.Id}.");
+}
+Register(adapters, "adapter", ModuleRole.Manager);
+Register(modelManager, "model", ModuleRole.Manager);
+Register(sessions, "session", ModuleRole.Manager);
+Register((IModule)channels!, "channel", ModuleRole.Manager);
+Register((IModule)graph!, "graph", ModuleRole.Manager);
+Register((IModule)clock!, "clock", ModuleRole.Manager);
+if (registrationFailures.Count > 0)
+{
+    foreach (var failure in registrationFailures) Console.Error.WriteLine(failure);
+    return 1;
+}
+// Which modules exist is not something anybody can discover from a log, and a catalogue that silently failed to
+// register would look exactly like one with nothing in it.
+restore.Note("modules", $"{modules.Count} registered: {string.Join(", ", modules.List().Select(entry => entry.Id.Value))}");
 var channelDelta = new FileChannelDeltaSource(messageStore, stateStore);
 var deltaContributor = roundContextContributors.Register(new ChannelDeltaContributor(channelDelta, channels));
 if (!deltaContributor.Ok) { Console.Error.WriteLine(deltaContributor.Error?.Message); return 1; }
-var clock = clockResult.Value;
 // The manager owns adapter startup; it only needs the heartbeat wired before the signal arrives.
 adapters.UseHeartbeat(new RecordingEventSink(queue, messageStore), clock, TimeSpan.FromSeconds(1));
 var adapterPackage = await modulePackages.LoadAsync(
