@@ -17,15 +17,11 @@ public sealed class GraphManager : IGraphRuntime, IModule
 
     private static readonly HashSet<string> AllowedCapabilities = new(StringComparer.Ordinal)
     { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelRoute, ScriptCapabilities.ChannelReply, ScriptCapabilities.ModelComplete, ScriptCapabilities.SessionRun, ScriptCapabilities.SessionActivate };
-    private readonly IAdapterManager _adapters;
-    private readonly IChannelManager _channels;
-    private readonly IClockManager _clock;
+    private readonly ICatalog _catalog;
     private readonly IModuleTypeCatalog _types;
     private readonly IScriptExecutor _executor;
     private readonly IAuditSink _audit;
     private readonly ISignalLog _signalLog;
-    private readonly IModelManager? _models;
-    private readonly ISessionManager? _sessions;
     private readonly Dictionary<string, ScriptPackage> _packages = new(StringComparer.Ordinal);
     private readonly List<MountedScript> _mounted = new();
     // Durable intents: what should be mounted, not what happens to be mounted right now. A rule whose
@@ -49,10 +45,35 @@ public sealed class GraphManager : IGraphRuntime, IModule
     public const string StateScope = "graph";
     public const string StateKey = "mounts";
 
-    public GraphManager(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IModuleTypeCatalog types,
-        IScriptExecutor executor, IAuditSink audit, ISignalLog signalLog, IModelManager? models = null, ISessionManager? sessions = null,
-        IStateStore? state = null, IRestoreReporter? report = null)
-    { _adapters = adapters; _channels = channels; _clock = clock; _types = types; _executor = executor; _audit = audit; _signalLog = signalLog; _models = models; _sessions = sessions; _state = state; _report = report ?? NullRestoreReporter.Instance; }
+    /// <summary>
+    /// The graph knows the address book and four things it cannot get from it (type tree, script runner, audit,
+    /// signal log). It holds no manager: a manager is found by its contract name when it is needed, which is also
+    /// what keeps "who is allowed to talk to whom" a question about names rather than about constructor graphs.
+    /// </summary>
+    public GraphManager(ICatalog catalog, IModuleTypeCatalog types, IScriptExecutor executor, IAuditSink audit,
+        ISignalLog signalLog, IStateStore? state = null, IRestoreReporter? report = null)
+    {
+        _catalog = catalog; _types = types; _executor = executor; _audit = audit; _signalLog = signalLog;
+        _state = state; _report = report ?? NullRestoreReporter.Instance;
+    }
+
+    private static ModuleId IdOf(Address address) => new(address.ToString());
+
+    /// <summary>The one module that answers to that name, by the contract name it was registered under.</summary>
+    private T Require<T>(string id) where T : class =>
+        _catalog.Find(new ModuleId(id)) as T
+        ?? throw new InvalidOperationException(
+            $"The graph needs {id}, and the address book has nothing of that name as {typeof(T).Name}.");
+
+    /// <summary>Same, for a manager the host may not have brought up at all.</summary>
+    private T? Maybe<T>(string id, string category) where T : class =>
+        _catalog.List(category: category).Any(row => row.Role is ModuleRole.Manager) ? _catalog.Find(new ModuleId(id)) as T : null;
+
+    private IAdapterManager Adapters => Require<IAdapterManager>(ModuleNames.AdapterManager);
+    private IChannelManager Channels => Require<IChannelManager>(ModuleNames.ChannelManager);
+    private IClockManager Clock => Require<IClockManager>(ModuleNames.Clock);
+    private IModelManager? Models => Maybe<IModelManager>(ModuleNames.ModelManager, "model");
+    private ISessionManager? Sessions => Maybe<ISessionManager>(ModuleNames.SessionManager, "session");
 
     public IReadOnlyList<MountedScript> Mounted
     { get { _gate.Wait(); try { return _mounted.ToArray(); } finally { _gate.Release(); } } }
@@ -144,11 +165,11 @@ public sealed class GraphManager : IGraphRuntime, IModule
                     return Result<MountRule>.Failure(new(ErrorCode.Invalid, "Instance scope needs a concrete address."));
                 if (_drainingTargets.Contains(named))
                     return Result<MountRule>.Failure(new(ErrorCode.Unavailable, "Manual mount target is draining.", Retryable: true));
-                if (!TargetExists(named) || !IsCompatible(package.Manifest.TargetType, named))
+                if (TargetOf(named) is not { } namedTarget || !IsCompatible(package.Manifest.TargetType, namedTarget))
                     return Result<MountRule>.Failure(new(ErrorCode.Invalid, "Manual mount target is absent or incompatible."));
             }
             else if (targets.Any(target => Matches(request.Scope, target) && IsCompatible(package.Manifest.TargetType, target) &&
-                                           _mounted.Any(m => m.Package.Manifest.Id == request.ScriptId && m.Target == target)))
+                                           _mounted.Any(m => m.Package.Manifest.Id == request.ScriptId && m.Target == target.Address)))
             {
                 return Result<MountRule>.Failure(new(ErrorCode.Conflict, "Script is already mounted on a matching target."));
             }
@@ -219,12 +240,23 @@ public sealed class GraphManager : IGraphRuntime, IModule
 
     private static string NewRuleId() => "r" + Guid.NewGuid().ToString("N")[..8];
 
-    private Address[] Targets() =>
-        _adapters.List().Select(a => a.Address).Concat(_channels.List().Select(c => c.Address)).ToArray();
+    private Target[] Targets() =>
+        _catalog.List()
+            .Where(row => row.Role is ModuleRole.Instance)
+            .Select(row => _catalog.Find(row.Id) is IAddressed addressed ? new Target(addressed.Address, row.TypeId) : (Target?)null)
+            .Where(target => target is not null)
+            .Select(target => target!.Value)
+            .ToArray();
 
-    private bool Matches(MountScope scope, Address target) => scope.Kind switch
+    /// <summary>
+    /// A mount target as the address book describes it: where it is, and what it is. The two travel together
+    /// because the mount rules match on the type — and the type comes from the catalog row, never from the name.
+    /// </summary>
+    private readonly record struct Target(Address Address, string TypeId);
+
+    private bool Matches(MountScope scope, Target target) => scope.Kind switch
     {
-        MountScopeKind.Instance => Address.TryParse(scope.Selector, out var named) && named == target,
+        MountScopeKind.Instance => Address.TryParse(scope.Selector, out var named) && named == target.Address,
         // "channel" (a module) and "channel.conversation" (a type) are the same walk up the type tree;
         // keeping them separate kinds is about what a person means, and about validating it.
         MountScopeKind.Type or MountScopeKind.Module => _types.IsAssignableTo(target.TypeId, scope.Selector),
@@ -232,21 +264,21 @@ public sealed class GraphManager : IGraphRuntime, IModule
     };
 
     /// <summary>True when this rule actually puts a script on this target right now.</summary>
-    private bool Resolves(MountRule rule, Address target) =>
-        !rule.IsSpent(target) &&
+    private bool Resolves(MountRule rule, Target target) =>
+        !rule.IsSpent(target.Address) &&
         Matches(rule.Scope, target) &&
         _packages.TryGetValue(rule.ScriptId, out var package) &&
         IsEnabled(package) &&
         IsCompatible(package.Manifest.TargetType, target);
 
     /// <summary>Call with the gate held: brings one target in line with every rule that names it.</summary>
-    private void ApplyRulesTo(Address target)
+    private void ApplyRulesTo(Target target)
     {
         foreach (var rule in _rules)
         {
             if (!Resolves(rule, target)) continue;
-            if (_mounted.Any(m => m.Package.Manifest.Id == rule.ScriptId && m.Target == target)) continue;
-            _mounted.Add(new(_packages[rule.ScriptId], target, rule.Id, rule.RemainingFor(target)));
+            if (_mounted.Any(m => m.Package.Manifest.Id == rule.ScriptId && m.Target == target.Address)) continue;
+            _mounted.Add(new(_packages[rule.ScriptId], target.Address, rule.Id, rule.RemainingFor(target.Address)));
         }
     }
 
@@ -319,7 +351,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
         // Two sources, one list: bundle scripts follow their package, rules follow a durable intent.
         foreach (var package in _packages.Values.Where(package => package.Manifest.Mount == MountMode.Default && IsEnabled(package)))
         foreach (var target in Targets())
-            if (IsCompatible(package.Manifest.TargetType, target)) _mounted.Add(new(package, target));
+            if (IsCompatible(package.Manifest.TargetType, target)) _mounted.Add(new(package, target.Address));
         foreach (var target in Targets()) ApplyRulesTo(target);
     }
 
@@ -452,14 +484,15 @@ public sealed class GraphManager : IGraphRuntime, IModule
         try
         {
             if (!_loaded) return Result.Failure(new(ErrorCode.Unavailable, "Graph scripts are not loaded."));
-            if (!_types.IsConcrete(target.TypeId)) return Result.Failure(new(ErrorCode.Invalid, "Mount target must be a concrete module instance."));
-            if (!TargetExists(target)) return Result.Failure(new(ErrorCode.Invalid, $"Mount target not found: {target}"));
+            var resolved = TargetOf(target);
+            if (resolved is not { } mountTarget || !_types.IsConcrete(mountTarget.TypeId))
+                return Result.Failure(new(ErrorCode.Invalid, $"Mount target must be a concrete module instance: {target}"));
             _drainingTargets.Remove(target);
-            foreach (var package in _packages.Values.Where(p => p.Manifest.Mount == MountMode.Default && IsEnabled(p) && IsCompatible(p.Manifest.TargetType, target)))
+            foreach (var package in _packages.Values.Where(p => p.Manifest.Mount == MountMode.Default && IsEnabled(p) && IsCompatible(p.Manifest.TargetType, mountTarget)))
                 if (!_mounted.Any(m => m.Package.Manifest.Id == package.Manifest.Id && m.Target == target)) _mounted.Add(new(package, target));
             // A target that appears now is also a target that some rule was already waiting for.
             var beforeRules = _mounted.Count(m => m.RuleId is not null);
-            ApplyRulesTo(target);
+            ApplyRulesTo(mountTarget);
             var applied = _mounted.Count(m => m.RuleId is not null) - beforeRules;
             if (applied > 0) _report.Note("graph", $"{applied} waiting rule(s) applied to {target}");
             return Result.Success();
@@ -547,7 +580,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
     {
         var target = routedEvent.Target ?? routedEvent.Source;
         ClockPulse? clockPulse = null;
-        if (routedEvent.Name == EventNames.ClockPulse && routedEvent.Source == _clock.Address && routedEvent.Target is not null)
+        if (routedEvent.Name == EventNames.ClockPulse && routedEvent.Source == Clock.Address && routedEvent.Target is not null)
         {
             try { clockPulse = JsonSerializer.Deserialize<ClockPulse>(routedEvent.PayloadJson, JsonOptions); }
             catch (JsonException) { }
@@ -621,7 +654,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
                 Result result;
                 using (SignalScope.Enter(invocationId, routedEvent.EventId))
                 {
-                    var api = new ScriptApi(_adapters, _channels, _clock, _audit, _signalLog, _models, _sessions, mount, routedEvent,
+                    var api = new ScriptApi(Adapters, Channels, Clock, _audit, _signalLog, Models, Sessions, mount, routedEvent,
                         stateScopes[handlerIndex], _state, deadline.Token);
                     result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
                 }
@@ -662,7 +695,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
             eventScope?.Dispose();
             if (dispatchEntered) await EndDispatchAsync(target).ConfigureAwait(false);
             if (clockPulse is not null && routedEvent.Target is { } clockTarget)
-                await _clock.AcknowledgeAsync(clockPulse.SubscriptionId, clockTarget, routedEvent.EventId, CancellationToken.None).ConfigureAwait(false);
+                await Clock.AcknowledgeAsync(clockPulse.SubscriptionId, clockTarget, routedEvent.EventId, CancellationToken.None).ConfigureAwait(false);
         }
     }
 
@@ -683,11 +716,19 @@ public sealed class GraphManager : IGraphRuntime, IModule
         finally { _gate.Release(); }
     }
 
-    private bool IsCompatible(string targetType, Address target) => _types.IsAssignableTo(target.TypeId, targetType);
+    private bool IsCompatible(string targetType, Target target) => _types.IsAssignableTo(target.TypeId, targetType);
     /// <summary>Stable edge identity derived from assembly-time data, not runtime names.</summary>
     internal static string EdgeId(MountedScript mount, string eventName) =>
-        $"{mount.Package.Manifest.Id}@{mount.Target}#{eventName}";    private bool TargetExists(Address target) => target.Module switch
-    { "adapter" => _adapters.Get(target).Ok, "channel" => _channels.Get(target).Ok, _ => false };
+        $"{mount.Package.Manifest.Id}@{mount.Target}#{eventName}";    /// <summary>The target as the address book describes it, or null when nothing answering that name can be mounted
+    /// on. The type comes from the catalog row; reading it out of the address is not an option.
+    private Target? TargetOf(Address address)
+    {
+        var id = IdOf(address);
+        var row = _catalog.Describe(id);
+        if (row is null || row.Role is not ModuleRole.Instance) return null;
+        return _catalog.Find(id) is IAddressed addressed ? new Target(addressed.Address, row.TypeId) : null;
+    }
+
 
     private sealed class ScriptApi(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IAuditSink audit,
         ISignalLog signalLog, IModelManager? models, ISessionManager? sessions, MountedScript mount, RoutedEvent current,

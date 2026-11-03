@@ -62,7 +62,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     {
         lock (_gate)
             return _channels.TryGetValue(id, out var channel)
-                ? new LocatedModule(channel, new CatalogEntry(channel.Id, channel.TypeId ?? "", Category, ModuleRole.Instance))
+                ? new LocatedModule(channel, new CatalogEntry(channel.Id, channel.TypeId, Category, ModuleRole.Instance))
                 : null;
     }
 
@@ -493,7 +493,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         return Result.Success();
     }
 
-    private sealed class ChannelInstance(ChannelSpec spec) : IModule
+    private sealed class ChannelInstance(ChannelSpec spec) : IAddressed, IModule
     {
         public Address Address { get; } = spec.Address;
         /// <summary>The address is the name; the catalog and the graph reach the instance by this.</summary>
@@ -505,7 +505,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         public string? ModelProfile { get; set; }
         public bool Running { get; set; }
         public bool Draining { get; set; }
-        public string? TypeId => spec.TypeId;
+        public string TypeId => spec.TypeId;
 
         public ChannelInfo ToInfo() => new(Address, Name, Bindings, Running, spec.TypeId, MaxMessages, ModelProfile);
 

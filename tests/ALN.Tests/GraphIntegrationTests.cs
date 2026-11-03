@@ -27,6 +27,7 @@ public sealed class GraphIntegrationTests : IDisposable
     private readonly GraphBindingProxy _bindings = new();
     private readonly AdapterManager _adapters;
     private readonly ChannelManager _channels;
+    private readonly ModuleCatalog _catalog;
     private readonly GraphManager _graph;
     private readonly FileMailbox _mailbox;
     private readonly FileAdapter _adapter;
@@ -46,8 +47,10 @@ public sealed class GraphIntegrationTests : IDisposable
         _adapters = new AdapterManager(_types, _bindings);
         _channels = new ChannelManager(_adapters, _events, _bindings);
         _sessions = new SessionManager(Path.Combine(_root, "sessions"), _model);
-        _graph = new GraphManager(_adapters, _channels, _clock, _types, new JintScriptExecutor(), _audit, _signals,
-            _model, _sessions);
+        // The graph finds its managers through the address book, exactly as the host wires it: names in, then the
+        // instance owners observed so the graph can enumerate mount targets without knowing what kinds exist.
+        _catalog = ModuleWiring.With(_adapters, _channels, _clock, _sessions);
+        _graph = new GraphManager(_catalog, _types, new JintScriptExecutor(), _audit, _signals, state: null);
         _bindings.Bind(_graph);
         _mailbox = new FileMailbox(Path.Combine(_root, "adapters", "test-1"));
         _adapter = new FileAdapter(new(_adapterAddress, new("file", "test-account", AdapterDirection.Both), "adapter.file"),
@@ -498,6 +501,49 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.False(dispatched.Ok);
         Assert.Empty(_channels.List());
         Assert.Contains(_signals.Snapshot(), r => r.Outcome == "denied");
+    }
+
+    /// <summary>
+    /// A mount target is whatever the address book says belongs to a type — not whatever falls into one of the two
+    /// categories the old dispatcher knew by name. The gadget here is a kind the graph has never heard of.
+    /// </summary>
+    [Fact]
+    public async Task A_kind_the_graph_has_never_heard_of_becomes_a_mount_target_by_being_in_the_catalog()
+    {
+        Assert.True(_adapterTypes.RegisterPackageTypes("test.gadget", [new("gadget", null, IsAbstract: true)]).Ok);
+        Assert.True(_adapterTypes.RegisterPackageTypes("test.gadget.thing", [new("gadget.thing", "gadget")]).Ok);
+        var gadget = new Address("gadget", "thing", "g-1");
+        var owner = new GadgetOwner(gadget);
+        var catalog = ModuleWiring.With(_adapters, _channels, _clock, owner);
+        var graph = new GraphManager(catalog, _types, new JintScriptExecutor(), _audit, _signals);
+        // A script that says it wants "gadget" targets. Nothing in the graph knows that word.
+        var watcher = new ScriptPackage(
+            new("gadget.watcher", 1, "gadget", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
+                [ScriptCapabilities.ChannelAccept], TrustDomain.Builtin),
+            "async function onEvent(event, ctx) { }");
+
+        Assert.True((await graph.LoadAsync([watcher], default)).Ok);
+
+        // It found one without being told what a gadget is: the address book said what belongs to the type.
+        Assert.Contains(graph.Mounted, mount => mount.Target == gadget);
+    }
+
+    /// <summary>An owner of one instance of a kind that exists only in this test.</summary>
+    private sealed class GadgetOwner(Address address) : IModuleIndex
+    {
+        public string Category => "gadget";
+        public IModule Module { get; } = new Gadget(address);
+        public LocatedModule? Locate(ModuleId id) => id == Module.Id
+            ? new LocatedModule(Module, new CatalogEntry(Module.Id, "gadget.thing", Category, ModuleRole.Instance))
+            : null;
+        public IReadOnlyList<CatalogEntry> Entries() =>
+            [new CatalogEntry(Module.Id, "gadget.thing", Category, ModuleRole.Instance)];
+    }
+
+    private sealed class Gadget(Address address) : IAddressed, IModule
+    {
+        public Address Address { get; } = address;
+        public ModuleId Id => new(Address.ToString());
     }
 
     private async Task<Result> DispatchEnvelopeAsync(AdapterEnvelope envelope) => await _graph.DispatchAsync(

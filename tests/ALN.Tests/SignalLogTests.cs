@@ -69,7 +69,7 @@ public sealed class SignalLogTests : IDisposable
         var clock = new ALN.Clock.ClockSource(events);
         // Channel manager is not reachable on this path; denial happens before any resource is touched.
         var channels = new ALN.Channel.ChannelManager(adapters, events, bindings);
-        var graph = new GraphManager(adapters, channels, clock, types, new JintScriptExecutor(), audit, signals);
+        var graph = new GraphManager(ModuleWiring.With(adapters, channels, clock), types, new JintScriptExecutor(), audit, signals);
         bindings.Bind(graph);
 
         // Declares no capabilities but calls one: RequireCapabilityAsync must deny.

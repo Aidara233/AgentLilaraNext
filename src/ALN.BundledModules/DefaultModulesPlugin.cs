@@ -38,8 +38,8 @@ public sealed class DefaultModulesPlugin : IModulePlugin
             var journal = HostService<ISignalLog>(context);
             var audit = HostService<IAuditSink>(context);
             var paths = HostService<ModuleHostPaths>(context);
-            var models = HostService<IModelManager>(context);
             var sessions = HostService<ISessionManager>(context);
+            var catalog = HostService<ICatalog>(context);
 
             var clock = new ClockSource(events);
             // The bin, if this host loaded one. Everything that can pile up registers here; the archive package
@@ -58,7 +58,7 @@ public sealed class DefaultModulesPlugin : IModulePlugin
                 context.HostServices.GetService(typeof(IParameterRegistry)) as IParameterRegistry,
                 state, report, atomic, queue, sessions, registry);
             var executor = new JintScriptExecutor();
-            var graph = new GraphManager(adapters, channels, clock, types, executor, audit, journal, models, sessions, state, report);
+            var graph = new GraphManager(catalog, types, executor, audit, journal, state, report);
             if (bindings is IInstanceBindingsProxy proxy) proxy.Bind(graph);
 
             // Sessions know better than anyone which of their directories stopped being useful; the archive

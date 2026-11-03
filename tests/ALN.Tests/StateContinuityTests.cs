@@ -470,8 +470,8 @@ public sealed class StateContinuityTests : IDisposable
             Adapters = new AdapterManager(_types, _bindings);
             Channels = new ChannelManager(Adapters, Events, _bindings,
                 new FileChannelSpecStore(Path.Combine(root, "channels")), Storage, Parameters, Storage, Report, Storage, Storage);
-            Graph = new GraphManager(Adapters, Channels, Clock, _types, new JintScriptExecutor(), Storage, Signals,
-                state: Storage, report: Report);
+            Catalog = ModuleWiring.With(Adapters, Channels, Clock);
+            Graph = new GraphManager(Catalog, _types, new JintScriptExecutor(), Storage, Signals, state: Storage, report: Report);
             _bindings.Bind(Graph);
             Settlers = new EventSettlers(new ChannelAcceptSettler(Channels), new InboundAckSettler(Acks));
             Mailbox = new FileMailbox(Path.Combine(root, "io", "file", "file-1"));
@@ -489,6 +489,7 @@ public sealed class StateContinuityTests : IDisposable
         public ClockSource Clock { get; }
         public AdapterManager Adapters { get; }
         public ChannelManager Channels { get; }
+        public ModuleCatalog Catalog { get; }
         public GraphManager Graph { get; }
         public FileMailbox Mailbox { get; }
         public FileAdapter Adapter { get; }
