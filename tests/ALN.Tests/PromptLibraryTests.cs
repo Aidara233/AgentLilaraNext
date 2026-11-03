@@ -165,13 +165,13 @@ public sealed class PromptLibraryTests : IDisposable
         var spec = new SessionSpec("default", "Answer briefly.", "1", new Dictionary<string, string> { ["人设"] = "标准人设" });
         var channel = new Address("channel", "conversation", "chat-1");
 
-        var first = await sessions.RunTurnAsync("s-prompt", spec, Guid.NewGuid(), Turn(channel), null, default);
+        var first = await sessions.TurnAsync("s-prompt", spec, Guid.NewGuid(), Turn(channel), null, default);
         Assert.True(first.Ok, first.Error?.Detail ?? first.Error?.Message);
         Assert.Equal("第一版人设", model.Requests[0].Messages[0].Content);
         Assert.Equal("system", model.Requests[0].Messages[0].Role);
 
         File.WriteAllText(path, "第二版人设");
-        var second = await sessions.RunTurnAsync("s-prompt", spec, Guid.NewGuid(), Turn(channel), null, default);
+        var second = await sessions.TurnAsync("s-prompt", spec, Guid.NewGuid(), Turn(channel), null, default);
         Assert.True(second.Ok, second.Error?.Detail ?? second.Error?.Message);
         // Same spec, same session id, new text: that is the edit taking effect instead of a Conflict.
         Assert.Equal("第二版人设", model.Requests[1].Messages[0].Content);
@@ -184,7 +184,7 @@ public sealed class PromptLibraryTests : IDisposable
         var sessions = new SessionManager(Path.Combine(_root, "sessions"), new RecordingModel(), prompts: Library());
         var spec = new SessionSpec("default", "Answer briefly.", "1", new Dictionary<string, string> { ["人设"] = "被删掉的人设" });
 
-        var turn = await sessions.RunTurnAsync("s-gone", spec, Guid.NewGuid(),
+        var turn = await sessions.TurnAsync("s-gone", spec, Guid.NewGuid(),
             Turn(new Address("channel", "conversation", "chat-1")), null, default);
 
         Assert.False(turn.Ok);
@@ -197,7 +197,7 @@ public sealed class PromptLibraryTests : IDisposable
         var model = new RecordingModel();
         var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, prompts: Library());
 
-        var turn = await sessions.RunTurnAsync("s-bare", new SessionSpec("default", "Answer briefly.", "1"),
+        var turn = await sessions.TurnAsync("s-bare", new SessionSpec("default", "Answer briefly.", "1"),
             Guid.NewGuid(), Turn(new Address("channel", "conversation", "chat-1")), null, default);
 
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);

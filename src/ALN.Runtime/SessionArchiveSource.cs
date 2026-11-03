@@ -30,7 +30,6 @@ public sealed class SessionArchiveSource(ISessionManager sessions, IChannelManag
         {
             var reason = session.Channel is null ? SessionArchiveReasons.ChannelUnknown
                 : !live.Contains(session.Channel) ? SessionArchiveReasons.ChannelGone
-                : session.SupersededAt is not null ? SessionArchiveReasons.SpecSuperseded
                 : cutoff is not null && session.LastActiveAt is { } lastActive && lastActive < cutoff
                     ? SessionArchiveReasons.Idle
                     : null;
@@ -88,9 +87,6 @@ public static class SessionArchiveReasons
 
     /// <summary>Its Channel no longer exists.</summary>
     public const string ChannelGone = "channel-gone";
-
-    /// <summary>A run was refused because the caller's spec has changed; the stored spec can never match again.</summary>
-    public const string SpecSuperseded = "spec-superseded";
 
     /// <summary>Nothing has talked to it for longer than the idle window.</summary>
     public const string Idle = "idle";

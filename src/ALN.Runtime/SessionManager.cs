@@ -11,10 +11,13 @@ namespace ALN.Runtime;
 
 /// <summary>Runs one serialized model step per activation and persists completed turns.</summary>
 [Module(SessionManagerId, Category = "session", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class SessionManager : ISessionManager, IModule
+public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
 {
     public const string SessionManagerId = ModuleNames.SessionManager;
+    public const string SessionTypeId = "session.chat";
     public ModuleId Id { get; } = new(SessionManagerId);
+
+    public string Category => "session";
 
     private const int StateSchemaVersion = 2;
     private const long MaxStoredHistoryBytes = 64 * 1024 * 1024;
@@ -48,27 +51,136 @@ public sealed class SessionManager : ISessionManager, IModule
         _prompts = prompts;
     }
 
-    public async ValueTask<Result<SessionTurnResult>> RunTurnAsync(
-        string sessionId, SessionSpec spec, Guid activationId, SessionTurnInput input,
-        ISessionToolbox? tools, CancellationToken cancellationToken)
+    /// <summary>
+    /// The Session by that name, created from <paramref name="spec"/> when there is none.
+    ///
+    /// A spec that names no profile is not incomplete: it means "whatever the host has". Resolving it here — once,
+    /// before it is written — is what makes the stored spec a fact rather than a different answer each turn.
+    /// </summary>
+    public async ValueTask<Result<ISession>> OpenAsync(string sessionId, SessionSpec spec, CancellationToken cancellationToken)
     {
+        if (spec is null) return Result<ISession>.Failure(new(ErrorCode.Invalid, "Session specification is incomplete."));
+        var resolved = spec;
+        if (string.IsNullOrWhiteSpace(spec.ModelProfileId))
+        {
+            var picked = ResolveProfile(spec);
+            if (!picked.Ok) return Result<ISession>.Failure(picked.Error!);
+            resolved = picked.Value!;
+        }
+        var loaded = await LoadAsync(sessionId, resolved, cancellationToken).ConfigureAwait(false);
+        return loaded.Ok && loaded.Value is not null
+            ? Result<ISession>.Success(new SessionHandle(this, sessionId, loaded.Value.Spec, loaded.Value.State))
+            : Result<ISession>.Failure(loaded.Error!);
+    }
+
+    /// <summary>An existing Session, or a failure. Never creates one: a name that was never opened is not a Session.</summary>
+    public async ValueTask<Result<ISession>> GetAsync(string sessionId, CancellationToken cancellationToken)
+    {
+        if (!IsValidSessionId(sessionId))
+            return Result<ISession>.Failure(new(ErrorCode.Invalid, "Session id must use 1-128 ASCII letters, digits, '-' or '_'."));
+        var directory = ResolveSessionDirectory(sessionId);
+        if (!Directory.Exists(directory))
+            return Result<ISession>.Failure(new(ErrorCode.Invalid, $"No Session is called {sessionId}."));
+        var loaded = await LoadAsync(sessionId, requestedSpec: null, cancellationToken).ConfigureAwait(false);
+        return loaded.Ok && loaded.Value is not null
+            ? Result<ISession>.Success(new SessionHandle(this, sessionId, loaded.Value.Spec, loaded.Value.State))
+            : Result<ISession>.Failure(loaded.Error!);
+    }
+
+    /// <summary>
+    /// Loads a Session against the spec it was created with. <paramref name="requestedSpec"/> is what an absent
+    /// Session becomes; an existing one keeps its own, and a caller asking for something else is told in the
+    /// signal log rather than by refusing to run.
+    /// </summary>
+    private async ValueTask<Result<SessionRecord>> LoadAsync(string sessionId, SessionSpec? requestedSpec,
+        CancellationToken cancellationToken)
+    {
+        if (!IsValidSessionId(sessionId))
+            return Result<SessionRecord>.Failure(new(ErrorCode.Invalid, "Session id must use 1-128 ASCII letters, digits, '-' or '_'."));
+        if (_loaded.TryGetValue(sessionId, out var cached))
+        {
+            NoteSpecDrift(sessionId, cached.Spec, requestedSpec);
+            return Result<SessionRecord>.Success(cached);
+        }
+
+        var gate = await AcquireLoadGateAsync(sessionId, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // Checked again under the gate: two callers arriving together must not both create the record.
+            if (_loaded.TryGetValue(sessionId, out cached))
+            {
+                NoteSpecDrift(sessionId, cached.Spec, requestedSpec);
+                return Result<SessionRecord>.Success(cached);
+            }
+            var directory = ResolveSessionDirectory(sessionId);
+            var loaded = await LoadOrCreateAsync(directory, requestedSpec, cancellationToken).ConfigureAwait(false);
+            if (!loaded.Ok || loaded.Value is null) return Result<SessionRecord>.Failure(loaded.Error!);
+            if (requestedSpec is not null) NoteSpecDrift(sessionId, loaded.Value.Spec, requestedSpec);
+
+            var historyResult = await ReadHistoryAsync(Path.Combine(directory, "history.jsonl"), repairTrailingLine: true,
+                cancellationToken).ConfigureAwait(false);
+            if (!historyResult.Ok || historyResult.Value is null) return Result<SessionRecord>.Failure(historyResult.Error!);
+
+            var recovered = await RecoverPendingAsync(directory, loaded.Value.State, historyResult.Value, cancellationToken)
+                .ConfigureAwait(false);
+            if (!recovered.Ok || recovered.Value is null) return Result<SessionRecord>.Failure(recovered.Error!);
+
+            var record = new SessionRecord(loaded.Value.Spec, directory) { State = recovered.Value.State };
+            record.Adopt(recovered.Value.History);
+            _loaded[sessionId] = record;
+            return Result<SessionRecord>.Success(record);
+        }
+        finally { gate.Release(); }
+    }
+
+    private async ValueTask<SemaphoreSlim> AcquireLoadGateAsync(string sessionId, CancellationToken cancellationToken)
+    {
+        var gate = _sessionGates.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return gate;
+    }
+
+    /// <summary>
+    /// Records that somebody addressed this Session with a spec it does not have. The Session keeps its own — that
+    /// is what makes it an instance — so the only thing to do is make the difference visible instead of letting a
+    /// caller believe its new prompt is in force.
+    /// </summary>
+    private void NoteSpecDrift(string sessionId, SessionSpec stored, SessionSpec? requested)
+    {
+        if (requested is null || SameSpec(stored, requested)) return;
+        _signalLog.Write(new()
+        {
+            Id = Guid.NewGuid(),
+            Group = "session",
+            Name = sessionId,
+            Mechanism = "session.spec",
+            Outcome = "stored-wins",
+            Level = SignalLevel.Warn,
+            Detail = new Dictionary<string, string>
+            {
+                ["storedProfile"] = stored.ModelProfileId ?? "",
+                ["requestedProfile"] = requested.ModelProfileId ?? "",
+                ["storedFormat"] = stored.FormatVersion,
+                ["requestedFormat"] = requested.FormatVersion
+            }
+        });
+    }
+
+    /// <summary>One turn of a loaded Session. Internal: callers hold an <see cref="ISession"/>, not a record.</summary>
+    private async ValueTask<Result<SessionTurnResult>> RunTurnAsync(SessionRecord record, Guid activationId,
+        SessionTurnInput input, ISessionToolbox? tools, CancellationToken cancellationToken)
+    {
+        var sessionId = Path.GetFileName(record.Directory);
+        var spec = record.Spec;
         var recordId = Guid.NewGuid();
         var parentId = SignalScope.CurrentId;
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         if (spec is null) return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Session specification is incomplete."));
-        // A spec that names no profile is not incomplete: it means "whatever the host has". Deciding it here
-        // keeps the choice visible — the signal log, the stored session and the error all show the real id.
-        if (string.IsNullOrWhiteSpace(spec.ModelProfileId))
-        {
-            var resolved = ResolveProfile(spec);
-            if (!resolved.Ok) return Result<SessionTurnResult>.Failure(resolved.Error!);
-            spec = resolved.Value!;
-        }
         try
         {
             Result<SessionTurnResult> result;
             using (SignalScope.Enter(recordId, activationId))
-                result = await RunTurnCoreAsync(sessionId, spec, activationId, input, tools, cancellationToken).ConfigureAwait(false);
+                result = await RunTurnCoreAsync(record, activationId, input, tools, cancellationToken).ConfigureAwait(false);
             RecordTurn(sessionId, spec, activationId, result, started, recordId, parentId);
             return result;
         }
@@ -305,11 +417,11 @@ public sealed class SessionManager : ISessionManager, IModule
     }
 
     private async ValueTask<Result<SessionTurnResult>> RunTurnCoreAsync(
-        string sessionId, SessionSpec spec, Guid activationId, SessionTurnInput input,
+        SessionRecord record, Guid activationId, SessionTurnInput input,
         ISessionToolbox? tools, CancellationToken cancellationToken)
     {
-        if (!IsValidSessionId(sessionId))
-            return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Session id must use 1-128 ASCII letters, digits, '-' or '_'."));
+        var sessionId = Path.GetFileName(record.Directory);
+        var spec = record.Spec;
         if (spec is null || string.IsNullOrWhiteSpace(spec.Objective) ||
             string.IsNullOrWhiteSpace(spec.FormatVersion))
             return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Session specification is incomplete."));
@@ -345,14 +457,9 @@ public sealed class SessionManager : ISessionManager, IModule
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var directory = ResolveSessionDirectory(sessionId);
+            var directory = record.Directory;
             var channel = input.Channel?.ToString();
             Directory.CreateDirectory(directory);
-            // One call: it loads from disk on the first turn of a Session's life (replaying a half-finished commit
-            // if there is one) and from memory after that. Everything below works on the record.
-            var loaded = await LoadSessionAsync(sessionId, directory, spec, channel, cancellationToken).ConfigureAwait(false);
-            if (!loaded.Ok || loaded.Value is null) return Result<SessionTurnResult>.Failure(loaded.Error!);
-            var record = loaded.Value;
             if (record.State.Locked)
                 return Result<SessionTurnResult>.Failure(new(ErrorCode.Denied, "Session is locked."));
 
@@ -383,6 +490,9 @@ public sealed class SessionManager : ISessionManager, IModule
                 var timelineState = state with
                 {
                     Revision = state.Revision + 1,
+                    // Recorded on the first commit rather than at creation: a Session is created by a name, and
+                    // the Channel it serves is only known when something addresses it.
+                    Channel = channel ?? state.Channel,
                     // Somebody came. A declaration that said "release me if nobody does" is answered by this very
                     // arrival, so it goes before the turn runs — and it goes even if the turn then fails, because
                     // the arrival already happened.
@@ -667,7 +777,7 @@ public sealed class SessionManager : ISessionManager, IModule
             // conflicts today may be reverted tomorrow, and the evidence of "it works again" is this turn.
             // Metadata only — the revision stays where the committed turn left it, so a pending commit written
             // earlier still recovers against exactly this file.
-            state = state with { Channel = channel ?? state.Channel, LastActiveAt = DateTimeOffset.UtcNow, SupersededAt = null };
+            state = state with { Channel = channel ?? state.Channel, LastActiveAt = DateTimeOffset.UtcNow };
             record.State = state;
             await WriteAtomicJsonAsync(Path.Combine(directory, "state.json"), state, cancellationToken).ConfigureAwait(false);
 
@@ -678,6 +788,75 @@ public sealed class SessionManager : ISessionManager, IModule
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
         { return Result<SessionTurnResult>.Failure(new(ErrorCode.Unavailable, "Session turn failed.", ex.Message)); }
         finally { gate.Release(); }
+    }
+
+    /// <summary>
+    /// A Session by name, for the address book. Only Sessions that exist on disk answer: this build cannot describe
+    /// a name that has no directory, and inventing one would make the catalog a list of wishes.
+    ///
+    /// The handle carries what the Session looked like when it was looked up (the same two small files
+    /// <see cref="GetState"/> reads). A caller that wants to run it gets a fresh handle through
+    /// <see cref="OpenAsync"/>, which is what loads the timeline.
+    /// </summary>
+    public LocatedModule? Locate(ModuleId id)
+    {
+        if (!IsValidSessionId(id.Value)) return null;
+        string directory;
+        try { directory = ResolveSessionDirectory(id.Value); }
+        catch (IOException) { return null; }
+        if (!Directory.Exists(directory)) return null;
+        var spec = TryReadSpec(directory);
+        var state = TryReadState(directory);
+        // A directory without a readable spec or state is not a Session anybody can address; it is either rubbish
+        // left by a crash or data from a build that wrote a different shape. Both are the operator's business.
+        if (spec is null || state is null) return null;
+        return new LocatedModule(new SessionHandle(this, id.Value, spec, state),
+            new CatalogEntry(new ModuleId(id.Value), SessionTypeId, Category, ModuleRole.Instance));
+    }
+
+    /// <summary>Every Session on disk. Reading the names is cheap; opening one is not, so that is left to callers.</summary>
+    public IReadOnlyList<CatalogEntry> Entries() => EnumerateSessions()
+        .Select(session => new CatalogEntry(new ModuleId(session.Id), SessionTypeId, Category, ModuleRole.Instance))
+        .ToArray();
+
+    /// <summary>
+    /// One Session as a caller holds it. Made on demand and not kept: a Session nobody talks to costs nothing, and
+    /// one that is talked to is reached the same way as any other module — by name.
+    /// </summary>
+    private sealed class SessionHandle(SessionManager owner, string sessionId, SessionSpec spec, SessionState state)
+        : ISession, IAddressed
+    {
+        public ModuleId Id { get; } = new(sessionId);
+        public Address Address { get; } = new("session", "chat", sessionId);
+
+        /// <summary>What this Session is. A handle cannot change it; neither can a caller.</summary>
+        public SessionSpec Spec { get; } = spec;
+
+        /// <summary>What the Session looked like when this handle was made. Ask the manager for the current state.</summary>
+        public SessionState State { get; } = state;
+
+        public ValueTask<Result<SessionTurnResult>> RunTurnAsync(Guid activationId, SessionTurnInput input,
+            ISessionToolbox? tools, CancellationToken cancellationToken) =>
+            owner.RunTurnByNameAsync(sessionId, activationId, input, tools, cancellationToken);
+    }
+
+    private async ValueTask<Result<SessionTurnResult>> RunTurnByNameAsync(string sessionId, Guid activationId,
+        SessionTurnInput input, ISessionToolbox? tools, CancellationToken cancellationToken)
+    {
+        var loaded = await LoadAsync(sessionId, requestedSpec: null, cancellationToken).ConfigureAwait(false);
+        if (!loaded.Ok || loaded.Value is null) return Result<SessionTurnResult>.Failure(loaded.Error!);
+        return await RunTurnAsync(loaded.Value, activationId, input, tools, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Reads spec.json, or null when it is missing or unreadable. Used to describe a Session without loading it.</summary>
+    private static SessionSpec? TryReadSpec(string directory)
+    {
+        var path = Path.Combine(directory, "spec.json");
+        try
+        {
+            return File.Exists(path) ? JsonSerializer.Deserialize<SessionSpec>(File.ReadAllBytes(path), JsonOptions) : null;
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { return null; }
     }
 
     public Result<SessionState> GetState(string sessionId)
@@ -735,7 +914,7 @@ public sealed class SessionManager : ISessionManager, IModule
                 // "idle since forever", and that is a reason to give something away on the strength of a guess.
                 var lastActive = state?.LastActiveAt ?? LastWritten(directory);
                 sessions.Add(new(id, state?.Channel, lastActive, state?.StepNumber ?? 0, DirectoryBytes(directory),
-                    state?.SupersededAt, state?.WaitUntil, state?.WaitRelease ?? false));
+                    state?.WaitUntil, state?.WaitRelease ?? false));
             }
             return ValueTask.FromResult(Result<IReadOnlyList<SessionSummary>>.Success(sessions));
         }
@@ -953,54 +1132,8 @@ public sealed class SessionManager : ISessionManager, IModule
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { return null; }
     }
 
-    /// <summary>
-    /// The Session's context: from memory when this process already has it, from disk otherwise.
-    ///
-    /// A cached record still goes through the spec check, because "you asked for a different persona" has to be
-    /// refused the same way whether the timeline came from memory or from the file.
-    /// </summary>
-    private async ValueTask<Result<SessionRecord>> LoadSessionAsync(string sessionId, string directory,
-        SessionSpec requestedSpec, string? channel, CancellationToken cancellationToken)
-    {
-        if (_loaded.TryGetValue(sessionId, out var cached))
-        {
-            if (SameSpec(cached.Spec, requestedSpec)) return Result<SessionRecord>.Success(cached);
-            await MarkSupersededAsync(cached, cancellationToken).ConfigureAwait(false);
-            return Result<SessionRecord>.Failure(new(ErrorCode.Conflict,
-                "Session specification is immutable; create a new session id to change it."));
-        }
-
-        var loaded = await LoadOrCreateAsync(directory, requestedSpec, channel, cancellationToken).ConfigureAwait(false);
-        if (!loaded.Ok || loaded.Value is null) return Result<SessionRecord>.Failure(loaded.Error!);
-
-        var historyResult = await ReadHistoryAsync(Path.Combine(directory, "history.jsonl"), repairTrailingLine: true,
-            cancellationToken).ConfigureAwait(false);
-        if (!historyResult.Ok || historyResult.Value is null) return Result<SessionRecord>.Failure(historyResult.Error!);
-
-        var recovered = await RecoverPendingAsync(directory, loaded.Value.State, historyResult.Value, cancellationToken)
-            .ConfigureAwait(false);
-        if (!recovered.Ok || recovered.Value is null) return Result<SessionRecord>.Failure(recovered.Error!);
-
-        var record = new SessionRecord(loaded.Value.Spec, directory) { State = recovered.Value.State };
-        record.Adopt(recovered.Value.History);
-        _loaded[sessionId] = record;
-        return Result<SessionRecord>.Success(record);
-    }
-
-    /// <summary>
-    /// Notes that a stored Session can never serve the caller that just asked. Written where maintenance can see
-    /// it: the specs are immutable, so without the note a dead Session looks exactly like a live one.
-    /// </summary>
-    private async ValueTask MarkSupersededAsync(SessionRecord record, CancellationToken cancellationToken)
-    {
-        if (record.State.SupersededAt is not null) return;
-        var stale = record.State with { SupersededAt = DateTimeOffset.UtcNow };
-        await WriteAtomicJsonAsync(Path.Combine(record.Directory, "state.json"), stale, cancellationToken).ConfigureAwait(false);
-        record.State = stale;
-    }
-
-    private async ValueTask<Result<LoadedSession>> LoadOrCreateAsync(string directory, SessionSpec requestedSpec,
-        string? channel, CancellationToken cancellationToken)
+    private async ValueTask<Result<LoadedSession>> LoadOrCreateAsync(string directory, SessionSpec? requestedSpec,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         Directory.CreateDirectory(directory);
@@ -1027,20 +1160,18 @@ public sealed class SessionManager : ISessionManager, IModule
                     ex.Message));
             }
             if (readSpec is null) return Result<LoadedSession>.Failure(new(ErrorCode.Invalid, "Session specification is invalid."));
-            if (!SameSpec(readSpec, requestedSpec))
-            {
-                // The refusal is written down where maintenance can see it: the stored spec is immutable, so this
-                // directory can never serve the caller that just asked. Without the note a dead Session looks
-                // exactly like a live one, and the operator's only clue is a Conflict repeated forever.
-                if (TryReadState(directory) is { SupersededAt: null } stale)
-                    await WriteAtomicJsonAsync(statePath, stale with { SupersededAt = DateTimeOffset.UtcNow }, cancellationToken)
-                        .ConfigureAwait(false);
-                return Result<LoadedSession>.Failure(new(ErrorCode.Conflict, "Session specification is immutable; create a new session id to change it."));
-            }
+            // The spec on disk wins. It is what this Session is, and the Session is the instance being addressed —
+            // not a proposal from whoever happened to call it this time. A difference is reported by the caller
+            // that asked (see NoteSpecDrift), never by rewriting the Session.
             persistedSpec = readSpec;
         }
         else
         {
+            // No spec and nobody offered one: this is somebody addressing a Session that does not exist. Creating it
+            // from nothing would mean inventing what a Session is, which is exactly what a spec is for.
+            if (requestedSpec is null)
+                return Result<LoadedSession>.Failure(new(ErrorCode.Invalid,
+                    $"No Session is called {Path.GetFileName(directory)}."));
             persistedSpec = requestedSpec;
             await WriteAtomicJsonAsync(specPath, persistedSpec, cancellationToken).ConfigureAwait(false);
         }
@@ -1061,7 +1192,8 @@ public sealed class SessionManager : ISessionManager, IModule
         }
         else
         {
-            state = new(SessionStatus.Dormant, 0, 0, false, new SessionUsage(0, 0), StateSchemaVersion, channel, DateTimeOffset.UtcNow);
+            state = new(SessionStatus.Dormant, 0, 0, false, new SessionUsage(0, 0), StateSchemaVersion,
+                LastActiveAt: DateTimeOffset.UtcNow);
             await WriteAtomicJsonAsync(statePath, state, cancellationToken).ConfigureAwait(false);
         }
         if (!File.Exists(historyPath)) await File.WriteAllTextAsync(historyPath, "", new UTF8Encoding(false), cancellationToken).ConfigureAwait(false);

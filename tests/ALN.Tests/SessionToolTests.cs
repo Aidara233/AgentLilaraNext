@@ -99,7 +99,7 @@ public sealed class SessionToolTests : IDisposable
         var speak = new RecordingTool("speak", endsTurn: false, spoken: null);
         var sessions = Manager(model);
 
-        var turn = await sessions.RunTurnAsync("s-1", Spec(SpeakShape), Guid.NewGuid(),
+        var turn = await sessions.TurnAsync("s-1", Spec(SpeakShape), Guid.NewGuid(),
             new SessionTurnInput([], null, null), new Toolbox(speak), default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
 
@@ -127,11 +127,11 @@ public sealed class SessionToolTests : IDisposable
         var sessions = Manager(model);
         var spec = Spec(SpeakShape);
 
-        Assert.True((await sessions.RunTurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], null, null),
+        Assert.True((await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], null, null),
             new Toolbox(speak), default)).Ok);
         // A second turn is where the bug this pins showed up: the step that carried the tool call had been left out
         // of the request, so its result arrived answering nothing — a 400 from every OpenAI-compatible provider.
-        Assert.True((await sessions.RunTurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], null, null),
+        Assert.True((await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], null, null),
             new Toolbox(speak), default)).Ok);
 
         var messages = model.Requests.Last().Messages;
@@ -161,7 +161,7 @@ public sealed class SessionToolTests : IDisposable
         var speak = new RecordingTool("speak", endsTurn: false, spoken: null);
         var sessions = Manager(model);
 
-        var turn = await sessions.RunTurnAsync("s-1", Spec(SpeakShape), Guid.NewGuid(),
+        var turn = await sessions.TurnAsync("s-1", Spec(SpeakShape), Guid.NewGuid(),
             new SessionTurnInput([], null, null), new Toolbox(speak), default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
         Assert.Single(model.Requests);
@@ -179,7 +179,7 @@ public sealed class SessionToolTests : IDisposable
         var speak = new RecordingTool("speak", endsTurn: false, spoken: "在的，说吧。");
         var sessions = Manager(model);
 
-        var turn = await sessions.RunTurnAsync("s-1", Spec(SpeakShape), Guid.NewGuid(),
+        var turn = await sessions.TurnAsync("s-1", Spec(SpeakShape), Guid.NewGuid(),
             new SessionTurnInput([], null, null), new Toolbox(speak), default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
         Assert.Single(speak.Calls);
@@ -207,7 +207,7 @@ public sealed class SessionToolTests : IDisposable
         var speak = new RecordingTool("speak", endsTurn: false, spoken: "一");
         var sessions = Manager(model);
 
-        var turn = await sessions.RunTurnAsync("s-1", Spec(SpeakShape), Guid.NewGuid(),
+        var turn = await sessions.TurnAsync("s-1", Spec(SpeakShape), Guid.NewGuid(),
             new SessionTurnInput([], null, null), new Toolbox(speak), default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
 
@@ -242,7 +242,7 @@ public sealed class SessionToolTests : IDisposable
             """{"id":"a:user","activationId":"a","stepNumber":1,"role":"user","content":"hi","at":"2026-01-01T00:00:00+00:00"}""" + "\n" +
             """{"id":"a:assistant:1","activationId":"a","stepNumber":1,"role":"assistant","content":"","at":"2026-01-01T00:00:01+00:00","toolCalls":[{"id":"call-9","name":"speak","argumentsJson":"{\"text\":\"x\"}"}]}""" + "\n");
 
-        var turn = await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+        var turn = await sessions.TurnAsync("s-1", Spec(), Guid.NewGuid(),
             new SessionTurnInput([], null, null), new Toolbox(new RecordingTool("speak", false, null)), default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
 
@@ -269,7 +269,7 @@ public sealed class SessionToolTests : IDisposable
         var sessions = Manager(model);
         var before = DateTimeOffset.UtcNow;
 
-        var turn = await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+        var turn = await sessions.TurnAsync("s-1", Spec(), Guid.NewGuid(),
             new SessionTurnInput([], null, null), null, default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
 
@@ -290,12 +290,12 @@ public sealed class SessionToolTests : IDisposable
             [new TextDelta("在的。"), new ModelCompleted(StopReason.EndTurn, new ModelUsage(1, 1))]);
         var sessions = Manager(model);
 
-        Assert.True((await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+        Assert.True((await sessions.TurnAsync("s-1", Spec(), Guid.NewGuid(),
             new SessionTurnInput([], null, null), null, default)).Ok);
         Assert.NotEqual(System.Text.Json.JsonValueKind.Null, (await StateAsync()).GetProperty("waitUntil").ValueKind);
 
         // The declaration said "release me if nobody comes". A second activation is somebody coming.
-        Assert.True((await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+        Assert.True((await sessions.TurnAsync("s-1", Spec(), Guid.NewGuid(),
             new SessionTurnInput([], null, null), null, default)).Ok);
 
         var state = await StateAsync();
@@ -315,7 +315,7 @@ public sealed class SessionToolTests : IDisposable
             [new ToolCallDelta(0, "call-3", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
         var sessions = Manager(model);
 
-        var turn = await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+        var turn = await sessions.TurnAsync("s-1", Spec(), Guid.NewGuid(),
             new SessionTurnInput([], null, null), null, default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
 
@@ -335,7 +335,7 @@ public sealed class SessionToolTests : IDisposable
              new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
         var sessions = Manager(model);
 
-        var turn = await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+        var turn = await sessions.TurnAsync("s-1", Spec(), Guid.NewGuid(),
             new SessionTurnInput([], null, null), null, default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
 
@@ -368,7 +368,7 @@ public sealed class SessionToolTests : IDisposable
     private async Task<SessionManager> WaitingAsync(ScriptedModel model, string sessionId)
     {
         var sessions = new SessionManager(Path.Combine(_root, "sweep-" + Guid.NewGuid().ToString("N")), model);
-        var turn = await sessions.RunTurnAsync(sessionId, Spec(), Guid.NewGuid(),
+        var turn = await sessions.TurnAsync(sessionId, Spec(), Guid.NewGuid(),
             new SessionTurnInput([], null, null), null, default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
         return sessions;
@@ -437,9 +437,9 @@ public sealed class SessionToolTests : IDisposable
     {
         // Two Sessions in one root: a refusal on the first must not take the second down with it.
         var sessions = new SessionManager(Path.Combine(_root, "sweep-shared"), WaitingModel("""{"timeout":60,"release":true}"""));
-        Assert.True((await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+        Assert.True((await sessions.TurnAsync("s-1", Spec(), Guid.NewGuid(),
             new SessionTurnInput([], null, null), null, default)).Ok);
-        Assert.True((await sessions.RunTurnAsync("s-2", Spec(), Guid.NewGuid(),
+        Assert.True((await sessions.TurnAsync("s-2", Spec(), Guid.NewGuid(),
             new SessionTurnInput([], null, null), null, default)).Ok);
 
         var refusesFirst = new RecordingDeadlineHandler(session => session.Id == "s-1");

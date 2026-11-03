@@ -107,7 +107,7 @@ public sealed class ChannelDeltaTests : IDisposable
         var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
         var spec = new SessionSpec("default", "Answer briefly.", "1");
 
-        var turn = await sessions.RunTurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding),
+        var turn = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding),
             null, default);
 
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
@@ -120,7 +120,7 @@ public sealed class ChannelDeltaTests : IDisposable
         Assert.Contains("在吗", user.Content, StringComparison.Ordinal);
 
         // Second activation with nothing new still runs, and the block is not empty.
-        var again = await sessions.RunTurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding),
+        var again = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding),
             null, default);
         Assert.True(again.Ok, again.Error?.Detail ?? again.Error?.Message);
         Assert.Equal(2, model.Requests.Count);
@@ -165,7 +165,7 @@ public sealed class ChannelDeltaTests : IDisposable
         var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
         var spec = new SessionSpec("default", "Answer briefly.", "1");
 
-        var turn = await sessions.RunTurnAsync("s-1", spec, Guid.NewGuid(),
+        var turn = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(),
             new SessionTurnInput([], Channel, new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456")), null, default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
 
@@ -195,7 +195,7 @@ public sealed class ChannelDeltaTests : IDisposable
         var spec = new SessionSpec("default", "Answer briefly.", "1");
         var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
 
-        var first = await sessions.RunTurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
+        var first = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
         Assert.True(first.Ok, first.Error?.Detail ?? first.Error?.Message);
 
         // A well-formed entry written behind the manager's back: a process that re-read the file on every commit
@@ -206,7 +206,7 @@ public sealed class ChannelDeltaTests : IDisposable
             JsonSerializer.Serialize(new SessionHistoryEntry("ghost", "ghost", 9, "user", "从外部写进来的条目",
                 new DateTimeOffset(2026, 11, 1, 9, 0, 0, TimeSpan.Zero))) + "\n");
 
-        var second = await sessions.RunTurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
+        var second = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
         Assert.True(second.Ok, second.Error?.Detail ?? second.Error?.Message);
         var request = model.Requests.Last();
         Assert.DoesNotContain(request.Messages, message => message.Content?.Contains("从外部写进来的条目", StringComparison.Ordinal) == true);
@@ -227,7 +227,7 @@ public sealed class ChannelDeltaTests : IDisposable
         var spec = new SessionSpec("default", "Answer briefly.", "1");
         var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
         var manager = new SessionManager(root, model, contributors);
-        var first = await manager.RunTurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
+        var first = await manager.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
         Assert.True(first.Ok, first.Error?.Detail ?? first.Error?.Message);
 
         // What a crash between "breadcrumb written" and "entries appended" leaves behind: state is still at the old
@@ -248,7 +248,7 @@ public sealed class ChannelDeltaTests : IDisposable
 
         // A fresh manager is what a restart looks like: the next turn has to finish that commit before it runs.
         var restarted = new SessionManager(root, model, contributors);
-        var next = await restarted.RunTurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
+        var next = await restarted.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
         Assert.True(next.Ok, next.Error?.Detail ?? next.Error?.Message);
         // The entry id is ASCII; the text itself is written escaped, as everything in this file is.
         Assert.Contains("crash-1", await File.ReadAllTextAsync(Path.Combine(directory, "history.jsonl")), StringComparison.Ordinal);

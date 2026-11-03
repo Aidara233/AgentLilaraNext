@@ -7,7 +7,6 @@ namespace ALN.Contracts.Sessions;
 /// <param name="Steps">Committed steps: one per model call, so a turn with tool calls counts more than once.</param>
 /// <param name="LastActiveAt">The recorded time, or — for a Session that never recorded one — its newest file.
 /// Never null for a directory that exists, because "no answer" would read as "idle since forever".</param>
-/// <param name="SupersededAt">When a run was refused because the caller's spec had moved on, if that happened.</param>
 /// <param name="WaitUntil">When this Session asked to be woken on its own, if it asked. Null means it is only
 /// waiting for somebody to write — which is not a deadline and must never be read as one.</param>
 /// <param name="WaitRelease">Whether the deadline above ends with the Session being archived.</param>
@@ -17,7 +16,6 @@ public sealed record SessionSummary(
     DateTimeOffset? LastActiveAt,
     int Steps,
     long Bytes,
-    DateTimeOffset? SupersededAt = null,
     DateTimeOffset? WaitUntil = null,
     bool WaitRelease = false);
 

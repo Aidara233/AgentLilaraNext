@@ -46,12 +46,6 @@ public sealed record SessionState(
     /// </summary>
     DateTimeOffset? LastActiveAt = null,
     /// <summary>
-    /// When a run was refused because the caller's spec no longer matches the stored one. The spec is immutable,
-    /// so this Session can only ever conflict again — the note is what turns "unexplained dead weight" into
-    /// "a stuck instance somebody can decide to drop".
-    /// </summary>
-    DateTimeOffset? SupersededAt = null,
-    /// <summary>
     /// When this Session asked to be woken on its own, or null when it is only waiting for somebody to write.
     /// Stored rather than held in a timer so that a restart cannot lose the promise: the sweep reads this and
     /// nothing else. Any inbound activation clears it — a declaration that says "release me if nobody comes"
@@ -146,20 +140,46 @@ public sealed record SessionTurnResult(
     ModelUsage Usage,
     bool DuplicateActivation = false);
 
-public interface ISessionManager
+/// <summary>
+/// A Session, by name: the thing a caller addresses, not a record on disk. Handles are made on demand and are
+/// not kept: a Session nobody talks to costs nothing, and one that is talked to is reached the same way.
+/// </summary>
+public interface ISession : IModule
 {
     /// <summary>
+    /// What this Session was created as. Not a per-turn argument — a Session <b>is</b> its spec, and a caller that
+    /// names an existing Session gets the spec that Session has rather than the one it passed.
+    /// </summary>
+    SessionSpec Spec { get; }
+
+    SessionState State { get; }
+
+    /// <summary>
     /// Run one turn: model steps and tool rounds until a tool ends the turn. <paramref name="tools"/> is the
-    /// per-turn toolbox the host built (see <see cref="ISessionToolbox"/>); null means "this turn has only the
-    /// built-in tools".
+    /// per-turn toolbox the host built (see <see cref="ISessionToolbox"/>); null means "only the built-in tools".
     /// </summary>
     ValueTask<Result<SessionTurnResult>> RunTurnAsync(
-        string sessionId,
-        SessionSpec spec,
         Guid activationId,
         SessionTurnInput input,
         ISessionToolbox? tools,
         CancellationToken cancellationToken);
+}
+
+public interface ISessionManager
+{
+    /// <summary>
+    /// The Session by that name, created from <paramref name="spec"/> when nothing exists under it yet.
+    ///
+    /// The spec is used <b>only</b> by creation. An existing Session keeps the one it has — that is what makes a
+    /// Session an instance rather than a function of its caller: whoever addresses it by name gets the same
+    /// Session back, and asking again with a different spec cannot silently rewrite what it is. When the two
+    /// differ the stored one wins and the difference is recorded in the signal log, so it is visible without
+    /// making the Session refuse to run for the rest of its life.
+    /// </summary>
+    ValueTask<Result<ISession>> OpenAsync(string sessionId, SessionSpec spec, CancellationToken cancellationToken);
+
+    /// <summary>An existing Session, or a failure when there is none. Never creates one.</summary>
+    ValueTask<Result<ISession>> GetAsync(string sessionId, CancellationToken cancellationToken);
 
     Result<SessionState> GetState(string sessionId);
 

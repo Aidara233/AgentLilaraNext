@@ -812,8 +812,12 @@ public sealed class GraphManager : IGraphRuntime, IModule
             // The trigger message is not handed over here on purpose: it is already in the Channel's history,
             // and the delta pull will include it. Passing it twice is how a conversation gets answered twice.
             var input = new SessionTurnInput([], channelMessage.Channel, channelMessage.Binding);
-            var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, input,
-                new TurnToolbox(new SpeakTool(this, current, mount, channels, audit)), cancellationToken).ConfigureAwait(false);
+            // The spec is what an absent Session becomes: one that already exists keeps the one it was created with.
+            var opened = await sessions.OpenAsync(sessionId, spec, cancellationToken).ConfigureAwait(false);
+            var result = opened.Ok && opened.Value is not null
+                ? await opened.Value.RunTurnAsync(current.EventId, input,
+                    new TurnToolbox(new SpeakTool(this, current, mount, channels, audit)), cancellationToken).ConfigureAwait(false)
+                : Result<SessionTurnResult>.Failure(opened.Error!);
             if (!result.Ok || result.Value is null)
             {
                 await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
@@ -846,8 +850,11 @@ public sealed class GraphManager : IGraphRuntime, IModule
                 mount.Target, ScriptCapabilities.SessionRun, "allowed", sessionId), cancellationToken).ConfigureAwait(false);
             var input = new SessionTurnInput([new SessionChannelMessage(channelMessage.MessageId.ToString("N"), "user",
                 channelMessage.Sender, channelMessage.Text, channelMessage.At)], channelMessage.Channel, channelMessage.Binding);
-            var result = await sessions.RunTurnAsync(sessionId, spec, current.EventId, input,
-                new TurnToolbox(new SpeakTool(this, current, mount, channels, audit)), cancellationToken).ConfigureAwait(false);
+            var opened = await sessions.OpenAsync(sessionId, spec, cancellationToken).ConfigureAwait(false);
+            var result = opened.Ok && opened.Value is not null
+                ? await opened.Value.RunTurnAsync(current.EventId, input,
+                    new TurnToolbox(new SpeakTool(this, current, mount, channels, audit)), cancellationToken).ConfigureAwait(false)
+                : Result<SessionTurnResult>.Failure(opened.Error!);
             if (!result.Ok || result.Value is null)
             {
                 await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,

@@ -30,6 +30,74 @@ public sealed class SessionLifecycleTests : IDisposable
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
     }
 
+    /// <summary>
+    /// A Session is a module: it has a name, the address book can find it by that name, and the name is the only
+    /// thing anybody needs to hold. That is what makes it addressable at all — a mount target, a clock pulse, an
+    /// operator action all start from a name.
+    /// </summary>
+    [Fact]
+    public async Task A_session_is_found_by_name_and_stops_being_found_once_it_is_gone()
+    {
+        var sessions = Sessions();
+        var catalog = ModuleWiring.With(sessions);
+
+        // Nothing has been created yet, so the name resolves to nothing — and asking for it does not create it.
+        Assert.Null(catalog.Find(new ModuleId("s-named")));
+        Assert.False((await sessions.GetAsync("s-named", default)).Ok);
+
+        var opened = await sessions.OpenAsync("s-named", Spec, default);
+        Assert.True(opened.Ok, opened.Error?.Message);
+
+        var found = Assert.IsAssignableFrom<ISession>(catalog.Find(new ModuleId("s-named")));
+        Assert.Equal(new Address("session", "chat", "s-named"), ((IAddressed)found).Address);
+        Assert.Equal(Spec.Objective, found.Spec.Objective);
+        // The manager is in the same category (it owns it), so a row that is an instance is the one with a type.
+        var row = Assert.Single(catalog.List(typeId: SessionManager.SessionTypeId));
+        Assert.Equal(SessionManager.SessionTypeId, row.TypeId);
+        Assert.Equal(ModuleRole.Instance, row.Role);
+        Assert.Equal("s-named", row.Id.Value);
+        Assert.Equal(ModuleRole.Manager, catalog.List(category: "session").Single(entry => entry.Role is ModuleRole.Manager).Role);
+
+        // Moved out of its living place: the row was never copied into the catalog, so nothing has to be un-registered.
+        var destination = Path.Combine(_root, "bin", "s-named");
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        var moved = await sessions.ArchiveAsync("s-named", destination, default);
+        Assert.True(moved.Ok, moved.Error?.Detail ?? moved.Error?.Message);
+        Assert.Null(catalog.Find(new ModuleId("s-named")));
+        Assert.Empty(catalog.List(typeId: SessionManager.SessionTypeId));
+    }
+
+    [Fact]
+    public async Task Opening_a_name_that_already_exists_hands_back_the_same_session()
+    {
+        var sessions = Sessions();
+
+        var first = await sessions.OpenAsync("s-twice", Spec, default);
+        Assert.True(first.Ok, first.Error?.Message);
+        var second = await sessions.OpenAsync("s-twice", Spec, default);
+        Assert.True(second.Ok, second.Error?.Message);
+
+        // One Session, not two: the second Open is a lookup, and the directory is the proof.
+        Assert.Single(Directory.GetDirectories(Path.Combine(_root, "sessions")));
+        Assert.Equal(first.Value!.Spec, second.Value!.Spec);
+        Assert.Equal(0, second.Value!.State.StepNumber);
+    }
+
+    [Fact]
+    public async Task A_spec_without_a_profile_is_settled_once_at_creation()
+    {
+        // "Whatever the host has" is decided when the Session is made, not on every turn: the resolution is written
+        // into the spec, so the same data root always runs the same profile and the answer is visible in the file.
+        var sessions = Sessions();
+
+        var opened = await sessions.OpenAsync("s-profile", Spec with { ModelProfileId = "" }, default);
+
+        Assert.True(opened.Ok, opened.Error?.Message);
+        Assert.Equal("default", opened.Value!.Spec.ModelProfileId);
+        Assert.Equal("default", JsonSerializer.Deserialize<SessionSpec>(
+            await File.ReadAllBytesAsync(Path.Combine(SessionPath("s-profile"), "spec.json")), Json)!.ModelProfileId);
+    }
+
     private SessionManager Sessions() => new(Path.Combine(_root, "sessions"), new ScriptedModel());
 
     private ArchiveManager Bin() => new(_root);
@@ -49,7 +117,7 @@ public sealed class SessionLifecycleTests : IDisposable
     {
         // Two instances over one root is what a restart looks like: nothing about a Session lives in the object.
         var first = Sessions();
-        var turn = await first.RunTurnAsync("s-one", Spec, Guid.NewGuid(), Input(Chat, "hello"), null, default);
+        var turn = await first.TurnAsync("s-one", Spec, Guid.NewGuid(), Input(Chat, "hello"), null, default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
 
         var afterFirst = StoredState("s-one");
@@ -60,7 +128,7 @@ public sealed class SessionLifecycleTests : IDisposable
         var spokeAt = afterFirst.LastActiveAt;
         await Task.Delay(20);
         var second = Sessions();
-        var again = await second.RunTurnAsync("s-one", Spec, Guid.NewGuid(), Input(Chat, "still here"), null, default);
+        var again = await second.TurnAsync("s-one", Spec, Guid.NewGuid(), Input(Chat, "still here"), null, default);
         Assert.True(again.Ok, again.Error?.Detail ?? again.Error?.Message);
 
         var afterSecond = StoredState("s-one");
@@ -78,7 +146,7 @@ public sealed class SessionLifecycleTests : IDisposable
         var sessions = Sessions();
         // Ghost's Channel does not exist here, so the Session is offered for the real reason (channel-gone)
         // rather than because a test wanted it to be.
-        Assert.True((await sessions.RunTurnAsync("s-one", Spec, Guid.NewGuid(), Input(Ghost, "hello"), null, default)).Ok);
+        Assert.True((await sessions.TurnAsync("s-one", Spec, Guid.NewGuid(), Input(Ghost, "hello"), null, default)).Ok);
         var before = StoredState("s-one");
         var bin = Bin();
         var channels = await ChannelsServing(sessions, bin, Chat);
@@ -118,7 +186,7 @@ public sealed class SessionLifecycleTests : IDisposable
         Assert.Equal("channel.conversation#ghost", Assert.Single((await sessions.ListAsync(default)).Value!).Channel);
 
         // And it is a working Session again, not just a directory: the engine picks the history up where it was.
-        var resumed = await sessions.RunTurnAsync("s-one", Spec, Guid.NewGuid(), Input(Ghost, "back again"), null, default);
+        var resumed = await sessions.TurnAsync("s-one", Spec, Guid.NewGuid(), Input(Ghost, "back again"), null, default);
         Assert.True(resumed.Ok, resumed.Error?.Detail ?? resumed.Error?.Message);
         Assert.True(resumed.Value!.StepNumber > before.StepNumber);
     }
@@ -127,11 +195,11 @@ public sealed class SessionLifecycleTests : IDisposable
     public async Task Candidates_cover_the_four_ways_a_session_stops_being_useful()
     {
         var sessions = Sessions();
-        Assert.True((await sessions.RunTurnAsync("s-live", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
-        Assert.True((await sessions.RunTurnAsync("s-orphan", Spec, Guid.NewGuid(), Input(Ghost, "hi"), null, default)).Ok);
+        Assert.True((await sessions.TurnAsync("s-live", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
+        Assert.True((await sessions.TurnAsync("s-orphan", Spec, Guid.NewGuid(), Input(Ghost, "hi"), null, default)).Ok);
         // No Channel at all: written by a caller that ran a Session straight through the manager.
-        Assert.True((await sessions.RunTurnAsync("s-unowned", Spec, Guid.NewGuid(), Input(null, "hi"), null, default)).Ok);
-        Assert.True((await sessions.RunTurnAsync("s-stale", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
+        Assert.True((await sessions.TurnAsync("s-unowned", Spec, Guid.NewGuid(), Input(null, "hi"), null, default)).Ok);
+        Assert.True((await sessions.TurnAsync("s-stale", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
 
         // Backdate one as "nobody has spoken to this since spring".
         var stale = StoredState("s-stale");
@@ -151,21 +219,28 @@ public sealed class SessionLifecycleTests : IDisposable
         Assert.DoesNotContain("s-live", offered.Keys);
         Assert.All(candidates.Value!, candidate => Assert.True(candidate.Bytes > 0));
 
-        // A spec that changed can never match again: the refusal leaves a note, and the note is a reason.
+        // A caller asking for a different spec does not get a different Session: it gets the one that exists, with
+        // the spec that one was created with. The difference is recorded (Warn, "stored-wins") rather than applied —
+        // rewriting what a Session is from what a caller happened to pass is how a conversation loses its persona.
         var changed = Spec with { Objective = "Answer differently." };
-        var refused = await sessions.RunTurnAsync("s-live", changed, Guid.NewGuid(), Input(Chat, "again"), null, default);
-        Assert.Equal(ErrorCode.Conflict, refused.Error!.Code);
-        var afterRefusal = await bin.CandidatesAsync(ArchiveKinds.Session, default);
-        Assert.Equal(SessionArchiveReasons.SpecSuperseded,
-            afterRefusal.Value!.Single(candidate => candidate.Id == "s-live").Reason);
+        var reopened = await sessions.OpenAsync("s-live", changed, default);
+        Assert.True(reopened.Ok, reopened.Error?.Message);
+        Assert.Equal(Spec.Objective, reopened.Value!.Spec.Objective);
+        var continued = await reopened.Value.RunTurnAsync(Guid.NewGuid(), Input(Chat, "again"), null, default);
+        Assert.True(continued.Ok, continued.Error?.Detail ?? continued.Error?.Message);
+        Assert.Equal(Spec.Objective, JsonSerializer.Deserialize<SessionSpec>(
+            await File.ReadAllBytesAsync(Path.Combine(SessionPath("s-live"), "spec.json")), Json)!.Objective);
+        // And nobody is offered it for archiving because of the difference: it is a live Session either way.
+        var afterDrift = await bin.CandidatesAsync(ArchiveKinds.Session, default);
+        Assert.DoesNotContain("s-live", afterDrift.Value!.Select(candidate => candidate.Id));
     }
 
     [Fact]
     public async Task A_destroyed_channel_puts_its_own_sessions_in_the_bin()
     {
         var sessions = Sessions();
-        Assert.True((await sessions.RunTurnAsync("s-chat", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
-        Assert.True((await sessions.RunTurnAsync("s-ghost", Spec, Guid.NewGuid(), Input(Ghost, "hi"), null, default)).Ok);
+        Assert.True((await sessions.TurnAsync("s-chat", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
+        Assert.True((await sessions.TurnAsync("s-ghost", Spec, Guid.NewGuid(), Input(Ghost, "hi"), null, default)).Ok);
 
         var bin = Bin();
         var channels = await ChannelsServing(sessions, bin, Chat);
@@ -190,12 +265,12 @@ public sealed class SessionLifecycleTests : IDisposable
         var channels = await ChannelsServing(sessions, bin, Chat);
         Assert.True(bin.Register(new SessionArchiveSource(sessions, channels)).Ok);
 
-        Assert.True((await sessions.RunTurnAsync("s-twice", Spec, Guid.NewGuid(), Input(Ghost, "first life"), null, default)).Ok);
+        Assert.True((await sessions.TurnAsync("s-twice", Spec, Guid.NewGuid(), Input(Ghost, "first life"), null, default)).Ok);
         var firstBytes = StoredState("s-twice").StepNumber;
         Assert.True((await bin.ArchiveAsync(ArchiveKinds.Session, null, dryRun: false, default)).Ok);
 
         // The same id exists again (a Channel's script does not know about the bin) and goes away again.
-        Assert.True((await sessions.RunTurnAsync("s-twice", Spec, Guid.NewGuid(), Input(Ghost, "second life"), null, default)).Ok);
+        Assert.True((await sessions.TurnAsync("s-twice", Spec, Guid.NewGuid(), Input(Ghost, "second life"), null, default)).Ok);
         Assert.True((await bin.ArchiveAsync(ArchiveKinds.Session, null, dryRun: false, default)).Ok);
 
         var entries = (await bin.ArchivedAsync(ArchiveKinds.Session, default)).Value!;
@@ -215,9 +290,9 @@ public sealed class SessionLifecycleTests : IDisposable
         var channels = await ChannelsServing(sessions, bin, Chat);
         Assert.True(bin.Register(new SessionArchiveSource(sessions, channels)).Ok);
 
-        Assert.True((await sessions.RunTurnAsync("s-twice", Spec, Guid.NewGuid(), Input(Ghost, "first life"), null, default)).Ok);
+        Assert.True((await sessions.TurnAsync("s-twice", Spec, Guid.NewGuid(), Input(Ghost, "first life"), null, default)).Ok);
         Assert.True((await bin.ArchiveAsync(ArchiveKinds.Session, null, dryRun: false, default)).Ok);
-        Assert.True((await sessions.RunTurnAsync("s-twice", Spec, Guid.NewGuid(), Input(Ghost, "second life"), null, default)).Ok);
+        Assert.True((await sessions.TurnAsync("s-twice", Spec, Guid.NewGuid(), Input(Ghost, "second life"), null, default)).Ok);
 
         var refused = await bin.RestoreAsync(ArchiveKinds.Session, ["s-twice"], dryRun: false, default);
         var outcome = Assert.Single(refused.Value!.Items);
@@ -234,7 +309,7 @@ public sealed class SessionLifecycleTests : IDisposable
         var before = ghosts.ToDictionary(dir => dir, Snapshot, StringComparer.Ordinal);
 
         var sessions = Sessions();
-        var turn = await sessions.RunTurnAsync("s-fresh", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default);
+        var turn = await sessions.TurnAsync("s-fresh", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
 
         // Nothing walked them, repaired them, migrated them or rewrote their metadata. Reads are not observable
@@ -254,7 +329,7 @@ public sealed class SessionLifecycleTests : IDisposable
         // A conversation that is broken (its stored spec no longer reads) is not "garbage" by any checkable rule,
         // yet putting it away is exactly what an operator needs. A bin that refuses that is only a garbage list.
         var sessions = Sessions();
-        Assert.True((await sessions.RunTurnAsync("s-live", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
+        Assert.True((await sessions.TurnAsync("s-live", Spec, Guid.NewGuid(), Input(Chat, "hi"), null, default)).Ok);
         var bin = Bin();
         var channels = await ChannelsServing(sessions, bin, Chat);
         Assert.True(bin.Register(new SessionArchiveSource(sessions, channels)).Ok);

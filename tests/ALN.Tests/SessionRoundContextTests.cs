@@ -31,12 +31,12 @@ public sealed class SessionRoundContextTests : IDisposable
     public async Task Time_is_rendered_each_round_but_channel_info_enters_history_only_once()
     {
         var spec = new SessionSpec("default", "Answer briefly.", "1");
-        var first = await _sessions.RunTurnAsync("s-chat-1", spec, Guid.NewGuid(),
+        var first = await _sessions.TurnAsync("s-chat-1", spec, Guid.NewGuid(),
             new SessionTurnInput([new("m-1", "user", "alice", "hello", DateTimeOffset.UtcNow)], Channel, Binding),
             null, default);
         Assert.True(first.Ok, first.Error?.Detail ?? first.Error?.Message);
 
-        var second = await _sessions.RunTurnAsync("s-chat-1", spec, Guid.NewGuid(),
+        var second = await _sessions.TurnAsync("s-chat-1", spec, Guid.NewGuid(),
             new SessionTurnInput([new("m-2", "user", "alice", "again", DateTimeOffset.UtcNow)], Channel, Binding),
             null, default);
         Assert.True(second.Ok, second.Error?.Detail ?? second.Error?.Message);

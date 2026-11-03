@@ -172,7 +172,7 @@ Register((IModule)graph!);
 Register((IModule)clock!);
 // The instances those managers hold are findable through them, not copied in: the owner's dictionary is the
 // truth, so a destroyed instance is gone from the catalog by being gone from its owner.
-foreach (var index in new[] { (IModuleIndex)adapters, modelManager, (IModuleIndex)channels! })
+foreach (var index in new[] { (IModuleIndex)adapters, modelManager, (IModuleIndex)channels!, (IModuleIndex)sessions })
 {
     var observed = modules.Observe(index);
     if (!observed.Ok) registrationFailures.Add(observed.Error?.Message ?? $"Could not observe {index.Category}.");

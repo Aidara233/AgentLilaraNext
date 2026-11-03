@@ -15,7 +15,12 @@ public sealed class AdapterTypeCatalog : IModuleTypeRegistry
         ["channel"] = new("channel", null, true),
         ["clock"] = new("clock", null, true),
         ["graph"] = new("graph", null, true),
-        ["model"] = new("model", null, true)
+        ["model"] = new("model", null, true),
+        // Sessions are instances of one type. It is a type here rather than a manager-only fact because mount rules
+        // and type lookups ask the same question about a Session as about an Adapter, and "not in the tree" would
+        // make the answer depend on which module happened to ask.
+        ["session"] = new("session", null, true),
+        ["session.chat"] = new("session.chat", "session", false)
     };
     private readonly Dictionary<string, HashSet<string>> _ownedTypes = new(StringComparer.Ordinal);
     private readonly object _gate = new();
