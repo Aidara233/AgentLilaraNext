@@ -92,6 +92,36 @@ public sealed class LifecycleTests : IDisposable
     }
 
     [Fact]
+    public async Task A_live_adapter_is_findable_by_name_and_stops_being_findable_once_it_is_gone()
+    {
+        var types = new AdapterTypeCatalog();
+        Assert.True(types.RegisterPackageTypes("test.adapter", [new("adapter.file", "adapter")]).Ok);
+        var factories = new AdapterFactoryRegistry();
+        Assert.True(factories.Register("test.adapter", new StubFactory()).Ok);
+        var catalog = new ModuleCatalog();
+        var manager = new AdapterManager(types, new StubBindings(), factories, new FileAdapterSpecStore(Path.Combine(_root, "adapters")));
+        Assert.True(catalog.Attach(manager).Ok);
+        Assert.True(catalog.Observe(manager).Ok);
+        var address = new Address("adapter", "file", "file-1");
+
+        Assert.True((await manager.CreateAsync(new(address, new("file", "file-1", AdapterDirection.Both), "adapter.file"), default)).Ok);
+
+        // Reachable by the name it carries, and listed as an instance of the type its spec named.
+        var found = catalog.Find(new ModuleId(address.ToString()));
+        Assert.NotNull(found);
+        Assert.Equal(address, Assert.IsAssignableFrom<IChatAdapter>(found).Address);
+        var row = Assert.Single(catalog.List(typeId: "adapter.file"));
+        Assert.Equal(ModuleRole.Instance, row.Role);
+        Assert.Equal("adapter", row.Category);
+
+        Assert.True((await manager.DestroyAsync(address, default)).Ok);
+
+        // Nothing had to be un-registered: the owner stopped holding it, so the catalog stopped finding it.
+        Assert.Null(catalog.Find(new ModuleId(address.ToString())));
+        Assert.Empty(catalog.List(typeId: "adapter.file"));
+    }
+
+    [Fact]
     public async Task Adapter_manager_starts_stored_adapters_and_hands_the_signal_down()
     {
         var types = new AdapterTypeCatalog();
@@ -163,6 +193,7 @@ public sealed class LifecycleTests : IDisposable
     private sealed class StubAdapter(Address address) : IChatAdapter, IPollingAdapter
     {
         public Address Address { get; } = address;
+        public ModuleId Id => new(Address.ToString());
         public AdapterDescriptor Descriptor { get; } = new("file", "file-1", AdapterDirection.Both);
         public AdapterState State { get; private set; } = AdapterState.Created;
         public ValueTask<Result> StartAsync(CancellationToken cancellationToken)

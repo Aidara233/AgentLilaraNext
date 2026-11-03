@@ -85,6 +85,7 @@ internal sealed class OpenAiChatProvider : IModelProvider
     { Address = address; Describe = descriptor; _endpoint = endpoint; _apiKey = apiKey; }
 
     public Address Address { get; }
+    public ModuleId Id => new(Address.ToString());
     public ModelProviderDescriptor Describe { get; }
 
     public async IAsyncEnumerable<ModelEvent> CompleteAsync(ModelRequest request,

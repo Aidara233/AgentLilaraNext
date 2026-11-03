@@ -93,16 +93,20 @@ public sealed class AdapterTypeCatalog : IModuleTypeRegistry
 }
 
 [Module(AdapterManagerId, Category = "adapter", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IModule
+public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecycleParticipant, IModule
 {
     public const string AdapterManagerId = "AdapterManager";
     public ModuleId Id { get; } = new(AdapterManagerId);
 
-    // Type per live adapter, written once at creation from the spec. Kept here rather than read out of the
-    // address because an address is a name, and a name says nothing about what it is.
-    private readonly Dictionary<Address, string> _adapterTypes = new();
+    public string Category => "adapter";
 
-    private readonly Dictionary<Address, IChatAdapter> _adapters = new();
+    /// <summary>One live instance and what its spec said it is. The name is the key: an address is a name, and a
+    /// name says nothing about what it is, so the type travels next to the object instead of in a parallel map.</summary>
+    private sealed record LiveAdapter(IChatAdapter Adapter, string TypeId);
+
+    private readonly Dictionary<ModuleId, LiveAdapter> _adapters = new();
+
+    private static ModuleId IdOf(Address address) => new(address.ToString());
     private readonly IModuleTypeCatalog _types;
     private readonly IInstanceBindings _bindings;
     private readonly IAdapterFactoryRegistry? _factories;
@@ -143,7 +147,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
     /// <inheritdoc />
     public string? TypeOf(Address address)
     {
-        lock (_gate) return _adapterTypes.TryGetValue(address, out var type) ? type : null;
+        lock (_gate) return _adapters.TryGetValue(IdOf(address), out var live) ? live.TypeId : null;
     }
 
     public ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, CancellationToken cancellationToken) =>
@@ -153,13 +157,28 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
     public Result<IChatAdapter> Get(Address address)
     {
         lock (_gate)
-            return _adapters.TryGetValue(address, out var adapter) ? Result<IChatAdapter>.Success(adapter)
+            return _adapters.TryGetValue(IdOf(address), out var live) ? Result<IChatAdapter>.Success(live.Adapter)
                 : Result<IChatAdapter>.Failure(new(ErrorCode.Invalid, $"Adapter not found: {address}"));
     }
     public IReadOnlyList<AdapterInfo> List()
     {
-        lock (_gate) return _adapters.Values.Select(a => new AdapterInfo(a.Address, a.Descriptor, a.State,
-            _adapterTypes.TryGetValue(a.Address, out var type) ? type : "")).ToArray();
+        lock (_gate) return _adapters.Values
+            .Select(live => new AdapterInfo(live.Adapter.Address, live.Adapter.Descriptor, live.Adapter.State, live.TypeId))
+            .ToArray();
+    }
+
+    /// <inheritdoc />
+    public IModule? Locate(ModuleId id)
+    {
+        lock (_gate) return _adapters.TryGetValue(id, out var live) ? live.Adapter : null;
+    }
+
+    /// <inheritdoc />
+    public IReadOnlyList<CatalogEntry> Entries()
+    {
+        lock (_gate) return _adapters.Values
+            .Select(live => new CatalogEntry(live.Adapter.Id, live.TypeId, Category, ModuleRole.Instance))
+            .ToArray();
     }
     public ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, Func<AdapterSpec, IChatAdapter> factory, CancellationToken cancellationToken) =>
         CreateCoreAsync(spec, s =>
@@ -178,8 +197,8 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
         {
             lock (_gate)
             {
-                if (_adapters.ContainsKey(spec.Address)) return Result<IChatAdapter>.Failure(new(ErrorCode.Conflict, $"Adapter already exists: {spec.Address}"));
-                if (_adapters.Values.Any(a => a.Descriptor.PlatformId == spec.Descriptor.PlatformId && a.Descriptor.AccountId == spec.Descriptor.AccountId))
+                if (_adapters.ContainsKey(IdOf(spec.Address))) return Result<IChatAdapter>.Failure(new(ErrorCode.Conflict, $"Adapter already exists: {spec.Address}"));
+                if (_adapters.Values.Any(live => live.Adapter.Descriptor.PlatformId == spec.Descriptor.PlatformId && live.Adapter.Descriptor.AccountId == spec.Descriptor.AccountId))
                     return Result<IChatAdapter>.Failure(new(ErrorCode.Conflict, "Platform/account is already registered."));
             }
             var created = factory(spec);
@@ -189,14 +208,13 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
                 return Result<IChatAdapter>.Failure(new(ErrorCode.Invalid, "Factory output does not match its AdapterSpec."));
             lock (_gate)
             {
-                _adapters.Add(spec.Address, adapter);
-                _adapterTypes[spec.Address] = spec.TypeId;
+                _adapters.Add(adapter.Id, new LiveAdapter(adapter, spec.TypeId));
             }
             if (_parameters is not null && adapter is IParameterTarget tunable) _parameters.Register(tunable);
             var attached = await _bindings.AttachAsync(spec.Address, cancellationToken).ConfigureAwait(false);
             if (!attached.Ok)
             {
-                lock (_gate) { _adapters.Remove(spec.Address); _adapterTypes.Remove(spec.Address); }
+                lock (_gate) _adapters.Remove(IdOf(spec.Address));
                 return Result<IChatAdapter>.Failure(attached.Error!);
             }
             if (_specs is not null)
@@ -205,7 +223,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
                 var persisted = await _specs.SaveAsync(spec, cancellationToken).ConfigureAwait(false);
                 if (!persisted.Ok)
                 {
-                    lock (_gate) _adapters.Remove(spec.Address);
+                    lock (_gate) _adapters.Remove(IdOf(spec.Address));
                     await _bindings.DetachAsync(spec.Address, CancellationToken.None).ConfigureAwait(false);
                     return Result<IChatAdapter>.Failure(persisted.Error!);
                 }
@@ -325,7 +343,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
                         await _bindings.AttachAsync(address, CancellationToken.None).ConfigureAwait(false);
                         return stopped;
                     }
-                    lock (_gate) { _adapters.Remove(address); _adapterTypes.Remove(address); }
+                    lock (_gate) _adapters.Remove(IdOf(address));
                 }
                 catch
                 {
@@ -352,7 +370,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
                     ? await forceBindings.ForceDetachAsync(address, cancellationToken).ConfigureAwait(false)
                     : await _bindings.DetachAsync(address, cancellationToken).ConfigureAwait(false);
                 if (!detached.Ok) return detached;
-                lock (_gate) { _adapters.Remove(address); _adapterTypes.Remove(address); }
+                lock (_gate) _adapters.Remove(IdOf(address));
                 _parameters?.Unregister(address.ToString());
             }
             return Result.Success();
@@ -379,7 +397,7 @@ public sealed class AdapterManager : IAdapterManager, ILifecycleParticipant, IMo
                     await _bindings.AttachAsync(address, CancellationToken.None).ConfigureAwait(false);
                     return stopped;
                 }
-                lock (_gate) _adapters.Remove(address);
+                lock (_gate) _adapters.Remove(IdOf(address));
                 _parameters?.Unregister(address.ToString());
                 if (_specs is not null)
                 {

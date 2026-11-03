@@ -170,6 +170,13 @@ Register(sessions);
 Register((IModule)channels!);
 Register((IModule)graph!);
 Register((IModule)clock!);
+// The instances those managers hold are findable through them, not copied in: the owner's dictionary is the
+// truth, so a destroyed instance is gone from the catalog by being gone from its owner.
+foreach (var index in new[] { (IModuleIndex)adapters, modelManager, (IModuleIndex)channels! })
+{
+    var observed = modules.Observe(index);
+    if (!observed.Ok) registrationFailures.Add(observed.Error?.Message ?? $"Could not observe {index.Category}.");
+}
 if (registrationFailures.Count > 0)
 {
     foreach (var failure in registrationFailures) Console.Error.WriteLine(failure);
@@ -177,7 +184,7 @@ if (registrationFailures.Count > 0)
 }
 // Which modules exist is not something anybody can discover from a log, and a catalogue that silently failed to
 // register would look exactly like one with nothing in it.
-restore.Note("modules", $"{modules.Count} registered: {string.Join(", ", modules.List().Select(entry => entry.Id.Value))}");
+restore.Note("modules", $"{modules.Count} registered: {string.Join(", ", modules.List().Where(row => row.Role is not ModuleRole.Instance).Select(row => row.Id.Value))}");
 var channelDelta = new FileChannelDeltaSource(messageStore, stateStore);
 var deltaContributor = roundContextContributors.Register(new ChannelDeltaContributor(channelDelta, channels));
 if (!deltaContributor.Ok) { Console.Error.WriteLine(deltaContributor.Error?.Message); return 1; }
@@ -299,6 +306,15 @@ if (waiting.Ok && waiting.Value is not null)
 }
 foreach (var outcome in lifecycleReport.Outcomes.Where(o => o.Outcome != "ok"))
     Console.Error.WriteLine($"startup {outcome.Outcome}: {outcome.Name} — {outcome.Message}");
+// What the address book can answer for once everything is running, instances included. A catalog whose instances
+// are only in somebody else's dictionary would look identical from the outside — until something asks.
+var liveInstances = modules.List()
+    .Where(row => row.Role is ModuleRole.Instance)
+    .GroupBy(row => row.Category, StringComparer.Ordinal)
+    .Select(group => $"{group.Key} {group.Count()}")
+    .Order(StringComparer.Ordinal)
+    .ToArray();
+restore.Note("instances", liveInstances.Length == 0 ? "none" : string.Join(", ", liveInstances));
 foreach (var note in restore.Snapshot())
     Console.WriteLine($"restored {note.Component}: {note.Summary}");
 if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))

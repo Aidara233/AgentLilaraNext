@@ -164,4 +164,90 @@ public sealed class ModuleCatalogTests
         Assert.Empty(catalog.List());
         Assert.False(catalog.Detach(new ModuleId("Fake.Thing#1")).Ok);
     }
+
+    /// <summary>Stands in for a manager: it owns its instances and answers for them, the catalog copies nothing.</summary>
+    private sealed class FakeIndex(string category = "fake-instance") : IModuleIndex
+    {
+        private readonly Dictionary<string, IModule> _held = new(StringComparer.OrdinalIgnoreCase);
+
+        public string Category => category;
+
+        public IModule Hold(string id, string typeId)
+        {
+            var module = new FakeThing(new ModuleId(id));
+            _held[id] = module;
+            _types[id] = typeId;
+            return module;
+        }
+
+        private readonly Dictionary<string, string> _types = new(StringComparer.OrdinalIgnoreCase);
+
+        public void Drop(string id) => _held.Remove(id);
+
+        public IModule? Locate(ModuleId id) => _held.TryGetValue(id.Value, out var module) ? module : null;
+
+        public IReadOnlyList<CatalogEntry> Entries() => _held
+            .Select(entry => new CatalogEntry(new ModuleId(entry.Key), _types[entry.Key], Category, ModuleRole.Instance))
+            .ToArray();
+    }
+
+    [Fact]
+    public void An_instance_is_found_through_its_owner_not_through_a_copy()
+    {
+        var catalog = new ModuleCatalog();
+        var index = new FakeIndex();
+        Assert.True(catalog.Observe(index).Ok);
+        var instance = index.Hold("Fake.Thing#1", "fake.thing");
+
+        Assert.Same(instance, catalog.Find(new ModuleId("Fake.Thing#1")));
+        Assert.Single(catalog.List(category: "fake-instance"));
+        Assert.Equal("fake.thing", Assert.Single(catalog.List(typeId: "fake.thing")).TypeId);
+
+        // The point of asking instead of copying: a destroyed instance cannot linger as a name that still resolves.
+        index.Drop("Fake.Thing#1");
+        Assert.Null(catalog.Find(new ModuleId("Fake.Thing#1")));
+        Assert.Empty(catalog.List());
+    }
+
+    [Fact]
+    public void Two_owners_in_one_category_are_refused()
+    {
+        // Otherwise "which of them has this name" becomes a coin toss at every lookup.
+        var catalog = new ModuleCatalog();
+        Assert.True(catalog.Observe(new FakeIndex()).Ok);
+
+        var second = catalog.Observe(new FakeIndex());
+
+        Assert.False(second.Ok);
+        Assert.Equal(ErrorCode.Conflict, second.Error!.Code);
+    }
+
+    [Fact]
+    public void The_same_owner_observed_twice_is_not_a_second_owner()
+    {
+        var catalog = new ModuleCatalog();
+        var index = new FakeIndex();
+        Assert.True(catalog.Observe(index).Ok);
+        Assert.True(catalog.Observe(index).Ok);
+        index.Hold("Fake.Thing#1", "fake.thing");
+
+        // One row, not two: asking the same owner twice would double every instance.
+        Assert.Single(catalog.List(category: "fake-instance"));
+    }
+
+    [Fact]
+    public void Two_owners_holding_the_same_name_is_an_error_not_a_coin_toss()
+    {
+        // Cross-owner duplicates are a bug upstream, and answering with whichever one was asked first is how the
+        // wrong object gets called.
+        var catalog = new ModuleCatalog();
+        var first = new FakeIndex();
+        var second = new FakeIndex("another-category");
+        Assert.True(catalog.Observe(first).Ok);
+        Assert.True(catalog.Observe(second).Ok);
+        first.Hold("Fake.Thing#dup", "fake.thing");
+        second.Hold("Fake.Thing#dup", "fake.thing");
+
+        Assert.Throws<InvalidOperationException>(() => catalog.Find(new ModuleId("Fake.Thing#dup")));
+    }
 }

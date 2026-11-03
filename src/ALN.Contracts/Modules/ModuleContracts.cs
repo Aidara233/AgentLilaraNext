@@ -41,6 +41,26 @@ public enum ModuleRole { Manager, Instance, Script }
 public sealed record CatalogEntry(ModuleId Id, string TypeId, string Category, ModuleRole Role);
 
 /// <summary>
+/// A manager that can answer for the instances it holds: "is this name mine, and what is it".
+///
+/// It exists so that instances are never copied into the catalog. The manager's own dictionary is the truth
+/// (it just created the thing, it will destroy it), and the catalog asks. Copying rows would mean every destroy
+/// path — normal, forced, by type, package unload — has to remember to delete the copy, and any path that
+/// forgets leaves a name that resolves to something no longer there.
+/// </summary>
+public interface IModuleIndex
+{
+    /// <summary>The namespace this owner holds instances in: <c>adapter</c>, <c>channel</c>, <c>model</c>, …</summary>
+    string Category { get; }
+
+    /// <summary>The instance by that name, or null when this owner holds nothing by it. Never invents one.</summary>
+    IModule? Locate(ModuleId id);
+
+    /// <summary>Every instance held right now. A destroyed one is absent because it is absent from the owner.</summary>
+    IReadOnlyList<CatalogEntry> Entries();
+}
+
+/// <summary>
 /// Every module that exists right now, findable by name or by type.
 ///
 /// It is not a module itself — otherwise "find a module" would require a module, which is a bootstrap circle.
@@ -67,6 +87,15 @@ public interface ICatalog
     /// case-insensitively, and a singleton must be named after its own type.
     /// </summary>
     Result Attach(IModule module);
+
+    /// <summary>
+    /// Registers an owner of instances — a manager — so that the instances it holds can be found here too.
+    ///
+    /// The catalog does not copy their rows. A copy is a second place the truth can be wrong, and it goes wrong
+    /// in the worst way available: a name that still resolves, to something that was destroyed three code paths
+    /// ago. Asking the owner costs one dictionary lookup and cannot be stale.
+    /// </summary>
+    Result Observe(IModuleIndex index);
 
     Result Detach(ModuleId id);
 }

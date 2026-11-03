@@ -10,8 +10,10 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
     IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IQueuedMessageStore? queue = null,
     ISessionManager? sessions = null, IArchiveRegistry? archive = null)
-    : IChannelManager, ILifecycleParticipant, IModule
+    : IChannelManager, IModuleIndex, ILifecycleParticipant, IModule
 {
+    public string Category => "channel";
+
     public const string ChannelManagerId = "ChannelManager";
     public ModuleId Id { get; } = new(ChannelManagerId);
 
@@ -34,7 +36,11 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     private readonly IQueuedMessageStore? _queue = queue;
     private readonly ISessionManager? _sessions = sessions;
     private readonly IArchiveRegistry? _archive = archive;
-    private readonly Dictionary<Address, ChannelInstance> _channels = new();
+    /// <summary>Instances by name. The address lives on the instance; the name is the key, so nothing has to take one
+    /// apart to look something up.</summary>
+    private readonly Dictionary<ModuleId, ChannelInstance> _channels = new();
+
+    private static ModuleId IdOf(Address address) => new(address.ToString());
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -42,18 +48,26 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     public Result<ChannelInfo> Get(Address address)
     {
         lock (_gate)
-            return _channels.TryGetValue(address, out var channel)
+            return _channels.TryGetValue(IdOf(address), out var channel)
                 ? Result<ChannelInfo>.Success(channel.ToInfo())
                 : Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
     }
     public string? TypeOf(Address address)
-    { lock (_gate) return _channels.TryGetValue(address, out var channel) ? channel.TypeId : null; }
+    { lock (_gate) return _channels.TryGetValue(IdOf(address), out var channel) ? channel.TypeId : null; }
     public IReadOnlyList<ChannelInfo> List()
     { lock (_gate) return _channels.Values.Select(c => c.ToInfo()).ToArray(); }
+
+    /// <inheritdoc />
+    public IModule? Locate(ModuleId id)
+    { lock (_gate) return _channels.TryGetValue(id, out var channel) ? channel : null; }
+
+    /// <inheritdoc />
+    public IReadOnlyList<CatalogEntry> Entries()
+    { lock (_gate) return _channels.Values.Select(c => new CatalogEntry(c.Id, c.TypeId, Category, ModuleRole.Instance)).ToArray(); }
     public bool IsBound(Address channelAddress, Address adapter, string platformConversationId)
     {
         lock (_gate)
-            return _channels.TryGetValue(channelAddress, out var channel) && channel.Running &&
+            return _channels.TryGetValue(IdOf(channelAddress), out var channel) && channel.Running &&
                    channel.Bindings.Any(b => b.Adapter == adapter && b.PlatformConversationId == platformConversationId);
     }
 
@@ -91,19 +105,19 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         {
             lock (_gate)
             {
-                if (_channels.ContainsKey(spec.Address))
+                if (_channels.ContainsKey(IdOf(spec.Address)))
                     return Result<ChannelInfo>.Failure(new(ErrorCode.Conflict, $"Channel already exists: {spec.Address}"));
                 foreach (var binding in spec.Bindings)
                     if (_channels.Values.Any(c => c.Bindings.Contains(binding)))
                         return Result<ChannelInfo>.Failure(new(ErrorCode.Conflict, "An Adapter/conversation binding can belong to only one Channel."));
                 var instance = new ChannelInstance(spec);
-                _channels.Add(spec.Address, instance);
+                _channels.Add(instance.Id, instance);
                 ApplyParameters(instance);
             }
             var mounted = await _bindings.AttachAsync(spec.Address, cancellationToken).ConfigureAwait(false);
             if (!mounted.Ok)
             {
-                lock (_gate) _channels.Remove(spec.Address);
+                lock (_gate) _channels.Remove(IdOf(spec.Address));
                 return Result<ChannelInfo>.Failure(mounted.Error!);
             }
             if (_specs is not null)
@@ -111,7 +125,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                 var persisted = await _specs.SaveAsync(spec, cancellationToken).ConfigureAwait(false);
                 if (!persisted.Ok)
                 {
-                    lock (_gate) _channels.Remove(spec.Address);
+                    lock (_gate) _channels.Remove(IdOf(spec.Address));
                     await _bindings.DetachAsync(spec.Address, CancellationToken.None).ConfigureAwait(false);
                     return Result<ChannelInfo>.Failure(persisted.Error!);
                 }
@@ -164,7 +178,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     {
         lock (_gate)
         {
-            if (!_channels.TryGetValue(address, out var channel)) return Result.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
+            if (!_channels.TryGetValue(IdOf(address), out var channel)) return Result.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
             channel.Running = running;
             return Result.Success();
         }
@@ -204,7 +218,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             ChannelInstance channel;
             lock (_gate)
             {
-                if (!_channels.TryGetValue(address, out channel!)) return Result.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
+                if (!_channels.TryGetValue(IdOf(address), out channel!)) return Result.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
                 channel.Draining = true;
             }
             Result detached;
@@ -222,7 +236,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             lock (_gate)
             {
                 channel.Running = false;
-                _channels.Remove(address);
+                _channels.Remove(IdOf(address));
             }
             if (_specs is not null)
             {
@@ -474,9 +488,11 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         return Result.Success();
     }
 
-    private sealed class ChannelInstance(ChannelSpec spec)
+    private sealed class ChannelInstance(ChannelSpec spec) : IModule
     {
         public Address Address { get; } = spec.Address;
+        /// <summary>The address is the name; the catalog and the graph reach the instance by this.</summary>
+        public ModuleId Id => new(Address.ToString());
         public string Name { get; } = spec.Name;
         public IReadOnlyList<ChannelBinding> Bindings { get; } = Array.AsReadOnly(spec.Bindings.ToArray());
         /// <summary>Spec value unless overridden at runtime; the window is read on every activation.</summary>

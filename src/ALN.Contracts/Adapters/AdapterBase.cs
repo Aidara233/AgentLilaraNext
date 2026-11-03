@@ -8,6 +8,9 @@ namespace ALN.Contracts;
 /// </summary>
 public abstract class AdapterBase : IChatAdapter
 {
+    /// <summary>The address is the name. One value, two spellings: the catalog keys by this, the transport by the other.</summary>
+    public ModuleId Id => new(Address.ToString());
+
     private int _state = (int)AdapterState.Created;
 
     protected AdapterBase(Address address, AdapterDescriptor descriptor)

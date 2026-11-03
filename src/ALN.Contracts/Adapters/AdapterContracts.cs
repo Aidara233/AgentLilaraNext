@@ -95,7 +95,12 @@ public interface IOutboundAdapter
 {
     ValueTask<Result<SendResult>> SendAsync(OutboundMessage message, CancellationToken cancellationToken);
 }
-public interface IChatAdapter : IInboundAdapter, IOutboundAdapter
+/// <summary>
+/// What an Adapter can do. It is also a module: an instance is a thing with a name, and the name is how the
+/// catalog and the graph reach it. The behavior lives here; "it exists under a name" comes from
+/// <see cref="IModule"/>, and <see cref="IModule.Id"/> is the same name as <see cref="Address"/>.
+/// </summary>
+public interface IChatAdapter : IInboundAdapter, IOutboundAdapter, IModule
 {
     Address Address { get; }
     AdapterDescriptor Descriptor { get; }

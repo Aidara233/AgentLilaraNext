@@ -6,15 +6,21 @@ namespace ALN.Runtime;
 
 /// <summary>Core registry and router for provider kinds, provider instances and model profiles.</summary>
 [Module(ModelManagerId, Category = "model", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? signalLog = null) : IModelManager, IModulePackageResourceRegistry, IModule
+public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? signalLog = null)
+    : IModelManager, IModuleIndex, IModulePackageResourceRegistry, IModule
 {
     public const string ModelManagerId = "ModelManager";
     public ModuleId Id { get; } = new(ModelManagerId);
 
+    public string Category => "model";
+
+    private static ModuleId IdOf(Address address) => new(address.ToString());
+
     private readonly object _gate = new();
     private readonly Dictionary<string, (string PackageId, IModelProviderFactory Factory)> _factories = new(StringComparer.Ordinal);
-    private readonly Dictionary<Address, (string PackageId, IModelProvider Provider, int InFlight)> _providers = new();
-    private readonly Dictionary<Address, string> _providerTypes = new();
+    // Keyed by name; the address stays on the provider. The type is not kept separately either: the provider
+    // descriptor carries it, and that descriptor came from the factory registered under that very type.
+    private readonly Dictionary<ModuleId, (string PackageId, IModelProvider Provider, int InFlight)> _providers = new();
     private readonly Dictionary<string, ModelProfile> _profiles = new(StringComparer.Ordinal);
 
     public Result RegisterFactory(string packageId, IModelProviderFactory factory)
@@ -42,7 +48,7 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
         {
             var ownedTypes = _factories.Where(x => x.Value.PackageId == packageId).Select(x => x.Key).ToHashSet(StringComparer.Ordinal);
             var activeInstances = _providers.Values
-                .Where(x => _providerTypes.TryGetValue(x.Provider.Address, out var type) && ownedTypes.Contains(type))
+                .Where(x => ownedTypes.Contains(x.Provider.Describe.TypeId))
                 .Select(x => x.Provider.Address).ToArray();
             if (activeInstances.Length > 0)
                 return Result.Failure(new(ErrorCode.Conflict, $"Model provider instances must be destroyed before unloading their package: {string.Join(", ", activeInstances)}"));
@@ -62,7 +68,7 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
     /// <inheritdoc />
     public string? TypeOf(Address address)
     {
-        lock (_gate) return _providerTypes.TryGetValue(address, out var type) ? type : null;
+        lock (_gate) return _providers.TryGetValue(IdOf(address), out var row) ? row.Provider.Describe.TypeId : null;
     }
 
     public async ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken)
@@ -76,7 +82,7 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
         string packageId;
         lock (_gate)
         {
-            if (_providers.ContainsKey(spec.Address))
+            if (_providers.ContainsKey(IdOf(spec.Address)))
                 return Result<IModelProvider>.Failure(new(ErrorCode.Conflict, $"Model provider instance already exists: {spec.Address}"));
             if (!_factories.TryGetValue(spec.TypeId, out var registration))
                 return Result<IModelProvider>.Failure(new(ErrorCode.Unavailable, $"Model provider type is not registered: {spec.TypeId}"));
@@ -95,13 +101,12 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
         }
         lock (_gate)
         {
-            if (_providers.ContainsKey(spec.Address))
+            if (_providers.ContainsKey(IdOf(spec.Address)))
             {
                 _ = created.Value.DisposeAsync();
                 return Result<IModelProvider>.Failure(new(ErrorCode.Conflict, $"Model provider instance already exists: {spec.Address}"));
             }
-            _providers.Add(spec.Address, (packageId, created.Value, 0));
-            _providerTypes[spec.Address] = spec.TypeId;
+            _providers.Add(created.Value.Id, (packageId, created.Value, 0));
         }
         return Result<IModelProvider>.Success(created.Value);
     }
@@ -131,14 +136,14 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
         IModelProvider instance;
         lock (_gate)
         {
-            if (!_providers.TryGetValue(provider, out var registration))
+            if (!_providers.TryGetValue(IdOf(provider), out var registration))
                 return Result.Failure(new(ErrorCode.Invalid, $"Model provider instance not found: {provider}"));
             if (registration.InFlight > 0)
                 return Result.Failure(new(ErrorCode.Conflict, $"Model provider has calls in flight: {provider}"));
             if (_profiles.Values.Any(p => p.Provider == provider))
                 return Result.Failure(new(ErrorCode.Conflict, $"Model provider is referenced by a profile: {provider}"));
             instance = registration.Provider;
-            _providers.Remove(provider);
+            _providers.Remove(IdOf(provider));
         }
         try { await instance.DisposeAsync().ConfigureAwait(false); return Result.Success(); }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
@@ -147,7 +152,7 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
 
     public Result<IModelProvider> Get(Address provider)
     {
-        lock (_gate) return _providers.TryGetValue(provider, out var registration)
+        lock (_gate) return _providers.TryGetValue(IdOf(provider), out var registration)
             ? Result<IModelProvider>.Success(registration.Provider)
             : Result<IModelProvider>.Failure(new(ErrorCode.Invalid, $"Model provider instance not found: {provider}"));
     }
@@ -158,13 +163,27 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
             .OrderBy(x => x.Address.ToString(), StringComparer.Ordinal).ToArray();
     }
 
+    /// <inheritdoc />
+    public IModule? Locate(ModuleId id)
+    {
+        lock (_gate) return _providers.TryGetValue(id, out var row) ? row.Provider : null;
+    }
+
+    /// <inheritdoc />
+    public IReadOnlyList<CatalogEntry> Entries()
+    {
+        lock (_gate) return _providers.Values
+            .Select(row => new CatalogEntry(row.Provider.Id, row.Provider.Describe.TypeId, Category, ModuleRole.Instance))
+            .ToArray();
+    }
+
     public Result RegisterProfile(ModelProfile profile)
     {
         if (profile is null || string.IsNullOrWhiteSpace(profile.Id) || string.IsNullOrWhiteSpace(profile.ModelId) || !profile.Provider.IsInstance)
             return Result.Failure(new(ErrorCode.Invalid, "Model profile is incomplete."));
         lock (_gate)
         {
-            if (!_providers.ContainsKey(profile.Provider))
+            if (!_providers.ContainsKey(IdOf(profile.Provider)))
                 return Result.Failure(new(ErrorCode.Invalid, $"Model profile provider is not instantiated: {profile.Provider}"));
             if (!_profiles.TryAdd(profile.Id, profile))
                 return Result.Failure(new(ErrorCode.Conflict, $"Model profile already exists: {profile.Id}"));
@@ -188,12 +207,12 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
         {
             if (!_profiles.TryGetValue(profileId, out profile!))
                 return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Failure(new(ErrorCode.Invalid, $"Model profile not found: {profileId}")));
-            if (!_providers.TryGetValue(profile.Provider, out var registration))
+            if (!_providers.TryGetValue(IdOf(profile.Provider), out var registration))
                 return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Failure(new(ErrorCode.Unavailable, $"Model provider is unavailable: {profile.Provider}")));
             provider = registration.Provider;
             if (request.Tools is { Count: > 0 } && !provider.Describe.Capabilities.HasFlag(ModelCapabilities.ToolCalls))
                 return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Failure(new(ErrorCode.Invalid, "Selected model provider does not support tool calls.")));
-            _providers[profile.Provider] = (registration.PackageId, provider, registration.InFlight + 1);
+            _providers[IdOf(profile.Provider)] = (registration.PackageId, provider, registration.InFlight + 1);
         }
         var routedRequest = request with { ModelId = profile.ModelId, Sampling = request.Sampling ?? profile.DefaultSampling };
         return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Success(
@@ -236,8 +255,8 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
         {
             lock (_gate)
             {
-                if (_providers.TryGetValue(address, out var registration) && ReferenceEquals(registration.Provider, provider))
-                    _providers[address] = (registration.PackageId, provider, Math.Max(0, registration.InFlight - 1));
+                if (_providers.TryGetValue(IdOf(address), out var registration) && ReferenceEquals(registration.Provider, provider))
+                    _providers[IdOf(address)] = (registration.PackageId, provider, Math.Max(0, registration.InFlight - 1));
             }
             await PersistCallAsync(callId, at, profileId, address, modelId, request, text.ToString(),
                 calls.Select(pair => new ModelToolCall(pair.Value.Id ?? "", pair.Value.Name ?? "", pair.Value.Arguments.ToString()))

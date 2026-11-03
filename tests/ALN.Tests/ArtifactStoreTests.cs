@@ -96,6 +96,7 @@ public sealed class ArtifactStoreTests : IDisposable
     private sealed class StubProvider(Address address) : IModelProvider
     {
         public Address Address { get; } = address;
+        public ModuleId Id => new(Address.ToString());
         public ModelProviderDescriptor Describe { get; } = new("model.stub", "chat", "Stub", ModelCapabilities.Streaming);
         public async IAsyncEnumerable<ModelEvent> CompleteAsync(ModelRequest request,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)

@@ -79,7 +79,7 @@ public sealed record ModelCallRecord(
     string? Error,
     string? ArtifactPath = null);
 
-public interface IModelProvider : IAsyncDisposable
+public interface IModelProvider : IAsyncDisposable, IModule
 {
     Address Address { get; }
     ModelProviderDescriptor Describe { get; }
