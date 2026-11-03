@@ -177,6 +177,14 @@ public interface ISessionManager
     ValueTask<Result<IReadOnlyList<SessionSummary>>> ListAsync(CancellationToken cancellationToken);
 
     /// <summary>
+    /// Acts on the deadlines Sessions declared when they called <c>wait</c>. Called by the host on startup and
+    /// then on a timer: it reads state and nothing else, so it cannot drift from what a Session actually asked
+    /// for. A Session with no deadline is not this method's business and is left untouched.
+    /// </summary>
+    ValueTask<Result<SessionSweepReport>> SweepAsync(DateTimeOffset now, ISessionDeadlineHandler? handler,
+        CancellationToken cancellationToken);
+
+    /// <summary>
     /// Moves one Session's data out of its living place into <paramref name="destinationDirectory"/>, holding
     /// its turn gate meanwhile. The layout stays the manager's business — a caller says "take it away", not
     /// "here are the files".

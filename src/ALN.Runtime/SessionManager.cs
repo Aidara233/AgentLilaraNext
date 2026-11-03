@@ -731,13 +731,88 @@ public sealed class SessionManager : ISessionManager
                 // "idle since forever", and that is a reason to give something away on the strength of a guess.
                 var lastActive = state?.LastActiveAt ?? LastWritten(directory);
                 sessions.Add(new(id, state?.Channel, lastActive, state?.StepNumber ?? 0, DirectoryBytes(directory),
-                    state?.SupersededAt));
+                    state?.SupersededAt, state?.WaitUntil, state?.WaitRelease ?? false));
             }
             return ValueTask.FromResult(Result<IReadOnlyList<SessionSummary>>.Success(sessions));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         { return ValueTask.FromResult(Result<IReadOnlyList<SessionSummary>>.Failure(new(ErrorCode.Unavailable, "Sessions could not be listed.", ex.Message))); }
     }
+
+    public async ValueTask<Result<SessionSweepReport>> SweepAsync(DateTimeOffset now, ISessionDeadlineHandler? handler,
+        CancellationToken cancellationToken)
+    {
+        var listed = await ListAsync(cancellationToken).ConfigureAwait(false);
+        if (!listed.Ok || listed.Value is null) return Result<SessionSweepReport>.Failure(listed.Error!);
+        // Null means "waiting for somebody to write", which is not a deadline. Only a declared instant counts:
+        // treating the absence of one as "due now" would archive every idle Session on the first pass.
+        var due = listed.Value.Where(session => session.WaitUntil is { } until && until <= now).ToArray();
+        if (due.Length == 0) return Result<SessionSweepReport>.Success(new(0, 0, 0, 0, 0));
+        // Something is due and this host cannot do anything about it. Saying so is the point: a promise with no
+        // keeper is exactly the failure this number exists to expose.
+        if (handler is null) return Result<SessionSweepReport>.Success(new(due.Length, 0, 0, 0, due.Length));
+
+        var released = 0;
+        var woken = 0;
+        var failed = 0;
+        foreach (var session in due)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Result outcome;
+            try
+            {
+                outcome = session.WaitRelease
+                    ? await handler.ReleaseAsync(session, cancellationToken).ConfigureAwait(false)
+                    : await handler.WakeAsync(session, session.WaitUntil!.Value, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            { outcome = Result.Failure(new(ErrorCode.Internal, "Handling a Session deadline failed.", ex.Message)); }
+
+            // One Session that refuses to go must not stop the others: the pass runs again in a moment, and a
+            // single stuck deadline would otherwise hold every other one hostage.
+            if (!outcome.Ok) { failed++; continue; }
+            if (session.WaitRelease) released++;
+            else woken++;
+        }
+        return Result<SessionSweepReport>.Success(new(due.Length, released, woken, failed, 0));
+    }
+
+    /// <summary>
+    /// The timer itself: one pass now, then on an interval until cancelled. Lives here, next to the state it
+    /// reads, but is driven by the host — a sweep that started its own timer could not be tested, and this one
+    /// can be handed a <see cref="TimeProvider"/> and a fake clock.
+    /// </summary>
+    public async Task RunDeadlineSweepAsync(ISessionDeadlineHandler handler, TimeProvider timeProvider,
+        TimeSpan interval, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+        ArgumentNullException.ThrowIfNull(timeProvider);
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                var swept = await SweepAsync(timeProvider.GetUtcNow(), handler, cancellationToken).ConfigureAwait(false);
+                if (!swept.Ok) RecordSweepFailure(swept.Error!);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return; }
+            catch (Exception ex) { RecordSweepFailure(new(ErrorCode.Internal, "Session deadline sweep failed.", ex.Message)); }
+            try { await Task.Delay(interval, timeProvider, cancellationToken).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+        }
+    }
+
+    private void RecordSweepFailure(Error error) =>
+        _signalLog.Write(new()
+        {
+            Id = Guid.NewGuid(),
+            Group = "session",
+            Name = "deadlines",
+            Mechanism = "session.sweep",
+            Outcome = "failed",
+            Level = SignalLevel.Warn,
+            Detail = new Dictionary<string, string> { ["message"] = error.Message }
+        });
 
     public async ValueTask<Result> ArchiveAsync(string sessionId, string destinationDirectory, CancellationToken cancellationToken)
     {

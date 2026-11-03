@@ -342,4 +342,128 @@ public sealed class SessionToolTests : IDisposable
         // Same brake as a model talking to nobody: what is counted is rounds without progress, not calls.
         Assert.Equal(SessionManager.TextOnlyNudgeLimit + 1, model.Requests.Count);
     }
+
+    // ---- the deadline sweep ---------------------------------------------------------------------
+
+    private sealed class RecordingDeadlineHandler(Func<SessionSummary, bool>? fail = null) : ISessionDeadlineHandler
+    {
+        public List<string> Released { get; } = [];
+        public List<string> Woken { get; } = [];
+
+        public ValueTask<Result> ReleaseAsync(SessionSummary session, CancellationToken cancellationToken)
+        {
+            if (fail?.Invoke(session) == true) return ValueTask.FromResult(Result.Failure(new(ErrorCode.Unavailable, "Refused.")));
+            Released.Add(session.Id);
+            return ValueTask.FromResult(Result.Success());
+        }
+
+        public ValueTask<Result> WakeAsync(SessionSummary session, DateTimeOffset dueAt, CancellationToken cancellationToken)
+        {
+            if (fail?.Invoke(session) == true) return ValueTask.FromResult(Result.Failure(new(ErrorCode.Unavailable, "Refused.")));
+            Woken.Add(session.Id);
+            return ValueTask.FromResult(Result.Success());
+        }
+    }
+
+    private async Task<SessionManager> WaitingAsync(ScriptedModel model, string sessionId)
+    {
+        var sessions = new SessionManager(Path.Combine(_root, "sweep-" + Guid.NewGuid().ToString("N")), model);
+        var turn = await sessions.RunTurnAsync(sessionId, Spec(), Guid.NewGuid(),
+            new SessionTurnInput([], null, null), null, default);
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+        return sessions;
+    }
+
+    private static ScriptedModel WaitingModel(string waitArguments) => new(
+        [new ToolCallDelta(0, "call-2", "wait", waitArguments),
+         new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
+
+    [Fact]
+    public async Task The_sweep_releases_a_session_whose_deadline_passed()
+    {
+        var sessions = await WaitingAsync(WaitingModel("""{"timeout":60,"release":true}"""), "s-1");
+        var handler = new RecordingDeadlineHandler();
+
+        var swept = await sessions.SweepAsync(DateTimeOffset.UtcNow.AddSeconds(61), handler, default);
+
+        Assert.True(swept.Ok, swept.Error?.Message);
+        Assert.Equal(1, swept.Value!.Due);
+        Assert.Equal(1, swept.Value.Released);
+        Assert.Equal(new[] { "s-1" }, handler.Released);
+        Assert.Empty(handler.Woken);
+    }
+
+    [Fact]
+    public async Task A_deadline_in_the_future_is_left_alone()
+    {
+        var sessions = await WaitingAsync(WaitingModel("""{"timeout":600,"release":true}"""), "s-1");
+        var handler = new RecordingDeadlineHandler();
+
+        var swept = await sessions.SweepAsync(DateTimeOffset.UtcNow, handler, default);
+
+        Assert.True(swept.Ok, swept.Error?.Message);
+        Assert.Equal(0, swept.Value!.Due);
+        Assert.Empty(handler.Released);
+    }
+
+    [Fact]
+    public async Task A_deadline_without_release_wakes_the_session_instead()
+    {
+        var sessions = await WaitingAsync(WaitingModel("""{"timeout":60}"""), "s-1");
+        var handler = new RecordingDeadlineHandler();
+
+        var swept = await sessions.SweepAsync(DateTimeOffset.UtcNow.AddSeconds(61), handler, default);
+
+        Assert.Equal(1, swept.Value!.Woken);
+        Assert.Empty(handler.Released);
+        Assert.Equal(new[] { "s-1" }, handler.Woken);
+    }
+
+    [Fact]
+    public async Task A_host_that_cannot_act_on_a_deadline_says_so_instead_of_dropping_it()
+    {
+        var sessions = await WaitingAsync(WaitingModel("""{"timeout":60,"release":true}"""), "s-1");
+
+        var swept = await sessions.SweepAsync(DateTimeOffset.UtcNow.AddSeconds(61), handler: null, default);
+
+        // A promise with no keeper must be visible, not quietly satisfied by doing nothing.
+        Assert.Equal(1, swept.Value!.Due);
+        Assert.Equal(1, swept.Value.Unhandled);
+        Assert.Equal(0, swept.Value.Released);
+    }
+
+    [Fact]
+    public async Task One_session_that_refuses_to_go_does_not_stop_the_others()
+    {
+        // Two Sessions in one root: a refusal on the first must not take the second down with it.
+        var sessions = new SessionManager(Path.Combine(_root, "sweep-shared"), WaitingModel("""{"timeout":60,"release":true}"""));
+        Assert.True((await sessions.RunTurnAsync("s-1", Spec(), Guid.NewGuid(),
+            new SessionTurnInput([], null, null), null, default)).Ok);
+        Assert.True((await sessions.RunTurnAsync("s-2", Spec(), Guid.NewGuid(),
+            new SessionTurnInput([], null, null), null, default)).Ok);
+
+        var refusesFirst = new RecordingDeadlineHandler(session => session.Id == "s-1");
+        var swept = await sessions.SweepAsync(DateTimeOffset.UtcNow.AddSeconds(61), refusesFirst, default);
+
+        Assert.Equal(2, swept.Value!.Due);
+        Assert.Equal(1, swept.Value.Failed);
+        Assert.Equal(1, swept.Value.Released);
+        Assert.Equal(new[] { "s-2" }, refusesFirst.Released);
+    }
+
+    [Fact]
+    public async Task The_sweep_drives_itself_on_an_interval_until_cancelled()
+    {
+        var sessions = await WaitingAsync(WaitingModel("""{"timeout":1,"release":true}"""), "s-1");
+        var handler = new RecordingDeadlineHandler();
+        using var stop = new CancellationTokenSource();
+
+        var loop = sessions.RunDeadlineSweepAsync(handler, TimeProvider.System, TimeSpan.FromMilliseconds(50), stop.Token);
+        var giveUp = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (handler.Released.Count == 0 && DateTimeOffset.UtcNow < giveUp) await Task.Delay(20);
+        stop.Cancel();
+        await loop;
+
+        Assert.Equal(new[] { "s-1" }, handler.Released);
+    }
 }

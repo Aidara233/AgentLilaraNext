@@ -120,6 +120,7 @@ if (!archiveService.Ok || archiveService.Value is null)
     return 1;
 }
 var archive = archiveService.Value;
+var deadlines = new SessionDeadlineHandler(archive);
 var bundledPackage = await modulePackages.LoadAsync(
     Path.Combine(AppContext.BaseDirectory, "modules", "bundled.runtime"), ModulePackageKind.Bundled, CancellationToken.None);
 if (!bundledPackage.Ok)
@@ -232,6 +233,10 @@ var pump = new EventPump(queue, graph.DispatchAsync, signalLog,
     new EventSettlers(new ChannelAcceptSettler(channels), new InboundAckSettler(acks)));
 var pumpTask = pump.RunAsync(pumpStop.Token);
 var clockTask = clock.RunAsync(shutdown.Token);
+// Deadlines a Session declared with wait. Started here, next to the other long-running loops, so that stopping
+// the host stops it too — a sweep that outlived the host would act on state nothing else is maintaining.
+var deadlineSweepTask = sessions.RunDeadlineSweepAsync(deadlines, TimeProvider.System,
+    SessionDeadlineHandler.Interval, shutdown.Token);
 
 // The host's only startup act: hand one signal to the managers, in dependency order.
 var lifecycle = new LifecycleCoordinator(new RecordingEventSink(queue, messageStore), signalLog);
@@ -256,6 +261,16 @@ if (!restored.Ok)
 var replayed = await channels.ReplayPendingAsync(CancellationToken.None);
 if (!replayed.Ok)
     Console.Error.WriteLine($"Warning: unfinished messages could not be replayed: {replayed.Error?.Message} {replayed.Error?.Detail}");
+// A deadline nobody can see is a deadline nobody can trust, and "the sweep is alive and found nothing" would
+// otherwise look exactly like "the sweep never ran". This line is the difference, for a person reading startup.
+var waiting = await sessions.ListAsync(CancellationToken.None);
+if (waiting.Ok && waiting.Value is not null)
+{
+    var declared = waiting.Value.Where(session => session.WaitUntil is not null).Select(session => session.WaitUntil!.Value).ToArray();
+    restore.Note("deferred", declared.Length == 0
+        ? "no Session is waiting on a deadline"
+        : $"{declared.Length} Session(s) waiting, earliest {declared.Min():O}");
+}
 foreach (var outcome in lifecycleReport.Outcomes.Where(o => o.Outcome != "ok"))
     Console.Error.WriteLine($"startup {outcome.Outcome}: {outcome.Name} — {outcome.Message}");
 foreach (var note in restore.Snapshot())
@@ -268,6 +283,7 @@ if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
     queue.Complete();
     try { await pumpTask; } catch (OperationCanceledException) { }
     try { await clockTask; } catch (OperationCanceledException) { }
+    try { await deadlineSweepTask; } catch (OperationCanceledException) { }
     return 1;
 }
 
@@ -310,6 +326,7 @@ finally
     await lifecycle.StopAsync(CancellationToken.None);
     shutdown.Cancel();
     try { await clockTask; } catch (OperationCanceledException) { }
+    try { await deadlineSweepTask; } catch (OperationCanceledException) { }
     queue.Complete();
     try { await pumpTask.WaitAsync(TimeSpan.FromSeconds(10)); }
     catch (TimeoutException) { pumpStop.Cancel(); try { await pumpTask; } catch (OperationCanceledException) { } }
