@@ -184,7 +184,9 @@ public sealed class ModuleCatalogTests
 
         public void Drop(string id) => _held.Remove(id);
 
-        public IModule? Locate(ModuleId id) => _held.TryGetValue(id.Value, out var module) ? module : null;
+        public LocatedModule? Locate(ModuleId id) => _held.TryGetValue(id.Value, out var module)
+            ? new LocatedModule(module, new CatalogEntry(new ModuleId(id.Value), _types[id.Value], Category, ModuleRole.Instance))
+            : null;
 
         public IReadOnlyList<CatalogEntry> Entries() => _held
             .Select(entry => new CatalogEntry(new ModuleId(entry.Key), _types[entry.Key], Category, ModuleRole.Instance))

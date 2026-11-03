@@ -79,9 +79,8 @@ public sealed record ModelCallRecord(
     string? Error,
     string? ArtifactPath = null);
 
-public interface IModelProvider : IAsyncDisposable, IModule
+public interface IModelProvider : IAsyncDisposable, IAddressed, IModule
 {
-    Address Address { get; }
     ModelProviderDescriptor Describe { get; }
     IAsyncEnumerable<ModelEvent> CompleteAsync(ModelRequest request, CancellationToken cancellationToken);
 }

@@ -100,9 +100,8 @@ public interface IOutboundAdapter
 /// catalog and the graph reach it. The behavior lives here; "it exists under a name" comes from
 /// <see cref="IModule"/>, and <see cref="IModule.Id"/> is the same name as <see cref="Address"/>.
 /// </summary>
-public interface IChatAdapter : IInboundAdapter, IOutboundAdapter, IModule
+public interface IChatAdapter : IInboundAdapter, IOutboundAdapter, IAddressed, IModule
 {
-    Address Address { get; }
     AdapterDescriptor Descriptor { get; }
     AdapterState State { get; }
     ValueTask<Result> StartAsync(CancellationToken cancellationToken);

@@ -25,6 +25,37 @@ public sealed class ModuleAttribute(string typeId) : Attribute
 }
 
 /// <summary>
+/// The names of the modules the host brings up exactly once. These are the only ids anything may hard-code: they
+/// are the contract — changing one is an API change. An instance id is a name and nothing else, so it is never
+/// listed here and never relied on.
+///
+/// They live in contracts rather than on the manager classes because every module that needs a manager has to
+/// compile against a project that does not contain it (the graph does not reference the adapter implementation).
+/// </summary>
+public static class ModuleNames
+{
+    public const string AdapterManager = "AdapterManager";
+    public const string ChannelManager = "ChannelManager";
+    public const string SessionManager = "SessionManager";
+    public const string ModelManager = "ModelManager";
+    public const string GraphManager = "GraphManager";
+    public const string Clock = "Clock";
+}
+
+/// <summary>
+/// A module that was configured with an address. It is the same value as <see cref="IModule.Id"/>, in the spelling
+/// specs and transports use — one value with two spellings, not two identities.
+///
+/// It exists so that anything holding only a name (the catalog, the mount table) can get the address back
+/// <b>without taking the name apart</b>. Reading the address out of the name is the one thing the module contract
+/// forbids, and it forbids it for a reason: the day the name changes, everything that read it changes meaning.
+/// </summary>
+public interface IAddressed
+{
+    Address Address { get; }
+}
+
+/// <summary>
 /// The only root in the system: a manager, an instance and a script instance are all of these. What a module
 /// can do comes from the interfaces it also implements (the adapter, channel, session and model contracts);
 /// this one only says it exists under a name.
@@ -53,12 +84,16 @@ public interface IModuleIndex
     /// <summary>The namespace this owner holds instances in: <c>adapter</c>, <c>channel</c>, <c>model</c>, …</summary>
     string Category { get; }
 
-    /// <summary>The instance by that name, or null when this owner holds nothing by it. Never invents one.</summary>
-    IModule? Locate(ModuleId id);
+    /// <summary>The instance by that name and its row, or null when this owner holds nothing by it. Never invents one.</summary>
+    LocatedModule? Locate(ModuleId id);
 
     /// <summary>Every instance held right now. A destroyed one is absent because it is absent from the owner.</summary>
     IReadOnlyList<CatalogEntry> Entries();
 }
+
+/// <summary>A module together with the row describing it, so that asking "what is this" and "what is it called"
+/// costs one lookup instead of two.</summary>
+public sealed record LocatedModule(IModule Module, CatalogEntry Row);
 
 /// <summary>
 /// Every module that exists right now, findable by name or by type.
@@ -75,6 +110,12 @@ public interface ICatalog
 
     /// <summary>Same as <see cref="Find"/> but absence is an error — which it usually is.</summary>
     Result<IModule> Require(ModuleId id);
+
+    /// <summary>
+    /// The row for that name — what it is, which category, which role — without the object. Null when nothing
+    /// answers. A caller that needs the type of an instance asks this; reading it out of the name is not an option.
+    /// </summary>
+    CatalogEntry? Describe(ModuleId id);
 
     /// <summary>
     /// By type or category, because an instance id cannot be guessed: without this, "having the id is having the

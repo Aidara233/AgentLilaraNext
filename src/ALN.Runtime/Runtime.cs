@@ -95,7 +95,7 @@ public sealed class AdapterTypeCatalog : IModuleTypeRegistry
 [Module(AdapterManagerId, Category = "adapter", Role = ModuleRole.Manager, Singleton = true)]
 public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecycleParticipant, IModule
 {
-    public const string AdapterManagerId = "AdapterManager";
+    public const string AdapterManagerId = ModuleNames.AdapterManager;
     public ModuleId Id { get; } = new(AdapterManagerId);
 
     public string Category => "adapter";
@@ -168,9 +168,12 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecyclePa
     }
 
     /// <inheritdoc />
-    public IModule? Locate(ModuleId id)
+    public LocatedModule? Locate(ModuleId id)
     {
-        lock (_gate) return _adapters.TryGetValue(id, out var live) ? live.Adapter : null;
+        lock (_gate)
+            return _adapters.TryGetValue(id, out var live)
+                ? new LocatedModule(live.Adapter, new CatalogEntry(live.Adapter.Id, live.TypeId, Category, ModuleRole.Instance))
+                : null;
     }
 
     /// <inheritdoc />

@@ -9,7 +9,7 @@ namespace ALN.Runtime;
 public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? signalLog = null)
     : IModelManager, IModuleIndex, IModulePackageResourceRegistry, IModule
 {
-    public const string ModelManagerId = "ModelManager";
+    public const string ModelManagerId = ModuleNames.ModelManager;
     public ModuleId Id { get; } = new(ModelManagerId);
 
     public string Category => "model";
@@ -164,9 +164,12 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
     }
 
     /// <inheritdoc />
-    public IModule? Locate(ModuleId id)
+    public LocatedModule? Locate(ModuleId id)
     {
-        lock (_gate) return _providers.TryGetValue(id, out var row) ? row.Provider : null;
+        lock (_gate)
+            return _providers.TryGetValue(id, out var row)
+                ? new LocatedModule(row.Provider, new CatalogEntry(row.Provider.Id, row.Provider.Describe.TypeId, Category, ModuleRole.Instance))
+                : null;
     }
 
     /// <inheritdoc />

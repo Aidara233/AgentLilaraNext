@@ -19,7 +19,19 @@ public sealed class ModuleCatalog : ICatalog
 
     private sealed record Entry(IModule Module, string TypeId, string Category, ModuleRole Role);
 
-    public IModule? Find(ModuleId id)
+    public IModule? Find(ModuleId id) => Locate(id)?.Module;
+
+    public CatalogEntry? Describe(ModuleId id) => Locate(id)?.Row;
+
+    public Result<IModule> Require(ModuleId id)
+    {
+        var found = Find(id);
+        return found is not null
+            ? Result<IModule>.Success(found)
+            : Result<IModule>.Failure(new(ErrorCode.Invalid, $"No module is registered as {id}."));
+    }
+
+    private LocatedModule? Locate(ModuleId id)
     {
         if (id.IsEmpty) return null;
 
@@ -30,10 +42,11 @@ public sealed class ModuleCatalog : ICatalog
             own = _byKey.TryGetValue(id.Value, out var entry) ? entry : null;
             indexes = [.. _indexes];
         }
-        if (own is not null) return own.Module;
+        if (own is not null)
+            return new LocatedModule(own.Module, new CatalogEntry(own.Module.Id, own.TypeId, own.Category, own.Role));
 
         // Asked outside the lock: an owner that answered by calling back in here would otherwise deadlock.
-        IModule? found = null;
+        LocatedModule? found = null;
         foreach (var index in indexes)
         {
             var candidate = index.Locate(id);
@@ -42,18 +55,10 @@ public sealed class ModuleCatalog : ICatalog
             // picking the first answer: a lookup that silently chooses is how the wrong object gets called.
             if (found is not null)
                 throw new InvalidOperationException(
-                    $"Two owners hold {id}: {found.GetType().Name} and {candidate.GetType().Name}.");
+                    $"Two owners hold {id}: {found.Module.GetType().Name} and {candidate.Module.GetType().Name}.");
             found = candidate;
         }
         return found;
-    }
-
-    public Result<IModule> Require(ModuleId id)
-    {
-        var found = Find(id);
-        return found is not null
-            ? Result<IModule>.Success(found)
-            : Result<IModule>.Failure(new(ErrorCode.Invalid, $"No module is registered as {id}."));
     }
 
     public IReadOnlyList<CatalogEntry> List(string? category = null, string? typeId = null)

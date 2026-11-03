@@ -13,7 +13,7 @@ namespace ALN.Runtime;
 [Module(SessionManagerId, Category = "session", Role = ModuleRole.Manager, Singleton = true)]
 public sealed class SessionManager : ISessionManager, IModule
 {
-    public const string SessionManagerId = "SessionManager";
+    public const string SessionManagerId = ModuleNames.SessionManager;
     public ModuleId Id { get; } = new(SessionManagerId);
 
     private const int StateSchemaVersion = 2;

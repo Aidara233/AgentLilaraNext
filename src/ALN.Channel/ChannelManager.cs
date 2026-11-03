@@ -14,7 +14,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
 {
     public string Category => "channel";
 
-    public const string ChannelManagerId = "ChannelManager";
+    public const string ChannelManagerId = ModuleNames.ChannelManager;
     public ModuleId Id { get; } = new(ChannelManagerId);
 
     /// <summary>Where the wish "this Channel should be running" is kept, so a stop survives a restart.</summary>
@@ -58,8 +58,13 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     { lock (_gate) return _channels.Values.Select(c => c.ToInfo()).ToArray(); }
 
     /// <inheritdoc />
-    public IModule? Locate(ModuleId id)
-    { lock (_gate) return _channels.TryGetValue(id, out var channel) ? channel : null; }
+    public LocatedModule? Locate(ModuleId id)
+    {
+        lock (_gate)
+            return _channels.TryGetValue(id, out var channel)
+                ? new LocatedModule(channel, new CatalogEntry(channel.Id, channel.TypeId ?? "", Category, ModuleRole.Instance))
+                : null;
+    }
 
     /// <inheritdoc />
     public IReadOnlyList<CatalogEntry> Entries()

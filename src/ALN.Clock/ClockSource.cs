@@ -6,7 +6,7 @@ namespace ALN.Clock;
 [Module(ClockId, Category = "clock", Role = ModuleRole.Manager, Singleton = true)]
 public sealed class ClockSource : IClockManager, IModule
 {
-    public const string ClockId = "Clock";
+    public const string ClockId = ModuleNames.Clock;
     public ModuleId Id { get; } = new(ClockId);
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
