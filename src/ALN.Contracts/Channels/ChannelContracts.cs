@@ -83,7 +83,9 @@ public sealed record ParameterView(
     double? Minimum,
     double? Maximum,
     string Description);
-public sealed record ChannelSpec(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, int? MaxMessages = null);
+public sealed record ChannelSpec(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, int? MaxMessages = null,
+    /// <summary>The type this instance implements. Null only in files written before the field existed.</summary>
+    string? TypeId = null);
 public sealed record ChannelInfo(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, bool Running,
     int? MaxMessages = null,
     /// <summary>Which model profile this Channel talks with; null means "whatever the host resolves".</summary>

@@ -63,7 +63,10 @@ public sealed record AdapterInfo(Address Address, AdapterDescriptor Descriptor, 
 /// that the value never leaves the process through an action (the DTOs don't carry it).
 /// </summary>
 public sealed record AdapterSpec(Address Address, AdapterDescriptor Descriptor,
-    IReadOnlyDictionary<string, string>? Settings = null);
+    IReadOnlyDictionary<string, string>? Settings = null,
+    /// <summary>The type this instance implements, written into the spec instead of being read back out of the
+    /// address. Null only in files written before the field existed; loading one fills it in and rewrites it.</summary>
+    string? TypeId = null);
 
 public sealed record RoutedEvent(string Name, Address Source, Guid EventId, string PayloadJson, Address? Target = null)
 {

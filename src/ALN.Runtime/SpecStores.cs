@@ -200,7 +200,10 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
     public ValueTask<Result> SaveAsync(AdapterSpec spec, CancellationToken cancellationToken) =>
         SpecTree.WriteAsync(root, FileName, spec.Address, new AdapterSpecDocument(
             spec.Address.ToString(), spec.Descriptor.PlatformId, spec.Descriptor.AccountId,
-            spec.Descriptor.Direction.ToString(), spec.Settings), JsonOptions, cancellationToken);
+            spec.Descriptor.Direction.ToString(), spec.Settings,
+            // Transitional: callers do not all pass a type yet, so fall back to the address it is still shaped
+            // like. Once the address carries nothing, this fallback has nothing to read and disappears with it.
+            spec.TypeId ?? spec.Address.TypeId), JsonOptions, cancellationToken);
 
     public ValueTask<Result> DeleteAsync(Address address, CancellationToken cancellationToken) =>
         SpecTree.DeleteAsync(root, FileName, address, cancellationToken);
@@ -219,7 +222,16 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
                 return Result<IReadOnlyList<AdapterSpec>>.Failure(new(ErrorCode.Invalid,
                     $"Stored Adapter direction is invalid: {entry.Document.Direction} ({entry.Path})"));
             specs.Add(new AdapterSpec(address.Value!, new AdapterDescriptor(entry.Document.PlatformId,
-                entry.Document.AccountId, direction), entry.Document.Settings));
+                entry.Document.AccountId, direction), entry.Document.Settings,
+                entry.Document.Type ?? address.Value!.TypeId));
+            // A file written before the type was recorded says so by having no type. Filling it in and writing it
+            // back is a one-time migration performed by the loader; nothing reads the type out of the address
+            // after this pass, which is the point of storing it at all.
+            if (entry.Document.Type is null)
+            {
+                var rewritten = await SaveAsync(specs[^1], cancellationToken).ConfigureAwait(false);
+                if (!rewritten.Ok) return Result<IReadOnlyList<AdapterSpec>>.Failure(rewritten.Error!);
+            }
         }
         return Result<IReadOnlyList<AdapterSpec>>.Success(specs);
     }
@@ -228,7 +240,7 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
     /// <c>Settings</c> is written only when present, so a spec that doesn't need any stays a short file.
     /// </summary>
     public sealed record AdapterSpecDocument(string Address, string PlatformId, string AccountId, string Direction,
-        IReadOnlyDictionary<string, string>? Settings = null);
+        IReadOnlyDictionary<string, string>? Settings = null, string? Type = null);
 }
 
 /// <summary>Channel specs: one directory per channel, holding <c>channel.json</c>.</summary>
@@ -243,7 +255,7 @@ public sealed class FileChannelSpecStore(string root) : IChannelSpecStore
         SpecTree.WriteAsync(root, FileName, spec.Address, new ChannelSpecDocument(
             spec.Address.ToString(), spec.Name,
             spec.Bindings.Select(b => new ChannelBindingDocument(b.Adapter.ToString(), b.PlatformConversationId)).ToArray(),
-            spec.MaxMessages),
+            spec.MaxMessages, spec.TypeId ?? spec.Address.TypeId),
             JsonOptions, cancellationToken);
 
     public ValueTask<Result> DeleteAsync(Address address, CancellationToken cancellationToken) =>
@@ -267,12 +279,19 @@ public sealed class FileChannelSpecStore(string root) : IChannelSpecStore
                         $"Stored Channel binding address is invalid: {binding.Adapter} ({entry.Path})"));
                 bindings.Add(new ChannelBinding(adapter, binding.PlatformConversationId));
             }
-            specs.Add(new ChannelSpec(address.Value!, entry.Document.Name, bindings, entry.Document.MaxMessages));
+            specs.Add(new ChannelSpec(address.Value!, entry.Document.Name, bindings, entry.Document.MaxMessages,
+                entry.Document.Type ?? address.Value!.TypeId));
+            // Same one-time migration as the Adapter specs: a file without a type gets one written into it.
+            if (entry.Document.Type is null)
+            {
+                var rewritten = await SaveAsync(specs[^1], cancellationToken).ConfigureAwait(false);
+                if (!rewritten.Ok) return Result<IReadOnlyList<ChannelSpec>>.Failure(rewritten.Error!);
+            }
         }
         return Result<IReadOnlyList<ChannelSpec>>.Success(specs);
     }
 
     public sealed record ChannelBindingDocument(string Adapter, string PlatformConversationId);
     public sealed record ChannelSpecDocument(string Address, string Name, ChannelBindingDocument[]? Bindings,
-        int? MaxMessages = null);
+        int? MaxMessages = null, string? Type = null);
 }

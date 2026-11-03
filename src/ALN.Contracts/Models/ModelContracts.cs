@@ -16,7 +16,9 @@ public sealed record ModelProviderDescriptor(
     string DisplayName,
     ModelCapabilities Capabilities);
 
-public sealed record ModelProviderSpec(Address Address, string ConfigurationJson);
+public sealed record ModelProviderSpec(Address Address, string ConfigurationJson,
+    /// <summary>The type this instance implements. Null only in files written before the field existed.</summary>
+    string? TypeId = null);
 
 public sealed record ModelProviderInfo(Address Address, ModelProviderDescriptor Descriptor, int InFlight);
 
