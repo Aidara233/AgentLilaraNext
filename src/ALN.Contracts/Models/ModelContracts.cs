@@ -99,6 +99,9 @@ public interface IModelManager
 {
     Result RegisterFactory(string packageId, IModelProviderFactory factory);
     Result RemovePackageFactories(string packageId);
+    /// <summary>The type this provider implements, as declared in its spec.</summary>
+    /// <summary>Stand-ins (test fakes) may legitimately know nothing; a real manager overrides this.</summary>
+    string? TypeOf(Address address) => null;
     IReadOnlyList<ModelProviderTypeInfo> ListTypes();
 
     ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken);

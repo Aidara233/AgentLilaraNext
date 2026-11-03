@@ -89,7 +89,9 @@ public sealed record ChannelSpec(Address Address, string Name, IReadOnlyList<Cha
 public sealed record ChannelInfo(Address Address, string Name, IReadOnlyList<ChannelBinding> Bindings, bool Running,
     int? MaxMessages = null,
     /// <summary>Which model profile this Channel talks with; null means "whatever the host resolves".</summary>
-    string? ModelProfile = null);
+    string? ModelProfile = null,
+    /// <summary>The type this instance implements, as declared in its spec. Never read out of the address.</summary>
+    string? TypeId = null);
 public sealed record ChannelMessage(Guid MessageId, Address Channel, ChannelBinding Binding,
     string? PlatformMessageId, string Text, DateTimeOffset At, string? Sender = null, bool MentionsSelf = false);
 
@@ -122,6 +124,9 @@ public interface IChannelDeltaSource
 
 public interface IChannelManager
 {
+    /// <summary>The type this instance implements, as declared in its spec.</summary>
+    /// <summary>Stand-ins (test fakes) may legitimately know nothing; a real manager overrides this.</summary>
+    string? TypeOf(Address address) => null;
     Result<ChannelInfo> Get(Address address);
     IReadOnlyList<ChannelInfo> List();
     bool IsBound(Address channel, Address adapter, string platformConversationId);

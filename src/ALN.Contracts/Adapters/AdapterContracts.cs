@@ -147,6 +147,10 @@ public interface IModuleTypeCatalog
 }
 public interface IAdapterManager
 {
+    /// <summary>The type this instance implements, as declared in its spec. Null when nothing by that name exists.
+    /// The alternative — reading it out of the address — is what the module contract forbids.</summary>
+    /// <summary>Stand-ins (test fakes) may legitimately know nothing; a real manager overrides this.</summary>
+    string? TypeOf(Address address) => null;
     Result<IChatAdapter> Get(Address address);
     IReadOnlyList<AdapterInfo> List();
     ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, CancellationToken cancellationToken);

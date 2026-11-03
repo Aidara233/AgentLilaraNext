@@ -46,6 +46,8 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                 ? Result<ChannelInfo>.Success(channel.ToInfo())
                 : Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
     }
+    public string? TypeOf(Address address)
+    { lock (_gate) return _channels.TryGetValue(address, out var channel) ? channel.TypeId : null; }
     public IReadOnlyList<ChannelInfo> List()
     { lock (_gate) return _channels.Values.Select(c => c.ToInfo()).ToArray(); }
     public bool IsBound(Address channelAddress, Address adapter, string platformConversationId)
@@ -482,7 +484,9 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
         public string? ModelProfile { get; set; }
         public bool Running { get; set; }
         public bool Draining { get; set; }
-        public ChannelInfo ToInfo() => new(Address, Name, Bindings, Running, MaxMessages, ModelProfile);
+        public string? TypeId => spec.TypeId;
+
+        public ChannelInfo ToInfo() => new(Address, Name, Bindings, Running, MaxMessages, ModelProfile, spec.TypeId);
 
         public IParameterTarget Parameters(ChannelManager owner) => new ChannelParameters(this, owner);
     }

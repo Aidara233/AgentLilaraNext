@@ -14,6 +14,7 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
     private readonly object _gate = new();
     private readonly Dictionary<string, (string PackageId, IModelProviderFactory Factory)> _factories = new(StringComparer.Ordinal);
     private readonly Dictionary<Address, (string PackageId, IModelProvider Provider, int InFlight)> _providers = new();
+    private readonly Dictionary<Address, string?> _providerTypes = new();
     private readonly Dictionary<string, ModelProfile> _profiles = new(StringComparer.Ordinal);
 
     public Result RegisterFactory(string packageId, IModelProviderFactory factory)
@@ -56,6 +57,12 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
                 .OrderBy(x => x.Category, StringComparer.Ordinal).ToArray();
     }
 
+    /// <inheritdoc />
+    public string? TypeOf(Address address)
+    {
+        lock (_gate) return _providerTypes.TryGetValue(address, out var type) ? type : null;
+    }
+
     public async ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken)
     {
         if (!spec.Address.IsInstance || spec.Address.Module != "model" || string.IsNullOrWhiteSpace(spec.ConfigurationJson))
@@ -92,6 +99,7 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
                 return Result<IModelProvider>.Failure(new(ErrorCode.Conflict, $"Model provider instance already exists: {spec.Address}"));
             }
             _providers.Add(spec.Address, (packageId, created.Value, 0));
+            _providerTypes[spec.Address] = spec.TypeId;
         }
         return Result<IModelProvider>.Success(created.Value);
     }
