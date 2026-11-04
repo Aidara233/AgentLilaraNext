@@ -412,6 +412,58 @@ public sealed class KernelTests : IDisposable
         Assert.False((await kernel.RemoveAsync(new ModuleId("slave"), default)).Ok);
     }
 
+    [Fact]
+    public async Task A_module_can_be_loaded_from_its_own_file_while_the_graph_runs()
+    {
+        Add(new TestModule(new("thing")), "test.plain");
+        var kernel = new Kernel(_root, _types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+        // A directory that appeared after startup: the file is the truth, so loading means reading it again.
+        var late = new TestModule(new("later"));
+        Add(late, "test.plain");
+
+        var loaded = await kernel.LoadAsync(new ModuleId("later"), default);
+
+        Assert.True(loaded.Ok, loaded.Error?.Message);
+        Assert.Equal(ModulePhase.Ready, loaded.Value!.Node.Phase);
+        // Asking for something with no readable file is an error that says so, not an empty node.
+        Assert.False((await kernel.LoadAsync(new ModuleId("absent"), default)).Ok);
+    }
+
+    [Fact]
+    public async Task Unloading_takes_it_out_of_the_graph_and_puts_its_directory_in_the_bin()
+    {
+        var module = new TestModule(new("thing"));
+        Add(module, "test.plain");
+        var kernel = new Kernel(_root, _types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+        var directory = Path.Combine(_root, "modules", "thing");
+        Assert.True(Directory.Exists(directory));
+
+        var unloaded = await kernel.UnloadAsync(new ModuleId("thing"), archive: true, default);
+
+        Assert.True(unloaded.Ok, unloaded.Error?.Message);
+        Assert.Null(kernel.Find(new ModuleId("thing")));
+        // Archived, not deleted: unloading is not a decision to forget what happened in there.
+        Assert.False(Directory.Exists(directory));
+        Assert.NotEmpty(Directory.GetDirectories(Path.Combine(_root, "archive", "modules")));
+    }
+
+    [Fact]
+    public async Task Unloading_without_archiving_leaves_the_directory_where_it_is()
+    {
+        Add(new TestModule(new("thing")), "test.plain");
+        var kernel = new Kernel(_root, _types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+        var directory = Path.Combine(_root, "modules", "thing");
+
+        Assert.True((await kernel.UnloadAsync(new ModuleId("thing"), archive: false, default)).Ok);
+
+        Assert.True(Directory.Exists(directory));
+        // Nothing was archived, so there is no bin to find - and no directory left behind by accident either.
+        Assert.False(Directory.Exists(Path.Combine(_root, "archive", "modules")));
+    }
+
     private async ValueTask<ModuleReceipt> Start(Kernel? kernel = null)
     {
         kernel ??= new Kernel(_root, _types);

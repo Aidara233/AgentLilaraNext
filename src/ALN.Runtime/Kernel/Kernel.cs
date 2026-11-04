@@ -22,6 +22,7 @@ public sealed class Kernel
     private readonly IModuleFactoryRegistry _types;
     private readonly ISignalLog _signals;
     private readonly TimeSpan _stopTimeout;
+    private readonly ModuleDataRoot _data;
     private readonly Dictionary<ModuleId, KernelNode> _nodes = new();
     private readonly Dictionary<ModuleId, KernelNode> _declared = new();
     private readonly object _gate = new();
@@ -41,6 +42,7 @@ public sealed class Kernel
         _types = types ?? throw new ArgumentNullException(nameof(types));
         _signals = signals ?? NullSignalLog.Instance;
         _stopTimeout = stopTimeout ?? TimeSpan.FromSeconds(5);
+        _data = new ModuleDataRoot(store.Root);
     }
 
     /// <summary>Every node the last start produced, in receipt form. Asking twice does not re-run anything.</summary>
@@ -639,6 +641,48 @@ public sealed class Kernel
         lock (_gate)
             if (_nodes.TryGetValue(masterId, out var master)) master.ReleaseSlave(instanceId);
         return Result.Success();
+    }
+
+    /// <summary>
+    /// Loads one module from its own file while the graph is running (docs/22, D2): read the manifest, build the
+    /// module, then add it the way a late node is added.
+    ///
+    /// It reads the file rather than taking a manifest as an argument because the file is the truth about what a
+    /// module is; a caller that passed one would be describing a module that may not be the one on disk.
+    /// </summary>
+    public async ValueTask<Result<ModuleAddition>> LoadAsync(ModuleId id, CancellationToken cancellationToken)
+    {
+        var scan = await _store.ScanAsync(_types, cancellationToken).ConfigureAwait(false);
+        var manifest = scan.Manifests.FirstOrDefault(candidate => candidate.Id == id);
+        if (manifest is null)
+        {
+            var issue = scan.Issues.FirstOrDefault(problem => problem.Path.Contains(id.Value, StringComparison.Ordinal));
+            return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid,
+                $"No readable module answers to \"{id}\".", issue?.Message));
+        }
+        var created = _types.Create(manifest);
+        if (!created.Ok || created.Value is null) return Result<ModuleAddition>.Failure(created.Error!);
+        return await AddAsync(created.Value, manifest.Slaves, manifest.Dependencies, manifest.Type, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Unloads a module: edges first (reported), then stop, then optionally the bin (docs/22, D2).
+    ///
+    /// Archiving is a parameter and not a default, because "I want this module to stop" and "I want this module
+    /// gone" are two decisions, and the second one is worth stating out loud.
+    /// </summary>
+    public async ValueTask<Result<IReadOnlyList<BadEdge>>> UnloadAsync(ModuleId id, bool archive,
+        CancellationToken cancellationToken)
+    {
+        var removed = await RemoveAsync(id, cancellationToken).ConfigureAwait(false);
+        if (!removed.Ok) return removed;
+        if (!archive) return removed;
+
+        var archived = _data.Archive(id, "unloaded");
+        return archived.Ok
+            ? removed
+            : Result<IReadOnlyList<BadEdge>>.Failure(archived.Error ?? new(ErrorCode.Internal, $"Could not archive {id}."));
     }
 
     private KernelNode[] Snapshot()
