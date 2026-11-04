@@ -193,7 +193,7 @@ public static class CoreActions
                         scope = scope.Trim(),
                         name = name.Trim(),
                         value = current?.Value,
-                        apply = current?.Apply.ToString(),
+                        apply = current?.Apply.ToString().ToLowerInvariant(),
                         secret = current?.Secret ?? false
                     }));
                 }),
@@ -593,8 +593,7 @@ public static class CoreActions
                         try { sampling = samplingItem.Deserialize<SamplingSettings>(JsonOptions); }
                         catch (JsonException ex) { return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "Profile sampling is malformed.", ex.Message)); }
                     }
-                    parsed.Add(new ModelProfile(idText.GetString()!.Trim(), new Address("model", named.Value.Kind, named.Value.Instance),
-                        modelText.GetString()!.Trim(), sampling));
+                    parsed.Add(new ModelProfile(idText.GetString()!.Trim(), default, modelText.GetString()!.Trim(), sampling));
                 }
                 profiles = parsed;
             }
@@ -661,8 +660,10 @@ public static class CoreActions
                 var stored = await modelInstances.ReadAsync(CategoryOfKind(kind), instance, ct).ConfigureAwait(false);
                 if (stored.Error is null && stored.Value is { } spec)
                 {
+                    // The provider is implied by the file it lives in, so the stored profile leaves it empty: a file that
+                    // repeats its own address is a file that can disagree with its own directory.
                     var profiles = (spec.Profiles ?? []).Where(profile => profile.Id != id.Trim())
-                        .Append(new ModelProfile(id.Trim(), provider.Value, model.Trim(), sampling)).ToArray();
+                        .Append(new ModelProfile(id.Trim(), default, model.Trim(), sampling)).ToArray();
                     var saved = await modelInstances.SaveAsync(CategoryOfKind(kind), instance,
                         spec with { Profiles = profiles }, ct).ConfigureAwait(false);
                     if (!saved.Ok) return Result<JsonElement>.Failure(saved.Error!);
