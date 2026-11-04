@@ -116,7 +116,7 @@ public interface IModuleCatalog
 /// with a message instead of failing later inside a method call.</summary>
 public static class ModuleContracts
 {
-    public const string Version = "1";
+    public const string Version = "2";
 }
 
 public interface IModulePlugin : IModuleUnloadParticipant

@@ -139,8 +139,8 @@ public sealed class ChannelDeltaTests : IDisposable
     {
         var (store, delta) = Create();
         Assert.True((await store.AppendAsync(Message("m1", "在吗"), default)).Ok);
-        var contributors = new RoundContextContributorRegistry();
-        Assert.True(contributors.Register(new ChannelDeltaContributor(delta, new StubChannels(maxMessages: null))).Ok);
+        var contributors = new SessionExtensionRegistry();
+        Assert.True(contributors.Register(new ChannelDeltaSource(delta, new StubChannels(maxMessages: null))).Ok);
         var model = new ScriptedModel();
         var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
         var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
@@ -196,8 +196,8 @@ public sealed class ChannelDeltaTests : IDisposable
                 "alice", index == 1 ? "the very first thing" : $"msg {index}", at), default)).Ok);
         }
 
-        var contributors = new RoundContextContributorRegistry();
-        Assert.True(contributors.Register(new ChannelDeltaContributor(delta, new StubChannels(maxMessages: null))).Ok);
+        var contributors = new SessionExtensionRegistry();
+        Assert.True(contributors.Register(new ChannelDeltaSource(delta, new StubChannels(maxMessages: null))).Ok);
         var model = new ScriptedModel();
         var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
         var spec = new SessionSpec("default", "Answer briefly.", "1");
@@ -225,8 +225,8 @@ public sealed class ChannelDeltaTests : IDisposable
     {
         var (store, delta) = Create();
         Assert.True((await store.AppendAsync(Message("m1", "第一句"), default)).Ok);
-        var contributors = new RoundContextContributorRegistry();
-        Assert.True(contributors.Register(new ChannelDeltaContributor(delta, new StubChannels(maxMessages: null))).Ok);
+        var contributors = new SessionExtensionRegistry();
+        Assert.True(contributors.Register(new ChannelDeltaSource(delta, new StubChannels(maxMessages: null))).Ok);
         var model = new ScriptedModel();
         var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
         var spec = new SessionSpec("default", "Answer briefly.", "1");
@@ -257,8 +257,8 @@ public sealed class ChannelDeltaTests : IDisposable
     public async Task A_commit_that_died_halfway_is_finished_when_the_session_is_next_loaded()
     {
         var (_, delta) = Create();
-        var contributors = new RoundContextContributorRegistry();
-        Assert.True(contributors.Register(new ChannelDeltaContributor(delta, new StubChannels(maxMessages: null))).Ok);
+        var contributors = new SessionExtensionRegistry();
+        Assert.True(contributors.Register(new ChannelDeltaSource(delta, new StubChannels(maxMessages: null))).Ok);
         var model = new ScriptedModel();
         var root = Path.Combine(_root, "sessions");
         var spec = new SessionSpec("default", "Answer briefly.", "1");
@@ -308,8 +308,8 @@ public sealed class ChannelDeltaTests : IDisposable
     {
         var (store, delta) = Create();
         Assert.True((await store.AppendAsync(Message("m1", "周四开始冻结客户"), default)).Ok);
-        var contributors = new RoundContextContributorRegistry();
-        Assert.True(contributors.Register(new ChannelDeltaContributor(delta, new StubChannels(maxMessages: null))).Ok);
+        var contributors = new SessionExtensionRegistry();
+        Assert.True(contributors.Register(new ChannelDeltaSource(delta, new StubChannels(maxMessages: null))).Ok);
         var model = new ScriptedModel { Failures = 1 };
         var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
         var spec = new SessionSpec("default", "Answer briefly.", "1");

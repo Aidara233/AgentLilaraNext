@@ -27,7 +27,7 @@ public sealed class SessionMemoryToolTests : IDisposable
     public SessionMemoryToolTests()
     {
         _store = new SqliteStore(Path.Combine(_root, "aln.db"));
-        _sessions = new SessionManager(Path.Combine(_root, "sessions"), new ScriptedModel([]), memory: _store);
+        _sessions = new SessionManager(Path.Combine(_root, "sessions"), new ScriptedModel([]), Extensions(_store));
     }
 
     public void Dispose()
@@ -88,7 +88,17 @@ public sealed class SessionMemoryToolTests : IDisposable
 
     /// <summary>One managed conversation: its own store, its own session directory.</summary>
     private SessionManager Manager(IModelManager model, IMemoryStore? memory) =>
-        new(Path.Combine(_root, "sessions-" + Guid.NewGuid().ToString("N")[..8]), model, memory: memory);
+        new(Path.Combine(_root, "sessions-" + Guid.NewGuid().ToString("N")[..8]), model,
+            memory is null ? null : Extensions(memory));
+
+    /// <summary>The memory module, as a host wires it: one module, two sources.</summary>
+    private static SessionExtensionRegistry Extensions(IMemoryStore memory)
+    {
+        var extensions = new SessionExtensionRegistry();
+        Assert.True(extensions.Register(new MemoryContextSource(memory)).Ok);
+        Assert.True(extensions.Register(new MemoryToolSource(memory)).Ok);
+        return extensions;
+    }
 
     /// <summary>
     /// What one tool answered, as the last request carries it. Read from the last request rather than the first,
@@ -212,9 +222,10 @@ public sealed class SessionMemoryToolTests : IDisposable
         // The hole this closes: memory as a tool only exists for a model that thinks to call it, so a model that
         // never recalls cannot know there is anything to recall. One line per round makes the store visible.
         var model = new ScriptedModel(Waiting());
-        var contributors = new RoundContextContributorRegistry();
-        Assert.True(contributors.Register(new MemoryContextContributor(_store)).Ok);
-        var sessions = new SessionManager(Path.Combine(_root, "sessions-floating"), model, contributors, memory: _store);
+        var contributors = new SessionExtensionRegistry();
+        Assert.True(contributors.Register(new MemoryContextSource(_store)).Ok);
+        Assert.True(contributors.Register(new MemoryToolSource(_store)).Ok);
+        var sessions = new SessionManager(Path.Combine(_root, "sessions-floating"), model, contributors);
         await _store.AddAsync(new MemoryDraft(Channel.ToString(), MemoryKind.Note, "周五下午部署",
             Evidence: "他说：周五下午吧。", At: DateTimeOffset.UtcNow), default);
 
@@ -234,9 +245,10 @@ public sealed class SessionMemoryToolTests : IDisposable
     public async Task An_empty_store_contributes_no_line_at_all()
     {
         var model = new ScriptedModel(Waiting());
-        var contributors = new RoundContextContributorRegistry();
-        Assert.True(contributors.Register(new MemoryContextContributor(_store)).Ok);
-        var sessions = new SessionManager(Path.Combine(_root, "sessions-empty"), model, contributors, memory: _store);
+        var contributors = new SessionExtensionRegistry();
+        Assert.True(contributors.Register(new MemoryContextSource(_store)).Ok);
+        Assert.True(contributors.Register(new MemoryToolSource(_store)).Ok);
+        var sessions = new SessionManager(Path.Combine(_root, "sessions-empty"), model, contributors);
 
         Turned(await sessions.TurnAsync("s-1", Spec(), Guid.NewGuid(), new SessionTurnInput([], Channel), null, default));
 

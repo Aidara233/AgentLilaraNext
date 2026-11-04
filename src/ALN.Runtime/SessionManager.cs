@@ -34,24 +34,22 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
     private readonly string _legacyRoot;
     private readonly IModelManager _models;
     private readonly ISignalLog _signalLog;
-    private readonly IRoundContextContributorRegistry _roundContextContributors;
+    private readonly ISessionExtensionRegistry _extensions;
     private readonly IPromptLibrary? _prompts;
-    private readonly IMemoryStore? _memory;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SessionRecord> _loaded = new(StringComparer.Ordinal);
 
-    public SessionManager(string dataRoot, IModelManager models, IRoundContextContributorRegistry? roundContextContributors = null,
-        ISignalLog? signalLog = null, IPromptLibrary? prompts = null, IMemoryStore? memory = null)
+    public SessionManager(string dataRoot, IModelManager models, ISessionExtensionRegistry? extensions = null,
+        ISignalLog? signalLog = null, IPromptLibrary? prompts = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         ArgumentNullException.ThrowIfNull(models);
         _root = Path.GetFullPath(dataRoot);
         _legacyRoot = Path.Combine(_root, "chat");
         _models = models;
-        _roundContextContributors = roundContextContributors ?? new RoundContextContributorRegistry();
+        _extensions = extensions ?? new SessionExtensionRegistry();
         _signalLog = signalLog ?? NullSignalLog.Instance;
         _prompts = prompts;
-        _memory = memory;
     }
 
     /// <summary>
@@ -399,52 +397,83 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
     }
 
     /// <summary>
-    /// What the model may call this turn: the built-in stop, plus every declared tool that something in the host
-    /// can actually run.
+    /// What the model may call this turn: the loop's own stop, every tool a module offered, and every tool the spec
+    /// declares and something can actually run.
     ///
     /// A declared tool with no implementation fails the turn. Offering a tool nobody can run only buys a wasted
     /// round, and quietly dropping it would run a Session with a different toolset than its spec names — the
     /// assembly mistake would then only ever show up as the model behaving oddly.
     /// </summary>
-    private Result<List<ModelToolDefinition>> ResolveTools(SessionSpec spec, ISessionToolbox? toolbox, SessionMemoryTools? memory)
+    private static Result<ResolvedTools> ResolveTools(SessionSpec spec, ISessionToolbox? toolbox, IReadOnlyList<SessionToolOffer> offered)
     {
         var visible = new List<ModelToolDefinition> { WaitTool.Definition };
-        if (memory is not null) visible.AddRange(SessionMemoryTools.Definitions);
+        var byName = new Dictionary<string, ISessionTool>(StringComparer.Ordinal);
+        var acting = 0;
+        foreach (var offer in offered)
+        {
+            if (!byName.TryAdd(offer.Tool.Name, offer.Tool))
+                return Result<ResolvedTools>.Failure(new(ErrorCode.Conflict, $"Two modules offer a tool named '{offer.Tool.Name}'."));
+            visible.Add(offer.Definition);
+            if (offer.ActsExternally) acting++;
+        }
+
         var missing = new List<string>();
         foreach (var declared in spec.Tools ?? [])
         {
-            if (IsBuiltin(declared.Name)) continue;
+            // A declared tool that a module already offers is the same tool; declaring it must not offer it twice.
+            if (byName.ContainsKey(declared.Name)) continue;
             if (toolbox is not null && toolbox.Names.Contains(declared.Name, StringComparer.Ordinal))
             {
                 visible.Add(declared);
+                acting++;
                 continue;
             }
             missing.Add(declared.Name);
         }
-        if (missing.Count == 0) return Result<List<ModelToolDefinition>>.Success(visible);
-        return Result<List<ModelToolDefinition>>.Failure(new(ErrorCode.Unavailable,
+        if (missing.Count == 0) return Result<ResolvedTools>.Success(new(visible, byName, acting));
+        return Result<ResolvedTools>.Failure(new(ErrorCode.Unavailable,
             $"Session declares tools nothing in this host provides: {string.Join(", ", missing)}. " +
             $"Available: {string.Join(", ", visible.Select(definition => definition.Name))}."));
     }
 
-    /// <summary>One of the loop's own tools by name, or null when it is not one.</summary>
-    private static ISessionTool? BuiltinTool(SessionMemoryTools? memory, string name) =>
-        memory is not null && IsBuiltin(name) ? memory.Find(name).Value : null;
+    /// <summary>
+    /// The tools every round is offered by the modules that extend sessions. A source that fails costs this round its
+    /// tools and says so; it does not cost the round (docs/22, C1).
+    /// </summary>
+    private async ValueTask<IReadOnlyList<SessionToolOffer>> CollectToolsAsync(
+        RoundContextRequest request, CancellationToken cancellationToken)
+    {
+        var offers = new List<SessionToolOffer>();
+        foreach (var source in _extensions.Tools)
+        {
+            try
+            {
+                var produced = await source.ToolsAsync(request, cancellationToken).ConfigureAwait(false);
+                if (!produced.Ok || produced.Value is null)
+                {
+                    ReportExtensionFailure(source.Id, "tools", request, produced.Error?.Message);
+                    continue;
+                }
+                offers.AddRange(produced.Value);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception ex) { ReportExtensionFailure(source.Id, "tools", request, ex.Message); }
+        }
+        return offers;
+    }
+
+    /// <summary>The channel this Session already serves, when the caller did not name one this round.</summary>
+    private static Address? PersistedChannel(SessionState state) =>
+        Address.TryParse(state.Channel, out var address) ? address : null;
 
     private static ISessionTool? ResolveHosted(ISessionToolbox? toolbox, string name) =>
         toolbox?.Find(name) is { Ok: true, Value: { } implementation } ? implementation : null;
 
-    /// <summary>
-    /// The tools the loop itself provides. Named in one place because two things depend on the same list: a spec
-    /// that declares one of them must not get a second copy, and a Session whose only tools are built-ins must not
-    /// look like a Session that can act — the two decide different behaviour (whether a text-only step was the
-    /// reply, or said nothing).
-    /// </summary>
-    private static bool IsBuiltin(string name) =>
-        string.Equals(name, WaitTool.ToolName, StringComparison.Ordinal) ||
-        string.Equals(name, SessionMemoryTools.RememberToolName, StringComparison.Ordinal) ||
-        string.Equals(name, SessionMemoryTools.RecallToolName, StringComparison.Ordinal) ||
-        string.Equals(name, SessionMemoryTools.ForgetToolName, StringComparison.Ordinal);
+    /// <summary>What a round may call: the definitions to show the model, and where to send each call.</summary>
+    private sealed record ResolvedTools(
+        IReadOnlyList<ModelToolDefinition> Definitions,
+        IReadOnlyDictionary<string, ISessionTool> ByName,
+        int ActingToolCount);
 
     private void WriteSignal(Guid stepId, string outcome, SignalLevel level, params (string Key, string Value)[] detail)
     {
@@ -579,18 +608,18 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
                 history = record.History;
             }
 
-            // What the model is offered this turn: the built-in stop and memory, plus every declared tool something
-            // in the host can actually run. Assembly mistakes fail here, before a single token is spent.
-            //
-            // Memory is scoped to the conversation (the Channel address), never to the Session id: a Session is
-            // meant to be replaced, and memory that dies with it would not be memory.
-            var memory = _memory is null
-                ? null
-                : new SessionMemoryTools(_memory, state.Channel ?? sessionId, sessionId);
-            var resolved = ResolveTools(record.Spec, tools, memory);
+            // What this round is about, decided once: every source gets the same request, and the tools a source
+            // offers are gathered before the model is shown anything. Assembly mistakes (a declared tool nobody
+            // provides) fail here, before a single token is spent.
+            var request = new RoundContextRequest(sessionId, activationId, state.StepNumber + 1,
+                input.Channel ?? PersistedChannel(state), input.Binding);
+            var offered = await CollectToolsAsync(request, cancellationToken).ConfigureAwait(false);
+            var resolved = ResolveTools(record.Spec, tools, offered);
             if (!resolved.Ok || resolved.Value is null) return Result<SessionTurnResult>.Failure(resolved.Error!);
-            var visible = resolved.Value;
-            var actingTools = visible.Count(definition => !IsBuiltin(definition.Name));
+            var visible = resolved.Value.Definitions;
+            // "Acts externally" is what decides whether a step's text was its reply or its thinking. A turn whose
+            // only tools wrote something down has not spoken to anyone.
+            var actingTools = resolved.Value.ActingToolCount;
 
             var messages = new List<ModelMessage>();
             // The prompt is read here, every turn, from files a person edits. Only the names are part of the
@@ -604,10 +633,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
             // turns back to back in the request. Which of the two meanings that text has depends on whether this
             // Session has tools at all: without them, the text *was* the reply.
             messages.AddRange(history.Where(entry => ShouldReplay(entry, actingTools > 0)).Select(ToModelMessage));
-            var collected = await CollectRoundContextAsync(
-                new RoundContextRequest(sessionId, activationId, state.StepNumber + 1, input.Channel, input.Binding,
-                    memory?.Scope),
-                cancellationToken).ConfigureAwait(false);
+            var collected = await CollectRoundContextAsync(request, cancellationToken).ConfigureAwait(false);
             if (!collected.Ok || collected.Value is null) return Result<SessionTurnResult>.Failure(collected.Error!);
 
             var persistedTimeline = await PersistTimelineContributionsAsync(record, activation, state,
@@ -773,11 +799,13 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
                 var stop = new WaitTool();
                 foreach (var call in completedCalls)
                 {
-                    // "wait" and memory are the loop's own tools, so they resolve even when the host handed over
-                    // nothing — a Session that woke itself up with nobody speaking still has to be able to recall.
+                    // "wait" belongs to the loop and resolves even when nothing else does: it is how a turn ends
+                    // without saying anything. Everything else comes from a module that offered it this round.
                     ISessionTool? tool = string.Equals(call.Name, WaitTool.ToolName, StringComparison.Ordinal)
                         ? stop
-                        : BuiltinTool(memory, call.Name) ?? ResolveHosted(tools, call.Name);
+                        : resolved.Value.ByName.TryGetValue(call.Name, out var offeredTool)
+                            ? offeredTool
+                            : ResolveHosted(tools, call.Name);
                     var found = tools?.Find(call.Name);
                     Result<SessionToolResult> execution;
                     try
@@ -1614,69 +1642,129 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
     private async ValueTask<Result<CollectedRoundContextSnapshot>> CollectRoundContextAsync(
         RoundContextRequest request, CancellationToken cancellationToken)
     {
-        var contributors = _roundContextContributors.Snapshot();
+        var floatingTasks = _extensions.Floating.Select(source => CollectFloatingAsync(source, request, cancellationToken).AsTask()).ToArray();
+        var timelineTasks = _extensions.Timeline.Select(source => CollectTimelineAsync(source, request, cancellationToken).AsTask()).ToArray();
+        var floating = await Task.WhenAll(floatingTasks).ConfigureAwait(false);
+        var timeline = await Task.WhenAll(timelineTasks).ConfigureAwait(false);
+
+        var roundContext = floating.SelectMany(items => items)
+            .OrderBy(item => item.Order)
+            .ThenBy(item => item.Source, StringComparer.Ordinal)
+            .ThenBy(item => item.Id, StringComparer.Ordinal)
+            .ToArray();
+        var entries = timeline.SelectMany(batch => batch.Entries)
+            .OrderBy(item => item.At)
+            .ThenBy(item => item.Source, StringComparer.Ordinal)
+            .ThenBy(item => item.Id, StringComparer.Ordinal)
+            .ToArray();
+        var commits = timeline.SelectMany(batch => batch.Commits).ToArray();
+        return Result<CollectedRoundContextSnapshot>.Success(new(roundContext, entries, commits));
+    }
+
+    private async ValueTask<IReadOnlyList<CollectedRoundContext>> CollectFloatingAsync(
+        IFloatingContextSource source, RoundContextRequest request, CancellationToken cancellationToken)
+    {
         try
         {
-            var results = await Task.WhenAll(contributors.Select(async contributor =>
+            var collected = await source.CollectAsync(request, cancellationToken).ConfigureAwait(false);
+            if (!collected.Ok || collected.Value is null)
             {
-                var timelineWriter = new TimelineWriter(contributor.Id);
-                var roundWriter = new ContributionWriter(contributor.Id);
-                var commits = new CommitCollector();
-                try
-                {
-                    if (string.IsNullOrWhiteSpace(contributor.Id))
-                        throw new InvalidOperationException("Round context contributor id is required.");
-                    await contributor.ContributeAsync(request, timelineWriter, roundWriter, commits, cancellationToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-                catch (Exception ex)
-                {
-                    // A contributor may not veto the turn: a slow or broken hook that fails the whole step is exactly
-                    // what belongs in the signal log instead. Whatever it managed to contribute is dropped with it,
-                    // so a half-written section never reaches the model.
-                    _signalLog.Write(new()
-                    {
-                        Id = Guid.NewGuid(),
-                        ParentId = SignalScope.CurrentId,
-                        Group = "session",
-                        Name = "round-context",
-                        StepId = request.ActivationId,
-                        From = "session",
-                        To = "round-context",
-                        Mechanism = "round.context.collect",
-                        Outcome = "failed",
-                        Level = SignalLevel.Warn,
-                        Detail = new Dictionary<string, string>(StringComparer.Ordinal)
-                        {
-                            ["contributor"] = contributor.Id,
-                            ["error"] = ex.Message
-                        }
-                    });
-                    timelineWriter = new TimelineWriter(contributor.Id);
-                    roundWriter = new ContributionWriter(contributor.Id);
-                    commits = new CommitCollector();
-                }
-                return (Timeline: timelineWriter.Seal(), Round: roundWriter.Seal(), Commits: commits.Seal());
-            })).ConfigureAwait(false);
-            var roundContext = results.SelectMany(result => result.Round)
-                .OrderBy(item => item.Order)
-                .ThenBy(item => item.Source, StringComparer.Ordinal)
-                .ThenBy(item => item.Id, StringComparer.Ordinal)
-                .ToArray();
-            var timeline = results.SelectMany(result => result.Timeline)
-                .OrderBy(item => item.At)
-                .ThenBy(item => item.Source, StringComparer.Ordinal)
-                .ThenBy(item => item.Id, StringComparer.Ordinal)
-                .ToArray();
-            var commits = results.SelectMany(result => result.Commits).ToArray();
-            return Result<CollectedRoundContextSnapshot>.Success(new(roundContext, timeline, commits));
+                ReportExtensionFailure(source.Id, "floating", request, collected.Error?.Message);
+                return [];
+            }
+            return ValidateFloating(source.Id, collected.Value, request.ActivationId);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
-            return Result<CollectedRoundContextSnapshot>.Failure(
-                new(ErrorCode.Unavailable, "Round context collection failed.", ex.Message));
+            ReportExtensionFailure(source.Id, "floating", request, ex.Message);
+            return [];
         }
+    }
+
+    private async ValueTask<CollectTimelineResult> CollectTimelineAsync(
+        ITimelineSource source, RoundContextRequest request, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var collected = await source.CollectAsync(request, cancellationToken).ConfigureAwait(false);
+            if (!collected.Ok || collected.Value is null)
+            {
+                ReportExtensionFailure(source.Id, "timeline", request, collected.Error?.Message);
+                return CollectTimelineResult.Empty;
+            }
+            var entries = ValidateTimeline(source.Id, collected.Value.Entries, request.ActivationId);
+            return new(entries, collected.Value.Commits ?? []);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            ReportExtensionFailure(source.Id, "timeline", request, ex.Message);
+            return CollectTimelineResult.Empty;
+        }
+    }
+
+    /// <summary>
+    /// A contribution that is too big, malformed, or doubling an id inside the same source is a bug in that source,
+    /// not in the round: the whole source is dropped and recorded, because half of a source's context is a context
+    /// nobody designed.
+    /// </summary>
+    private static IReadOnlyList<CollectedRoundContext> ValidateFloating(string source,
+        IReadOnlyList<RoundContextContribution> items, Guid activationId)
+    {
+        var collected = new List<CollectedRoundContext>();
+        foreach (var item in items)
+        {
+            ArgumentNullException.ThrowIfNull(item);
+            if (!IsContextIdValue(item.Id) || !IsContextIdValue(item.Section) || item.Content is null || item.Content.Length > 64_000)
+                throw new ArgumentException($"Round context contribution from {source} is invalid or oversized.");
+            if (collected.Any(existing => StringComparer.Ordinal.Equals(existing.Id, item.Id)))
+                throw new ArgumentException($"Duplicate round context contribution id from {source}: {item.Id}");
+            collected.Add(new(source, item.Id, item.Section, item.Content, item.Order));
+        }
+        _ = activationId;
+        return collected;
+    }
+
+    private static IReadOnlyList<CollectedTimelineMessage> ValidateTimeline(string source,
+        IReadOnlyList<SessionTimelineContribution> items, Guid activationId)
+    {
+        var collected = new List<CollectedTimelineMessage>();
+        foreach (var item in items)
+        {
+            ArgumentNullException.ThrowIfNull(item);
+            if (!IsContextIdValue(item.Id) || item.Content is null || item.Content.Length > 64_000)
+                throw new ArgumentException($"Timeline contribution from {source} is invalid or oversized.");
+            if (collected.Any(existing => StringComparer.Ordinal.Equals(existing.Id, item.Id)))
+                throw new ArgumentException($"Duplicate timeline contribution id from {source}: {item.Id}");
+            collected.Add(new(source, item.Id, item.Sender, item.Content, item.At));
+        }
+        _ = activationId;
+        return collected;
+    }
+
+    /// <summary>An extension that misbehaved: one record, and the round goes on without what it would have said.</summary>
+    private void ReportExtensionFailure(string sourceId, string kind, RoundContextRequest request, string? message)
+    {
+        _signalLog.Write(new()
+        {
+            Id = Guid.NewGuid(),
+            ParentId = SignalScope.CurrentId,
+            Group = "session",
+            Name = "round-context",
+            StepId = request.ActivationId,
+            From = "session",
+            To = sourceId,
+            Mechanism = "round.context.collect",
+            Outcome = "failed",
+            Level = SignalLevel.Warn,
+            Detail = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["source"] = sourceId,
+                ["kind"] = kind,
+                ["error"] = message ?? "no detail"
+            }
+        });
     }
 
     /// <summary>
@@ -1745,81 +1833,17 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
         IReadOnlyList<CollectedTimelineMessage> Timeline,
         IReadOnlyList<ITurnCommit> Commits);
 
-    /// <summary>
-    /// Gathers what contributors want to happen once the turn they fed has been written down.
-    /// </summary>
-    private sealed class CommitCollector : ITurnCommitSink
+    private sealed record CollectTimelineResult(
+        IReadOnlyList<CollectedTimelineMessage> Entries,
+        IReadOnlyList<ITurnCommit> Commits)
     {
-        private readonly List<ITurnCommit> _commits = [];
-        public void Add(ITurnCommit commit) => _commits.Add(commit);
-        public IReadOnlyList<ITurnCommit> Seal() => _commits;
+        public static CollectTimelineResult Empty { get; } = new([], []);
     }
+
     private sealed record PersistedTimeline(SessionState State, IReadOnlyList<SessionHistoryEntry> History);
 
-    private sealed class TimelineWriter(string source) : ISessionTimelineWriter
-    {
-        private readonly object _gate = new();
-        private readonly List<CollectedTimelineMessage> _items = [];
-        private bool _sealed;
-
-        public void Add(SessionTimelineContribution contribution)
-        {
-            ArgumentNullException.ThrowIfNull(contribution);
-            if (!ContributionWriter.IsContextIdValue(contribution.Id) || contribution.Content is null ||
-                contribution.Content.Length > 64_000)
-                throw new ArgumentException("Session timeline contribution is invalid or oversized.", nameof(contribution));
-            lock (_gate)
-            {
-                if (_sealed) throw new InvalidOperationException("Session timeline collection is already complete.");
-                if (_items.Any(item => StringComparer.Ordinal.Equals(item.Id, contribution.Id)))
-                    throw new InvalidOperationException($"Duplicate timeline contribution id: {contribution.Id}");
-                _items.Add(new(source, contribution.Id, contribution.Sender, contribution.Content, contribution.At));
-            }
-        }
-
-        public IReadOnlyList<CollectedTimelineMessage> Seal()
-        {
-            lock (_gate)
-            {
-                _sealed = true;
-                return _items.ToArray();
-            }
-        }
-    }
-
-    private sealed class ContributionWriter(string source) : IRoundContextWriter
-    {
-        private readonly object _gate = new();
-        private readonly List<CollectedRoundContext> _items = [];
-        private bool _sealed;
-
-        public void Add(RoundContextContribution contribution)
-        {
-            ArgumentNullException.ThrowIfNull(contribution);
-            if (!IsContextIdValue(contribution.Id) || !IsContextIdValue(contribution.Section) || contribution.Content is null ||
-                contribution.Content.Length > 64_000)
-                throw new ArgumentException("Round context contribution is invalid or oversized.", nameof(contribution));
-            lock (_gate)
-            {
-                if (_sealed) throw new InvalidOperationException("Round context collection is already complete.");
-                if (_items.Any(item => StringComparer.Ordinal.Equals(item.Id, contribution.Id)))
-                    throw new InvalidOperationException($"Duplicate round context contribution id: {contribution.Id}");
-                _items.Add(new(source, contribution.Id, contribution.Section, contribution.Content, contribution.Order));
-            }
-        }
-
-        public IReadOnlyList<CollectedRoundContext> Seal()
-        {
-            lock (_gate)
-            {
-                _sealed = true;
-                return _items.ToArray();
-            }
-        }
-
-        public static bool IsContextIdValue(string value) => value is { Length: > 0 and <= 128 } &&
-            value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.');
-    }
+    private static bool IsContextIdValue(string? value) => value is { Length: > 0 and <= 128 } &&
+        value.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-' or ':');
 
     private string ResolveSessionDirectory(string sessionId)
     {

@@ -50,13 +50,15 @@ var parameters = new ParameterRegistry(stateStore);
 var adapters = new AdapterManager(adapterTypes, bindings, adapterFactories, adapterSpecs, parameters: parameters);
 var artifacts = new FileArtifactStore(Path.Combine(data.Root, "artifacts"));
 var modelManager = new ModelManager(artifacts, signalLog);
-var roundContextContributors = new RoundContextContributorRegistry();
-var timeContributor = roundContextContributors.Register(new TimeContextContributor());
-if (!timeContributor.Ok) { Console.Error.WriteLine(timeContributor.Error?.Message); return 1; }
-var channelContributor = roundContextContributors.Register(new ChannelInfoContributor());
-if (!channelContributor.Ok) { Console.Error.WriteLine(channelContributor.Error?.Message); return 1; }
-var memoryContributor = roundContextContributors.Register(new MemoryContextContributor(storage));
-if (!memoryContributor.Ok) { Console.Error.WriteLine(memoryContributor.Error?.Message); return 1; }
+var sessionExtensions = new SessionExtensionRegistry();
+var timeSource = sessionExtensions.Register(new TimeContextSource());
+if (!timeSource.Ok) { Console.Error.WriteLine(timeSource.Error?.Message); return 1; }
+var channelInfoSource = sessionExtensions.Register(new ChannelInfoSource());
+if (!channelInfoSource.Ok) { Console.Error.WriteLine(channelInfoSource.Error?.Message); return 1; }
+var memorySource = sessionExtensions.Register(new MemoryContextSource(storage));
+if (!memorySource.Ok) { Console.Error.WriteLine(memorySource.Error?.Message); return 1; }
+var memoryTools = sessionExtensions.Register(new MemoryToolSource(storage));
+if (!memoryTools.Ok) { Console.Error.WriteLine(memoryTools.Error?.Message); return 1; }
 // The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.
@@ -77,8 +79,7 @@ var catalog = prompts.List();
 if (catalog.Groups.Count > 0 || catalog.Warnings.Count > 0)
     restore.Note("prompts", $"{catalog.Groups.Count} group(s), {catalog.Groups.Sum(group => group.Entries.Count)} prompt(s)" +
         (catalog.Warnings.Count == 0 ? "" : $"; skipped {catalog.Warnings.Count}: {string.Join("; ", catalog.Warnings)}"));
-var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, roundContextContributors, signalLog, prompts,
-    storage);
+var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, sessionExtensions, signalLog, prompts);
 var reloadState = new ModuleReloadStateStore();
 var hostServices = new HostServiceProvider(
     (typeof(IAdapterManager), adapters),
@@ -86,7 +87,7 @@ var hostServices = new HostServiceProvider(
     (typeof(IModelManager), modelManager),
     (typeof(ISessionManager), sessions),
     (typeof(IPromptLibrary), prompts),
-    (typeof(IRoundContextContributorRegistry), roundContextContributors),
+    (typeof(ISessionExtensionRegistry), sessionExtensions),
     (typeof(IFileMailbox), mailbox),
     (typeof(IEventSink), new RecordingEventSink(queue, messageStore)),
     (typeof(IMessageStore), messageStore),
@@ -191,8 +192,8 @@ if (registrationFailures.Count > 0)
 // register would look exactly like one with nothing in it.
 restore.Note("modules", $"{modules.Count} registered: {string.Join(", ", modules.List().Where(row => row.Role is not ModuleRole.Instance).Select(row => row.Id.Value))}");
 var channelDelta = new FileChannelDeltaSource(messageStore, stateStore);
-var deltaContributor = roundContextContributors.Register(new ChannelDeltaContributor(channelDelta, channels));
-if (!deltaContributor.Ok) { Console.Error.WriteLine(deltaContributor.Error?.Message); return 1; }
+var deltaSource = sessionExtensions.Register(new ChannelDeltaSource(channelDelta, channels));
+if (!deltaSource.Ok) { Console.Error.WriteLine(deltaSource.Error?.Message); return 1; }
 // The manager owns adapter startup and the stop sweep; the clock interval belongs to the Adapter, which is the
 // only thing that knows how its transport wants to be polled.
 adapters.UseHeartbeat(new RecordingEventSink(queue, messageStore), clock);

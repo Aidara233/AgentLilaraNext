@@ -1,7 +1,7 @@
 {
   "id": "sample.environment",
   "version": "1.0.0",
-  "contracts": "1",
+  "contracts": "2",
   "entryAssembly": "SampleEnvironment.dll",
   "entryType": "SampleEnvironment.Plugin",
   "provides": [],

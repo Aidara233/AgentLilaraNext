@@ -138,27 +138,7 @@ public interface IRoundContextWriter
     void Add(RoundContextContribution contribution);
 }
 
-/// <summary>A registered module that performs just-in-time queries before a model request.</summary>
-public interface IRoundContextContributor
-{
-    string Id { get; }
-
-    /// <param name="commits">
-    /// Where a contributor puts what only becomes true when the turn succeeds. Reading is not delivering: a
-    /// contributor that took something from a queue (a message delta, a claim on a batch) must not move that queue's
-    /// cursor here — it registers the advance instead, and the Session runs it after the turn is written down.
-    /// </param>
-    ValueTask ContributeAsync(RoundContextRequest request, ISessionTimelineWriter timeline,
-        IRoundContextWriter roundContext, ITurnCommitSink commits, CancellationToken cancellationToken);
-}
-
-public interface IRoundContextContributorRegistry
-{
-    Result Register(IRoundContextContributor contributor);
-    Result Unregister(string contributorId);
-    IReadOnlyList<IRoundContextContributor> Snapshot();
-}
-
+/// <summary>What one turn produced, whether or not it spoke: the text, the calls it made, how it stopped.</summary>
 public sealed record SessionTurnResult(
     string SessionId,
     int StepNumber,

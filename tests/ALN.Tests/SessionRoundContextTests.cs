@@ -10,15 +10,15 @@ public sealed class SessionRoundContextTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-round-context-" + Guid.NewGuid().ToString("N"));
     private readonly ScriptedModel _model = new();
-    private readonly RoundContextContributorRegistry _contributors = new();
+    private readonly SessionExtensionRegistry _contributors = new();
     private readonly SessionManager _sessions;
     private static readonly Address Channel = new("channel", "conversation", "chat-1");
     private static readonly ChannelBinding Binding = new(new("adapter", "file", "file-1"), "chat-1");
 
     public SessionRoundContextTests()
     {
-        Assert.True(_contributors.Register(new TimeContextContributor(new FixedClock())).Ok);
-        Assert.True(_contributors.Register(new ChannelInfoContributor()).Ok);
+        Assert.True(_contributors.Register(new TimeContextSource(new FixedClock())).Ok);
+        Assert.True(_contributors.Register(new ChannelInfoSource()).Ok);
         _sessions = new SessionManager(Path.Combine(_root, "sessions"), _model, _contributors);
     }
 
@@ -65,7 +65,7 @@ public sealed class SessionRoundContextTests : IDisposable
     [Fact]
     public async Task A_broken_contributor_is_left_out_of_the_turn_instead_of_failing_it()
     {
-        Assert.True(_contributors.Register(new ThrowingContributor("broken")).Ok);
+        Assert.True(_contributors.Register(new ThrowingSource("broken")).Ok);
         var spec = new SessionSpec("default", "Answer briefly.", "1");
 
         var turn = await _sessions.TurnAsync("s-broken", spec, Guid.NewGuid(),
@@ -81,12 +81,13 @@ public sealed class SessionRoundContextTests : IDisposable
         Assert.Contains("当前时间：", block.Content ?? string.Empty, StringComparison.Ordinal);
     }
 
-    private sealed class ThrowingContributor(string id) : IRoundContextContributor
+    private sealed class ThrowingSource(string id) : IFloatingContextSource
     {
         public string Id => id;
-        public ValueTask ContributeAsync(RoundContextRequest request, ISessionTimelineWriter timeline,
-            IRoundContextWriter roundContext, ITurnCommitSink commits, CancellationToken cancellationToken) =>
-            ValueTask.FromException(new InvalidOperationException("contributor is broken"));
+        public ValueTask<Result<IReadOnlyList<RoundContextContribution>>> CollectAsync(
+            RoundContextRequest request, CancellationToken cancellationToken) =>
+            ValueTask.FromException<Result<IReadOnlyList<RoundContextContribution>>>(
+                new InvalidOperationException("source is broken"));
     }
 
     private static int CountOccurrences(string text, string needle)

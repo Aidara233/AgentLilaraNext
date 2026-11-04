@@ -40,7 +40,7 @@ public sealed class ModulePluginTests : IDisposable
     [Fact]
     public async Task A_dropped_in_plugin_loads_is_visible_and_unloads_cleanly()
     {
-        var contributors = new RoundContextContributorRegistry();
+        var contributors = new SessionExtensionRegistry();
         var packageDirectory = WriteSamplePackage("sample.environment");
         await using var loader = CreateLoader(contributors);
 
@@ -50,26 +50,25 @@ public sealed class ModulePluginTests : IDisposable
         Assert.Equal(ModulePackageKind.Plugin, loaded.Value.PackageKind);
 
         // What it did is observable through the host, not through a log line.
-        Assert.Contains(contributors.Snapshot(), contributor => contributor.Id == "sample.environment");
+        Assert.Contains(contributors.Floating, source => source.Id == "sample.environment");
         Assert.Contains(loader.Loaded, manifest => manifest.Id == "sample.environment");
 
-        // The contributor it registered actually answers a request.
-        var roundContext = new CapturingWriter();
-        await contributors.Snapshot().Single(c => c.Id == "sample.environment")
-            .ContributeAsync(new RoundContextRequest("s-1", Guid.NewGuid(), 1), new NullTimeline(), roundContext,
-                new NullCommits(), default);
-        Assert.Contains(roundContext.Contributions, contribution => contribution.Section == "environment");
+        // The source it registered actually answers a request, and says what it has instead of writing into one.
+        var collected = await contributors.Floating.Single(source => source.Id == "sample.environment")
+            .CollectAsync(new RoundContextRequest("s-1", Guid.NewGuid(), 1), default);
+        Assert.True(collected.Ok, collected.Error?.Message);
+        Assert.Contains(collected.Value!, contribution => contribution.Section == "environment");
 
         var unloaded = await loader.UnloadAsync("sample.environment", TimeSpan.FromSeconds(5), force: false, default);
         Assert.True(unloaded.Ok, unloaded.Error?.Message);
-        Assert.DoesNotContain(contributors.Snapshot(), contributor => contributor.Id == "sample.environment");
+        Assert.DoesNotContain(contributors.Floating, source => source.Id == "sample.environment");
     }
 
     [Fact]
     public async Task A_package_built_against_another_contract_version_is_refused_with_a_reason()
     {
         var packageDirectory = WriteSamplePackage("sample.environment", contracts: "999");
-        await using var loader = CreateLoader(new RoundContextContributorRegistry());
+        await using var loader = CreateLoader(new SessionExtensionRegistry());
 
         var loaded = await loader.LoadAsync(packageDirectory, ModulePackageKind.Plugin, default);
 
@@ -85,7 +84,7 @@ public sealed class ModulePluginTests : IDisposable
         var broken = Path.Combine(_root, "modules", "broken");
         Directory.CreateDirectory(broken);
         await File.WriteAllTextAsync(Path.Combine(broken, "plugin.json"), "{ this is not json");
-        await using var loader = CreateLoader(new RoundContextContributorRegistry());
+        await using var loader = CreateLoader(new SessionExtensionRegistry());
 
         var outcomes = await DroppedModules.LoadAsync(loader, Path.Combine(_root, "modules"), default);
 
@@ -102,7 +101,7 @@ public sealed class ModulePluginTests : IDisposable
     public async Task The_same_package_id_cannot_be_loaded_twice()
     {
         var packageDirectory = WriteSamplePackage("sample.environment");
-        await using var loader = CreateLoader(new RoundContextContributorRegistry());
+        await using var loader = CreateLoader(new SessionExtensionRegistry());
         Assert.True((await loader.LoadAsync(packageDirectory, ModulePackageKind.Plugin, default)).Ok);
 
         var again = await loader.LoadAsync(packageDirectory, ModulePackageKind.Plugin, default);
@@ -185,14 +184,16 @@ public sealed class ModulePluginTests : IDisposable
         foreach (var file in Directory.GetFiles(AppContext.BaseDirectory, "SampleEnvironment.*"))
             File.Copy(file, Path.Combine(directory, Path.GetFileName(file)), overwrite: true);
         var manifest = File.ReadAllText(Path.Combine(RepositoryRoot(), "samples", "plugins", name, "plugin.json"));
-        if (contracts is not null) manifest = manifest.Replace("\"contracts\": \"1\"", $"\"contracts\": \"{contracts}\"");
+        // Written against the host's own version, so the test cannot drift when the version moves.
+        if (contracts is not null) manifest = manifest.Replace($"\"contracts\": \"{ModuleContracts.Version}\"",
+            $"\"contracts\": \"{contracts}\"", StringComparison.Ordinal);
         File.WriteAllText(Path.Combine(directory, "plugin.json"), manifest);
         return directory;
     }
 
-    private ModulePackageLoader CreateLoader(IRoundContextContributorRegistry contributors) =>
+    private ModulePackageLoader CreateLoader(ISessionExtensionRegistry contributors) =>
         new(new ModuleUnloadCoordinator(),
-            new ModuleServiceRegistry(new SingleServiceProvider(typeof(IRoundContextContributorRegistry), contributors)),
+            new ModuleServiceRegistry(new SingleServiceProvider(typeof(ISessionExtensionRegistry), contributors)),
             new AdapterTypeCatalog());
 
     private static string RepositoryRoot()
