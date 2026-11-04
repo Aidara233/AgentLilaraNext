@@ -185,6 +185,47 @@ public sealed class KernelTests : IDisposable
         Assert.Equal(ModulePhase.Stopped, kernel.Nodes.Single(node => node.Id.Value == "master").Phase);
     }
 
+    [Fact]
+    public async Task Two_startups_of_the_same_disk_produce_the_same_receipt()
+    {
+        // Restarting is not a repair step (docs/22 §7 I3): what the disk says has to be what the second start does.
+        Add(new TestModule(new("plain")), "test.plain");
+        Add(new TestMaster(new("master")), "test.master", slaves: ["plain", "nobody"]);
+        var kernel = new Kernel(_root, _types);
+
+        var first = await Start(kernel);
+        var second = await Start(kernel);
+
+        string Shape(ModuleReceipt receipt) => string.Join("|", receipt.Nodes
+            .OrderBy(node => node.Id.Value, StringComparer.Ordinal)
+            .Select(node => $"{node.Id}:{node.Type}:{node.Phase}")) + $"|{receipt.WiredEdges}|{receipt.BadEdges.Count}|{receipt.Cycles.Count}";
+        Assert.Equal(Shape(first), Shape(second));
+    }
+
+    [Fact]
+    public async Task Abort_does_not_wait_for_a_module_that_will_not_return()
+    {
+        var stuck = new TestModule(new("stuck"));
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        stuck.Abort = async token =>
+        {
+            await gate.Task.WaitAsync(token);
+            return Result.Success();
+        };
+        Add(stuck, "test.plain");
+        var kernel = new Kernel(_root, _types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        await kernel.AbortAsync(default);
+        started.Stop();
+
+        // Abort promises that everyone was told, not that everyone finished (docs/22 §4).
+        Assert.True(started.Elapsed < TimeSpan.FromSeconds(2), $"Abort waited {started.Elapsed}.");
+        Assert.Contains("abort", stuck.Calls);
+        gate.TrySetResult();
+    }
+
     private async ValueTask<ModuleReceipt> Start(Kernel? kernel = null)
     {
         kernel ??= new Kernel(_root, _types);
@@ -221,6 +262,7 @@ public sealed class KernelTests : IDisposable
         public Func<ValueTask<Result>>? Initialize { get; set; }
         public Func<ValueTask<Result>>? Ready { get; set; }
         public Action? Stop { get; set; }
+        public Func<CancellationToken, ValueTask<Result>>? Abort { get; set; }
         public Func<ModuleError, ValueTask<Result>>? OnError { get; set; }
 
         public ValueTask<Result> InitializeAsync(CancellationToken cancellationToken)
@@ -245,7 +287,7 @@ public sealed class KernelTests : IDisposable
         public ValueTask<Result> AbortAsync(CancellationToken cancellationToken)
         {
             Calls.Add("abort");
-            return ValueTask.FromResult(Result.Success());
+            return Abort?.Invoke(cancellationToken) ?? ValueTask.FromResult(Result.Success());
         }
 
         public ValueTask<Result> OnErrorAsync(ModuleError error, CancellationToken cancellationToken)
