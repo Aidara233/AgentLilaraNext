@@ -31,6 +31,14 @@ public sealed class AdapterTypeCatalog : IModuleTypeRegistry
     { lock (_gate) return _types.TryGetValue(typeId, out var type) && type.IsAbstract; }
     public bool IsConcrete(string id)
     { lock (_gate) return _types.TryGetValue(id, out var type) && !type.IsAbstract; }
+    public IReadOnlyList<ModuleTypeEntry> ListTypes()
+    {
+        lock (_gate) return _types.Values
+            .OrderBy(type => type.Id, StringComparer.Ordinal)
+            .Select(type => new ModuleTypeEntry(type.Id, type.ParentId, type.IsAbstract))
+            .ToArray();
+    }
+
     public bool IsAssignableTo(string concreteTypeId, string abstractTypeId)
     {
         lock (_gate)

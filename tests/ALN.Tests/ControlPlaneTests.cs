@@ -154,6 +154,47 @@ public sealed class ControlPlaneTests : IDisposable
         Assert.Equal(ErrorCode.Unavailable, refused.Error?.Code);
     }
 
+    [Fact]
+    public async Task System_types_lists_what_a_create_form_can_offer()
+    {
+        var catalog = new AdapterTypeCatalog();
+        Assert.True(catalog.RegisterPackageTypes("test.pack", [
+            new("adapter.file", "adapter"),
+            new("channel.conversation", "channel")
+        ]).Ok);
+
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null),
+            _signals, new FakeGraph(), new FakeParameters(), moduleTypes: catalog).Ok);
+
+        var result = await plane.InvokeAsync(User(Capabilities.SystemRead), CoreActions.ModuleTypes, default, default);
+        Assert.True(result.Ok, result.Error?.Message);
+        var types = result.Value.GetProperty("types").EnumerateArray()
+            .Select(item => (Id: item.GetProperty("typeId").GetString(), Parent: item.GetProperty("parent").GetString(),
+                Abstract: item.GetProperty("abstract").GetBoolean()))
+            .ToList();
+        Assert.Contains(types, type => type is { Id: "channel.conversation", Parent: "channel", Abstract: false });
+        Assert.Contains(types, type => type is { Id: "adapter", Parent: null, Abstract: true });
+        // Sessions are in the catalog too: a mount rule has to be able to name them.
+        Assert.Contains(types, type => type.Id == "session.chat");
+        // Listing types is a read: a viewer may open the create form, and still be refused the create itself.
+        Assert.True(User("*.read").Allows(Capabilities.SystemRead));
+    }
+
+    [Fact]
+    public void A_type_catalog_answers_what_it_registered()
+    {
+        var catalog = new AdapterTypeCatalog();
+        Assert.Contains(catalog.ListTypes(), type => type is { TypeId: "adapter", IsAbstract: true, ParentTypeId: null });
+        Assert.Contains(catalog.ListTypes(), type => type is { TypeId: "session.chat", ParentTypeId: "session", IsAbstract: false });
+        Assert.True(catalog.RegisterPackageTypes("test.pack", [new("adapter.file", "adapter"), new("channel.conversation", "channel")]).Ok);
+        Assert.Contains(catalog.ListTypes(), type => type is { TypeId: "adapter.file", ParentTypeId: "adapter", IsAbstract: false });
+        // Removing the package takes its types back out: a listing that keeps them would offer a type nothing can build.
+        Assert.True(catalog.RemovePackageTypes("test.pack").Ok);
+        Assert.DoesNotContain(catalog.ListTypes(), type => type.TypeId == "adapter.file");
+        Assert.Contains(catalog.ListTypes(), type => type.TypeId == "adapter");
+    }
+
     private sealed class CollectingAudit(List<AuditRecord> records) : IAuditSink
     {
         public ValueTask AppendAsync(AuditRecord record, CancellationToken cancellationToken)

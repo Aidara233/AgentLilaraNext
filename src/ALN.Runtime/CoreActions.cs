@@ -30,6 +30,7 @@ public static class CoreActions
     public const string GraphUnmount = "graph.unmount";
     public const string ModelsList = "models.list";
     public const string ModulesList = "modules.list";
+    public const string ModuleTypes = "system.types";
     public const string ScriptsList = "scripts.list";
     public const string ScriptsSet = "scripts.set";
     public const string SignalsRecent = "signals.recent";
@@ -46,7 +47,7 @@ public static class CoreActions
     public static Result RegisterAll(ControlPlane plane, IAdapterManager adapters, IChannelManager channels,
         IModelManager models, ISignalLog signals, IGraphRuntime graph, IParameterRegistry parameters,
         IModuleCatalog? modules = null, ISessionManager? sessions = null, IArchiveRegistry? archive = null,
-        IPromptLibrary? prompts = null)
+        IPromptLibrary? prompts = null, IModuleTypeCatalog? moduleTypes = null)
     {
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
@@ -190,6 +191,16 @@ public static class CoreActions
                         ? Result<JsonElement>.Success(ToJson(new { target = target.Trim(), enabled, mounted = graph.Mounted.Count }))
                         : Result<JsonElement>.Failure(switched.Error!);
                 }),
+            (new(ModuleTypes, "Every module type the process knows: what a spec may name, and its abstract family.", Capabilities.SystemRead, false),
+                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+                {
+                    types = (moduleTypes?.ListTypes() ?? []).Select(type => new
+                    {
+                        typeId = type.TypeId,
+                        parent = type.ParentTypeId,
+                        @abstract = type.IsAbstract
+                    })
+                })))),
             (new(ModulesList, "Module packages loaded into this process, with what each provides.", Capabilities.SystemRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
                 {

@@ -148,11 +148,22 @@ public interface IAdapterFactoryRegistry : IModulePackageResourceRegistry
     Result<IChatAdapter> Create(string typeId, AdapterSpec spec);
 }
 
+/// <summary>One type the process knows about: what a spec may name, and what its instances are.</summary>
+/// <param name="ParentTypeId">The abstract type it belongs to ("adapter.file" → "adapter"); null for the abstract ones.</param>
+/// <param name="IsAbstract">An abstract type names a family; only concrete ones can be instantiated.</param>
+public sealed record ModuleTypeEntry(string TypeId, string? ParentTypeId, bool IsAbstract);
+
 public interface IModuleTypeCatalog
 {
     bool IsKnownAbstract(string typeId);
     bool IsConcrete(string typeId);
     bool IsAssignableTo(string concreteTypeId, string abstractTypeId);
+
+    /// <summary>
+    /// Every type registered right now. Defaulted to empty because most stand-ins know nothing; a catalog that
+    /// holds types but answers empty is the one thing a create form cannot work around, so real ones implement it.
+    /// </summary>
+    IReadOnlyList<ModuleTypeEntry> ListTypes() => [];
 }
 public interface IAdapterManager
 {
