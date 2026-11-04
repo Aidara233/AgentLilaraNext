@@ -74,6 +74,30 @@ public sealed class OpenAiChatProviderFactory(ModelProviderDescriptor descriptor
 
 public sealed record OpenAiChatProviderOptions(string ApiKey, string? Endpoint = null);
 
+/// <summary>
+/// The wire shape of one chat message.
+///
+/// <c>content</c> is always present, empty string when there is nothing to say. The OpenAI shape allows it to be
+/// absent on an assistant message that only called tools; DeepSeek rejects that outright (HTTP 422, "missing field
+/// `content`"), and that message is not an edge case — a turn that ends by asking to wait says nothing and calls a
+/// tool, so replaying one such turn broke the next round of a real conversation. Sending the empty string costs a
+/// few bytes and cannot be argued about.
+///
+/// Public because the shape is the thing worth testing without an HTTP server: a 422 is a slow way to learn it.
+/// </summary>
+public static class ChatPayload
+{
+    public static Dictionary<string, object?> Message(ModelMessage message)
+    {
+        var item = new Dictionary<string, object?> { ["role"] = message.Role, ["content"] = message.Content ?? "" };
+        if (message.Name is not null) item["name"] = message.Name;
+        if (message.ToolCallId is not null) item["tool_call_id"] = message.ToolCallId;
+        if (message.ToolCalls is { Count: > 0 }) item["tool_calls"] = message.ToolCalls.Select(call => new
+        { id = call.Id, type = "function", function = new { name = call.Name, arguments = call.ArgumentsJson } }).ToArray();
+        return item;
+    }
+}
+
 internal sealed class OpenAiChatProvider : IModelProvider
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -243,16 +267,7 @@ internal sealed class OpenAiChatProvider : IModelProvider
 
     private HttpRequestMessage BuildRequest(ModelRequest request)
     {
-        var messages = request.Messages.Select(message =>
-        {
-            var item = new Dictionary<string, object?> { ["role"] = message.Role };
-            if (message.Content is not null) item["content"] = message.Content;
-            if (message.Name is not null) item["name"] = message.Name;
-            if (message.ToolCallId is not null) item["tool_call_id"] = message.ToolCallId;
-            if (message.ToolCalls is { Count: > 0 }) item["tool_calls"] = message.ToolCalls.Select(call => new
-            { id = call.Id, type = "function", function = new { name = call.Name, arguments = call.ArgumentsJson } }).ToArray();
-            return item;
-        }).ToArray();
+        var messages = request.Messages.Select(ChatPayload.Message).ToArray();
         var body = new Dictionary<string, object?>
         { ["model"] = request.ModelId, ["messages"] = messages, ["stream"] = true, ["stream_options"] = new { include_usage = true } };
         if (request.Sampling?.Temperature is { } temperature) body["temperature"] = temperature;
