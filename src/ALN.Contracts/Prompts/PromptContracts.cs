@@ -61,6 +61,17 @@ public interface IPromptLibrary
     /// different persona than the one asked for is worse than failing this turn.
     /// </summary>
     ValueTask<Result<PromptSet>> ResolveAsync(PromptSelection selection, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Writes one prompt file and says where it went.
+    ///
+    /// It writes to the <b>last</b> root — the operator's data root — because that is the one that wins when two
+    /// roots have the same group and file (see <see cref="Roots"/>). Writing anywhere else would produce an edit
+    /// that is silently overridden by the file the loader actually reads, which is worse than refusing.
+    /// </summary>
+    /// <param name="group">The group directory, e.g. "1身份".</param>
+    /// <param name="name">The file name without the .md extension, e.g. "标准".</param>
+    ValueTask<Result<string>> SaveAsync(string group, string name, string text, CancellationToken cancellationToken);
 }
 
 /// <summary>Limits, in one place: a prompt is an instruction, not a knowledge base.</summary>

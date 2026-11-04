@@ -364,6 +364,73 @@ public sealed class ControlPlaneTests : IDisposable
         Assert.Equal(ErrorCode.Unavailable, refused.Error?.Code);
     }
 
+    [Fact]
+    public async Task A_prompt_can_be_read_edited_and_the_edit_is_the_copy_that_wins()
+    {
+        var shipped = Path.Combine(_root, "prompts-shipped");
+        var data = Path.Combine(_root, "data", "prompts");
+        Directory.CreateDirectory(Path.Combine(shipped, "1身份"));
+        File.WriteAllText(Path.Combine(shipped, "1身份", "标准.md"), "运送来的原文");
+        var prompts = new PromptLibrary([shipped, data]);
+
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null),
+            _signals, new FakeGraph(), new FakeParameters(), prompts: prompts).Ok);
+
+        var read = await plane.InvokeAsync(User(Capabilities.PromptsRead), CoreActions.PromptsGet,
+            JsonSerializer.SerializeToElement(new { group = "1身份", name = "标准" }), default);
+        Assert.True(read.Ok, read.Error?.Message);
+        Assert.Equal("运送来的原文", read.Value.GetProperty("text").GetString());
+        // The path shown is the winning file, which is the shipped one until somebody edits it.
+        Assert.StartsWith(shipped, read.Value.GetProperty("path").GetString(), StringComparison.OrdinalIgnoreCase);
+
+        var written = await plane.InvokeAsync(User(Capabilities.PromptsWrite), CoreActions.PromptsSet,
+            JsonSerializer.SerializeToElement(new { group = "1身份", name = "标准", text = "改过之后的话" }), default);
+        Assert.True(written.Ok, written.Error?.Message);
+        // An edit lands in the data root, because that is the root that wins. Writing to the shipped one would
+        // produce an edit the loader never reads.
+        Assert.StartsWith(data, written.Value.GetProperty("path").GetString(), StringComparison.OrdinalIgnoreCase);
+
+        var edited = await plane.InvokeAsync(User(Capabilities.PromptsRead), CoreActions.PromptsGet,
+            JsonSerializer.SerializeToElement(new { group = "1身份", name = "标准" }), default);
+        Assert.Equal("改过之后的话", edited.Value.GetProperty("text").GetString());
+
+        // Editing is not a read.
+        Assert.Equal(Capabilities.PromptsWrite, Assert.Single(plane.Catalog, a => a.Id == CoreActions.PromptsSet).Capability);
+        Assert.Equal(ErrorCode.Denied, (await plane.InvokeAsync(User(Capabilities.PromptsRead), CoreActions.PromptsSet,
+            JsonSerializer.SerializeToElement(new { group = "1身份", name = "标准", text = "x" }), default)).Error!.Code);
+        // An empty prompt is refused: it is almost always a half-finished edit, and the next turn would answer
+        // with no instructions at all.
+        Assert.Equal(ErrorCode.Invalid, (await plane.InvokeAsync(User(Capabilities.PromptsWrite), CoreActions.PromptsSet,
+            JsonSerializer.SerializeToElement(new { group = "1身份", name = "标准", text = "  " }), default)).Error!.Code);
+        // A name that is a path is refused rather than written through.
+        Assert.Equal(ErrorCode.Invalid, (await plane.InvokeAsync(User(Capabilities.PromptsWrite), CoreActions.PromptsSet,
+            JsonSerializer.SerializeToElement(new { group = "..", name = "x", text = "y" }), default)).Error!.Code);
+    }
+
+    [Fact]
+    public async Task A_script_can_be_read_as_loaded()
+    {
+        var manifest = new ScriptManifest("channel.echo", 2, "channel", MountMode.Manual, ["channel.message.accepted"],
+            "onEvent", ["session.activate"], TrustDomain.Trusted);
+        var script = new ScriptPackage(manifest, "async function onEvent(event, ctx) { return; }", "abc123");
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null),
+            _signals, new FakeGraph(script), new FakeParameters()).Ok);
+
+        var read = await plane.InvokeAsync(User(Capabilities.GraphRead), CoreActions.ScriptsGet,
+            JsonSerializer.SerializeToElement(new { id = "channel.echo" }), default);
+        Assert.True(read.Ok, read.Error?.Message);
+        Assert.Equal("async function onEvent(event, ctx) { return; }", read.Value.GetProperty("source").GetString());
+        Assert.Equal("onEvent", read.Value.GetProperty("entryPoint").GetString());
+        Assert.Equal("manual", read.Value.GetProperty("mount").GetString());
+        Assert.True(read.Value.GetProperty("enabled").GetBoolean());
+        // Reading a script is not controlling the graph.
+        Assert.False(User("*.read").Allows(Capabilities.GraphControl));
+        Assert.Equal(ErrorCode.Invalid, (await plane.InvokeAsync(User(Capabilities.GraphRead), CoreActions.ScriptsGet,
+            JsonSerializer.SerializeToElement(new { id = "nope" }), default)).Error!.Code);
+    }
+
     private sealed class CollectingAudit(List<AuditRecord> records) : IAuditSink
     {
         public ValueTask AppendAsync(AuditRecord record, CancellationToken cancellationToken)
@@ -383,7 +450,7 @@ public sealed class ControlPlaneTests : IDisposable
     }
 
     /// <summary>Just enough graph to keep the action catalogue registrable; mounting has its own tests.</summary>
-    private sealed class FakeGraph : IGraphRuntime
+    private sealed class FakeGraph(ScriptPackage? script = null) : IGraphRuntime
     {
         public ValueTask<Result> LoadAsync(IEnumerable<ScriptPackage> packages, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken ct) => ValueTask.FromResult(Result.Success());
@@ -391,7 +458,7 @@ public sealed class ControlPlaneTests : IDisposable
         public IReadOnlyList<MountedScript> Mounted => [];
         public IReadOnlyList<MountRule> Rules => [];
         public IReadOnlyList<MountRule> PendingRules => [];
-        public IReadOnlyList<(ScriptPackage Package, bool Enabled)> Scripts => [];
+        public IReadOnlyList<(ScriptPackage Package, bool Enabled)> Scripts => script is null ? [] : [(script, true)];
         public ValueTask<Result> SetScriptEnabledAsync(string target, bool enabled, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result<MountRule>> AddRuleAsync(MountRequest request, CancellationToken ct) =>
             ValueTask.FromResult(Result<MountRule>.Failure(new(ErrorCode.Invalid, "Fake graph does not keep rules.")));

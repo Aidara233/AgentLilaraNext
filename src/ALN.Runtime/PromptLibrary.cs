@@ -37,6 +37,30 @@ public sealed class PromptLibrary : IPromptLibrary
     /// <summary>The roots in precedence order, for a message that has to say where to look.</summary>
     public IReadOnlyList<string> Roots => _roots;
 
+    public async ValueTask<Result<string>> SaveAsync(string group, string name, string text, CancellationToken cancellationToken)
+    {
+        if (!IsName(group)) return Result<string>.Failure(new(ErrorCode.Invalid, $"Not a usable prompt group: {group}"));
+        if (!IsName(name)) return Result<string>.Failure(new(ErrorCode.Invalid, $"Not a usable prompt name: {name}"));
+        if (string.IsNullOrWhiteSpace(text))
+            return Result<string>.Failure(new(ErrorCode.Invalid, "A prompt cannot be empty: an empty file is almost always a half-finished edit."));
+        var bytes = Encoding.UTF8.GetByteCount(text);
+        if (bytes > PromptLimits.MaxFileBytes)
+            return Result<string>.Failure(new(ErrorCode.Invalid, $"Prompt is larger than {PromptLimits.MaxFileBytes} bytes."));
+        try
+        {
+            // The last root wins, so that is where an edit has to land to be the one anybody reads.
+            var directory = Path.Combine(_roots[^1], group);
+            Directory.CreateDirectory(directory);
+            var path = Path.Combine(directory, name + PromptLimits.Extension);
+            var temporary = path + ".tmp";
+            await File.WriteAllTextAsync(temporary, text, new UTF8Encoding(false), cancellationToken).ConfigureAwait(false);
+            File.Move(temporary, path, overwrite: true);
+            return Result<string>.Success(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        { return Result<string>.Failure(new(ErrorCode.Unavailable, "Prompt could not be written.", ex.Message)); }
+    }
+
     public PromptCatalog List()
     {
         var groups = new Dictionary<string, Dictionary<string, PromptEntry>>(StringComparer.Ordinal);

@@ -80,4 +80,6 @@ public static class Capabilities
     public const string ArchiveRead = "archive.read";
     public const string ArchiveControl = "archive.control";
     public const string PromptsRead = "prompts.read";
+    /// Editing a prompt changes what the next turn says. A viewer with prompts.read may look, not rewrite.
+    public const string PromptsWrite = "prompts.write";
 }

@@ -48,6 +48,9 @@ public static class CoreActions
     public const string ArchiveMove = "archive.move";
     public const string ArchiveRestore = "archive.restore";
     public const string PromptsList = "prompts.list";
+    public const string PromptsGet = "prompts.get";
+    public const string PromptsSet = "prompts.set";
+    public const string ScriptsGet = "scripts.get";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -242,8 +245,7 @@ public static class CoreActions
                     })
                 })))),
 
-            (new(ModelsProviderGet, "One provider instance as configured on disk, with credentials masked as ***.", Capabilities.ModelsRead, false), GetModelProvider),
-            (new(ModelsProviderSave, "Write a provider instance's configuration. A *** value means \"keep the stored one\"; applies now when the provider is not running, else on restart.", Capabilities.ModelsControl, true), SaveModelProvider),
+            (new(ModelsProviderGet, "One provider instance as configured on disk, with credentials masked as ***.", Capabilities.ModelsRead, false), GetModelProvider),            (new(ModelsProviderSave, "Write a provider instance's configuration. A *** value means \"keep the stored one\"; applies now when the provider is not running, else on restart.", Capabilities.ModelsControl, true), SaveModelProvider),
             (new(ModelsProviderDestroy, "Destroy a provider instance and delete its configuration file.", Capabilities.ModelsControl, true), DestroyModelProvider),
             (new(ModelsProfileCreate, "Register one model profile and write it into its provider's file.", Capabilities.ModelsControl, true), CreateModelProfile),
             (new(ModelsProfileRemove, "Remove one model profile from the registry and from its provider's file.", Capabilities.ModelsControl, true), RemoveModelProfile),
@@ -282,6 +284,9 @@ public static class CoreActions
 
             // Prompts are files; this is the "what do I have and where do I edit it" action. There is no write
             // side on purpose: editing a prompt is editing a file, not calling an API.
+            (new(PromptsGet, "Read one prompt file's text so it can be edited.", Capabilities.PromptsRead, false), ReadPrompt),
+            (new(PromptsSet, "Write one prompt file into the data root (the copy that wins).", Capabilities.PromptsWrite, true), WritePrompt),
+            (new(ScriptsGet, "One script package as loaded: manifest and source.", Capabilities.GraphRead, false), ReadScript),
             (new(PromptsList, "Prompt groups and the files in them, with their origin and fingerprint.", Capabilities.PromptsRead, false),
                 (_, _) =>
                 {
@@ -663,6 +668,87 @@ public static class CoreActions
                 }
             }
             return Result<JsonElement>.Success(ToJson(new { id = id.Trim(), removed = true }));
+        }
+
+        async ValueTask<Result<JsonElement>> ReadPrompt(JsonElement arguments, CancellationToken ct)
+        {
+            if (prompts is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "The prompt library is unavailable."));
+            if (!TryReadText(arguments, "group", out var group) || group.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "prompts.get requires 'group'."));
+            if (!TryReadText(arguments, "name", out var name) || name.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "prompts.get requires 'name'."));
+            group = group.Trim();
+            name = name.Trim();
+
+            // The catalog is what knows where the winning copy lives; resolving alone would answer with the text
+            // but not with the path the editor needs to show.
+            var catalog = prompts.List();
+            var known = catalog.Groups.FirstOrDefault(candidate => string.Equals(candidate.Group, group, StringComparison.Ordinal));
+            var entry = known?.Entries.FirstOrDefault(candidate => string.Equals(candidate.Name, name, StringComparison.Ordinal));
+            if (entry is null)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
+                    $"No prompt '{name}' in group '{group}'. Available: {(known is null ? catalog.Groups.Count == 0 ? "(no groups)" : string.Join(", ", catalog.Groups.Select(g => g.Group)) : string.Join(", ", known.Entries.Select(e => e.Name)))}."));
+
+            var selection = new PromptSelection(new Dictionary<string, string>(StringComparer.Ordinal) { [group] = name });
+            var resolved = await prompts.ResolveAsync(selection, ct).ConfigureAwait(false);
+            if (!resolved.Ok || resolved.Value is null) return Result<JsonElement>.Failure(resolved.Error!);
+            return Result<JsonElement>.Success(ToJson(new
+            {
+                group,
+                name,
+                path = entry.Path,
+                bytes = entry.Bytes,
+                fingerprint = entry.Fingerprint,
+                text = resolved.Value.Text
+            }));
+        }
+
+        async ValueTask<Result<JsonElement>> WritePrompt(JsonElement arguments, CancellationToken ct)
+        {
+            if (prompts is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "The prompt library is unavailable."));
+            if (!TryReadText(arguments, "group", out var group) || group.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "prompts.set requires 'group'."));
+            if (!TryReadText(arguments, "name", out var name) || name.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "prompts.set requires 'name'."));
+            // Required even when empty-looking, so that clearing a prompt is a decision somebody made rather than a
+            // field the client forgot to send.
+            if (!arguments.TryGetProperty("text", out var textItem) || textItem.ValueKind != JsonValueKind.String)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "prompts.set requires 'text' as a string."));
+
+            var saved = await prompts.SaveAsync(group.Trim(), name.Trim(), textItem.GetString() ?? "", ct).ConfigureAwait(false);
+            if (!saved.Ok || saved.Value is null) return Result<JsonElement>.Failure(saved.Error!);
+            return Result<JsonElement>.Success(ToJson(new
+            {
+                group = group.Trim(),
+                name = name.Trim(),
+                path = saved.Value,
+                bytes = System.Text.Encoding.UTF8.GetByteCount(textItem.GetString() ?? "")
+            }));
+        }
+
+        ValueTask<Result<JsonElement>> ReadScript(JsonElement arguments, CancellationToken ct)
+        {
+            if (!TryReadText(arguments, "id", out var id) || id.Trim().Length == 0)
+                return ValueTask.FromResult(Result<JsonElement>.Failure(new(ErrorCode.Invalid, "scripts.get requires 'id'.")));
+            var found = graph.Scripts.FirstOrDefault(entry => string.Equals(entry.Package.Manifest.Id, id.Trim(), StringComparison.Ordinal));
+            if (found.Package is null)
+                return ValueTask.FromResult(Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"No script named '{id.Trim()}'.")));
+            var manifest = found.Package.Manifest;
+            return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+            {
+                id = manifest.Id,
+                version = manifest.Version,
+                library = string.IsNullOrWhiteSpace(found.Package.Origin) ? "user" : found.Package.Origin,
+                targetType = manifest.TargetType,
+                mount = JsonNamingPolicy.CamelCase.ConvertName(manifest.Mount.ToString()),
+                trust = JsonNamingPolicy.CamelCase.ConvertName(manifest.TrustDomain.ToString()),
+                entryPoint = manifest.EntryPoint,
+                events = manifest.Events,
+                capabilities = manifest.Capabilities,
+                fingerprint = found.Package.Fingerprint,
+                enabled = found.Enabled,
+                source = found.Package.Source
+            })));
         }
 
         async ValueTask<Result<JsonElement>> StartAdapter(JsonElement arguments, CancellationToken ct)
