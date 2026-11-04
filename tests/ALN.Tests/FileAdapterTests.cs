@@ -127,6 +127,26 @@ public sealed class FileAdapterTests : IDisposable
         finally { Environment.CurrentDirectory = current; }
     }
 
+    [Fact]
+    public async Task Stop_still_stops_when_the_clock_subscription_is_already_gone()
+    {
+        var mailbox = new FileMailbox(Path.Combine(_directory, "adapters", "instance-1"));
+        var sink = new RecordingSink(Result.Success());
+        var clock = new ALN.Clock.ClockSource(sink);
+        var adapter = new FileAdapter(
+            new AdapterSpec(new Address("adapter", "file", "test"), new("file", "account", AdapterDirection.Both), "adapter.file"),
+            mailbox, sink, clock);
+        Assert.True((await adapter.StartAsync(default)).Ok);
+        // What the owner used to do first: clear the target's subscriptions before telling it to stop.
+        Assert.True((await clock.UnregisterTargetAsync(adapter.Address, default)).Ok);
+
+        var stopped = await adapter.StopAsync(default);
+
+        Assert.True(stopped.Ok, stopped.Error?.Detail ?? stopped.Error?.Message);
+        Assert.Equal(AdapterState.Stopped, adapter.State);
+        Assert.False((await adapter.PollOnceAsync()).Ok);
+    }
+
     private static string Inbox(FileMailbox mailbox, string conversationId)
     {
         var path = Path.Combine(mailbox.Root, "inbox", conversationId);

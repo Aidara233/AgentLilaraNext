@@ -43,11 +43,13 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter
 
     public override async ValueTask<Result> StopAsync(CancellationToken cancellationToken)
     {
+        // A clock that no longer has this subscription is not a reason to stay Running: having no subscription is
+        // exactly what stopping is for. Treating its answer as a failure used to leave the Adapter Running while
+        // its owner believed it had stopped — and it skipped the base stop below, so the state never changed.
         if (_clockSubscriptionId is { } subscriptionId)
         {
             var unregistered = await _clock.UnregisterAsync(subscriptionId, Address, cancellationToken).ConfigureAwait(false);
-            if (!unregistered.Ok) return unregistered;
-            _clockSubscriptionId = null;
+            if (unregistered.Ok) _clockSubscriptionId = null;
         }
         await _pollGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try { return await base.StopAsync(cancellationToken).ConfigureAwait(false); }

@@ -117,7 +117,15 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                         return Result<ChannelInfo>.Failure(new(ErrorCode.Conflict, "An Adapter/conversation binding can belong to only one Channel."));
                 var instance = new ChannelInstance(spec);
                 _channels.Add(instance.Id, instance);
-                ApplyParameters(instance);
+                // A scope that is already taken means a Channel nobody removed still answers to this address; that
+                // is a bug in how the old one went away, and it must not be reported as a successful creation with
+                // silent tunables.
+                var parameters = ApplyParameters(instance);
+                if (!parameters.Ok)
+                {
+                    _channels.Remove(instance.Id);
+                    return Result<ChannelInfo>.Failure(parameters.Error!);
+                }
             }
             var mounted = await _bindings.AttachAsync(spec.Address, cancellationToken).ConfigureAwait(false);
             if (!mounted.Ok)
@@ -243,6 +251,10 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                 channel.Running = false;
                 _channels.Remove(IdOf(address));
             }
+            // The scope is keyed by the address, so leaving it registered outlives the Channel: a new Channel at
+            // the same address then collided with the dead one, its registration was quietly dropped, and it came
+            // up with no tunables at all (while a restart replayed the old Channel's saved overrides into it).
+            _parameters?.Unregister(address.ToString());
             if (_specs is not null)
             {
                 var removed = await _specs.DeleteAsync(address, cancellationToken).ConfigureAwait(false);
@@ -563,10 +575,6 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     }
 
     /// <summary>Registers a channel's tunables so they can be listed and changed while it runs.</summary>
-    private void ApplyParameters(ChannelInstance channel)
-    {
-        if (_parameters is null) return;
-        var registered = _parameters.Register(channel.Parameters(this));
-        if (!registered.Ok) return; // A duplicate scope is already somebody else's channel; nothing to do here.
-    }
+    private Result ApplyParameters(ChannelInstance channel) =>
+        _parameters?.Register(channel.Parameters(this)) ?? Result.Success();
 }

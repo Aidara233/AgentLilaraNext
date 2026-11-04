@@ -193,8 +193,9 @@ restore.Note("modules", $"{modules.Count} registered: {string.Join(", ", modules
 var channelDelta = new FileChannelDeltaSource(messageStore, stateStore);
 var deltaContributor = roundContextContributors.Register(new ChannelDeltaContributor(channelDelta, channels));
 if (!deltaContributor.Ok) { Console.Error.WriteLine(deltaContributor.Error?.Message); return 1; }
-// The manager owns adapter startup; it only needs the heartbeat wired before the signal arrives.
-adapters.UseHeartbeat(new RecordingEventSink(queue, messageStore), clock, TimeSpan.FromSeconds(1));
+// The manager owns adapter startup and the stop sweep; the clock interval belongs to the Adapter, which is the
+// only thing that knows how its transport wants to be polled.
+adapters.UseHeartbeat(new RecordingEventSink(queue, messageStore), clock);
 var adapterPackage = await modulePackages.LoadAsync(
     Path.Combine(AppContext.BaseDirectory, "modules", "adapter.file"), ModulePackageKind.Plugin, CancellationToken.None);
 if (!adapterPackage.Ok || adapterPackage.Value is null)

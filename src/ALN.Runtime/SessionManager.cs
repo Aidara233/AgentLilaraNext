@@ -1619,12 +1619,43 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
         {
             var results = await Task.WhenAll(contributors.Select(async contributor =>
             {
-                if (string.IsNullOrWhiteSpace(contributor.Id))
-                    throw new InvalidOperationException("Round context contributor id is required.");
                 var timelineWriter = new TimelineWriter(contributor.Id);
                 var roundWriter = new ContributionWriter(contributor.Id);
                 var commits = new CommitCollector();
-                await contributor.ContributeAsync(request, timelineWriter, roundWriter, commits, cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    if (string.IsNullOrWhiteSpace(contributor.Id))
+                        throw new InvalidOperationException("Round context contributor id is required.");
+                    await contributor.ContributeAsync(request, timelineWriter, roundWriter, commits, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                catch (Exception ex)
+                {
+                    // A contributor may not veto the turn: a slow or broken hook that fails the whole step is exactly
+                    // what belongs in the signal log instead. Whatever it managed to contribute is dropped with it,
+                    // so a half-written section never reaches the model.
+                    _signalLog.Write(new()
+                    {
+                        Id = Guid.NewGuid(),
+                        ParentId = SignalScope.CurrentId,
+                        Group = "session",
+                        Name = "round-context",
+                        StepId = request.ActivationId,
+                        From = "session",
+                        To = "round-context",
+                        Mechanism = "round.context.collect",
+                        Outcome = "failed",
+                        Level = SignalLevel.Warn,
+                        Detail = new Dictionary<string, string>(StringComparer.Ordinal)
+                        {
+                            ["contributor"] = contributor.Id,
+                            ["error"] = ex.Message
+                        }
+                    });
+                    timelineWriter = new TimelineWriter(contributor.Id);
+                    roundWriter = new ContributionWriter(contributor.Id);
+                    commits = new CommitCollector();
+                }
                 return (Timeline: timelineWriter.Seal(), Round: roundWriter.Seal(), Commits: commits.Seal());
             })).ConfigureAwait(false);
             var roundContext = results.SelectMany(result => result.Round)

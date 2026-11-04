@@ -126,7 +126,6 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecyclePa
     private readonly IAdapterSpecStore? _specs;
     private IEventSink? _events;
     private IClockManager? _clock;
-    private TimeSpan _pollInterval = TimeSpan.FromSeconds(1);
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
     // Adapters that declare tunables register themselves here, the same way Channels do.
@@ -134,7 +133,7 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecyclePa
 
     public AdapterManager(IModuleTypeCatalog types, IInstanceBindings bindings, IAdapterFactoryRegistry? factories = null,
         IAdapterSpecStore? specs = null, IEventSink? events = null, IClockManager? clock = null,
-        TimeSpan? pollInterval = null, IParameterRegistry? parameters = null)
+        IParameterRegistry? parameters = null)
     {
         _types = types;
         _bindings = bindings;
@@ -142,7 +141,6 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecyclePa
         _specs = specs;
         _events = events;
         _clock = clock;
-        _pollInterval = pollInterval ?? TimeSpan.FromSeconds(1);
         _parameters = parameters;
     }
 
@@ -150,11 +148,10 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecyclePa
     /// Wires the two things a manager needs but cannot be given at construction time (they live in
     /// module packages resolved later). Must be called before the lifecycle signal arrives.
     /// </summary>
-    public void UseHeartbeat(IEventSink events, IClockManager clock, TimeSpan? pollInterval = null)
+    public void UseHeartbeat(IEventSink events, IClockManager clock)
     {
         _events = events ?? throw new ArgumentNullException(nameof(events));
         _clock = clock ?? throw new ArgumentNullException(nameof(clock));
-        if (pollInterval is { } interval) _pollInterval = interval;
     }
 
     /// <inheritdoc />
@@ -303,13 +300,15 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecyclePa
         return Result.Success();
     }
 
+    /// <summary>
+    /// Hands the same start signal one level down. The heartbeat is deliberately not here: an Adapter
+    /// subscribes to the clock itself, because the interval is a property of the transport (a file mailbox
+    /// polls at 200ms, a socket listens), and a manager that guessed would either pick the wrong interval or
+    /// add a second subscription on top of the Adapter's own — which is exactly what used to happen, and is
+    /// why every polled Adapter used to be polled twice per interval.
+    /// </summary>
     private async ValueTask<Result> StartChildrenAsync(Address address, LifecycleSignal signal, CancellationToken cancellationToken)
     {
-        if (Get(address).Value is IPollingAdapter && _clock is not null)
-        {
-            var subscribed = await _clock.RegisterAsync(address, _pollInterval, cancellationToken).ConfigureAwait(false);
-            if (!subscribed.Ok) return Result.Failure(subscribed.Error!);
-        }
         if (_events is null) return Result.Success();
         // The same signal, one level down: whatever is mounted on this Adapter sees lifecycle.start.
         return await _events.PublishAsync(new(EventNames.LifecycleStart, address, Guid.NewGuid(),
@@ -319,17 +318,23 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecyclePa
 
     public async ValueTask<Result> StopAsync(LifecycleSignal signal, CancellationToken cancellationToken)
     {
+        Result firstFailure = Result.Success();
         foreach (var address in List().Select(a => a.Address))
         {
+            // Child first, then the heartbeat: an Adapter's own Stop unregisters the subscription it made, and
+            // clearing the clock for it beforehand made that unregistration fail — which the Adapter read as
+            // "not stopped", leaving it Running while the manager believed it was down. The sweep afterwards is
+            // only for Adapters that forgot to clean up after themselves, and its answer is not a verdict.
+            var stopped = await StopAsync(address, cancellationToken).ConfigureAwait(false);
+            if (!stopped.Ok && firstFailure.Ok) firstFailure = stopped;
             if (_clock is not null)
                 await _clock.UnregisterTargetAsync(address, CancellationToken.None).ConfigureAwait(false);
-            await StopAsync(address, cancellationToken).ConfigureAwait(false);
             if (_events is not null)
                 await _events.PublishAsync(new(EventNames.LifecycleStop, address, Guid.NewGuid(),
                     JsonSerializer.Serialize(signal.For(address), new JsonSerializerOptions(JsonSerializerDefaults.Web)), address),
                     cancellationToken).ConfigureAwait(false);
         }
-        return Result.Success();
+        return firstFailure;
     }
 
     public async ValueTask<Result<IReadOnlyList<AdapterInfo>>> SnapshotByTypeAsync(string concreteTypeId, CancellationToken cancellationToken)

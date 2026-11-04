@@ -62,6 +62,33 @@ public sealed class SessionRoundContextTests : IDisposable
         Assert.Single(channelInfoEntries);
     }
 
+    [Fact]
+    public async Task A_broken_contributor_is_left_out_of_the_turn_instead_of_failing_it()
+    {
+        Assert.True(_contributors.Register(new ThrowingContributor("broken")).Ok);
+        var spec = new SessionSpec("default", "Answer briefly.", "1");
+
+        var turn = await _sessions.TurnAsync("s-broken", spec, Guid.NewGuid(),
+            new SessionTurnInput([new("m-1", "user", "alice", "hello", DateTimeOffset.UtcNow)], Channel, Binding),
+            null, default);
+
+        // A hook may contribute or observe, never veto: a broken one used to fail the whole step.
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+        var request = Assert.Single(_model.Requests);
+        var block = Assert.Single(request.Messages, m => m.Role == "user" &&
+            m.Content?.Contains("<channel_context>", StringComparison.Ordinal) == true);
+        // What the healthy contributors had to say still arrives.
+        Assert.Contains("当前时间：", block.Content ?? string.Empty, StringComparison.Ordinal);
+    }
+
+    private sealed class ThrowingContributor(string id) : IRoundContextContributor
+    {
+        public string Id => id;
+        public ValueTask ContributeAsync(RoundContextRequest request, ISessionTimelineWriter timeline,
+            IRoundContextWriter roundContext, ITurnCommitSink commits, CancellationToken cancellationToken) =>
+            ValueTask.FromException(new InvalidOperationException("contributor is broken"));
+    }
+
     private static int CountOccurrences(string text, string needle)
     {
         var count = 0;
