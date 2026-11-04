@@ -73,6 +73,8 @@ public static class Capabilities
     public const string ParamsRead = "params.read";
     public const string ParamsWrite = "params.write";
     public const string ModelsRead = "models.read";
+    /// <summary>Changing which provider or profile exists, or what a provider is configured with. Not a read.</summary>
+    public const string ModelsControl = "models.control";
     public const string SignalsRead = "signals.read";
     public const string SessionsRead = "sessions.read";
     public const string ArchiveRead = "archive.read";

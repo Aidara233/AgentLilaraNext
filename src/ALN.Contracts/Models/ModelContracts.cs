@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace ALN.Contracts.Models;
 
 [Flags]
@@ -27,6 +29,99 @@ public sealed record ModelProfile(
     Address Provider,
     string ModelId,
     SamplingSettings? DefaultSampling = null);
+
+/// <summary>
+/// One model provider instance as it is written on disk: <c>models/&lt;category&gt;/&lt;instance&gt;.json</c>.
+///
+/// The file, not the running manager, is the thing an operator edits — a key is rotated in a file and the process
+/// is restarted, because a provider holds its connection. Keeping the shape in the contracts is what lets the
+/// startup loader and the API write the same file without either owning the other's format.
+/// </summary>
+/// <param name="Configuration">Provider configuration as the provider's own type expects it (endpoint, key, …).</param>
+/// <param name="Profiles">Profiles this provider serves. Ids are global: "default" is resolved by name.</param>
+/// <param name="Enabled">False keeps the file as documentation and loads nothing.</param>
+public sealed record ModelInstanceSpec(JsonElement Configuration, IReadOnlyList<ModelProfile>? Profiles = null, bool Enabled = true);
+
+/// <summary>One instance file, named the way the loader finds it.</summary>
+public sealed record ModelInstanceEntry(string Category, string Instance, ModelInstanceSpec Spec);
+
+/// <summary>The model configuration tree, as files. Nothing here knows how to talk to a provider.</summary>
+public interface IModelInstanceStore
+{
+    ValueTask<Result<IReadOnlyList<ModelInstanceEntry>>> LoadAllAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Null when no such file — an absent instance is not an error, but note that <c>Ok</c> is false for a null Value
+    /// (that is how Result<T> is defined): decide with <c>Error is null</c>, not with <c>Ok</c>.
+    /// </summary>
+    ValueTask<Result<ModelInstanceSpec?>> ReadAsync(string category, string instance, CancellationToken cancellationToken);
+
+    /// <summary>Writes the file, creating the category directory when needed.</summary>
+    ValueTask<Result> SaveAsync(string category, string instance, ModelInstanceSpec spec, CancellationToken cancellationToken);
+
+    /// <summary>Deletes the file. Deleting what is not there is a success, the same way forgetting a key is.</summary>
+    ValueTask<Result> DeleteAsync(string category, string instance, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// Reads and writes a configuration JSON while hiding the parts that are secrets.
+///
+/// Two rules, both about not making things worse:
+/// <list type="bullet">
+///   <item>Reading replaces the value of any key that looks like a credential with <c>***</c>. A screenshot of the
+///   settings page should not be a key leak, and neither should a bug report.</item>
+///   <item>Writing treats an incoming <c>***</c> as "unchanged". Without that rule every save would silently erase
+///   the key it could not display, which is the one bug a masked form reliably causes.</item>
+/// </list>
+/// </summary>
+public static class ModelSecrets
+{
+    public const string Placeholder = "***";
+
+    private static readonly string[] SecretWords = ["apikey", "token", "secret", "password", "credentials"];
+
+    public static bool LooksSecret(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        var normalized = new string(name.Where(char.IsLetterOrDigit).ToArray()).ToLowerInvariant();
+        return SecretWords.Any(word => normalized.Contains(word, StringComparison.Ordinal));
+    }
+
+    /// <summary>The JSON with credential values replaced. Non-object input is returned as it came.</summary>
+    public static JsonElement Mask(JsonElement configuration)
+    {
+        if (configuration.ValueKind != JsonValueKind.Object) return configuration;
+        var masked = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        foreach (var property in configuration.EnumerateObject())
+        {
+            masked[property.Name] = LooksSecret(property.Name) && property.Value.ValueKind == JsonValueKind.String
+                ? JsonSerializer.SerializeToElement(Placeholder)
+                : Mask(property.Value);
+        }
+        return JsonSerializer.SerializeToElement(masked);
+    }
+
+    /// <summary>
+    /// The JSON to store: <paramref name="incoming"/> with every <c>***</c> replaced by what <paramref name="existing"/>
+    /// had at the same path. A credential the caller did not see is a credential the caller did not mean to change.
+    /// </summary>
+    public static JsonElement Restore(JsonElement incoming, JsonElement existing)
+    {
+        if (incoming.ValueKind != JsonValueKind.Object) return incoming;
+        var merged = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        foreach (var property in incoming.EnumerateObject())
+        {
+            var previous = existing.ValueKind == JsonValueKind.Object && existing.TryGetProperty(property.Name, out var found)
+                ? found
+                : (JsonElement?)null;
+            merged[property.Name] = property.Value.ValueKind == JsonValueKind.String &&
+                                    property.Value.GetString() == Placeholder && previous is { } kept
+                ? kept
+                : Restore(property.Value, previous ?? default);
+        }
+        return JsonSerializer.SerializeToElement(merged);
+    }
+}
 
 public sealed record ModelRequest(
     IReadOnlyList<ModelMessage> Messages,

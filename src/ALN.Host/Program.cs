@@ -142,7 +142,8 @@ if (!modelPackage.Ok)
     Console.Error.WriteLine(modelPackage.Error?.Message ?? "OpenAI Chat provider module failed to load.");
     return 1;
 }
-var modelConfiguration = await LoadModelConfigurationAsync(Path.Combine(data.Root, "models"));
+var modelInstances = new FileModelInstanceStore(Path.Combine(data.Root, "models"));
+var modelConfiguration = await LoadModelConfigurationAsync(modelInstances);
 if (!modelConfiguration.Ok)
 {
     Console.Error.WriteLine(modelConfiguration.Error?.Message ?? "Model configuration failed to load.");
@@ -336,7 +337,7 @@ if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
 // The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
 // WebUI itself — it exposes actions, and a separate project consumes them.
 var controlPlane = new ControlPlane(auditSink, signalLog);
-var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes);
+var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes, modelInstances);
 if (!actionsRegistered.Ok)
 {
     Console.Error.WriteLine(actionsRegistered.Error?.Message ?? "Action registration failed.");
@@ -384,39 +385,24 @@ finally
 }
 return 0;
 
-async Task<Result> LoadModelConfigurationAsync(string modelsRoot)
+async Task<Result> LoadModelConfigurationAsync(IModelInstanceStore store)
 {
-    if (!Directory.Exists(modelsRoot)) return Result.Success();
-    try
+    var loaded = await store.LoadAllAsync(CancellationToken.None);
+    if (!loaded.Ok || loaded.Value is null) return Result.Failure(loaded.Error!);
+    foreach (var entry in loaded.Value)
     {
-        foreach (var categoryDirectory in Directory.EnumerateDirectories(modelsRoot).Order(StringComparer.Ordinal))
-        foreach (var configPath in Directory.EnumerateFiles(categoryDirectory, "*.json", SearchOption.TopDirectoryOnly).Order(StringComparer.Ordinal))
+        if (!entry.Spec.Enabled) continue;
+        var createdProvider = await modelManager.CreateAsync(entry.Category, entry.Instance,
+            entry.Spec.Configuration.GetRawText(), CancellationToken.None);
+        if (!createdProvider.Ok || createdProvider.Value is null) return Result.Failure(createdProvider.Error!);
+        var providerAddress = createdProvider.Value.Address;
+        foreach (var profile in entry.Spec.Profiles ?? [])
         {
-            var bytes = await File.ReadAllBytesAsync(configPath, CancellationToken.None);
-            if (bytes.Length > 256_000)
-                return Result.Failure(new(ErrorCode.Invalid, $"Model configuration exceeds 256 KB: {configPath}"));
-            var config = JsonSerializer.Deserialize<ModelInstanceConfiguration>(bytes, new JsonSerializerOptions(JsonSerializerDefaults.Web));
-            if (config is null)
-                return Result.Failure(new(ErrorCode.Invalid, $"Model configuration is incomplete: {configPath}"));
-            if (!config.Enabled) continue;
-            if (config.Configuration.ValueKind != JsonValueKind.Object)
-                return Result.Failure(new(ErrorCode.Invalid, $"Model provider configuration must be a JSON object: {configPath}"));
-
-            var category = Path.GetFileName(categoryDirectory);
-            var instance = Path.GetFileNameWithoutExtension(configPath);
-            var createdProvider = await modelManager.CreateAsync(category, instance, config.Configuration.GetRawText(), CancellationToken.None);
-            if (!createdProvider.Ok || createdProvider.Value is null) return Result.Failure(createdProvider.Error!);
-            var providerAddress = createdProvider.Value.Address;
-            foreach (var profile in config.Profiles ?? [])
-            {
-                var registered = modelManager.RegisterProfile(new(profile.Id, providerAddress, profile.ModelId, profile.DefaultSampling));
-                if (!registered.Ok) return registered;
-            }
+            var registered = modelManager.RegisterProfile(new(profile.Id, providerAddress, profile.ModelId, profile.DefaultSampling));
+            if (!registered.Ok) return registered;
         }
-        return Result.Success();
     }
-    catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException or InvalidOperationException)
-    { return Result.Failure(new(ErrorCode.Invalid, "Model configuration could not be loaded.", ex.Message)); }
+    return Result.Success();
 }
 
 // Channels are created by scripts and persisted; startup only revives what already exists.
@@ -428,9 +414,3 @@ sealed class HostServiceProvider(params (Type Type, object Service)[] services) 
     private readonly IReadOnlyDictionary<Type, object> _services = services.ToDictionary(x => x.Type, x => x.Service);
     public object? GetService(Type serviceType) => _services.GetValueOrDefault(serviceType);
 }
-
-sealed record ModelInstanceConfiguration(
-    JsonElement Configuration,
-    IReadOnlyList<ModelProfileConfiguration>? Profiles,
-    bool Enabled = true);
-sealed record ModelProfileConfiguration(string Id, string ModelId, SamplingSettings? DefaultSampling = null);

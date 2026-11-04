@@ -33,6 +33,11 @@ public static class CoreActions
     public const string ParamsSet = "params.set";
     public const string GraphUnmount = "graph.unmount";
     public const string ModelsList = "models.list";
+    public const string ModelsProviderGet = "models.provider.get";
+    public const string ModelsProviderSave = "models.provider.save";
+    public const string ModelsProviderDestroy = "models.provider.destroy";
+    public const string ModelsProfileCreate = "models.profile.create";
+    public const string ModelsProfileRemove = "models.profile.remove";
     public const string ModulesList = "modules.list";
     public const string ModuleTypes = "system.types";
     public const string ScriptsList = "scripts.list";
@@ -51,7 +56,7 @@ public static class CoreActions
     public static Result RegisterAll(ControlPlane plane, IAdapterManager adapters, IChannelManager channels,
         IModelManager models, ISignalLog signals, IGraphRuntime graph, IParameterRegistry parameters,
         IModuleCatalog? modules = null, ISessionManager? sessions = null, IArchiveRegistry? archive = null,
-        IPromptLibrary? prompts = null, IModuleTypeCatalog? moduleTypes = null)
+        IPromptLibrary? prompts = null, IModuleTypeCatalog? moduleTypes = null, IModelInstanceStore? modelInstances = null)
     {
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
@@ -236,6 +241,12 @@ public static class CoreActions
                         model = p.ModelId
                     })
                 })))),
+
+            (new(ModelsProviderGet, "One provider instance as configured on disk, with credentials masked as ***.", Capabilities.ModelsRead, false), GetModelProvider),
+            (new(ModelsProviderSave, "Write a provider instance's configuration. A *** value means \"keep the stored one\"; applies now when the provider is not running, else on restart.", Capabilities.ModelsControl, true), SaveModelProvider),
+            (new(ModelsProviderDestroy, "Destroy a provider instance and delete its configuration file.", Capabilities.ModelsControl, true), DestroyModelProvider),
+            (new(ModelsProfileCreate, "Register one model profile and write it into its provider's file.", Capabilities.ModelsControl, true), CreateModelProfile),
+            (new(ModelsProfileRemove, "Remove one model profile from the registry and from its provider's file.", Capabilities.ModelsControl, true), RemoveModelProfile),
 
             (new(SignalsRecent, "Recent signal records, newest last.", Capabilities.SignalsRead, false), RecentSignals),
 
@@ -431,6 +442,227 @@ public static class CoreActions
                 bindings = bindings.Select(binding => new { adapter = binding.Adapter.ToString(), conversation = binding.PlatformConversationId }),
                 maxMessages
             }));
+        }
+
+        // ---- model configuration: the files a person edits, behind the same single execution point ----------
+
+        /// <summary>"openai-chat" → "chat": the file's category comes from the type, not from the kind in the address.</summary>
+        string CategoryOfKind(string kind)
+        {
+            var typeId = "model." + kind;
+            return models.ListTypes().FirstOrDefault(type => string.Equals(type.TypeId, typeId, StringComparison.Ordinal))?.Category ?? kind;
+        }
+
+        /// <summary>
+        /// Accepts either an address ("model.openai-chat#deepseek_official") or category + instance. Two spellings
+        /// because two callers exist: the UI edits a row it found, a person adds one they are typing.
+        /// </summary>
+        (string Category, string Instance, string Kind, string Address)? ReadModelName(JsonElement arguments, out Error? error)
+        {
+            error = null;
+            var category = TryReadText(arguments, "category", out var categoryText) && categoryText.Trim().Length > 0 ? categoryText.Trim() : null;
+            var instance = TryReadText(arguments, "instance", out var instanceText) && instanceText.Trim().Length > 0 ? instanceText.Trim() : null;
+            string? kind = null;
+            if (TryReadText(arguments, "address", out var addressText) && addressText.Trim().Length > 0)
+            {
+                if (!Address.TryParse(addressText.Trim(), out var address) || !address.IsInstance || address.Module != "model")
+                {
+                    error = new(ErrorCode.Invalid, $"Not a model provider address: {addressText}");
+                    return null;
+                }
+                kind = address.Kind;
+                instance = address.Instance;
+            }
+            if (instance is null)
+            {
+                error = new(ErrorCode.Invalid, "A model provider needs 'instance' (or an 'address').");
+                return null;
+            }
+            if (category is null)
+            {
+                if (kind is null)
+                {
+                    error = new(ErrorCode.Invalid, "A model provider needs 'category' (or an 'address' with its kind).");
+                    return null;
+                }
+                category = CategoryOfKind(kind);
+            }
+            if (kind is null)
+            {
+                var typeId = models.ListTypes().FirstOrDefault(type => string.Equals(type.Category, category, StringComparison.Ordinal))?.TypeId;
+                var prefix = $"model.";
+                if (typeId is null || !typeId.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    error = new(ErrorCode.Invalid, $"No model provider type serves category '{category}'.");
+                    return null;
+                }
+                kind = typeId[prefix.Length..];
+            }
+            return (category, instance, kind, $"model.{kind}#{instance}");
+        }
+
+        async ValueTask<Result<JsonElement>> GetModelProvider(JsonElement arguments, CancellationToken ct)
+        {
+            if (modelInstances is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "No model instance store is configured."));
+            var named = ReadModelName(arguments, out var error);
+            if (named is null) return Result<JsonElement>.Failure(error!);
+            var stored = await modelInstances.ReadAsync(named.Value.Category, named.Value.Instance, ct).ConfigureAwait(false);
+            // "No such file" is Success(null), so the test is Error, not Ok: a nullable Value makes Ok false by itself.
+            if (stored.Error is { } storedError) return Result<JsonElement>.Failure(storedError);
+            var running = models.List().Any(provider => provider.Address.ToString() == named.Value.Address);
+            if (stored.Value is null)
+                return Result<JsonElement>.Success(ToJson(new { address = named.Value.Address, found = false, running }));
+            return Result<JsonElement>.Success(ToJson(new
+            {
+                address = named.Value.Address,
+                found = true,
+                running,
+                category = named.Value.Category,
+                instance = named.Value.Instance,
+                enabled = stored.Value.Enabled,
+                // The credentials go back as ***, so a screenshot of this page is not a key leak.
+                configuration = ModelSecrets.Mask(stored.Value.Configuration),
+                profiles = (stored.Value.Profiles ?? []).Select(profile => new
+                {
+                    id = profile.Id,
+                    model = profile.ModelId,
+                    defaultSampling = profile.DefaultSampling
+                })
+            }));
+        }
+
+        async ValueTask<Result<JsonElement>> SaveModelProvider(JsonElement arguments, CancellationToken ct)
+        {
+            if (modelInstances is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "No model instance store is configured."));
+            var named = ReadModelName(arguments, out var error);
+            if (named is null) return Result<JsonElement>.Failure(error!);
+            if (!arguments.TryGetProperty("configuration", out var configuration) || configuration.ValueKind != JsonValueKind.Object)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "models.provider.save requires 'configuration' as a JSON object."));
+
+            var existing = await modelInstances.ReadAsync(named.Value.Category, named.Value.Instance, ct).ConfigureAwait(false);
+            if (existing.Error is { } existingError) return Result<JsonElement>.Failure(existingError);
+            // A *** the caller could not read back means "leave it alone" — otherwise every save erases the key.
+            var merged = existing.Value is null
+                ? configuration
+                : ModelSecrets.Restore(configuration, existing.Value.Configuration);
+
+            var profiles = existing.Value?.Profiles;
+            if (arguments.TryGetProperty("profiles", out var profileItems))
+            {
+                if (profileItems.ValueKind != JsonValueKind.Array)
+                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "models.provider.save 'profiles' must be an array."));
+                var parsed = new List<ModelProfile>();
+                foreach (var item in profileItems.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.Object ||
+                        !item.TryGetProperty("id", out var idText) || idText.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(idText.GetString()) ||
+                        !item.TryGetProperty("model", out var modelText) || modelText.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(modelText.GetString()))
+                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "Each profile needs a non-empty 'id' and 'model'."));
+                    SamplingSettings? sampling = null;
+                    if (item.TryGetProperty("defaultSampling", out var samplingItem) && samplingItem.ValueKind == JsonValueKind.Object)
+                    {
+                        try { sampling = samplingItem.Deserialize<SamplingSettings>(JsonOptions); }
+                        catch (JsonException ex) { return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "Profile sampling is malformed.", ex.Message)); }
+                    }
+                    parsed.Add(new ModelProfile(idText.GetString()!.Trim(), new Address("model", named.Value.Kind, named.Value.Instance),
+                        modelText.GetString()!.Trim(), sampling));
+                }
+                profiles = parsed;
+            }
+
+            var enabled = !arguments.TryGetProperty("enabled", out var enabledItem) || enabledItem.ValueKind != JsonValueKind.False;
+            var spec = new ModelInstanceSpec(merged, profiles, enabled);
+            var saved = await modelInstances.SaveAsync(named.Value.Category, named.Value.Instance, spec, ct).ConfigureAwait(false);
+            if (!saved.Ok) return Result<JsonElement>.Failure(saved.Error!);
+
+            // A provider that is not running yet can be built right now, so a freshly added key is usable without a
+            // restart. One that is running holds its configuration; saying "restart" is honest, applying silently
+            // is not possible without pulling it out from under calls that are in flight.
+            var running = models.List().Any(provider => provider.Address.ToString() == named.Value.Address);
+            if (!running && enabled)
+            {
+                var created = await models.CreateAsync(named.Value.Category, named.Value.Instance, merged.GetRawText(), ct).ConfigureAwait(false);
+                if (!created.Ok || created.Value is null) return Result<JsonElement>.Failure(created.Error ?? new(ErrorCode.Unavailable, "Provider could not be created."));
+                foreach (var profile in profiles ?? []) models.RegisterProfile(profile);
+                return Result<JsonElement>.Success(ToJson(new { address = named.Value.Address, saved = true, applied = "now" }));
+            }
+            return Result<JsonElement>.Success(ToJson(new { address = named.Value.Address, saved = true, applied = running ? "restart" : "disabled" }));
+        }
+
+        async ValueTask<Result<JsonElement>> DestroyModelProvider(JsonElement arguments, CancellationToken ct)
+        {
+            if (modelInstances is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "No model instance store is configured."));
+            var named = ReadModelName(arguments, out var error);
+            if (named is null) return Result<JsonElement>.Failure(error!);
+            var running = models.List().Any(provider => provider.Address.ToString() == named.Value.Address);
+            if (running)
+            {
+                // Destroy refuses while a profile still points at it, and that refusal is the useful answer: a
+                // profile with no provider is a session that fails at its next turn with a stranger error.
+                var destroyed = await models.DestroyAsync(new Address("model", named.Value.Kind, named.Value.Instance), ct).ConfigureAwait(false);
+                if (!destroyed.Ok) return Result<JsonElement>.Failure(destroyed.Error!);
+            }
+            var deleted = await modelInstances.DeleteAsync(named.Value.Category, named.Value.Instance, ct).ConfigureAwait(false);
+            return deleted.Ok
+                ? Result<JsonElement>.Success(ToJson(new { address = named.Value.Address, destroyed = true, wasRunning = running }))
+                : Result<JsonElement>.Failure(deleted.Error!);
+        }
+
+        async ValueTask<Result<JsonElement>> CreateModelProfile(JsonElement arguments, CancellationToken ct)
+        {
+            if (!TryReadText(arguments, "id", out var id) || id.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "models.profile.create requires 'id'."));
+            if (!TryReadText(arguments, "model", out var model) || model.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "models.profile.create requires 'model'."));
+            var provider = ReadAddress(arguments, "provider");
+            if (!provider.Ok) return Result<JsonElement>.Failure(provider.Error!);
+            SamplingSettings? sampling = null;
+            if (arguments.TryGetProperty("defaultSampling", out var samplingItem) && samplingItem.ValueKind == JsonValueKind.Object)
+            {
+                try { sampling = samplingItem.Deserialize<SamplingSettings>(JsonOptions); }
+                catch (JsonException ex) { return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "defaultSampling is malformed.", ex.Message)); }
+            }
+            var registered = models.RegisterProfile(new ModelProfile(id.Trim(), provider.Value, model.Trim(), sampling));
+            if (!registered.Ok) return Result<JsonElement>.Failure(registered.Error!);
+
+            // The live registry is not the file: a profile that is not written down dies at the next restart, and
+            // "it worked until we restarted" is the worst kind of configuration bug.
+            if (modelInstances is not null && Address.TryParse(provider.Value.ToString(), out var address) && address.Kind is { } kind && address.Instance is { } instance)
+            {
+                var stored = await modelInstances.ReadAsync(CategoryOfKind(kind), instance, ct).ConfigureAwait(false);
+                if (stored.Error is null && stored.Value is { } spec)
+                {
+                    var profiles = (spec.Profiles ?? []).Where(profile => profile.Id != id.Trim())
+                        .Append(new ModelProfile(id.Trim(), provider.Value, model.Trim(), sampling)).ToArray();
+                    var saved = await modelInstances.SaveAsync(CategoryOfKind(kind), instance,
+                        spec with { Profiles = profiles }, ct).ConfigureAwait(false);
+                    if (!saved.Ok) return Result<JsonElement>.Failure(saved.Error!);
+                }
+            }
+            return Result<JsonElement>.Success(ToJson(new { id = id.Trim(), provider = provider.Value.ToString(), model = model.Trim() }));
+        }
+
+        async ValueTask<Result<JsonElement>> RemoveModelProfile(JsonElement arguments, CancellationToken ct)
+        {
+            if (!TryReadText(arguments, "id", out var id) || id.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "models.profile.remove requires 'id'."));
+            var removed = models.RemoveProfile(id.Trim());
+            if (!removed.Ok) return Result<JsonElement>.Failure(removed.Error!);
+            if (modelInstances is not null)
+            {
+                var all = await modelInstances.LoadAllAsync(ct).ConfigureAwait(false);
+                if (all.Error is null && all.Value is { } entries)
+                {
+                    foreach (var entry in entries.Where(entry => (entry.Spec.Profiles ?? []).Any(profile => profile.Id == id.Trim())))
+                    {
+                        var profiles = (entry.Spec.Profiles ?? []).Where(profile => profile.Id != id.Trim()).ToArray();
+                        var saved = await modelInstances.SaveAsync(entry.Category, entry.Instance, entry.Spec with { Profiles = profiles }, ct)
+                            .ConfigureAwait(false);
+                        if (!saved.Ok) return Result<JsonElement>.Failure(saved.Error!);
+                    }
+                }
+            }
+            return Result<JsonElement>.Success(ToJson(new { id = id.Trim(), removed = true }));
         }
 
         async ValueTask<Result<JsonElement>> StartAdapter(JsonElement arguments, CancellationToken ct)

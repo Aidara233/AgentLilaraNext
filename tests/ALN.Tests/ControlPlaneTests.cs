@@ -293,6 +293,77 @@ public sealed class ControlPlaneTests : IDisposable
         Assert.Equal("channel.conversation#group-1", Assert.Single(channels.Destroyed).ToString());
     }
 
+    [Fact]
+    public async Task A_saved_provider_is_written_to_disk_masked_on_the_way_back_and_enough_to_run()
+    {
+        var store = new FileModelInstanceStore(Path.Combine(_root, "models"));
+        var models = new FakeModels(null);
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), models,
+            _signals, new FakeGraph(), new FakeParameters(), modelInstances: store).Ok);
+
+        var saved = await plane.InvokeAsync(User(Capabilities.ModelsControl), CoreActions.ModelsProviderSave,
+            JsonSerializer.SerializeToElement(new
+            {
+                category = "chat", instance = "one",
+                configuration = new { endpoint = "https://api.example.com", apiKey = "sk-real" },
+                profiles = new[] { new { id = "default", model = "deepseek-flash" } }
+            }), default);
+        Assert.True(saved.Ok, saved.Error?.Message);
+        // Nothing was running, so the provider is built now instead of at the next restart.
+        Assert.Equal("now", saved.Value.GetProperty("applied").GetString());
+        Assert.Equal("now", saved.Value.GetProperty("applied").GetString());
+        Assert.Equal("chat/one", Assert.Single(models.Created));
+        Assert.Equal("default", Assert.Single(models.Profiles).Id);
+
+        // Reading it back hides the key but keeps the shape an editor needs.
+        var read = await plane.InvokeAsync(User(Capabilities.ModelsRead), CoreActions.ModelsProviderGet,
+            JsonSerializer.SerializeToElement(new { address = "model.openai-chat#one" }), default);
+        Assert.True(read.Ok, read.Error?.Message);
+        Assert.True(read.Value.GetProperty("found").GetBoolean());
+        Assert.Equal(ModelSecrets.Placeholder, read.Value.GetProperty("configuration").GetProperty("apiKey").GetString());
+        Assert.Equal("https://api.example.com", read.Value.GetProperty("configuration").GetProperty("endpoint").GetString());
+
+        // Saving the masked form back must not replace the key with "***".
+        models.Profiles.Clear();
+        var resaved = await plane.InvokeAsync(User(Capabilities.ModelsControl), CoreActions.ModelsProviderSave,
+            JsonSerializer.SerializeToElement(new
+            {
+                category = "chat", instance = "one",
+                configuration = new { endpoint = "https://api.example.com", apiKey = "***" }
+            }), default);
+        Assert.True(resaved.Ok, resaved.Error?.Message);
+        using var stored = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(_root, "models", "chat", "one.json")));
+        Assert.Equal("sk-real", stored.RootElement.GetProperty("configuration").GetProperty("apiKey").GetString());
+        // This one was already running: its configuration lives in memory, so the honest answer is "restart".
+        Assert.Equal("restart", resaved.Value.GetProperty("applied").GetString());
+    }
+
+    [Fact]
+    public async Task Saving_a_provider_is_not_a_read()
+    {
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null),
+            _signals, new FakeGraph(), new FakeParameters(),
+            modelInstances: new FileModelInstanceStore(Path.Combine(_root, "models"))).Ok);
+
+        foreach (var id in new[] { CoreActions.ModelsProviderSave, CoreActions.ModelsProviderDestroy,
+                     CoreActions.ModelsProfileCreate, CoreActions.ModelsProfileRemove })
+        {
+            var action = Assert.Single(plane.Catalog, candidate => candidate.Id == id);
+            Assert.Equal(Capabilities.ModelsControl, action.Capability);
+            Assert.True(action.Mutating);
+            Assert.False(User("*.read").Allows(action.Capability));
+        }
+        Assert.Equal(Capabilities.ModelsRead, Assert.Single(plane.Catalog, a => a.Id == CoreActions.ModelsProviderGet).Capability);
+        // Without a store the actions are registered and say so, instead of half-working.
+        var noStore = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(noStore, new FakeAdapters(), new FakeChannels(), new FakeModels(null),
+            _signals, new FakeGraph(), new FakeParameters()).Ok);
+        var refused = await noStore.InvokeAsync(Actor.System, CoreActions.ModelsProviderGet, default, default);
+        Assert.Equal(ErrorCode.Unavailable, refused.Error?.Code);
+    }
+
     private sealed class CollectingAudit(List<AuditRecord> records) : IAuditSink
     {
         public ValueTask AppendAsync(AuditRecord record, CancellationToken cancellationToken)
@@ -396,19 +467,57 @@ public sealed class ControlPlaneTests : IDisposable
         public Result<ChannelInfo> FindBound(Address adapter, string conversation) => Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "none"));
     }
 
-    private sealed class FakeModels(ModelProviderInfo provider) : IModelManager
+    private sealed class FakeModels(ModelProviderInfo? provider) : IModelManager
     {
+        private readonly List<ModelProviderInfo> _providers = provider is null ? [] : [provider];
+        public List<string> Created { get; } = [];
+        public List<ModelProfile> Profiles { get; } = [];
+
         public ValueTask<Result<IAsyncEnumerable<ModelEvent>>> CompleteAsync(string profileId, ModelRequest request, CancellationToken ct) => throw new NotSupportedException();
         public Result RegisterFactory(string packageId, IModelProviderFactory factory) => Result.Success();
         public Result RemovePackageFactories(string packageId) => Result.Success();
-        public IReadOnlyList<ModelProviderTypeInfo> ListTypes() => [];
+        public IReadOnlyList<ModelProviderTypeInfo> ListTypes() => [new("model.openai-chat", "chat", "OpenAI Chat", ModelCapabilities.Streaming)];
         public ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken ct) => throw new NotSupportedException();
-        public ValueTask<Result<IModelProvider>> CreateAsync(string category, string instance, string configurationJson, CancellationToken ct) => throw new NotSupportedException();
-        public ValueTask<Result> DestroyAsync(Address provider, CancellationToken ct) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result<IModelProvider>> CreateAsync(string category, string instance, string configurationJson, CancellationToken ct)
+        {
+            Created.Add($"{category}/{instance}");
+            var address = new Address("model", "openai-chat", instance);
+            var descriptor = new ModelProviderDescriptor("model.openai-chat", category, "OpenAI Chat", ModelCapabilities.Streaming);
+            _providers.Add(new ModelProviderInfo(address, descriptor, 0));
+            return ValueTask.FromResult(Result<IModelProvider>.Success(new StubProvider(address, descriptor)));
+        }
+        public ValueTask<Result> DestroyAsync(Address provider, CancellationToken ct)
+        {
+            _providers.RemoveAll(row => row.Address == provider);
+            return ValueTask.FromResult(Result.Success());
+        }
         public Result<IModelProvider> Get(Address provider) => Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "none"));
-        public IReadOnlyList<ModelProviderInfo> List() => [provider];
-        public Result RegisterProfile(ModelProfile profile) => Result.Success();
-        public Result RemoveProfile(string profileId) => Result.Success();
-        public IReadOnlyList<ModelProfile> ListProfiles() => [];
+        public IReadOnlyList<ModelProviderInfo> List() => _providers;
+        public Result RegisterProfile(ModelProfile profile)
+        {
+            Profiles.Add(profile);
+            return Result.Success();
+        }
+        public Result RemoveProfile(string profileId)
+        {
+            Profiles.RemoveAll(profile => profile.Id == profileId);
+            return Result.Success();
+        }
+        public IReadOnlyList<ModelProfile> ListProfiles() => Profiles;
+    }
+
+    private sealed class StubProvider(Address address, ModelProviderDescriptor describe) : IModelProvider
+    {
+        public Address Address => address;
+        public ModelProviderDescriptor Describe => describe;
+        public ModuleId Id => new(address.ToString());
+        public IAsyncEnumerable<ModelEvent> CompleteAsync(ModelRequest request, CancellationToken ct) => Empty();
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        private static async IAsyncEnumerable<ModelEvent> Empty()
+        {
+            await Task.Yield();
+            yield break;
+        }
     }
 }
