@@ -496,6 +496,50 @@ public sealed class KernelTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task An_instance_announced_by_its_manager_becomes_a_node_with_an_edge_to_it()
+    {
+        var manager = new TestMaster(new("ChannelManager"));
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(manager, typeId: ModuleNames.ChannelManager).Ok);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+        var host = new InstanceNodeHost(kernel, new ModuleId("ChannelManager"));
+        var instance = new ModuleId("channel.conversation#chat-1");
+
+        var attached = await host.AttachAsync(new ModuleId("ChannelManager"), instance, "channel.conversation", ["message.accepted"], default);
+
+        Assert.True(attached.Ok, attached.Error?.Message);
+        Assert.Equal(ModulePhase.Ready, kernel.Nodes.Single(node => node.Id == instance).Phase);
+        Assert.Equal("channel.conversation", kernel.Nodes.Single(node => node.Id == instance).Type);
+        // The manager was asked to accept it, which is what makes this an edge rather than a bookmark.
+        Assert.Equal([instance], manager.Wired);
+
+        var detached = await host.DetachAsync(new ModuleId("ChannelManager"), instance, default);
+        Assert.True(detached.Ok, detached.Error?.Message);
+        Assert.Null(kernel.Find(instance));
+        // Detaching twice is not an error: absent is what detaching wanted.
+        Assert.True((await host.DetachAsync(new ModuleId("ChannelManager"), instance, default)).Ok);
+    }
+
+    [Fact]
+    public async Task A_manager_only_accepts_the_instances_it_holds()
+    {
+        // The master judges: a Channel manager that does not have this Channel refuses the edge, and the refusal is
+        // reported rather than leaving a node nobody owns.
+        var manager = new TestMaster(new("ChannelManager")) { Accept = (_, _, _) => Result.Failure(new(ErrorCode.Invalid, "not mine")) };
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(manager, typeId: ModuleNames.ChannelManager).Ok);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+        var host = new InstanceNodeHost(kernel, new ModuleId("ChannelManager"));
+        var instance = new ModuleId("channel.conversation#chat-1");
+
+        var attached = await host.AttachAsync(new ModuleId("ChannelManager"), instance, "channel.conversation", null, default);
+
+        Assert.False(attached.Ok);
+        Assert.Contains("not mine", attached.Error!.Message, StringComparison.Ordinal);
+        Assert.Null(kernel.Find(instance));
+    }
+
     private sealed class RecordingSignals : ISignalLog
     {
         public List<SignalRecord> Records { get; } = [];

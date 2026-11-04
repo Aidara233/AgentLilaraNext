@@ -9,10 +9,24 @@ namespace ALN.Runtime;
 /// deliberately does <b>not</b> do is invent work: a manager's own startup happens in the Start signal it already
 /// understands, so <see cref="InitializeAsync"/> is a no-op. The day a manager needs to build something before
 /// anything is wired, it implements <see cref="IKernelModule"/> itself and this adapter disappears from its path.
+///
+/// The id is a parameter because a manager's participant name ("channels") is not the name the rest of the process
+/// calls it by (<see cref="ModuleNames.ChannelManager"/>), and an instance edge has to name the same node the
+/// receipt shows.
 /// </summary>
-public sealed class LifecycleModule(ILifecycleParticipant participant) : IKernelModule
+public sealed class LifecycleModule(ILifecycleParticipant participant, ModuleId? id = null) : IKernelModule, IModuleWiring
 {
-    public ModuleId Id { get; } = new(participant.Name);
+    public ModuleId Id { get; } = id ?? new ModuleId(participant.Name);
+
+    /// <summary>
+    /// The manager behind this node, when it is the manager itself. A manager that holds instances announces them
+    /// through the graph, and the graph asks the master to accept each one — the master here is the manager, not
+    /// this adapter.
+    /// </summary>
+    public Result WireSlave(ModuleId slaveId, IReadOnlyList<string> kinds, IKernelModule instance) =>
+        participant is IModuleWiring wiring
+            ? wiring.WireSlave(slaveId, kinds, instance)
+            : Result.Failure(new(ErrorCode.Invalid, $"{Id} does not hold instances."));
 
     public ValueTask<Result> InitializeAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
 

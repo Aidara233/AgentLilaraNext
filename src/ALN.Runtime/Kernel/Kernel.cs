@@ -26,6 +26,9 @@ public sealed class Kernel
     private readonly Dictionary<ModuleId, KernelNode> _declared = new();
     private readonly object _gate = new();
     private IReadOnlyList<ModuleIssue> _issues = [];
+    // Edges made after startup. The receipt counts them, because "nine edges" that silently becomes eleven is a
+    // number a reader would trust and should not.
+    private int _runtimeEdges;
 
     public Kernel(string dataRoot, IModuleFactoryRegistry types, ISignalLog? signals = null, TimeSpan? stopTimeout = null)
         : this(new ModuleManifestStore(dataRoot), types, signals, stopTimeout)
@@ -101,7 +104,7 @@ public sealed class Kernel
 
     public async ValueTask<Result<ModuleReceipt>> StartAsync(CancellationToken cancellationToken)
     {
-        lock (_gate) { _nodes.Clear(); _issues = []; }
+        lock (_gate) { _nodes.Clear(); _issues = []; _runtimeEdges = 0; }
         foreach (var declared in Declared()) lock (_gate) _nodes[declared.Manifest.Id] = declared;
 
         // 0 — Scan: everything the disk says, plus one line per directory that is not a module.
@@ -200,7 +203,8 @@ public sealed class Kernel
         }
 
         lock (_gate) _issues = issues;
-        return Result<ModuleReceipt>.Success(new(Snapshot().Select(node => node.Info()).ToArray(), wired, badEdges, cycles, issues));
+        return Result<ModuleReceipt>.Success(new(Snapshot().Select(node => node.Info()).ToArray(), wired + _runtimeEdges,
+            badEdges, cycles, issues));
     }
 
     /// <summary>
@@ -569,6 +573,74 @@ public sealed class Kernel
         return Result<IReadOnlyList<BadEdge>>.Success(dropped);
     }
 
+    /// <summary>
+    /// Attaches an instance to the manager that owns it: the manager becomes the master, the instance becomes a
+    /// slave, and the edge is the same edge the graph already knows how to draw (docs/22 §1.2, docs/23 §4 step 1).
+    ///
+    /// The instance takes no lifecycle work here: its manager creates, starts and stops it, and always has. What
+    /// this adds is that the relation becomes <b>visible</b> — before it, the only place "this manager holds this
+    /// instance" existed was a dictionary inside the manager, which nobody outside could read.
+    /// </summary>
+    public async ValueTask<Result<ModuleAddition>> AdoptAsync(ModuleId masterId, IKernelModule instance,
+        IReadOnlyList<string>? kinds = null, string? typeId = null, CancellationToken cancellationToken = default)
+    {
+        if (instance is null) return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, "An instance cannot be null."));
+        KernelNode master;
+        lock (_gate)
+        {
+            if (!_nodes.TryGetValue(masterId, out master!))
+                return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, $"No module answers to \"{masterId}\"."));
+            if (_nodes.ContainsKey(instance.Id))
+                return Result<ModuleAddition>.Failure(new(ErrorCode.Conflict, $"A module already answers to \"{instance.Id}\"."));
+        }
+        if (master.Module is not IModuleWiring wiring)
+            return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, $"{masterId} does not hold instances."));
+
+        var manifest = new ModuleManifest(instance.Id, typeId ?? instance.Id.Value, true, null,
+            [new ModuleSlave(masterId, kinds ?? [], RequireAll: false)], []);
+        var node = new KernelNode(manifest, instance);
+        lock (_gate) _nodes[instance.Id] = node;
+
+        await InitializeAsync(node, cancellationToken).ConfigureAwait(false);
+        if (node.Phase != ModulePhase.Initialized)
+            return Result<ModuleAddition>.Success(new(node.Info(), []));
+
+        Result accepted;
+        try { accepted = wiring.WireSlave(instance.Id, kinds ?? [], instance); }
+        catch (Exception ex) { accepted = Result.Failure(new(ErrorCode.Internal, "Wire threw.", ex.Message)); }
+        if (!accepted.Ok)
+        {
+            var edge = new BadEdge(masterId, instance.Id, BadEdgeReason.RejectedByMaster, accepted.Error?.Message ?? "Rejected.");
+            lock (_gate) _nodes.Remove(instance.Id);
+            return Result<ModuleAddition>.Success(new(node.Info(), [edge]));
+        }
+
+        // The edge is recorded on the master too, so the next receipt shows it as a declared slave rather than as
+        // something that only exists in this method's local variable.
+        lock (_gate)
+        {
+            master.AdoptSlave(new ModuleSlave(instance.Id, kinds ?? [], RequireAll: false));
+            _runtimeEdges++;
+        }
+
+        await ReadyAsync(node, cancellationToken).ConfigureAwait(false);
+        return Result<ModuleAddition>.Success(new(node.Info(), [], 1));
+    }
+
+    /// <summary>
+    /// Takes an instance out of the graph: stopped through its own hook, then gone, and the master stops listing it.
+    /// The instance's data is not touched here — that is the manager's call, because only it knows whether this
+    /// instance is going to the bin or coming back.
+    /// </summary>
+    public async ValueTask<Result> ReleaseAsync(ModuleId masterId, ModuleId instanceId, CancellationToken cancellationToken)
+    {
+        var removed = await RemoveAsync(instanceId, cancellationToken).ConfigureAwait(false);
+        if (!removed.Ok) return Result.Failure(removed.Error!);
+        lock (_gate)
+            if (_nodes.TryGetValue(masterId, out var master)) master.ReleaseSlave(instanceId);
+        return Result.Success();
+    }
+
     private KernelNode[] Snapshot()
     {
         lock (_gate) return _nodes.Values.ToArray();
@@ -584,10 +656,21 @@ public sealed class Kernel
 
     private sealed class KernelNode(ModuleManifest manifest, IKernelModule module)
     {
-        public ModuleManifest Manifest { get; } = manifest;
+        public ModuleManifest Manifest { get; private set; } = manifest;
         public IKernelModule Module { get; } = module;
         public ModulePhase Phase { get; set; } = ModulePhase.Loaded;
         public string? Failure { get; set; }
+
+        /// <summary>
+        /// A slave that arrived at runtime. The manifest is the in-memory truth for this process; the file on disk
+        /// still shows what was there at startup, which is why the two are read differently: one for the graph now,
+        /// one for what somebody wrote down.
+        /// </summary>
+        public void AdoptSlave(ModuleSlave slave) =>
+            Manifest = Manifest with { Slaves = [.. (Manifest.Slaves ?? []), slave] };
+
+        public void ReleaseSlave(ModuleId id) =>
+            Manifest = Manifest with { Slaves = (Manifest.Slaves ?? []).Where(slave => slave.Id != id).ToArray() };
 
         public ModuleNodeInfo Info() => new(Manifest.Id, Manifest.Type, Phase, Failure);
     }

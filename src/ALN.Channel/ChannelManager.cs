@@ -9,10 +9,29 @@ namespace ALN.Channel;
 public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, IInstanceBindings bindings,
     IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
     IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IQueuedMessageStore? queue = null,
-    ISessionManager? sessions = null, IArchiveRegistry? archive = null)
-    : IChannelManager, IModuleIndex, ILifecycleParticipant, IModule
+    ISessionManager? sessions = null, IArchiveRegistry? archive = null, IInstanceNodeHost? nodes = null)
+    : IChannelManager, IModuleIndex, IModuleWiring, IInstanceNodeSink, ILifecycleParticipant, IModule
 {
+    /// <inheritdoc />
     public string Category => "channel";
+
+    /// <summary>
+    /// Wires the port the manager announces its instances through. Set after construction because the graph does not
+    /// exist yet when the package that provides this manager is loaded.
+    /// </summary>
+    public void UseInstanceNodes(IInstanceNodeHost nodes) => _nodes = nodes ?? throw new ArgumentNullException(nameof(nodes));
+
+    /// <summary>
+    /// The master side of the edge: the graph offers an instance and this manager says whether it holds it. It only
+    /// accepts what it already has, because a channel is created here and announced afterwards — never the reverse.
+    /// </summary>
+    public Result WireSlave(ModuleId slaveId, IReadOnlyList<string> kinds, IKernelModule instance)
+    {
+        lock (_gate)
+            return _channels.Values.Any(channel => string.Equals(channel.Address.ToString(), slaveId.Value, StringComparison.Ordinal))
+                ? Result.Success()
+                : Result.Failure(new(ErrorCode.Invalid, $"{slaveId} is not one of this manager's Channels."));
+    }
 
     public const string ChannelManagerId = ModuleNames.ChannelManager;
     public ModuleId Id { get; } = new(ChannelManagerId);
@@ -36,6 +55,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     private readonly IQueuedMessageStore? _queue = queue;
     private readonly ISessionManager? _sessions = sessions;
     private readonly IArchiveRegistry? _archive = archive;
+    private IInstanceNodeHost? _nodes = nodes;
     /// <summary>Instances by name. The address lives on the instance; the name is the key, so nothing has to take one
     /// apart to look something up.</summary>
     private readonly Dictionary<ModuleId, ChannelInstance> _channels = new();
@@ -132,6 +152,20 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             {
                 lock (_gate) _channels.Remove(IdOf(spec.Address));
                 return Result<ChannelInfo>.Failure(mounted.Error!);
+            }
+            // The Channel is now a node with an edge to this manager, so anything that asks the graph "what is
+            // mounted on this instance" gets an answer. Failing here is a real failure: a Channel that exists but
+            // is invisible is exactly the shape nobody can reason about later.
+            if (_nodes is not null)
+            {
+                var announced = await _nodes.AttachAsync(new ModuleId(ModuleNames.ChannelManager),
+                    new ModuleId(spec.Address.ToString()), spec.TypeId, ["message.accepted"], cancellationToken).ConfigureAwait(false);
+                if (!announced.Ok)
+                {
+                    lock (_gate) _channels.Remove(IdOf(spec.Address));
+                    await _bindings.DetachAsync(spec.Address, CancellationToken.None).ConfigureAwait(false);
+                    return Result<ChannelInfo>.Failure(announced.Error!);
+                }
             }
             if (_specs is not null)
             {
@@ -255,6 +289,11 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             // the same address then collided with the dead one, its registration was quietly dropped, and it came
             // up with no tunables at all (while a restart replayed the old Channel's saved overrides into it).
             _parameters?.Unregister(address.ToString());
+            // Out of the graph too. Data is left alone on purpose: whether this Channel's history goes to the bin
+            // is decided below, and it is a different question from whether the node still exists.
+            if (_nodes is not null)
+                await _nodes.DetachAsync(new ModuleId(ModuleNames.ChannelManager), new ModuleId(address.ToString()),
+                    CancellationToken.None).ConfigureAwait(false);
             if (_specs is not null)
             {
                 var removed = await _specs.DeleteAsync(address, cancellationToken).ConfigureAwait(false);

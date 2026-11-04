@@ -287,7 +287,7 @@ foreach (var declared in new (ILifecycleParticipant Participant, string TypeId)[
              ((ILifecycleParticipant)channels!, ModuleNames.ChannelManager)
          })
 {
-    var declaration = kernel.Declare(new LifecycleModule(declared.Participant), typeId: declared.TypeId);
+    var declaration = kernel.Declare(new LifecycleModule(declared.Participant, new ModuleId(declared.TypeId)), typeId: declared.TypeId);
     if (declaration.Ok) continue;
     Console.Error.WriteLine(declaration.Error?.Message ?? "Module declaration failed.");
     shutdown.Cancel();
@@ -302,6 +302,11 @@ if (!memoryDeclared.Ok)
     queue.Complete();
     return 1;
 }
+// Instances are announced to the graph by the manager that holds them, so "what is mounted on this Channel" stops
+// being a question only the manager can answer (docs/23 §4 step 1). Installed before startup, because reviving a
+// stored Channel happens *during* startup — wiring it afterwards would announce only the ones created later.
+if (channels is IInstanceNodeSink sink)
+    sink.UseInstanceNodes(new InstanceNodeHost(kernel, new ModuleId(ModuleNames.ChannelManager)));
 var started = await kernel.StartAsync(shutdown.Token);
 if (!started.Ok || started.Value is null)
 {
