@@ -40,6 +40,7 @@ public static class ModuleNames
     public const string ModelManager = "ModelManager";
     public const string GraphManager = "GraphManager";
     public const string Clock = "Clock";
+    public const string Memory = "Memory";
 }
 
 /// <summary>

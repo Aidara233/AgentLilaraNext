@@ -55,10 +55,8 @@ var timeSource = sessionExtensions.Register(new TimeContextSource());
 if (!timeSource.Ok) { Console.Error.WriteLine(timeSource.Error?.Message); return 1; }
 var channelInfoSource = sessionExtensions.Register(new ChannelInfoSource());
 if (!channelInfoSource.Ok) { Console.Error.WriteLine(channelInfoSource.Error?.Message); return 1; }
-var memorySource = sessionExtensions.Register(new MemoryContextSource(storage));
-if (!memorySource.Ok) { Console.Error.WriteLine(memorySource.Error?.Message); return 1; }
-var memoryTools = sessionExtensions.Register(new MemoryToolSource(storage));
-if (!memoryTools.Ok) { Console.Error.WriteLine(memoryTools.Error?.Message); return 1; }
+// Memory is a module of its own: it registers its own line and its own tools, and nothing else knows it exists.
+var memoryModule = new MemoryModule(storage, sessionExtensions);
 // The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.
@@ -292,6 +290,14 @@ foreach (var declared in new (ILifecycleParticipant Participant, string TypeId)[
     var declaration = kernel.Declare(new LifecycleModule(declared.Participant), typeId: declared.TypeId);
     if (declaration.Ok) continue;
     Console.Error.WriteLine(declaration.Error?.Message ?? "Module declaration failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
+var memoryDeclared = kernel.Declare(memoryModule, typeId: MemoryModule.TypeId);
+if (!memoryDeclared.Ok)
+{
+    Console.Error.WriteLine(memoryDeclared.Error?.Message ?? "Memory module declaration failed.");
     shutdown.Cancel();
     queue.Complete();
     return 1;
