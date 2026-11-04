@@ -158,11 +158,17 @@ public sealed record ModuleReceipt(
     IReadOnlyList<CycleInfo> Cycles,
     IReadOnlyList<ModuleIssue> Issues)
 {
-    public int Ready => Nodes.Count(node => node.Phase == ModulePhase.Ready);
-    public int Failed => Nodes.Count(node => node.Phase is ModulePhase.Failed or ModulePhase.Error);
+    public int Ready => Nodes.Count(node => node.Phase == ModulePhase.Ready);    public int Failed => Nodes.Count(node => node.Phase is ModulePhase.Failed or ModulePhase.Error);
 
     /// <summary>Everything that makes this startup different from a clean one, in one number for health checks.</summary>
     public int Degraded => BadEdges.Count + Issues.Count + Failed;
 
     public bool AllReady => Nodes.Count > 0 && Ready == Nodes.Count;
 }
+
+/// <summary>
+/// What adding a node at runtime produced (docs/22, D1): where the node got to, the edges that did not become calls,
+/// and how many did. A node that arrives late can be refused for reasons that did not exist at startup — the slave
+/// it wanted is gone, the master it needed never got ready — so the answer carries them instead of only a success.
+/// </summary>
+public sealed record ModuleAddition(ModuleNodeInfo Node, IReadOnlyList<BadEdge> BadEdges, int WiredEdges = 0);

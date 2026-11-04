@@ -329,6 +329,89 @@ public sealed class KernelTests : IDisposable
         Assert.False(kernel.RequireOfType("test.absent").Ok);
     }
 
+    [Fact]
+    public async Task A_module_added_while_the_graph_is_running_starts_against_what_is_ready_now()
+    {
+        Add(new TestModule(new("target")), "test.plain");
+        var kernel = new Kernel(_root, _types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+
+        var late = new TestMaster(new("late"));
+        var added = await kernel.AddAsync(late, slaves: [new ModuleSlave(new ModuleId("target"), ["ping"])],
+            typeId: "test.master", cancellationToken: default);
+
+        Assert.True(added.Ok, added.Error?.Message);
+        Assert.Equal(ModulePhase.Ready, added.Value!.Node.Phase);
+        Assert.Equal(1, added.Value.WiredEdges);
+        Assert.Equal([new ModuleId("target")], late.Wired);
+        Assert.Contains(kernel.Nodes, node => node.Id.Value == "late");
+        // Adding the same name twice is a conflict, not a second node.
+        Assert.False((await kernel.AddAsync(new TestModule(new("late")), cancellationToken: default)).Ok);
+    }
+
+    [Fact]
+    public async Task A_module_added_late_that_needs_something_missing_is_reported_not_refused()
+    {
+        // A slave that is not there is a bad edge, exactly like at startup: the node exists, said what it wanted,
+        // and the answer says which edge never became a call.
+        Add(new TestModule(new("only")), "test.plain");
+        var kernel = new Kernel(_root, _types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+
+        var late = new TestMaster(new("late"));
+        var added = await kernel.AddAsync(late, slaves: [new ModuleSlave(new ModuleId("gone"), ["ping"])],
+            typeId: "test.master", cancellationToken: default);
+
+        Assert.True(added.Ok, added.Error?.Message);
+        Assert.Equal(ModulePhase.Ready, added.Value!.Node.Phase);
+        var edge = Assert.Single(added.Value.BadEdges);
+        Assert.Equal(BadEdgeReason.MissingModule, edge.Reason);
+        Assert.Equal(0, added.Value.WiredEdges);
+    }
+
+    [Fact]
+    public async Task A_module_added_late_that_needs_an_unready_module_does_not_start()
+    {
+        var broken = new TestModule(new("broken"));
+        broken.Initialize = () => throw new InvalidOperationException("cannot start");
+        Add(broken, "test.plain");
+        Add(new TestModule(new("target")), "test.plain");
+        var kernel = new Kernel(_root, _types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+
+        var late = new TestModule(new("late"));
+        var added = await kernel.AddAsync(late, dependencies: [new ModuleId("broken")], cancellationToken: default);
+
+        Assert.True(added.Ok, added.Error?.Message);
+        Assert.Equal(ModulePhase.Failed, added.Value!.Node.Phase);
+        Assert.Contains("broken", added.Value.Node.Failure!, StringComparison.Ordinal);
+        Assert.Empty(late.Calls.Skip(1));
+    }
+
+    [Fact]
+    public async Task Removing_a_node_stops_it_and_reports_the_edges_that_pointed_at_it()
+    {
+        var master = new TestMaster(new("master"));
+        var stopped = new List<string>();
+        var slave = new TestModule(new("slave"));
+        slave.Stop = () => stopped.Add("slave");
+        Add(slave, "test.plain");
+        Add(master, "test.master", slaves: ["slave"]);
+        var kernel = new Kernel(_root, _types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+
+        var removed = await kernel.RemoveAsync(new ModuleId("slave"), default);
+
+        Assert.True(removed.Ok, removed.Error?.Message);
+        Assert.Equal(["slave"], stopped);
+        Assert.Null(kernel.Find(new ModuleId("slave")));
+        Assert.DoesNotContain(kernel.Nodes, node => node.Id.Value == "slave");
+        // The master's file still lists it, so the edge is reported rather than rewritten behind its back.
+        var edge = Assert.Single(removed.Value!);
+        Assert.Equal(BadEdgeReason.MissingModule, edge.Reason);
+        Assert.False((await kernel.RemoveAsync(new ModuleId("slave"), default)).Ok);
+    }
+
     private async ValueTask<ModuleReceipt> Start(Kernel? kernel = null)
     {
         kernel ??= new Kernel(_root, _types);

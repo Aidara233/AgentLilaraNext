@@ -460,6 +460,115 @@ public sealed class Kernel
         return ordered;
     }
 
+    /// <summary>
+    /// Adds a node while the graph is running (docs/22, D1): initialize it, wire the slaves it declares, then let it
+    /// start — but only if what it says it needs is already ready.
+    ///
+    /// This is not the startup path with fewer phases. Startup waits for everyone because nobody can be trusted
+    /// before everyone has built themselves; a node that arrives later finds the graph already established, so the
+    /// only thing it may assume is that whatever is ready now is ready.
+    /// </summary>
+    public async ValueTask<Result<ModuleAddition>> AddAsync(IKernelModule module, IReadOnlyList<ModuleSlave>? slaves = null,
+        IReadOnlyList<ModuleId>? dependencies = null, string? typeId = null, CancellationToken cancellationToken = default)
+    {
+        if (module is null) return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, "A module cannot be null."));
+        KernelNode node;
+        lock (_gate)
+        {
+            if (_nodes.ContainsKey(module.Id))
+                return Result<ModuleAddition>.Failure(new(ErrorCode.Conflict, $"A module already answers to \"{module.Id}\"."));
+            node = new KernelNode(new ModuleManifest(module.Id, typeId ?? module.Id.Value, true, null,
+                slaves ?? [], dependencies ?? []), module);
+            _nodes[module.Id] = node;
+        }
+
+        await InitializeAsync(node, cancellationToken).ConfigureAwait(false);
+        if (node.Phase != ModulePhase.Initialized)
+            return Result<ModuleAddition>.Success(new(node.Info(), []));
+
+        var badEdges = new List<BadEdge>();
+        var wired = 0;
+        if (node.Manifest.Slaves is { Count: > 0 })
+        {
+            if (module is IModuleWiring master)
+            {
+                foreach (var slave in node.Manifest.Slaves!)
+                {
+                    var resolved = Resolve(slave.Id, badEdges, node.Manifest.Id);
+                    if (resolved is null) continue;
+                    Result accepted;
+                    try { accepted = master.WireSlave(slave.Id, slave.Kinds, resolved.Module); }
+                    catch (Exception ex) { accepted = Result.Failure(new(ErrorCode.Internal, "Wire threw.", ex.Message)); }
+                    if (!accepted.Ok)
+                    {
+                        badEdges.Add(new(node.Manifest.Id, slave.Id, BadEdgeReason.RejectedByMaster,
+                            accepted.Error?.Message ?? "Rejected."));
+                        continue;
+                    }
+                    wired++;
+                }
+            }
+            else
+            {
+                foreach (var slave in node.Manifest.Slaves!)
+                    badEdges.Add(new(node.Manifest.Id, slave.Id, BadEdgeReason.MasterDoesNotWire,
+                        $"{node.Manifest.Id} declares slaves but does not implement {nameof(IModuleWiring)}."));
+            }
+        }
+
+        // What it declared it needs has to be ready *now*: there is no later wave to wait for. Two different
+        // verdicts, because they are two different mistakes: a named dependency that does not exist is a broken
+        // configuration, while a slave that is not there is a dropped edge (reported above, and the node may still
+        // work without it).
+        var missingDependency = (node.Manifest.Dependencies ?? [])
+            .FirstOrDefault(id => Snapshot().All(candidate => candidate.Manifest.Id != id));
+        if (missingDependency != default)
+        {
+            node.Phase = ModulePhase.Failed;
+            node.Failure = $"Not started: declared dependency \"{missingDependency}\" does not exist.";
+            return Result<ModuleAddition>.Success(new(node.Info(), badEdges, wired));
+        }
+        var unready = DependenciesOf(node)
+            .Select(id => Snapshot().FirstOrDefault(candidate => candidate.Manifest.Id == id))
+            .FirstOrDefault(candidate => candidate is not null && candidate.Phase != ModulePhase.Ready);
+        if (unready is not null)
+        {
+            node.Phase = ModulePhase.Failed;
+            node.Failure = $"Not started: {unready.Manifest.Id} is {unready.Phase}.";
+            return Result<ModuleAddition>.Success(new(node.Info(), badEdges, wired));
+        }
+
+        await ReadyAsync(node, cancellationToken).ConfigureAwait(false);
+        return Result<ModuleAddition>.Success(new(node.Info(), badEdges, wired));
+    }
+
+    /// <summary>
+    /// Stops a node and takes it out of the graph, reporting every edge that pointed at it (docs/22, D1).
+    ///
+    /// The edges are reported rather than repaired: a master that still lists this id in its manifest has a file
+    /// that no longer matches the graph, and rewriting somebody else's file is not this method's business.
+    /// </summary>
+    public async ValueTask<Result<IReadOnlyList<BadEdge>>> RemoveAsync(ModuleId id, CancellationToken cancellationToken)
+    {
+        KernelNode? node;
+        lock (_gate) _nodes.TryGetValue(id, out node);
+        if (node is null) return Result<IReadOnlyList<BadEdge>>.Failure(new(ErrorCode.Invalid, $"No module answers to \"{id}\"."));
+
+        await StopOneAsync(node, cancellationToken).ConfigureAwait(false);
+
+        var dropped = new List<BadEdge>();
+        lock (_gate)
+        {
+            _nodes.Remove(id);
+            _declared.Remove(id);
+            foreach (var other in _nodes.Values)
+                foreach (var slave in other.Manifest.Slaves ?? [])
+                    if (slave.Id == id)
+                        dropped.Add(new(other.Manifest.Id, id, BadEdgeReason.MissingModule, "Removed while still declared as a slave."));
+        }
+        return Result<IReadOnlyList<BadEdge>>.Success(dropped);
+    }
+
     private KernelNode[] Snapshot()
     {
         lock (_gate) return _nodes.Values.ToArray();
