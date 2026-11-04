@@ -58,6 +58,28 @@ public sealed class Kernel
         lock (_gate) return _nodes.Values.Where(node => node.Manifest.Type == typeId).Select(node => node.Module).ToArray();
     }
 
+    /// <summary>The one module of a type that is declared a singleton. Two answers is an error, not a coin toss.</summary>
+    public Result<IKernelModule> RequireOfType(string typeId)
+    {
+        var found = OfType(typeId);
+        return found.Count switch
+        {
+            1 => Result<IKernelModule>.Success(found[0]),
+            0 => Result<IKernelModule>.Failure(new(ErrorCode.Unavailable, $"No module implements \"{typeId}\".")),
+            _ => Result<IKernelModule>.Failure(new(ErrorCode.Conflict,
+                $"More than one module implements \"{typeId}\": {string.Join(", ", found.Select(module => module.Id.Value))}."))
+        };
+    }
+
+    /// <summary>By id, when the caller already knows which module it means. Absence is an error, not a null.</summary>
+    public Result<IKernelModule> Require(ModuleId id)
+    {
+        var found = Find(id);
+        return found is null
+            ? Result<IKernelModule>.Failure(new(ErrorCode.Invalid, $"No module answers to \"{id}\"."))
+            : Result<IKernelModule>.Success(found);
+    }
+
     /// <summary>
     /// Adds a node the host built itself, before startup. This is how the core's own managers reach the graph
     /// while their manifests are still code rather than files: the moment a module has a directory, it comes from

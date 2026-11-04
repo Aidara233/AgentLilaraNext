@@ -293,6 +293,42 @@ public sealed class KernelTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task A_type_finds_capability_and_an_id_names_one_module()
+    {
+        // Two modules of one type, one of them called something that says nothing: an id can only answer "which
+        // one", a type can only answer "who can do this" (docs/22 §3.5).
+        var first = new TestModule(new("foo"));
+        var second = new TestModule(new("second"));
+        Add(first, "test.plain");
+        Add(second, "test.plain");
+        var kernel = new Kernel(_root, _types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+
+        Assert.Equal(2, kernel.OfType("test.plain").Count);
+        Assert.Same(first, kernel.Find(new ModuleId("foo")));
+        Assert.Null(kernel.Find(new ModuleId("nobody")));
+        Assert.False(kernel.Require(new ModuleId("nobody")).Ok);
+        // A type with two implementations cannot answer "the one": that must be an error naming both.
+        var ambiguous = kernel.RequireOfType("test.plain");
+        Assert.False(ambiguous.Ok);
+        Assert.Equal(ErrorCode.Conflict, ambiguous.Error!.Code);
+        Assert.Contains("foo", ambiguous.Error.Message, StringComparison.Ordinal);
+        Assert.Contains("second", ambiguous.Error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_singleton_type_answers_with_its_one_module()
+    {
+        var only = new TestModule(new("clock"));
+        Add(only, "test.clock");
+        var kernel = new Kernel(_root, _types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+
+        Assert.Same(only, kernel.RequireOfType("test.clock").Value);
+        Assert.False(kernel.RequireOfType("test.absent").Ok);
+    }
+
     private async ValueTask<ModuleReceipt> Start(Kernel? kernel = null)
     {
         kernel ??= new Kernel(_root, _types);
