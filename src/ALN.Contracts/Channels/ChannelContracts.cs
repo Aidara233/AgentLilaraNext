@@ -1,3 +1,5 @@
+using ALN.Contracts.Sessions;
+
 namespace ALN.Contracts;
 
 public sealed record ChannelBinding(Address Adapter, string PlatformConversationId);
@@ -115,6 +117,15 @@ public sealed record ChannelDelta(Address Channel, IReadOnlyList<StoredMessage> 
 }
 
 /// <summary>
+/// One hand-out, plus what has to happen for it to count as delivered.
+///
+/// The claim is what makes a lost turn recoverable: reading does not move the cursor, so a request that dies — a
+/// provider 422, a timeout, a crash — leaves the messages exactly where they were and the next turn gets them
+/// again. <see cref="Commit"/> advances the cursor, and it runs only after the turn it fed has been written down.
+/// </summary>
+public sealed record ChannelDeltaClaim(ChannelDelta Delta, ITurnCommit Commit);
+
+/// <summary>
 /// The Channel side of activation: content is pulled, never pushed.
 ///
 /// A Channel decides whether a message is worth waking a Session for, and that decision travels as a
@@ -123,14 +134,16 @@ public sealed record ChannelDelta(Address Channel, IReadOnlyList<StoredMessage> 
 /// moment we started", not "whatever happened to arrive with the signal". Pull is also what lets a batch
 /// of messages become one turn instead of N turns.
 ///
-/// Handing out is at-most-once: the cursor moves when the delta is delivered, so a failed model call
-/// does not repeat the same messages (a repeated answer in a real conversation is worse than a missed one).
+/// Handing out is <b>at-least-once</b>, closed by the turn's commit: reading does not move the cursor, so a request
+/// that fails is asked for again next turn instead of swallowing what people said. Delivering twice is safe because
+/// the Session timeline deduplicates by platform message id; dropping once is not, because nothing can recover what
+/// the model never saw.
 /// </summary>
 public interface IChannelDeltaSource
 {
-    /// <param name="maxMessages">Window for this hand-out; null means "no window". Older messages beyond it
-    /// are consumed but reported as omitted, never re-delivered later.</param>
-    ValueTask<Result<ChannelDelta>> TakeDeltaAsync(Address channel, int? maxMessages, CancellationToken cancellationToken);
+    /// <param name="maxMessages">Window for this hand-out; null means "no window". Older messages beyond it are
+    /// elided but still counted as delivered when the turn commits, so a backlog is not re-elided forever.</param>
+    ValueTask<Result<ChannelDeltaClaim>> ClaimDeltaAsync(Address channel, int? maxMessages, CancellationToken cancellationToken);
 }
 
 public interface IChannelManager

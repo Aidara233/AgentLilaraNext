@@ -186,7 +186,10 @@ public sealed class StateContinuityTests : IDisposable
             var delta = new FileChannelDeltaSource(first.Messages, first.State);
             Assert.True((await first.Messages.AppendAsync(new("m1", ChatOne, "chat-1", "p1", "alice", "first",
                 DateTimeOffset.UtcNow), default)).Ok);
-            Assert.Single((await delta.TakeDeltaAsync(ChatOne, null, default)).Value!.Messages);
+            var claim = await delta.ClaimDeltaAsync(ChatOne, null, default);
+            Assert.True(claim.Ok, claim.Error?.Message);
+            Assert.Single(claim.Value!.Delta.Messages);
+            Assert.True((await claim.Value.Commit.CommitAsync(default)).Ok);
         }
 
         using var second = new Node(_root);
@@ -195,8 +198,8 @@ public sealed class StateContinuityTests : IDisposable
         Assert.Equal("1", second.Parameters.List().Single(p => p.Scope == ChatOne.ToString() && p.Name == "maxMessages").Value);
         Assert.True(second.Channels.Get(ChatOne).Value!.MaxMessages == 1);
         // The cursor survived, so the next turn does not re-read what was already delivered.
-        var afterRestart = await new FileChannelDeltaSource(second.Messages, second.State).TakeDeltaAsync(ChatOne, null, default);
-        Assert.True(afterRestart.Value!.IsEmpty);
+        var afterRestart = await new FileChannelDeltaSource(second.Messages, second.State).ClaimDeltaAsync(ChatOne, null, default);
+        Assert.True(afterRestart.Value!.Delta.IsEmpty);
     }
 
     [Fact]

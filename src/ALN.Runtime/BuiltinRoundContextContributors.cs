@@ -17,7 +17,7 @@ public sealed class TimeContextContributor(TimeProvider? timeProvider = null) : 
     public string Id => ContributorId;
 
     public ValueTask ContributeAsync(RoundContextRequest request, ISessionTimelineWriter timeline,
-        IRoundContextWriter roundContext, CancellationToken cancellationToken)
+        IRoundContextWriter roundContext, ITurnCommitSink commits, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var now = _time.GetLocalNow();
@@ -49,7 +49,7 @@ public sealed class MemoryContextContributor(IMemoryStore store) : IRoundContext
     public string Id => ContributorId;
 
     public async ValueTask ContributeAsync(RoundContextRequest request, ISessionTimelineWriter timeline,
-        IRoundContextWriter roundContext, CancellationToken cancellationToken)
+        IRoundContextWriter roundContext, ITurnCommitSink commits, CancellationToken cancellationToken)
     {
         if (request.MemoryScope is not { Length: > 0 } scope) return;
         var counts = await store.CountEntriesAsync(scope, cancellationToken).ConfigureAwait(false);
@@ -107,16 +107,20 @@ public sealed class ChannelDeltaContributor(IChannelDeltaSource source, IChannel
     public string Id => ContributorId;
 
     public async ValueTask ContributeAsync(RoundContextRequest request, ISessionTimelineWriter timeline,
-        IRoundContextWriter roundContext, CancellationToken cancellationToken)
+        IRoundContextWriter roundContext, ITurnCommitSink commits, CancellationToken cancellationToken)
     {
         if (request.Channel is not { } channel) return;
         var window = channels.Get(channel) is { Ok: true, Value: { } info } ? info.MaxMessages : null;
-        var delta = await source.TakeDeltaAsync(channel, window, cancellationToken).ConfigureAwait(false);
+        var claimed = await source.ClaimDeltaAsync(channel, window, cancellationToken).ConfigureAwait(false);
         // A failed pull fails the round: silently sending the model a context that is missing what people
         // just said is worse than not answering this time.
-        if (!delta.Ok) throw new InvalidOperationException(delta.Error!.Message);
+        if (!claimed.Ok) throw new InvalidOperationException(claimed.Error!.Message);
 
-        var value = delta.Value!;
+        var claim = claimed.Value!;
+        // The cursor moves when this turn has been written down, not now: a turn that dies still owes these
+        // messages to the next one.
+        commits.Add(claim.Commit);
+        var value = claim.Delta;
         if (value.Omitted > 0)
             timeline.Add(new SessionTimelineContribution(
                 $"omitted-{value.Messages[0].Id}",
@@ -140,7 +144,7 @@ public sealed class ChannelInfoContributor : IRoundContextContributor
     public string Id => ContributorId;
 
     public ValueTask ContributeAsync(RoundContextRequest request, ISessionTimelineWriter timeline,
-        IRoundContextWriter roundContext, CancellationToken cancellationToken)
+        IRoundContextWriter roundContext, ITurnCommitSink commits, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (request.Channel is not { } channel) return ValueTask.CompletedTask;

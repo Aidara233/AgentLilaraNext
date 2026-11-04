@@ -43,6 +43,16 @@ public sealed class ChannelDeltaTests : IDisposable
     private static StoredMessage Message(string id, string text) =>
         new(id, Channel, "group-123456", id, "alice", text, new DateTimeOffset(2026, 11, 1, 8, 0, 0, TimeSpan.Zero));
 
+    /// <summary>A whole hand-out as a turn that finished performs it: claim, then commit.</summary>
+    private static async ValueTask<ChannelDelta> DeliverAsync(FileChannelDeltaSource delta, int? maxMessages = null)
+    {
+        var claim = await delta.ClaimDeltaAsync(Channel, maxMessages, default);
+        Assert.True(claim.Ok, claim.Error?.Detail ?? claim.Error?.Message);
+        var committed = await claim.Value!.Commit.CommitAsync(default);
+        Assert.True(committed.Ok, committed.Error?.Detail ?? committed.Error?.Message);
+        return claim.Value.Delta;
+    }
+
     [Fact]
     public async Task A_delta_is_everything_since_the_last_hand_out_and_never_twice()
     {
@@ -50,19 +60,52 @@ public sealed class ChannelDeltaTests : IDisposable
         Assert.True((await store.AppendAsync(Message("m1", "first"), default)).Ok);
         Assert.True((await store.AppendAsync(Message("m2", "second"), default)).Ok);
 
-        var first = await delta.TakeDeltaAsync(Channel, null, default);
-        Assert.True(first.Ok, first.Error?.Detail ?? first.Error?.Message);
-        Assert.Equal(["first", "second"], first.Value!.Messages.Select(m => m.Text));
+        var first = await DeliverAsync(delta);
+        Assert.Equal(["first", "second"], first.Messages.Select(m => m.Text));
 
         // Nothing new since: an empty delta is a normal answer, not a failure.
-        var second = await delta.TakeDeltaAsync(Channel, null, default);
-        Assert.True(second.Ok);
-        Assert.True(second.Value!.IsEmpty);
+        Assert.True((await DeliverAsync(delta)).IsEmpty);
 
         // A message that arrives later belongs to the next hand-out only.
         Assert.True((await store.AppendAsync(Message("m3", "third"), default)).Ok);
-        var third = await delta.TakeDeltaAsync(Channel, null, default);
-        Assert.Equal(["third"], third.Value!.Messages.Select(m => m.Text));
+        Assert.Equal(["third"], (await DeliverAsync(delta)).Messages.Select(m => m.Text));
+    }
+
+    [Fact]
+    public async Task Reading_alone_moves_nothing_so_a_turn_that_died_can_be_asked_again()
+    {
+        var (store, delta) = Create();
+        Assert.True((await store.AppendAsync(Message("m1", "说的一句话"), default)).Ok);
+
+        // Two reads, no commit: this is what a request that fails before the turn is written down looks like.
+        // Before the claim existed, the first read spent the message and the second came back empty — which is how
+        // a person's message disappeared for good when a provider answered 422.
+        Assert.Equal(["说的一句话"], (await delta.ClaimDeltaAsync(Channel, null, default)).Value!.Delta.Messages.Select(m => m.Text));
+        var retried = await delta.ClaimDeltaAsync(Channel, null, default);
+        Assert.Equal(["说的一句话"], retried.Value!.Delta.Messages.Select(m => m.Text));
+
+        // Committing is what makes it delivered, and it is idempotent: a second commit changes nothing.
+        Assert.True((await retried.Value.Commit.CommitAsync(default)).Ok);
+        Assert.True((await retried.Value.Commit.CommitAsync(default)).Ok);
+        Assert.True((await delta.ClaimDeltaAsync(Channel, null, default)).Value!.Delta.IsEmpty);
+    }
+
+    [Fact]
+    public async Task A_commit_never_moves_the_cursor_backwards()
+    {
+        var (store, delta) = Create();
+        Assert.True((await store.AppendAsync(Message("m1", "one"), default)).Ok);
+        var old = await delta.ClaimDeltaAsync(Channel, null, default);
+
+        // A message arrives, a later turn reads both and commits, and only then does the late commit land.
+        Assert.True((await store.AppendAsync(Message("m2", "two"), default)).Ok);
+        var newer = await delta.ClaimDeltaAsync(Channel, null, default);
+        Assert.Equal(["one", "two"], newer.Value!.Delta.Messages.Select(m => m.Text));
+        Assert.True((await newer.Value.Commit.CommitAsync(default)).Ok);
+
+        Assert.True((await old.Value!.Commit.CommitAsync(default)).Ok);
+        // The newer commit survives: a stale one must not un-read a message somebody already saw.
+        Assert.True((await delta.ClaimDeltaAsync(Channel, null, default)).Value!.Delta.IsEmpty);
     }
 
     [Fact]
@@ -70,13 +113,11 @@ public sealed class ChannelDeltaTests : IDisposable
     {
         var (store, delta) = Create();
         Assert.True((await store.AppendAsync(Message("m1", "before restart"), default)).Ok);
-        Assert.Single((await delta.TakeDeltaAsync(Channel, null, default)).Value!.Messages);
+        Assert.Single((await DeliverAsync(delta)).Messages);
 
         // A fresh instance on the same root is what a restart looks like.
         var restarted = new FileChannelDeltaSource(store, OpenStore());
-        var afterRestart = await restarted.TakeDeltaAsync(Channel, null, default);
-        Assert.True(afterRestart.Ok);
-        Assert.True(afterRestart.Value!.IsEmpty);
+        Assert.True((await DeliverAsync(restarted)).IsEmpty);
     }
 
     [Fact]
@@ -84,15 +125,13 @@ public sealed class ChannelDeltaTests : IDisposable
     {
         var (store, delta) = Create();
         Assert.True((await store.AppendAsync(Message("m1", "hello"), default)).Ok);
-        Assert.Single((await delta.TakeDeltaAsync(Channel, null, default)).Value!.Messages);
+        Assert.Single((await DeliverAsync(delta)).Messages);
 
         // Replaying is visible and the Session timeline deduplicates by message id; skipping would silently
         // lose what people said, which is worse.
         var corrupt = await store.WriteAsync("channel.delta", Channel.ToString(), "{ not json", default);
         Assert.True(corrupt.Ok, corrupt.Error?.Message);
-        var replayed = await delta.TakeDeltaAsync(Channel, null, default);
-        Assert.True(replayed.Ok);
-        Assert.Equal(["hello"], replayed.Value!.Messages.Select(m => m.Text));
+        Assert.Equal(["hello"], (await DeliverAsync(delta)).Messages.Select(m => m.Text));
     }
 
     [Fact]
@@ -133,17 +172,15 @@ public sealed class ChannelDeltaTests : IDisposable
         for (var index = 1; index <= 5; index++)
             Assert.True((await store.AppendAsync(Message($"m{index}", $"msg {index}"), default)).Ok);
 
-        var windowed = await delta.TakeDeltaAsync(Channel, maxMessages: 2, default);
-        Assert.True(windowed.Ok, windowed.Error?.Message);
+        var windowed = await DeliverAsync(delta, maxMessages: 2);
         // The newest two survive; the older three are gone from this turn but not from the conversation.
-        Assert.Equal(["msg 4", "msg 5"], windowed.Value!.Messages.Select(m => m.Text));
-        Assert.Equal(3, windowed.Value.Omitted);
+        Assert.Equal(["msg 4", "msg 5"], windowed.Messages.Select(m => m.Text));
+        Assert.Equal(3, windowed.Omitted);
 
-        // Elided messages are consumed, not deferred: otherwise the same head would be re-elided forever.
-        var next = await delta.TakeDeltaAsync(Channel, maxMessages: 2, default);
-        Assert.True(next.Ok);
-        Assert.True(next.Value!.IsEmpty);
-        Assert.Equal(0, next.Value.Omitted);
+        // Elided messages are delivered, not deferred: otherwise the same head would be re-elided forever.
+        var next = await DeliverAsync(delta, maxMessages: 2);
+        Assert.True(next.IsEmpty);
+        Assert.Equal(0, next.Omitted);
     }
 
     [Fact]
@@ -261,9 +298,48 @@ public sealed class ChannelDeltaTests : IDisposable
     public async Task A_non_positive_window_is_rejected_rather_than_treated_as_unlimited()
     {
         var (_, delta) = Create();
-        var zero = await delta.TakeDeltaAsync(Channel, maxMessages: 0, default);
+        var zero = await delta.ClaimDeltaAsync(Channel, maxMessages: 0, default);
         Assert.False(zero.Ok);
         Assert.Equal(ErrorCode.Invalid, zero.Error!.Code);
+    }
+
+    [Fact]
+    public async Task A_turn_that_failed_leaves_the_message_pending_for_the_next_one()
+    {
+        var (store, delta) = Create();
+        Assert.True((await store.AppendAsync(Message("m1", "周四开始冻结客户"), default)).Ok);
+        var contributors = new RoundContextContributorRegistry();
+        Assert.True(contributors.Register(new ChannelDeltaContributor(delta, new StubChannels(maxMessages: null))).Ok);
+        var model = new ScriptedModel { Failures = 1 };
+        var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
+        var spec = new SessionSpec("default", "Answer briefly.", "1");
+        var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
+
+        // The provider fails on the first turn (the real run's 422). Before the claim existed, the cursor had
+        // already moved past this message and the next turn never saw it again.
+        var failed = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
+        Assert.False(failed.Ok);
+
+        var second = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
+        Assert.True(second.Ok, second.Error?.Detail ?? second.Error?.Message);
+
+        var user = model.Requests.Last().Messages
+            .First(m => m.Content?.Contains("<channel_messages", StringComparison.Ordinal) == true).Content!;
+        // Delivered again — and exactly once: the timeline collapses the copy by platform message id, so the model
+        // reads the sentence one time even though two turns claimed it.
+        Assert.Equal(1, CountOf(user, "周四开始冻结客户"));
+
+        // Now that a turn finished, the cursor has moved and nothing is pending.
+        Assert.True((await delta.ClaimDeltaAsync(Channel, null, default)).Value!.Delta.IsEmpty);
+    }
+
+    private static int CountOf(string text, string needle)
+    {
+        var count = 0;
+        for (var index = text.IndexOf(needle, StringComparison.Ordinal); index >= 0;
+             index = text.IndexOf(needle, index + needle.Length, StringComparison.Ordinal))
+            count++;
+        return count;
     }
 
     private sealed class StubChannels(int? maxMessages) : IChannelManager
@@ -289,11 +365,21 @@ public sealed class ChannelDeltaTests : IDisposable
     {
         public List<ModelRequest> Requests { get; } = [];
 
+        /// <summary>How many of the next calls fail the way a provider does, before any text arrives.</summary>
+        public int Failures { get; set; }
+
         public ValueTask<Result<IAsyncEnumerable<ModelEvent>>> CompleteAsync(string profileId, ModelRequest request,
             CancellationToken cancellationToken)
         {
             Requests.Add(request);
+            if (Failures > 0) { Failures--; return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Success(Failing())); }
             return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Success(Stream()));
+        }
+
+        private static async IAsyncEnumerable<ModelEvent> Failing([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.Yield();
+            yield return new ModelFailed(new Error(ErrorCode.Unavailable, "OpenAI Chat returned HTTP 422.", null, false));
         }
 
         private static async IAsyncEnumerable<ModelEvent> Stream([EnumeratorCancellation] CancellationToken cancellationToken = default)

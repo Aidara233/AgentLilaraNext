@@ -862,6 +862,11 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
             record.State = state;
             await WriteAtomicJsonAsync(Path.Combine(directory, "state.json"), state, cancellationToken).ConfigureAwait(false);
 
+            // What the round context read from a queue becomes true here, and only here: the turn is written down, so
+            // the messages it was built from are handled. A turn that failed never reaches this line, which is the
+            // whole point — its messages stay pending instead of vanishing.
+            await RunTurnCommitsAsync(activationId, collected.Value.Commits, cancellationToken).ConfigureAwait(false);
+
             return Result<SessionTurnResult>.Success(new(sessionId, state.StepNumber, finalText, executedCalls,
                 finalStopReason, turnUsage));
         }
@@ -1514,6 +1519,26 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
         (left.CacheReadTokens ?? 0) + (right.CacheReadTokens ?? 0),
         (left.CacheWriteTokens ?? 0) + (right.CacheWriteTokens ?? 0));
 
+    /// <summary>
+    /// Runs the promises the round context made, after the turn they fed has been committed.
+    ///
+    /// A failure here is logged rather than returned: the turn really did happen, and telling the caller it failed
+    /// would be a lie that costs a duplicate answer. What a failed commit costs is the opposite — the same messages
+    /// are offered again next turn, and the timeline collapses the copy by platform message id.
+    /// </summary>
+    private async ValueTask RunTurnCommitsAsync(Guid activationId, IReadOnlyList<ITurnCommit> commits,
+        CancellationToken cancellationToken)
+    {
+        foreach (var commit in commits)
+        {
+            var committed = await commit.CommitAsync(cancellationToken).ConfigureAwait(false);
+            if (committed.Ok) continue;
+            WriteSignal(activationId, "commit-failed", SignalLevel.Warn,
+                ("message", committed.Error?.Message ?? ""),
+                ("detail", committed.Error?.Detail ?? ""));
+        }
+    }
+
     private async ValueTask<Result<PersistedTimeline>> PersistTimelineContributionsAsync(SessionRecord record, string activation,
         SessionState state, IReadOnlyList<CollectedTimelineMessage> contributions,
         CancellationToken cancellationToken)
@@ -1598,8 +1623,9 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
                     throw new InvalidOperationException("Round context contributor id is required.");
                 var timelineWriter = new TimelineWriter(contributor.Id);
                 var roundWriter = new ContributionWriter(contributor.Id);
-                await contributor.ContributeAsync(request, timelineWriter, roundWriter, cancellationToken).ConfigureAwait(false);
-                return (Timeline: timelineWriter.Seal(), Round: roundWriter.Seal());
+                var commits = new CommitCollector();
+                await contributor.ContributeAsync(request, timelineWriter, roundWriter, commits, cancellationToken).ConfigureAwait(false);
+                return (Timeline: timelineWriter.Seal(), Round: roundWriter.Seal(), Commits: commits.Seal());
             })).ConfigureAwait(false);
             var roundContext = results.SelectMany(result => result.Round)
                 .OrderBy(item => item.Order)
@@ -1611,7 +1637,8 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
                 .ThenBy(item => item.Source, StringComparer.Ordinal)
                 .ThenBy(item => item.Id, StringComparer.Ordinal)
                 .ToArray();
-            return Result<CollectedRoundContextSnapshot>.Success(new(roundContext, timeline));
+            var commits = results.SelectMany(result => result.Commits).ToArray();
+            return Result<CollectedRoundContextSnapshot>.Success(new(roundContext, timeline, commits));
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (Exception ex)
@@ -1684,7 +1711,18 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
     private sealed record CollectedTimelineMessage(string Source, string Id, string? Sender, string Content, DateTimeOffset At);
     private sealed record CollectedRoundContextSnapshot(
         IReadOnlyList<CollectedRoundContext> RoundContext,
-        IReadOnlyList<CollectedTimelineMessage> Timeline);
+        IReadOnlyList<CollectedTimelineMessage> Timeline,
+        IReadOnlyList<ITurnCommit> Commits);
+
+    /// <summary>
+    /// Gathers what contributors want to happen once the turn they fed has been written down.
+    /// </summary>
+    private sealed class CommitCollector : ITurnCommitSink
+    {
+        private readonly List<ITurnCommit> _commits = [];
+        public void Add(ITurnCommit commit) => _commits.Add(commit);
+        public IReadOnlyList<ITurnCommit> Seal() => _commits;
+    }
     private sealed record PersistedTimeline(SessionState State, IReadOnlyList<SessionHistoryEntry> History);
 
     private sealed class TimelineWriter(string source) : ISessionTimelineWriter

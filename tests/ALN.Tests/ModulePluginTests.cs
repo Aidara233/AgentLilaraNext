@@ -56,7 +56,8 @@ public sealed class ModulePluginTests : IDisposable
         // The contributor it registered actually answers a request.
         var roundContext = new CapturingWriter();
         await contributors.Snapshot().Single(c => c.Id == "sample.environment")
-            .ContributeAsync(new RoundContextRequest("s-1", Guid.NewGuid(), 1), new NullTimeline(), roundContext, default);
+            .ContributeAsync(new RoundContextRequest("s-1", Guid.NewGuid(), 1), new NullTimeline(), roundContext,
+                new NullCommits(), default);
         Assert.Contains(roundContext.Contributions, contribution => contribution.Section == "environment");
 
         var unloaded = await loader.UnloadAsync("sample.environment", TimeSpan.FromSeconds(5), force: false, default);
@@ -216,5 +217,10 @@ public sealed class ModulePluginTests : IDisposable
     private sealed class NullTimeline : ISessionTimelineWriter
     {
         public void Add(SessionTimelineContribution contribution) { }
+    }
+
+    private sealed class NullCommits : ITurnCommitSink
+    {
+        public void Add(ITurnCommit commit) { }
     }
 }

@@ -66,7 +66,7 @@ public sealed class Plugin : IModulePlugin
         public string Id => ContributorId;
 
         public ValueTask ContributeAsync(RoundContextRequest request, ISessionTimelineWriter timeline,
-            IRoundContextWriter roundContext, CancellationToken cancellationToken)
+            IRoundContextWriter roundContext, ITurnCommitSink commits, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             roundContext.Add(new RoundContextContribution(
