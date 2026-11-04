@@ -195,6 +195,104 @@ public sealed class ControlPlaneTests : IDisposable
         Assert.Contains(catalog.ListTypes(), type => type.TypeId == "adapter");
     }
 
+    [Fact]
+    public async Task Creating_an_adapter_names_it_after_its_type_and_refuses_what_it_cannot_build()
+    {
+        var types = new AdapterTypeCatalog();
+        Assert.True(types.RegisterPackageTypes("test.pack", [new("adapter.file", "adapter")]).Ok);
+        var adapters = new FakeAdapters();
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, adapters, new FakeChannels(), new FakeModels(null),
+            _signals, new FakeGraph(), new FakeParameters(), moduleTypes: types).Ok);
+
+        var created = await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate,
+            JsonSerializer.SerializeToElement(new
+            {
+                type = "adapter.file", instance = "file-2", direction = "inbound",
+                settings = new Dictionary<string, string> { ["mailbox"] = "io/file/file-2" }
+            }), default);
+        Assert.True(created.Ok, created.Error?.Message);
+        var spec = Assert.Single(adapters.Created);
+        // The address comes from type + instance, so the two can never disagree in the stored spec.
+        Assert.Equal("adapter.file#file-2", spec.Address.ToString());
+        Assert.Equal("file", spec.Descriptor.PlatformId);   // default: the type's own name
+        Assert.Equal("file-2", spec.Descriptor.AccountId);  // default: the instance
+        Assert.Equal(AdapterDirection.Inbound, spec.Descriptor.Direction);
+        Assert.Equal("io/file/file-2", spec.Settings!["mailbox"]);
+        Assert.Equal("adapter.file", spec.TypeId);
+
+        // A direction typo is refused: defaulting it to "both" would quietly turn a reader into a sender.
+        var typo = await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate,
+            JsonSerializer.SerializeToElement(new { type = "adapter.file", instance = "file-3", direction = "inboud" }), default);
+        Assert.Equal(ErrorCode.Invalid, typo.Error!.Code);
+        // A type nothing registered cannot be built, so the form must not be able to ask for it.
+        var unknown = await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate,
+            JsonSerializer.SerializeToElement(new { type = "adapter.nope", instance = "x" }), default);
+        Assert.Equal(ErrorCode.Invalid, unknown.Error!.Code);
+        // A settings value that is not a string is refused rather than stringified into the file.
+        var badSetting = await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate,
+            JsonSerializer.SerializeToElement(new { type = "adapter.file", instance = "file-4", settings = new { retry = 3 } }), default);
+        Assert.Equal(ErrorCode.Invalid, badSetting.Error!.Code);
+        Assert.Single(adapters.Created);
+
+        // Creating changes things; reading the list does not.
+        Assert.Equal(Capabilities.AdaptersControl, Assert.Single(plane.Catalog, a => a.Id == CoreActions.AdaptersCreate).Capability);
+        Assert.True(Assert.Single(plane.Catalog, a => a.Id == CoreActions.AdaptersDestroy).Mutating);
+        var denied = await plane.InvokeAsync(User(Capabilities.AdaptersRead), CoreActions.AdaptersDestroy,
+            JsonSerializer.SerializeToElement(new { address = "adapter.file#file-2" }), default);
+        Assert.Equal(ErrorCode.Denied, denied.Error!.Code);
+
+        var destroyed = await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersDestroy,
+            JsonSerializer.SerializeToElement(new { address = "adapter.file#file-2" }), default);
+        Assert.True(destroyed.Ok, destroyed.Error?.Message);
+        Assert.Equal("adapter.file#file-2", Assert.Single(adapters.Destroyed).ToString());
+    }
+
+    [Fact]
+    public async Task Creating_a_channel_takes_its_bindings_and_refuses_half_of_one()
+    {
+        var types = new AdapterTypeCatalog();
+        Assert.True(types.RegisterPackageTypes("test.pack", [new("channel.conversation", "channel")]).Ok);
+        var channels = new FakeChannels();
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), channels, new FakeModels(null),
+            _signals, new FakeGraph(), new FakeParameters(), moduleTypes: types).Ok);
+
+        var created = await plane.InvokeAsync(User(Capabilities.ChannelsControl), CoreActions.ChannelsCreate,
+            JsonSerializer.SerializeToElement(new
+            {
+                type = "channel.conversation", instance = "group-1", maxMessages = 25,
+                bindings = new[] { new { adapter = "adapter.qq#qq-1", conversation = "group-123" } }
+            }), default);
+        Assert.True(created.Ok, created.Error?.Message);
+        var spec = Assert.Single(channels.Created);
+        Assert.Equal("channel.conversation#group-1", spec.Address.ToString());
+        Assert.Equal("group-1", spec.Name);          // default: the instance name
+        Assert.Equal(25, spec.MaxMessages);
+        var binding = Assert.Single(spec.Bindings);
+        Assert.Equal("adapter.qq#qq-1", binding.Adapter.ToString());
+        Assert.Equal("group-123", binding.PlatformConversationId);
+
+        // Half a binding is not a binding: an adapter without a conversation would bind to nothing.
+        var half = await plane.InvokeAsync(User(Capabilities.ChannelsControl), CoreActions.ChannelsCreate,
+            JsonSerializer.SerializeToElement(new
+            {
+                type = "channel.conversation", instance = "group-2",
+                bindings = new[] { new { adapter = "adapter.qq#qq-1" } }
+            }), default);
+        Assert.Equal(ErrorCode.Invalid, half.Error!.Code);
+        // Zero is refused rather than read as "unlimited".
+        var zero = await plane.InvokeAsync(User(Capabilities.ChannelsControl), CoreActions.ChannelsCreate,
+            JsonSerializer.SerializeToElement(new { type = "channel.conversation", instance = "group-3", maxMessages = 0 }), default);
+        Assert.Equal(ErrorCode.Invalid, zero.Error!.Code);
+        Assert.Single(channels.Created);
+
+        var destroyed = await plane.InvokeAsync(User(Capabilities.ChannelsControl), CoreActions.ChannelsDestroy,
+            JsonSerializer.SerializeToElement(new { address = "channel.conversation#group-1" }), default);
+        Assert.True(destroyed.Ok, destroyed.Error?.Message);
+        Assert.Equal("channel.conversation#group-1", Assert.Single(channels.Destroyed).ToString());
+    }
+
     private sealed class CollectingAudit(List<AuditRecord> records) : IAuditSink
     {
         public ValueTask AppendAsync(AuditRecord record, CancellationToken cancellationToken)
@@ -234,9 +332,20 @@ public sealed class ControlPlaneTests : IDisposable
 
     private sealed class FakeAdapters : IAdapterManager
     {
-        public ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, CancellationToken ct) => throw new NotSupportedException();
+        public List<AdapterSpec> Created { get; } = [];
+        public List<Address> Destroyed { get; } = [];
+
+        public ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, CancellationToken ct)
+        {
+            Created.Add(spec);
+            return ValueTask.FromResult(Result<IChatAdapter>.Success(new StubAdapter(spec)));
+        }
         public ValueTask<Result<IChatAdapter>> CreateAsync(AdapterSpec spec, Func<AdapterSpec, IChatAdapter> factory, CancellationToken ct) => throw new NotSupportedException();
-        public ValueTask<Result> DestroyAsync(Address address, CancellationToken ct) => throw new NotSupportedException();
+        public ValueTask<Result> DestroyAsync(Address address, CancellationToken ct)
+        {
+            Destroyed.Add(address);
+            return ValueTask.FromResult(Result.Success());
+        }
         public ValueTask<Result> DestroyByTypeAsync(string typeId, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result> ForceDestroyByTypeAsync(string typeId, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result> StartAsync(Address address, CancellationToken ct) => ValueTask.FromResult(Result.Success());
@@ -247,12 +356,36 @@ public sealed class ControlPlaneTests : IDisposable
             ValueTask.FromResult(Result<IReadOnlyList<AdapterInfo>>.Success([]));
     }
 
+    private sealed class StubAdapter(AdapterSpec spec) : IChatAdapter
+    {
+        public Address Address => spec.Address;
+        public AdapterDescriptor Descriptor => spec.Descriptor;
+        public AdapterState State => AdapterState.Stopped;
+        public ModuleId Id => new(spec.Address.ToString());
+        public ValueTask<Result> StartAsync(CancellationToken ct) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> StopAsync(CancellationToken ct) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result<SendResult>> SendAsync(OutboundMessage message, CancellationToken ct) =>
+            ValueTask.FromResult(Result<SendResult>.Success(new(true, "attempt")));
+    }
+
     private sealed class FakeChannels : IChannelManager
     {
-        public ValueTask<Result<ChannelInfo>> CreateAsync(ChannelSpec spec, CancellationToken ct) => throw new NotSupportedException();
+        public List<ChannelSpec> Created { get; } = [];
+        public List<Address> Destroyed { get; } = [];
+
+        public ValueTask<Result<ChannelInfo>> CreateAsync(ChannelSpec spec, CancellationToken ct)
+        {
+            Created.Add(spec);
+            return ValueTask.FromResult(Result<ChannelInfo>.Success(new ChannelInfo(spec.Address, spec.Name, spec.Bindings,
+                true, spec.TypeId, spec.MaxMessages)));
+        }
         public ValueTask<Result> StartAsync(Address address, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result> StopAsync(Address address, CancellationToken ct) => ValueTask.FromResult(Result.Success());
-        public ValueTask<Result> DestroyAsync(Address address, CancellationToken ct) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> DestroyAsync(Address address, CancellationToken ct)
+        {
+            Destroyed.Add(address);
+            return ValueTask.FromResult(Result.Success());
+        }
         public ValueTask<Result<int>> AcceptAsync(AdapterEnvelope envelope, CancellationToken ct) => throw new NotSupportedException();
         public ValueTask<Result> CompleteAcceptAsync(Address channel, Guid messageId, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result> RecordReplyAsync(Address channel, Guid answeredMessageId, string platformConversationId, string text, string? platformMessageId, CancellationToken ct) => ValueTask.FromResult(Result.Success());

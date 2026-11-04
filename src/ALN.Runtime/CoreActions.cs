@@ -19,9 +19,13 @@ public static class CoreActions
     public const string AdaptersList = "adapters.list";
     public const string AdaptersStart = "adapters.start";
     public const string AdaptersStop = "adapters.stop";
+    public const string AdaptersCreate = "adapters.create";
+    public const string AdaptersDestroy = "adapters.destroy";
     public const string ChannelsList = "channels.list";
     public const string ChannelsStart = "channels.start";
     public const string ChannelsStop = "channels.stop";
+    public const string ChannelsCreate = "channels.create";
+    public const string ChannelsDestroy = "channels.destroy";
     public const string ChannelsSend = "channels.send";
     public const string GraphList = "graph.list";
     public const string GraphMount = "graph.mount";
@@ -81,6 +85,8 @@ public static class CoreActions
 
             (new(AdaptersStart, "Start one adapter.", Capabilities.AdaptersControl, true), StartAdapter),
             (new(AdaptersStop, "Stop one adapter.", Capabilities.AdaptersControl, true), StopAdapter),
+            (new(AdaptersCreate, "Create one adapter instance: {\"type\", \"instance\", \"platform\", \"account\", \"direction\", \"settings\"}.", Capabilities.AdaptersControl, true), CreateAdapter),
+            (new(AdaptersDestroy, "Destroy one adapter instance and forget its spec.", Capabilities.AdaptersControl, true), DestroyAdapter),
 
             (new(ChannelsList, "List channels and their bindings.", Capabilities.ChannelsRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(
@@ -100,6 +106,8 @@ public static class CoreActions
             (new(ChannelsStart, "Start one channel.", Capabilities.ChannelsControl, true), StartChannel),
             (new(ChannelsStop, "Stop one channel.", Capabilities.ChannelsControl, true), StopChannel),
             (new(ChannelsSend, "Send one text message through a channel's binding.", Capabilities.MessagesWrite, true), SendChannel),
+            (new(ChannelsCreate, "Create one channel instance: {\"type\", \"instance\", \"name\", \"bindings\": [{\"adapter\", \"conversation\"}], \"maxMessages\"}.", Capabilities.ChannelsControl, true), CreateChannel),
+            (new(ChannelsDestroy, "Destroy one channel instance and forget its spec.", Capabilities.ChannelsControl, true), DestroyChannel),
 
             (new(GraphList, "List mounted scripts, durable mount rules, and which rules are still waiting.", Capabilities.GraphRead, false),
                 (_, _) =>
@@ -296,6 +304,134 @@ public static class CoreActions
             if (!registered.Ok) return registered;
         }
         return Result.Success();
+
+        async ValueTask<Result<JsonElement>> DestroyAdapter(JsonElement arguments, CancellationToken ct)
+        {
+            var target = ReadAddress(arguments, "address");
+            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
+            var destroyed = await adapters.DestroyAsync(target.Value, ct).ConfigureAwait(false);
+            return destroyed.Ok
+                ? Result<JsonElement>.Success(ToJson(new { address = target.Value.ToString(), destroyed = true }))
+                : Result<JsonElement>.Failure(destroyed.Error!);
+        }
+
+        /// <summary>
+        /// Creates one adapter from a form's worth of arguments.
+        ///
+        /// The address is built from the type and the instance name, never from arguments that spell it out: an
+        /// address is a name, and a caller that can choose "adapter.file#x" while naming type "adapter.qq" is a
+        /// caller that can make the two disagree before the spec is even stored.
+        /// </summary>
+        async ValueTask<Result<JsonElement>> CreateAdapter(JsonElement arguments, CancellationToken ct)
+        {
+            if (!TryReadText(arguments, "type", out var typeId) || typeId.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "adapters.create requires 'type'."));
+            var type = typeId.Trim();
+            if (!type.StartsWith("adapter.", StringComparison.Ordinal))
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Not an adapter type: {type}"));
+            if (moduleTypes is { } catalog && !catalog.IsConcrete(type))
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Adapter type is not registered in this process: {type}"));
+            if (!TryReadText(arguments, "instance", out var instance) || instance.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "adapters.create requires 'instance'."));
+            var address = BuildAddress(type, instance.Trim());
+            if (!address.Ok) return Result<JsonElement>.Failure(address.Error!);
+
+            var platform = TryReadText(arguments, "platform", out var platformText) && platformText.Trim().Length > 0
+                ? platformText.Trim()
+                : address.Value.Kind!;
+            var account = TryReadText(arguments, "account", out var accountText) && accountText.Trim().Length > 0
+                ? accountText.Trim()
+                : instance.Trim();
+            // Direction decides which half of IChatAdapter anyone may call, so a typo must be refused rather than
+            // defaulted: "inboud" quietly becoming Both turns an inbound-only account into a sender.
+            var direction = AdapterDirection.Both;
+            if (TryReadText(arguments, "direction", out var directionText) && directionText.Trim().Length > 0)
+            {
+                if (!Enum.TryParse<AdapterDirection>(directionText.Trim(), ignoreCase: true, out direction) || !Enum.IsDefined(direction))
+                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
+                        $"adapters.create 'direction' must be inbound, outbound or both, not '{directionText}'."));
+            }
+
+            var settings = ReadSettings(arguments, out var settingsError);
+            if (settingsError is not null) return Result<JsonElement>.Failure(settingsError);
+
+            var spec = new AdapterSpec(address.Value, new AdapterDescriptor(platform, account, direction), type, settings);
+            var created = await adapters.CreateAsync(spec, ct).ConfigureAwait(false);
+            if (!created.Ok || created.Value is null) return Result<JsonElement>.Failure(created.Error ?? new(ErrorCode.Unavailable, "Adapter could not be created."));
+            return Result<JsonElement>.Success(ToJson(new
+            {
+                address = address.Value.ToString(),
+                type,
+                platform,
+                account,
+                direction = direction.ToString().ToLowerInvariant()
+            }));
+        }
+
+        async ValueTask<Result<JsonElement>> DestroyChannel(JsonElement arguments, CancellationToken ct)
+        {
+            var target = ReadAddress(arguments, "address");
+            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
+            var destroyed = await channels.DestroyAsync(target.Value, ct).ConfigureAwait(false);
+            return destroyed.Ok
+                ? Result<JsonElement>.Success(ToJson(new { address = target.Value.ToString(), destroyed = true }))
+                : Result<JsonElement>.Failure(destroyed.Error!);
+        }
+
+        async ValueTask<Result<JsonElement>> CreateChannel(JsonElement arguments, CancellationToken ct)
+        {
+            if (!TryReadText(arguments, "type", out var typeId) || typeId.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.create requires 'type'."));
+            var type = typeId.Trim();
+            if (!type.StartsWith("channel.", StringComparison.Ordinal))
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Not a channel type: {type}"));
+            if (moduleTypes is { } catalog && !catalog.IsConcrete(type))
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Channel type is not registered in this process: {type}"));
+            if (!TryReadText(arguments, "instance", out var instance) || instance.Trim().Length == 0)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.create requires 'instance'."));
+            var address = BuildAddress(type, instance.Trim());
+            if (!address.Ok) return Result<JsonElement>.Failure(address.Error!);
+            var name = TryReadText(arguments, "name", out var nameText) && nameText.Trim().Length > 0 ? nameText.Trim() : instance.Trim();
+
+            var bindings = new List<ChannelBinding>();
+            if (arguments.ValueKind == JsonValueKind.Object && arguments.TryGetProperty("bindings", out var bindingItems))
+            {
+                if (bindingItems.ValueKind != JsonValueKind.Array)
+                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.create 'bindings' must be an array."));
+                foreach (var item in bindingItems.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.Object ||
+                        !item.TryGetProperty("adapter", out var adapterText) || adapterText.ValueKind != JsonValueKind.String ||
+                        !Address.TryParse(adapterText.GetString(), out var adapterAddress) || !adapterAddress.IsInstance)
+                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "Each binding needs 'adapter' as an instance address."));
+                    if (!item.TryGetProperty("conversation", out var conversationText) || conversationText.ValueKind != JsonValueKind.String ||
+                        string.IsNullOrWhiteSpace(conversationText.GetString()))
+                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "Each binding needs a non-empty 'conversation'."));
+                    bindings.Add(new ChannelBinding(adapterAddress, conversationText.GetString()!.Trim()));
+                }
+            }
+
+            int? maxMessages = null;
+            if (arguments.ValueKind == JsonValueKind.Object && arguments.TryGetProperty("maxMessages", out var window) &&
+                window.ValueKind != JsonValueKind.Null)
+            {
+                if (window.ValueKind != JsonValueKind.Number || !window.TryGetInt32(out var parsed) || parsed <= 0)
+                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.create 'maxMessages' must be a positive integer."));
+                maxMessages = parsed;
+            }
+
+            var spec = new ChannelSpec(address.Value, name, bindings, type, maxMessages);
+            var created = await channels.CreateAsync(spec, ct).ConfigureAwait(false);
+            if (!created.Ok || created.Value is null) return Result<JsonElement>.Failure(created.Error ?? new(ErrorCode.Unavailable, "Channel could not be created."));
+            return Result<JsonElement>.Success(ToJson(new
+            {
+                address = address.Value.ToString(),
+                type,
+                name,
+                bindings = bindings.Select(binding => new { adapter = binding.Adapter.ToString(), conversation = binding.PlatformConversationId }),
+                maxMessages
+            }));
+        }
 
         async ValueTask<Result<JsonElement>> StartAdapter(JsonElement arguments, CancellationToken ct)
         {
@@ -605,6 +741,47 @@ public static class CoreActions
                 });
             return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new { records })));
         }
+    }
+
+    /// <summary>
+    /// "adapter.file" + "file-1" → adapter.file#file-1, through the same parser that reads them back, so a name
+    /// the server would later refuse cannot be produced here.
+    /// </summary>
+    private static Result<Address> BuildAddress(string typeId, string instance)
+    {
+        if (typeId.Contains('#') || instance.Contains('#') || instance.Any(char.IsWhiteSpace))
+            return Result<Address>.Failure(new(ErrorCode.Invalid, $"Not a usable instance name: {instance}"));
+        if (!Address.TryParse($"{typeId}#{instance}", out var address) || !address.IsInstance)
+            return Result<Address>.Failure(new(ErrorCode.Invalid, $"Not an instance address: {typeId}#{instance}"));
+        return Result<Address>.Success(address);
+    }
+
+    /// <summary>
+    /// Adapter settings as a flat string map. Strict on purpose: an object value here would be stored as
+    /// "[object Object]" by whoever reads it next, and a number that silently became "1.0" is a config bug
+    /// nobody can see in the file.
+    /// </summary>
+    private static IReadOnlyDictionary<string, string>? ReadSettings(JsonElement arguments, out Error? error)
+    {
+        error = null;
+        if (arguments.ValueKind != JsonValueKind.Object || !arguments.TryGetProperty("settings", out var settings) ||
+            settings.ValueKind == JsonValueKind.Null) return null;
+        if (settings.ValueKind != JsonValueKind.Object)
+        {
+            error = new(ErrorCode.Invalid, "adapters.create 'settings' must be an object of string values.");
+            return null;
+        }
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var property in settings.EnumerateObject())
+        {
+            if (property.Value.ValueKind != JsonValueKind.String)
+            {
+                error = new(ErrorCode.Invalid, $"Setting '{property.Name}' must be a string.");
+                return null;
+            }
+            map[property.Name] = property.Value.GetString() ?? "";
+        }
+        return map;
     }
 
     private static bool TryReadText(JsonElement arguments, string property, out string value)
