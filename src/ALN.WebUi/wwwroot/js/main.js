@@ -11,8 +11,12 @@ import { channels } from './views/channels.js';
 import { models } from './views/models.js';
 import { signals } from './views/signals.js';
 import { actions } from './views/actions.js';
+import { prompts } from './views/prompts.js';
+import { scripts } from './views/scripts.js';
+import { params } from './views/params.js';
+import { sessions } from './views/sessions.js';
 
-const VIEWS = [overview, adapters, channels, models, signals, actions];
+const VIEWS = [overview, adapters, channels, models, prompts, scripts, params, sessions, signals, actions];
 const KEY_BASE = 'aln.api';
 const KEY_TOKEN = 'aln.token';
 const KEY_LIVE = 'aln.live';

@@ -92,10 +92,11 @@ public sealed class ControlPlaneTests : IDisposable
 
         Assert.True(result.Ok, result.Error?.Message);
         using var document = JsonDocument.Parse(result.Value.GetRawText());
-        // Exactly one field per provider: configuration (which can hold an api key) is not part of
-        // ModelProviderInfo at all, and adding it later would fail this test.
+        // The field list is pinned: configuration (which can hold an api key) is not part of
+        // ModelProviderInfo at all, and adding it later would fail this test. typeId and inFlight were
+        // added for the settings page — neither is a secret, and both are things a list has to show.
         var provider = Assert.Single(document.RootElement.GetProperty("providers").EnumerateArray());
-        Assert.Equal(["address"], provider.EnumerateObject().Select(p => p.Name));
+        Assert.Equal(["address", "typeId", "inFlight"], provider.EnumerateObject().Select(p => p.Name));
         Assert.Equal("model.openai-chat#one", provider.GetProperty("address").GetString());
     }
 

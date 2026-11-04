@@ -57,6 +57,9 @@
   </div>
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
+  <!-- One dialog host for every form in the console: a write always happens in the same place, and
+       closing it always puts the page back exactly as it was. -->
+  <div id="modal" class="modal" hidden></div>
   <script type="module" src="./js/main.js"></script>
 </body>
 </html>

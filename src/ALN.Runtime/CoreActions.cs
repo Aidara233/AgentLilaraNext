@@ -155,7 +155,24 @@ public static class CoreActions
             (new(GraphUnmount, "Unmount a script from one instance.", Capabilities.GraphControl, true), UnmountScript),
 
             (new(ParamsList, "List every tunable the running components expose, with its current value.", Capabilities.ParamsRead, false),
-                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new { parameters = parameters.List() })))),
+                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+                {
+                    // Enums as words: a client that has to know "2 means Reconnect" is a client that will get it
+                    // wrong the first time a third value is added.
+                    parameters = parameters.List().Select(parameter => new
+                    {
+                        scope = parameter.Scope,
+                        name = parameter.Name,
+                        kind = parameter.Kind.ToString().ToLowerInvariant(),
+                        value = parameter.Value,
+                        defaultValue = parameter.DefaultValue,
+                        apply = parameter.Apply.ToString().ToLowerInvariant(),
+                        secret = parameter.Secret,
+                        minimum = parameter.Minimum,
+                        maximum = parameter.Maximum,
+                        description = parameter.Description
+                    })
+                })))),
 
             (new(ParamsSet, "Change a tunable: validated by its owner, applied now, persisted for restarts.", Capabilities.ParamsWrite, true),
                 async (arguments, ct) =>
@@ -236,12 +253,19 @@ public static class CoreActions
                 {
                     // Only addresses and type ids: ModelProviderInfo carries configuration, which can
                     // hold an api key, so it is never serialized here.
-                    providers = models.List().Select(p => new { address = p.Address.ToString() }),
+                    providers = models.List().Select(p => new { address = p.Address.ToString(), typeId = p.Descriptor.TypeId, inFlight = p.InFlight }),
                     profiles = models.ListProfiles().Select(p => new
                     {
                         id = p.Id,
                         provider = p.Provider.ToString(),
                         model = p.ModelId
+                    }),
+                    // Which provider kinds this process can build: a form has to know before it can offer one.
+                    types = models.ListTypes().Select(type => new
+                    {
+                        typeId = type.TypeId,
+                        category = type.Category,
+                        display = type.DisplayName
                     })
                 })))),
 
