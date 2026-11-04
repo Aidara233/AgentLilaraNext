@@ -226,6 +226,73 @@ public sealed class KernelTests : IDisposable
         gate.TrySetResult();
     }
 
+    [Fact]
+    public async Task A_node_the_host_declares_in_code_starts_like_any_other_and_cannot_be_declared_twice()
+    {
+        var declared = new TestModule(new("adapters"));
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(declared).Ok);
+        Assert.False(kernel.Declare(new TestModule(new("adapters"))).Ok);
+
+        var started = await kernel.StartAsync(default);
+
+        Assert.True(started.Ok);
+        Assert.Equal(ModulePhase.Ready, started.Value!.Nodes.Single(node => node.Id.Value == "adapters").Phase);
+        Assert.Equal(["initialize", "ready"], declared.Calls);
+    }
+
+    [Fact]
+    public async Task A_manager_that_still_speaks_the_old_lifecycle_protocol_is_driven_by_the_kernel()
+    {
+        var participant = new RecordingParticipant("channels");
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(new LifecycleModule(participant), typeId: ModuleNames.ChannelManager).Ok);
+
+        var started = await kernel.StartAsync(default);
+        Assert.True(started.Ok);
+        Assert.Equal(["start"], participant.Calls);
+
+        Assert.True((await kernel.StopAsync(default)).Ok);
+        Assert.Equal(["start", "stop"], participant.Calls);
+    }
+
+    [Fact]
+    public async Task A_manager_that_fails_to_start_is_reported_and_does_not_take_down_the_others()
+    {
+        var failing = new RecordingParticipant("channels") { Fail = true };
+        var healthy = new RecordingParticipant("adapters");
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(new LifecycleModule(failing)).Ok);
+        Assert.True(kernel.Declare(new LifecycleModule(healthy)).Ok);
+
+        var started = await kernel.StartAsync(default);
+
+        Assert.True(started.Ok);
+        var nodes = started.Value!.Nodes;
+        Assert.Equal(ModulePhase.Failed, nodes.Single(node => node.Id.Value == "channels").Phase);
+        Assert.Equal(ModulePhase.Ready, nodes.Single(node => node.Id.Value == "adapters").Phase);
+        Assert.Equal(1, started.Value.Degraded);
+    }
+
+    private sealed class RecordingParticipant(string name) : ILifecycleParticipant
+    {
+        public string Name { get; } = name;
+        public bool Fail { get; init; }
+        public List<string> Calls { get; } = [];
+
+        public ValueTask<Result> StartAsync(LifecycleSignal signal, CancellationToken cancellationToken)
+        {
+            Calls.Add("start");
+            return ValueTask.FromResult(Fail ? Result.Failure(new(ErrorCode.Unavailable, "cannot start")) : Result.Success());
+        }
+
+        public ValueTask<Result> StopAsync(LifecycleSignal signal, CancellationToken cancellationToken)
+        {
+            Calls.Add("stop");
+            return ValueTask.FromResult(Result.Success());
+        }
+    }
+
     private async ValueTask<ModuleReceipt> Start(Kernel? kernel = null)
     {
         kernel ??= new Kernel(_root, _types);

@@ -242,7 +242,7 @@ if (!loaded.Ok)
 }
 
 // Configuration, not startup: make sure the file Adapter has a spec to revive. Starting it is the
-// lifecycle coordinator's job, not the host's.
+// kernel's job, not the host's.
 var storedAdapters = await adapterSpecs.LoadAllAsync(CancellationToken.None);
 if (!storedAdapters.Ok)
 {
@@ -277,20 +277,34 @@ var clockTask = clock.RunAsync(shutdown.Token);
 var deadlineSweepTask = sessions.RunDeadlineSweepAsync(deadlines, TimeProvider.System,
     SessionDeadlineHandler.Interval, shutdown.Token);
 
-// The host's only startup act: hand one signal to the managers, in dependency order.
-var lifecycle = new LifecycleCoordinator(new RecordingEventSink(queue, messageStore), signalLog);
-var registered = lifecycle.Register(adapters);
-// No dependency between adapters and channels: availability is checked when a message is delivered,
-// so neither manager has to wait for the other.
-if (registered.Ok) registered = lifecycle.Register((ILifecycleParticipant)channels);
-if (!registered.Ok)
+// The host's only startup act: build the graph and hand it to the kernel, which decides the phases, the order
+// and what to do about a module that fails. The host does not know what a wave is.
+var kernel = new Kernel(data.Root, new ModuleFactoryRegistry(), signalLog);
+foreach (var declared in new (ILifecycleParticipant Participant, string TypeId)[]
+         {
+             (adapters, ModuleNames.AdapterManager),
+             // No dependency between adapters and channels: availability is checked when a message is delivered,
+             // so neither manager has to wait for the other.
+             ((ILifecycleParticipant)channels!, ModuleNames.ChannelManager)
+         })
 {
-    Console.Error.WriteLine(registered.Error?.Message ?? "Lifecycle wiring failed.");
+    var declaration = kernel.Declare(new LifecycleModule(declared.Participant), typeId: declared.TypeId);
+    if (declaration.Ok) continue;
+    Console.Error.WriteLine(declaration.Error?.Message ?? "Module declaration failed.");
     shutdown.Cancel();
     queue.Complete();
     return 1;
 }
-var lifecycleReport = await lifecycle.StartAsync(shutdown.Token);
+var started = await kernel.StartAsync(shutdown.Token);
+if (!started.Ok || started.Value is null)
+{
+    Console.Error.WriteLine(started.Error?.Message ?? "Module startup failed.");
+    await kernel.StopAsync(CancellationToken.None);
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
+var receipt = started.Value;
 // Channels register their tunables when they are revived, so persisted overrides are applied after startup,
 // before anything reads a value.
 var restored = await parameters.RestoreAsync(CancellationToken.None);
@@ -310,8 +324,16 @@ if (waiting.Ok && waiting.Value is not null)
         ? "no Session is waiting on a deadline"
         : $"{declared.Length} Session(s) waiting, earliest {declared.Min():O}");
 }
-foreach (var outcome in lifecycleReport.Outcomes.Where(o => o.Outcome != "ok"))
-    Console.Error.WriteLine($"startup {outcome.Outcome}: {outcome.Name} — {outcome.Message}");
+foreach (var outcome in receipt.Nodes.Where(node => node.Phase != ModulePhase.Ready))
+    Console.Error.WriteLine($"startup {outcome.Phase}: {outcome.Id} — {outcome.Failure}");
+foreach (var edge in receipt.BadEdges)
+    Console.Error.WriteLine($"startup bad edge: {edge.Master} -> {edge.Slave} ({edge.Reason}): {edge.Detail}");
+foreach (var cycle in receipt.Cycles)
+    Console.Error.WriteLine($"startup cycle (ready together): {string.Join(" <-> ", cycle.Members)}");
+foreach (var issue in receipt.Issues)
+    Console.Error.WriteLine($"startup issue: {issue.Path} — {issue.Message}");
+restore.Note("graph", $"{receipt.Ready}/{receipt.Nodes.Count} ready, {receipt.WiredEdges} edge(s) wired" +
+    (receipt.Degraded == 0 ? "" : $", degraded {receipt.Degraded}"));
 // What the address book can answer for once everything is running, instances included. A catalog whose instances
 // are only in somebody else's dictionary would look identical from the outside — until something asks.
 var liveInstances = modules.List()
@@ -323,10 +345,10 @@ var liveInstances = modules.List()
 restore.Note("instances", liveInstances.Length == 0 ? "none" : string.Join(", ", liveInstances));
 foreach (var note in restore.Snapshot())
     Console.WriteLine($"restored {note.Component}: {note.Summary}");
-if (!lifecycleReport.Outcomes.Any(o => o.Outcome == "ok"))
+if (receipt.Ready == 0)
 {
     // Nothing came up at all: that is the only startup failure that justifies refusing to run.
-    await lifecycle.StopAsync(CancellationToken.None);
+    await kernel.StopAsync(CancellationToken.None);
     shutdown.Cancel();
     queue.Complete();
     try { await pumpTask; } catch (OperationCanceledException) { }
@@ -342,7 +364,7 @@ var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels
 if (!actionsRegistered.Ok)
 {
     Console.Error.WriteLine(actionsRegistered.Error?.Message ?? "Action registration failed.");
-    await lifecycle.StopAsync(CancellationToken.None);
+    await kernel.StopAsync(CancellationToken.None);
     shutdown.Cancel();
     queue.Complete();
     return 1;
@@ -371,7 +393,7 @@ catch (OperationCanceledException) when (shutdown.IsCancellationRequested) { }
 finally
 {
     if (api is not null) await api.DisposeAsync();
-    await lifecycle.StopAsync(CancellationToken.None);
+    await kernel.StopAsync(CancellationToken.None);
     shutdown.Cancel();
     try { await clockTask; } catch (OperationCanceledException) { }
     try { await deadlineSweepTask; } catch (OperationCanceledException) { }

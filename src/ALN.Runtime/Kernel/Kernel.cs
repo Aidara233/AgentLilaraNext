@@ -23,6 +23,7 @@ public sealed class Kernel
     private readonly ISignalLog _signals;
     private readonly TimeSpan _stopTimeout;
     private readonly Dictionary<ModuleId, KernelNode> _nodes = new();
+    private readonly Dictionary<ModuleId, KernelNode> _declared = new();
     private readonly object _gate = new();
     private IReadOnlyList<ModuleIssue> _issues = [];
 
@@ -57,9 +58,29 @@ public sealed class Kernel
         lock (_gate) return _nodes.Values.Where(node => node.Manifest.Type == typeId).Select(node => node.Module).ToArray();
     }
 
+    /// <summary>
+    /// Adds a node the host built itself, before startup. This is how the core's own managers reach the graph
+    /// while their manifests are still code rather than files: the moment a module has a directory, it comes from
+    /// <see cref="ModuleManifestStore"/> instead, and the two must not both claim the same id.
+    /// </summary>
+    public Result Declare(IKernelModule module, IReadOnlyList<ModuleSlave>? slaves = null,
+        IReadOnlyList<ModuleId>? dependencies = null, string? typeId = null)
+    {
+        if (module is null) return Result.Failure(new(ErrorCode.Invalid, "A declared module cannot be null."));
+        lock (_gate)
+        {
+            if (_declared.ContainsKey(module.Id))
+                return Result.Failure(new(ErrorCode.Conflict, $"Module is already declared: {module.Id}"));
+            var manifest = new ModuleManifest(module.Id, typeId ?? module.Id.Value, true, null, slaves ?? [], dependencies ?? []);
+            _declared[module.Id] = new KernelNode(manifest, module);
+        }
+        return Result.Success();
+    }
+
     public async ValueTask<Result<ModuleReceipt>> StartAsync(CancellationToken cancellationToken)
     {
         lock (_gate) { _nodes.Clear(); _issues = []; }
+        foreach (var declared in Declared()) lock (_gate) _nodes[declared.Manifest.Id] = declared;
 
         // 0 — Scan: everything the disk says, plus one line per directory that is not a module.
         var scan = await _store.ScanAsync(_types, cancellationToken).ConfigureAwait(false);
@@ -67,6 +88,13 @@ public sealed class Kernel
 
         foreach (var manifest in scan.Manifests)
         {
+            if (_nodes.ContainsKey(manifest.Id))
+            {
+                // Declared in code and on disk: the code wins, and the collision is reported. Two nodes with one
+                // name is the shape that makes "which one did I just stop" unanswerable.
+                issues.Add(new ModuleIssue(manifest.Id.Value, $"Declared by the host and also present on disk: {manifest.Id}."));
+                continue;
+            }
             var created = _types.Create(manifest);
             if (!created.Ok || created.Value is null)
             {
@@ -413,6 +441,11 @@ public sealed class Kernel
     private KernelNode[] Snapshot()
     {
         lock (_gate) return _nodes.Values.ToArray();
+    }
+
+    private KernelNode[] Declared()
+    {
+        lock (_gate) return _declared.Values.ToArray();
     }
 
     private static string? Describe(Result result) =>
