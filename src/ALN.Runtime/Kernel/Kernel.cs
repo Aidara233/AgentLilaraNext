@@ -643,9 +643,13 @@ public sealed class Kernel
             _nodes.Remove(id);
             _declared.Remove(id);
             foreach (var other in _nodes.Values)
-                foreach (var slave in other.Manifest.Slaves ?? [])
-                    if (slave.Id == id)
-                        dropped.Add(new(other.Manifest.Id, id, BadEdgeReason.MissingModule, "Removed while still declared as a slave."));
+                foreach (var slave in (other.Manifest.Slaves ?? []).Where(slave => slave.Id == id).ToArray())
+                {
+                    // The instance is gone, so no edge may keep pointing at it: the edge is dropped here and the
+                    // receipt says why it disappeared rather than leaving a master holding a name nothing answers to.
+                    dropped.Add(new(other.Manifest.Id, id, BadEdgeReason.MissingModule, "Removed while still declared as a slave."));
+                    other.ReleaseSlave(id);
+                }
         }
         KeepBadEdges(dropped);
         return Result<IReadOnlyList<BadEdge>>.Success(dropped);
@@ -770,17 +774,18 @@ public sealed class Kernel
     }
 
     /// <summary>
-    /// Takes an instance out of the graph: stopped through its own hook, then gone, and the master stops listing it.
-    /// The instance's data is not touched here — that is the manager's call, because only it knows whether this
-    /// instance is going to the bin or coming back.
+    /// Drops one edge. Nothing happens to the instance: a master holding less is not the same event as a module
+    /// being destroyed, and only whoever constructed it decides that (C-16, C-41). Absent is not an error — a
+    /// manager tearing down is allowed to say so twice.
     /// </summary>
-    public async ValueTask<Result> ReleaseAsync(ModuleId masterId, ModuleId instanceId, CancellationToken cancellationToken)
+    public ValueTask<Result> ReleaseAsync(ModuleId masterId, ModuleId instanceId, CancellationToken cancellationToken)
     {
-        var removed = await RemoveAsync(instanceId, cancellationToken).ConfigureAwait(false);
-        if (!removed.Ok) return Result.Failure(removed.Error!);
         lock (_gate)
-            if (_nodes.TryGetValue(masterId, out var master)) master.ReleaseSlave(instanceId);
-        return Result.Success();
+        {
+            if (_nodes.TryGetValue(masterId, out var master) || _declared.TryGetValue(masterId, out master))
+                master.ReleaseSlave(instanceId);
+        }
+        return ValueTask.FromResult(Result.Success());
     }
 
     /// <summary>

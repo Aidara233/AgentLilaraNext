@@ -592,9 +592,14 @@ public sealed class KernelTests : IDisposable
 
         var detached = await host.DetachAsync(new ModuleId("ChannelManager"), instance, default);
         Assert.True(detached.Ok, detached.Error?.Message);
+        // Detaching drops the edge and nothing else: the instance is still in the graph (C-16).
+        Assert.NotNull(kernel.Find(instance));
+
+        var forgotten = await host.ForgetAsync(new ModuleId("ChannelManager"), instance, default);
+        Assert.True(forgotten.Ok, forgotten.Error?.Message);
         Assert.Null(kernel.Find(instance));
-        // Detaching twice is not an error: absent is what detaching wanted.
-        Assert.True((await host.DetachAsync(new ModuleId("ChannelManager"), instance, default)).Ok);
+        // Forgetting twice is not an error: absent is what forgetting wanted.
+        Assert.True((await host.ForgetAsync(new ModuleId("ChannelManager"), instance, default)).Ok);
     }
 
     [Fact]
@@ -638,6 +643,32 @@ public sealed class KernelTests : IDisposable
 
         Assert.False(clash.Ok);
         Assert.Equal(ErrorCode.Conflict, clash.Error!.Code);
+    }
+
+    [Fact]
+    public async Task One_master_releasing_its_edge_leaves_the_instance_alone()
+    {
+        // C-16 with two masters: a master holding less is not an event in the instance's life. It keeps running,
+        // keeps its other edge, and is not stopped — only its constructor may take it apart.
+        var first = new TestMaster(new("first"));
+        var second = new TestMaster(new("second"));
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(first, typeId: "test.master").Ok);
+        Assert.True(kernel.Declare(second, typeId: "test.master").Ok);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+        var instance = new TestModule(new("shared-2"));
+        Assert.True((await kernel.AdoptAsync(first.Id, instance, typeId: "test.plain", cancellationToken: default)).Ok);
+        Assert.True((await kernel.AdoptAsync(second.Id, instance, typeId: "test.plain", cancellationToken: default)).Ok);
+        var before = instance.Calls.Count;
+
+        var released = await kernel.ReleaseAsync(first.Id, instance.Id, default);
+
+        Assert.True(released.Ok, released.Error?.Message);
+        Assert.NotNull(kernel.Find(instance.Id));
+        Assert.Equal(ModulePhase.Ready, kernel.Nodes.Single(node => node.Id == instance.Id).Phase);
+        Assert.Equal(before, instance.Calls.Count);     // nothing stopped, nothing re-initialized
+        // Releasing again is still fine: a manager tearing down is allowed to say so twice.
+        Assert.True((await kernel.ReleaseAsync(first.Id, instance.Id, default)).Ok);
     }
 
     [Fact]

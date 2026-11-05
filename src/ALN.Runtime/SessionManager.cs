@@ -1275,7 +1275,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     private async ValueTask DetachNodeAsync(string sessionId)
     {
         if (_nodes is null) return;
-        await _nodes.DetachAsync(new ModuleId(SessionManagerId), new ModuleId(sessionId), CancellationToken.None)
+        await _nodes.ForgetAsync(new ModuleId(SessionManagerId), new ModuleId(sessionId), CancellationToken.None)
             .ConfigureAwait(false);
     }
 

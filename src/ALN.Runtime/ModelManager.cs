@@ -178,7 +178,7 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
         // Out of the graph before the provider is disposed: a node whose target is gone is worse than no node.
         // Data is not touched here — whether this provider's configuration is deleted is the caller's decision.
         if (_nodes is not null)
-            await _nodes.DetachAsync(new ModuleId(ModelManagerId), IdOf(provider), CancellationToken.None).ConfigureAwait(false);
+            await _nodes.ForgetAsync(new ModuleId(ModelManagerId), IdOf(provider), CancellationToken.None).ConfigureAwait(false);
         try { await instance.DisposeAsync().ConfigureAwait(false); return Result.Success(); }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (Exception ex) { return Result.Failure(new(ErrorCode.Internal, "Model provider disposal failed.", ex.Message)); }

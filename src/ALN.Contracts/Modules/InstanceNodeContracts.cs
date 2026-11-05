@@ -18,8 +18,14 @@ public interface IInstanceNodeHost
     ValueTask<Result> AttachAsync(ModuleId master, ModuleId instance, string typeId,
         IReadOnlyList<string>? kinds, CancellationToken cancellationToken, ITriggerSink? trigger = null);
 
-    /// <summary>Announces that the manager no longer holds it. Absent is not an error: a manager may be tearing down.</summary>
+    /// <summary>Announces that the manager no longer holds it. Nothing happens to the instance: this drops one edge.
+    /// Absent is not an error: a manager may be tearing down.</summary>
     ValueTask<Result> DetachAsync(ModuleId master, ModuleId instance, CancellationToken cancellationToken);
+
+    /// <summary>Announces that the instance is gone from the graph because it was destroyed. For the constructor,
+    /// after it has taken the thing apart; a master that merely stops holding something must use
+    /// <see cref="DetachAsync"/> instead.</summary>
+    ValueTask<Result> ForgetAsync(ModuleId master, ModuleId instance, CancellationToken cancellationToken);
 }
 
 /// <summary>

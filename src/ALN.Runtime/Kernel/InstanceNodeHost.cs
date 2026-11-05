@@ -38,9 +38,17 @@ public sealed class InstanceNodeHost(Kernel kernel, ModuleId master) : IInstance
     {
         if (masterId != master)
             return Result.Failure(new(ErrorCode.Denied, $"This host announces instances for {master}, not {masterId}."));
-        var released = await kernel.ReleaseAsync(master, instance, cancellationToken).ConfigureAwait(false);
-        // Already gone is what detaching was trying to achieve.
-        if (released.Ok) return released;
-        return kernel.Find(instance) is null ? Result.Success() : released;
+        // One edge, nothing else: the instance keeps existing and keeps its other masters.
+        return await kernel.ReleaseAsync(master, instance, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<Result> ForgetAsync(ModuleId masterId, ModuleId instance, CancellationToken cancellationToken)
+    {
+        if (masterId != master)
+            return Result.Failure(new(ErrorCode.Denied, $"This host announces instances for {master}, not {masterId}."));
+        // The constructor took it apart, so the graph lets go of it — including the edge it held here.
+        var removed = await kernel.RemoveAsync(instance, cancellationToken).ConfigureAwait(false);
+        // Absent is what forgetting wanted.
+        return removed.Ok || kernel.Find(instance) is null ? Result.Success() : Result.Failure(removed.Error!);
     }
 }
