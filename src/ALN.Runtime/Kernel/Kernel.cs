@@ -229,8 +229,13 @@ public sealed class Kernel
                 foreach (var slave in instance.Manifest.Slaves!)
                     badEdges.Add(new(instance.Manifest.Id, slave.Id, BadEdgeReason.MasterDoesNotWire,
                         $"{instance.Manifest.Id} declares slaves but does not implement {nameof(IModuleWiring)}."));
+                var before = badEdges.Count - instance.Manifest.Slaves!.Count;
+                for (var i = before; i < badEdges.Count; i++)
+                    await NotifyEdgeErrorAsync(instance, nameof(IModuleWiring.WireSlave),
+                        $"{badEdges[i].Slave}: {badEdges[i].Detail}", cancellationToken).ConfigureAwait(false);
                 continue;
             }
+            var start = badEdges.Count;
             foreach (var slave in instance.Manifest.Slaves!)
             {
                 var resolved = Resolve(slave.Id, badEdges, instance.Manifest.Id);
@@ -246,6 +251,12 @@ public sealed class Kernel
                 }
                 wired++;
             }
+            // C-13: an edge that did not wire is the module's business, not a silent line in a receipt. Tell the
+            // master through its own error hook, one call per bad edge, and let the rest of startup carry on — only
+            // the connection that failed is affected.
+            for (var i = start; i < badEdges.Count; i++)
+                await NotifyEdgeErrorAsync(instance, nameof(IModuleWiring.WireSlave),
+                    $"{badEdges[i].Slave}: {badEdges[i].Detail}", cancellationToken).ConfigureAwait(false);
         }
 
         // 3 — Ready: dependencies first, and modules that depend on each other at the same time.
@@ -428,6 +439,42 @@ public sealed class Kernel
                 ["exception"] = exception?.GetType().Name ?? ""
             }
         });
+    }
+
+    /// <summary>
+    /// Tells a module that one of its edges did not wire. The module is fine — the connection is not — so its phase is
+    /// left alone: this is the "your wiring failed" hook, not "you failed". Failure of the hook itself is recorded and
+    /// swallowed, like every other error path here.
+    /// </summary>
+    private async ValueTask NotifyEdgeErrorAsync(KernelInstance instance, string method, string message,
+        CancellationToken cancellationToken)
+    {
+        _signals.Write(new()
+        {
+            Id = Guid.NewGuid(),
+            ParentId = SignalScope.CurrentId,
+            Group = "kernel",
+            Name = "module",
+            From = instance.Manifest.Id.Value,
+            To = "kernel",
+            Detail = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["type"] = instance.Manifest.Type,
+                ["error"] = message,
+                ["edge"] = "bad"
+            }
+        });
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(_stopTimeout);
+            await instance.Module.OnErrorAsync(new(method, message), timeout.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Same rule as everywhere else: one attempt at telling, then nothing.
+            Record(instance, nameof(IKernelModule.OnErrorAsync), ex.Message, ex);
+        }
     }
 
     private KernelInstance? Resolve(ModuleId id, List<BadEdge> badEdges, ModuleId master)

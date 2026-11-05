@@ -121,6 +121,29 @@ public sealed class KernelTests : IDisposable
     }
 
     [Fact]
+    public async Task A_master_whose_edge_failed_hears_about_it_and_the_rest_still_starts()
+    {
+        // The wiring phase walks the modules and builds each edge. One that cannot be built goes to that module's own
+        // error hook and affects only that edge — the phase does not stop, and the module itself did not fail.
+        var picky = new TestMaster(new("picky")) { Accept = (_, _, _) => Result.Failure(new(ErrorCode.Denied, "not that one")) };
+        var other = new TestMaster(new("other"));
+        var slave = new TestModule(new("slave-1"));
+        Add(slave, "test.plain");
+        Add(picky, "test.master", slaves: ["slave-1"]);
+        Add(other, "test.master", slaves: ["slave-1"]);
+
+        var receipt = await Start();
+
+        Assert.Single(receipt.BadEdges);
+        Assert.Equal(new ModuleId("picky"), receipt.BadEdges[0].Master);
+        Assert.Contains(picky.Errors, error => error.Message.Contains("not that one", StringComparison.Ordinal));
+        // Only that edge failed: the other master's edge is wired and nobody was demoted.
+        Assert.Equal(new ModuleId("slave-1"), Assert.Single(other.Wired));
+        Assert.Equal(ModulePhase.Ready, receipt.Instances.Single(instance => instance.Id.Value == "picky").Phase);
+        Assert.Equal(ModulePhase.Ready, receipt.Instances.Single(instance => instance.Id.Value == "slave-1").Phase);
+    }
+
+    [Fact]
     public async Task A_startup_with_broken_edges_completes_and_reports_each_one()
     {
         var missing = new TestMaster(new("missing"));
