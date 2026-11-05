@@ -54,7 +54,8 @@ public enum AdapterDirection { Inbound, Outbound, Both }
 public enum AdapterState { Created, Running, Stopped, Faulted, Destroyed }
 public sealed record AdapterDescriptor(string PlatformId, string AccountId, AdapterDirection Direction);
 public sealed record AdapterEnvelope(Address Adapter, string PlatformId, string PlatformConversationId,
-    string? PlatformMessageId, string Text, DateTimeOffset At, string? Sender = null, bool MentionsSelf = false)
+    string? PlatformMessageId, string Text, DateTimeOffset At, string? Sender = null, bool MentionsSelf = false,
+    string? SenderRemark = null)
 {
     public Guid EventId { get; init; } = Guid.NewGuid();
 }

@@ -12,6 +12,23 @@ public sealed class ModuleCatalogTests
     }
 
     [Fact]
+    public void A_sender_is_addressed_by_name_and_the_remark_is_extra()
+    {
+        // The remark never replaces the name: both stay visible, one in brackets. When there is no name at all the
+        // remark is all there is, and when neither exists the text is empty rather than "()".
+        var binding = new ChannelBinding(new Address("adapter.file", "one"), "conversation-1");
+        var channel = new Address("channel", "conversation", "main");
+        ChannelMessage Make(string? name, string? remark) =>
+            new(Guid.NewGuid(), channel, binding, null, "text", DateTimeOffset.UnixEpoch, name, false, remark);
+
+        Assert.Equal("小林(同事)", Make("小林", "同事").DisplaySender);
+        Assert.Equal("小林", Make("小林", null).DisplaySender);
+        Assert.Equal("阿岚", Make("阿岚", null).DisplaySender);
+        Assert.Equal("备注", Make(null, "备注").DisplaySender);   // 只有备注时，它就是全部，不加括号
+        Assert.Equal("", Make(null, null).DisplaySender);
+    }
+
+    [Fact]
     public void A_source_answers_only_when_nothing_attached_and_no_owner_answers()
     {
         // The fallback exists so the catalog can see what the kernel holds without the two being registered twice. What

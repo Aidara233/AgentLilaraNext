@@ -106,7 +106,18 @@ public sealed record ChannelInfo(Address Address, string Name, IReadOnlyList<Cha
     /// <summary>Which model profile this Channel talks with; null means "whatever the host resolves".</summary>
     string? ModelProfile = null);
 public sealed record ChannelMessage(Guid MessageId, Address Channel, ChannelBinding Binding,
-    string? PlatformMessageId, string Text, DateTimeOffset At, string? Sender = null, bool MentionsSelf = false);
+    string? PlatformMessageId, string Text, DateTimeOffset At, string? Sender = null, bool MentionsSelf = false,
+    string? SenderRemark = null)
+{
+    /// <summary>
+    /// How to address the sender in text: the name that was found (group card, nickname or the account id) and, when
+    /// there is one, the remark in brackets after it. The remark never replaces the name — it is an extra thing to know
+    /// about the same person, so both stay visible.
+    /// </summary>
+    public string DisplaySender =>
+        Sender is null ? (SenderRemark ?? "") :
+        SenderRemark is null ? Sender : $"{Sender}({SenderRemark})";
+}
 
 /// <summary>Messages accepted for one Channel that a Session has not consumed yet.</summary>
 /// <param name="Messages">At most the Channel's window; the newest ones.</param>

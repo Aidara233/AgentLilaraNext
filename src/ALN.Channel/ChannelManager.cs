@@ -352,7 +352,7 @@ public sealed class ChannelManager(IEventSink events, IInstanceBindings bindings
                 return Result<int>.Failure(new(ErrorCode.Unavailable,
                     $"Bound Adapter is not available, message not delivered: {binding.Adapter}"));
             var message = new ChannelMessage(envelope.EventId, channel.Address, binding, envelope.PlatformMessageId,
-                envelope.Text, envelope.At, envelope.Sender, envelope.MentionsSelf);
+                envelope.Text, envelope.At, envelope.Sender, envelope.MentionsSelf, envelope.SenderRemark);
             // One fact, one transaction: the history row and the "accepted but unfinished" marker are written
             // together. Half of them is either a message nobody will look at or a marker naming nothing.
             var duplicate = false;

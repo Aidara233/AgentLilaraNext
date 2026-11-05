@@ -850,7 +850,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
                 opened.Ok && opened.Value is not null ? opened.Value.Id.Value : channelMessage.Channel.ToString()),
                 cancellationToken).ConfigureAwait(false);
             var input = new SessionTurnInput([new SessionChannelMessage(channelMessage.MessageId.ToString("N"), "user",
-                channelMessage.Sender, channelMessage.Text, channelMessage.At)], channelMessage.Channel, channelMessage.Binding);
+                channelMessage.DisplaySender, channelMessage.Text, channelMessage.At)], channelMessage.Channel, channelMessage.Binding);
             var result = opened.Ok && opened.Value is not null
                 ? await opened.Value.RunTurnAsync(current.EventId, input,
                     new TurnToolbox(new SpeakTool(this, current, mount, channels, audit)), cancellationToken).ConfigureAwait(false)
