@@ -26,4 +26,28 @@ public static class HostComposition
         }
         return Result.Success();
     }
+
+    /// <summary>
+    /// Puts the host's managers in the catalog: the ones that are modules are attached, the ones that hold instances
+    /// are announced as their owner. Two tables and two loops, because a manager that joins or leaves the host should
+    /// be one edit, and every failure should be reported in the same way — all of them, not the first.
+    /// </summary>
+    public static Result Register(ModuleCatalog catalog, IReadOnlyList<IModule> modules, IReadOnlyList<IModuleIndex> owners)
+    {
+        ArgumentNullException.ThrowIfNull(catalog);
+        ArgumentNullException.ThrowIfNull(modules);
+        ArgumentNullException.ThrowIfNull(owners);
+        var failures = new List<string>();
+        foreach (var module in modules)
+        {
+            var attached = catalog.Attach(module);
+            if (!attached.Ok) failures.Add(attached.Error?.Message ?? $"Could not register {module.Id}.");
+        }
+        foreach (var owner in owners)
+        {
+            var observed = catalog.Observe(owner);
+            if (!observed.Ok) failures.Add(observed.Error?.Message ?? $"Could not observe {owner.Category}.");
+        }
+        return failures.Count == 0 ? Result.Success() : Result.Failure(new(ErrorCode.Invalid, string.Join(Environment.NewLine, failures)));
+    }
 }

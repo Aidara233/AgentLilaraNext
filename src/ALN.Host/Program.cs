@@ -165,28 +165,16 @@ var clock = clockResult.Value;
 // The address book comes up before anything else and is filled in as modules appear. Every registration here
 // is a *singleton*: the type is the manager class itself — not the category it owns, which is why an adapter
 // lookup by type never returns the manager. The category is the namespace it manages.
-var registrationFailures = new List<string>();
-void Register(IModule module)
+// One table per concern: what the catalog lists, and which of those own instances the catalog should not copy.
+var registered = HostComposition.Register(
+    modules,
+    [adapters, modelManager, sessions, (IModule)channels!, (IModule)graph!, (IModule)clock!],
+    // The instances those managers hold are findable through them, not copied in: the owner's dictionary is the
+    // truth, so a destroyed instance is gone from the catalog by being gone from its owner.
+    [adapters, modelManager, (IModuleIndex)channels!, sessions]);
+if (!registered.Ok)
 {
-    var attached = modules.Attach(module);
-    if (!attached.Ok) registrationFailures.Add(attached.Error?.Message ?? $"Could not register {module.Id}.");
-}
-Register(adapters);
-Register(modelManager);
-Register(sessions);
-Register((IModule)channels!);
-Register((IModule)graph!);
-Register((IModule)clock!);
-// The instances those managers hold are findable through them, not copied in: the owner's dictionary is the
-// truth, so a destroyed instance is gone from the catalog by being gone from its owner.
-foreach (var index in new[] { (IModuleIndex)adapters, modelManager, (IModuleIndex)channels!, (IModuleIndex)sessions })
-{
-    var observed = modules.Observe(index);
-    if (!observed.Ok) registrationFailures.Add(observed.Error?.Message ?? $"Could not observe {index.Category}.");
-}
-if (registrationFailures.Count > 0)
-{
-    foreach (var failure in registrationFailures) Console.Error.WriteLine(failure);
+    Console.Error.WriteLine(registered.Error?.Message);
     return 1;
 }
 // Which modules exist is not something anybody can discover from a log, and a catalogue that silently failed to

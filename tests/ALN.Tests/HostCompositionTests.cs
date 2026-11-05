@@ -66,9 +66,45 @@ public sealed class HostCompositionTests : IDisposable
         Assert.Contains("Adapter manager again", declared.Error!.Message, StringComparison.Ordinal);
     }
 
-    private sealed class Stub(ModuleId id) : IKernelModule
+    [Fact]
+    public async Task The_catalog_table_attaches_the_modules_and_announces_their_owners()
+    {
+        // Two tables, two loops: what the catalog lists, and which of those own instances it must not copy. Both are
+        // answered from one place, and a failure names the module that caused it.
+        var catalog = new ModuleCatalog();
+        var alpha = new Stub(new("alpha"));
+        var beta = new Stub(new("beta"));
+
+        var registered = HostComposition.Register(catalog, [alpha, beta], [(IModuleIndex)alpha]);
+
+        Assert.True(registered.Ok, registered.Error?.Message);
+        Assert.Equal(2, catalog.Count);
+        Assert.NotNull(catalog.Find(new("alpha")));
+        Assert.NotNull(catalog.Find(new("beta")));
+    }
+
+    [Fact]
+    public async Task A_catalog_table_that_names_one_id_twice_reports_the_collision()
+    {
+        var catalog = new ModuleCatalog();
+        var again = new Stub(new("alpha"));
+
+        var registered = HostComposition.Register(catalog, [new Stub(new("alpha")), again], []);
+
+        Assert.False(registered.Ok);
+        Assert.Contains("alpha", registered.Error!.Message, StringComparison.Ordinal);
+    }
+
+    [Module("stub", Category = "stub", Role = ModuleRole.Manager)]
+    private sealed class Stub(ModuleId id) : IKernelModule, IModule, IModuleIndex
     {
         public ModuleId Id { get; } = id;
+
+        public string Category => "stub";
+
+        public IReadOnlyList<CatalogEntry> Entries() => [];
+
+        public LocatedModule? Locate(ModuleId located) => null;
 
         public ValueTask<Result> InitializeAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
 
