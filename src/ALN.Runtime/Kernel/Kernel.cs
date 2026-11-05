@@ -666,6 +666,7 @@ public sealed class Kernel
         var edge = new ModuleSlave(instance.Id, kinds ?? [], RequireAll: false);
         KernelNode master;
         KernelNode node;
+        bool alreadyThere;
         lock (_gate)
         {
             // Before startup the master may only be *declared*: the graph does not exist yet, and refusing here
@@ -673,23 +674,68 @@ public sealed class Kernel
             // case — it is held before anything runs.
             if (!_nodes.TryGetValue(masterId, out master!) && !_declared.TryGetValue(masterId, out master!))
                 return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, $"No module answers to \"{masterId}\"."));
-            if (_nodes.ContainsKey(instance.Id) || _declared.ContainsKey(instance.Id))
+
+            // C-16: an instance may have more than one master, so a second one is not a conflict — holding the same
+            // object twice is what "two masters" means. Two *different* objects under one id still is (C-14).
+            var same = _nodes.TryGetValue(instance.Id, out var live) ? live
+                : _declared.TryGetValue(instance.Id, out var declared) ? declared : null;
+            if (same is not null && !ReferenceEquals(same.Module, instance))
                 return Result<ModuleAddition>.Failure(new(ErrorCode.Conflict, $"A module already answers to \"{instance.Id}\"."));
 
-            // The edge lives on the master, and only there: the master is what holds the instance and what has to
-            // accept it during Wire. Writing the master into the instance's own slave list would make the instance a
-            // master too — the kernel would then ask it to wire its "slave", and report the refusal as a bad edge.
-            node = new KernelNode(new ModuleManifest(instance.Id, typeId ?? instance.Id.Value), instance);
-            if (_state == KernelRunState.BeforeStart)
+            if (same is not null)
             {
-                // Nothing to phase through yet: this is a declaration that happens to come from a manager. Startup
-                // will initialize, wire and start it like any other, so the receipt counts the edge and the master
-                // still has to accept it.
-                _declared[instance.Id] = node;
-                master.AdoptSlave(edge);
+                node = same;
+                alreadyThere = true;
+            }
+            else
+            {
+                // The edge lives on the master, and only there: the master is what holds the instance and what has to
+                // accept it during Wire. Writing the master into the instance's own slave list would make the instance a
+                // master too — the kernel would then ask it to wire its "slave", and report the refusal as a bad edge.
+                node = new KernelNode(new ModuleManifest(instance.Id, typeId ?? instance.Id.Value), instance);
+                alreadyThere = false;
+                if (_state == KernelRunState.BeforeStart)
+                {
+                    // Nothing to phase through yet: this is a declaration that happens to come from a manager. Startup
+                    // will initialize, wire and start it like any other, so the receipt counts the edge and the master
+                    // still has to accept it.
+                    _declared[instance.Id] = node;
+                    master.AdoptSlave(edge);
+                    return Result<ModuleAddition>.Success(new(node.Info(), []));
+                }
+                _nodes[instance.Id] = node;
+            }
+        }
+
+        if (alreadyThere)
+        {
+            // The instance is already in the graph: its phases are the core's business and are not re-run. All this
+            // master gets is an edge, and the edge is wired the same way it would be at startup — asked, refused,
+            // refused as a bad edge.
+            if (node.Phase is not (ModulePhase.Initialized or ModulePhase.Ready))
+            {
+                // Still starting: the Wire pass will reach this edge because it is on the master's list now.
+                lock (_gate) master.AdoptSlave(edge);
                 return Result<ModuleAddition>.Success(new(node.Info(), []));
             }
-            _nodes[instance.Id] = node;
+            if (WiringOf(master) is not { } second)
+            {
+                var dropped = new BadEdge(masterId, instance.Id, BadEdgeReason.MasterDoesNotWire,
+                    $"{masterId} declares slaves but does not implement {nameof(IModuleWiring)}.");
+                KeepBadEdges([dropped]);
+                return Result<ModuleAddition>.Success(new(node.Info(), [dropped]));
+            }
+            Result refused;
+            try { refused = second.WireSlave(instance.Id, kinds ?? [], instance); }
+            catch (Exception ex) { refused = Result.Failure(new(ErrorCode.Internal, "Wire threw.", ex.Message)); }
+            if (!refused.Ok)
+            {
+                var bad = new BadEdge(masterId, instance.Id, BadEdgeReason.RejectedByMaster, refused.Error?.Message ?? "Rejected.");
+                KeepBadEdges([bad]);
+                return Result<ModuleAddition>.Success(new(node.Info(), [bad]));
+            }
+            lock (_gate) master.AdoptSlave(edge);
+            return Result<ModuleAddition>.Success(new(node.Info(), [], 1));
         }
 
         if (WiringOf(master) is not { } wiring)

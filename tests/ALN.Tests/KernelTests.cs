@@ -598,6 +598,49 @@ public sealed class KernelTests : IDisposable
     }
 
     [Fact]
+    public async Task A_second_master_may_hold_an_instance_that_already_exists()
+    {
+        // C-16 at runtime: a manager announcing an instance another manager already holds gives it a second edge,
+        // not a conflict — and the instance's phases are not re-run for the newcomer's sake.
+        var first = new TestMaster(new("first"));
+        var second = new TestMaster(new("second"));
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(first, typeId: "test.master").Ok);
+        Assert.True(kernel.Declare(second, typeId: "test.master").Ok);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+        var instance = new TestModule(new("shared-1"));
+
+        var one = await kernel.AdoptAsync(first.Id, instance, typeId: "test.plain", cancellationToken: default);
+        var two = await kernel.AdoptAsync(second.Id, instance, typeId: "test.plain", cancellationToken: default);
+
+        Assert.True(one.Ok, one.Error?.Message);
+        Assert.True(two.Ok, two.Error?.Message);
+        Assert.Empty(two.Value!.BadEdges);
+        Assert.Equal(new ModuleId("shared-1"), Assert.Single(first.Wired));
+        Assert.Equal(new ModuleId("shared-1"), Assert.Single(second.Wired));
+        Assert.Single(instance.Calls, call => call == "initialize");
+        Assert.Equal(ModulePhase.Ready, kernel.Nodes.Single(node => node.Id == instance.Id).Phase);
+    }
+
+    [Fact]
+    public async Task Two_different_objects_under_one_id_are_still_a_conflict()
+    {
+        // The id names one instance (C-14). A second *object* claiming it is a collision, not a second master.
+        var first = new TestMaster(new("first"));
+        var second = new TestMaster(new("second"));
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(first, typeId: "test.master").Ok);
+        Assert.True(kernel.Declare(second, typeId: "test.master").Ok);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+
+        Assert.True((await kernel.AdoptAsync(first.Id, new TestModule(new("dup")), typeId: "test.plain", cancellationToken: default)).Ok);
+        var clash = await kernel.AdoptAsync(second.Id, new TestModule(new("dup")), typeId: "test.plain", cancellationToken: default);
+
+        Assert.False(clash.Ok);
+        Assert.Equal(ErrorCode.Conflict, clash.Error!.Code);
+    }
+
+    [Fact]
     public async Task A_manager_only_accepts_the_instances_it_holds()
     {
         // The master judges: a Channel manager that does not have this Channel refuses the edge, and the refusal is
