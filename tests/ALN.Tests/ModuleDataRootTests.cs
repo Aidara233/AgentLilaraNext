@@ -67,10 +67,10 @@ public sealed class ModuleDataRootTests : IDisposable
     [Fact]
     public async Task What_belongs_to_the_store_survives_the_directory_being_deleted()
     {
-        // The split from docs/22 §2.2 in one test: history is the module's, memory is not.
+        // The split from docs/22 §2.2 in one test: history is the module's, what is recorded in the database is not.
+        // Memory used to be the example here; it is a directory of its own now, so the surviving thing is state.
         using var store = new SqliteStore(Path.Combine(_root, "aln.db"));
-        var written = await store.AddAsync(new MemoryDraft("chat-1", MemoryKind.Fragment, "部署改到周五了", At: DateTimeOffset.UtcNow), default);
-        Assert.True(written.Ok);
+        Assert.True((await store.WriteAsync("channel.desired", "chat-1", """{"running":true}""", default)).Ok);
         var directory = _data.Ensure(Session);
         File.WriteAllText(Path.Combine(directory, "history.jsonl"), "{}");
 
@@ -78,6 +78,6 @@ public sealed class ModuleDataRootTests : IDisposable
         Assert.True(_data.Delete(Session).Ok);
 
         Assert.False(Directory.Exists(directory));
-        Assert.Equal(1, store.CountMemoryEntries());
+        Assert.Equal("""{"running":true}""", (await store.ReadAsync("channel.desired", "chat-1", default)).Value);
     }
 }

@@ -17,7 +17,7 @@ namespace ALN.Storage.Sqlite;
 /// Durability: <c>journal_mode=WAL</c> with <c>synchronous=NORMAL</c>, which survives a killed process (the
 /// case this whole state story is about) and can lose only the last commit on a power cut.
 /// </summary>
-public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomicWork, IQueuedMessageStore, IMemoryStore, IDisposable
+public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomicWork, IQueuedMessageStore, IDisposable
 {
     private const int SchemaVersion = 6;
     private const int SqliteConstraint = 19;
@@ -389,225 +389,11 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
         finally { _gate.Release(); }
     }
 
-    // ---- IMemoryStore: what outlives one Session -----------------------------------------------
-
-    /// <summary>
-    /// Rows a search will look at. A scope is supposed to shrink as fragments are folded into notes, so reading
-    /// it whole is honest rather than clever; the cap is only there so a scope that was never consolidated cannot
-    /// turn one recall into an unbounded read.
-    /// </summary>
-    private const int SearchCeiling = 5000;
-
-    public ValueTask<Result<MemoryWrite>> AddAsync(MemoryDraft draft, CancellationToken cancellationToken) =>
-        RunAsync(cancellationToken, Result<MemoryWrite>.Failure, "Memory could not be written.", () =>
-        {
-            if (draft is null) return Result<MemoryWrite>.Failure(new(ErrorCode.Invalid, "Memory draft is required."));
-            var invalid = Validate(draft.Scope, draft.Text, draft.Evidence);
-            if (invalid is not null) return Result<MemoryWrite>.Failure(invalid);
-            if (!Enum.IsDefined(draft.Kind))
-                return Result<MemoryWrite>.Failure(new(ErrorCode.Invalid, $"Unknown memory kind: {(int)draft.Kind}"));
-
-            var at = draft.At ?? DateTimeOffset.UtcNow;
-            var text = MemoryText.Normalize(draft.Text);
-            var evidence = string.IsNullOrWhiteSpace(draft.Evidence) ? null : draft.Evidence.Trim();
-            var source = string.IsNullOrWhiteSpace(draft.Source) ? null : draft.Source;
-
-            // Same words, same kind, same conversation: this is the same thing said again, not a new thing. The
-            // row keeps its id (so a note that other rows point at stays pointed at) and gains a repeat, a newer
-            // time, and the newest words it was said with.
-            if (FindExact(draft.Scope, draft.Kind, text) is { } existing)
-            {
-                var repeated = existing with
-                {
-                    At = at,
-                    Repeats = existing.Repeats + 1,
-                    Evidence = evidence ?? existing.Evidence,
-                    Source = source ?? existing.Source
-                };
-                // The WHERE repeats=... makes the increment depend on what was read rather than on wall clock
-                // ordering: two turns writing the same thing at once must not both think they saw count one.
-                using var update = Command(
-                    "UPDATE memory SET at=$at, repeats=$repeats, evidence=$evidence, source=$source " +
-                    "WHERE id=$id AND repeats=$was AND at=$wasAt;");
-                update.Parameters.AddWithValue("$at", Timestamp(repeated.At));
-                update.Parameters.AddWithValue("$repeats", repeated.Repeats);
-                update.Parameters.AddWithValue("$evidence", (object?)repeated.Evidence ?? DBNull.Value);
-                update.Parameters.AddWithValue("$source", (object?)repeated.Source ?? DBNull.Value);
-                update.Parameters.AddWithValue("$id", existing.Id);
-                update.Parameters.AddWithValue("$was", existing.Repeats);
-                update.Parameters.AddWithValue("$wasAt", Timestamp(existing.At));
-                if (update.ExecuteNonQuery() == 1) return Result<MemoryWrite>.Success(new MemoryWrite(repeated, Created: false));
-                // Somebody else moved the row between the read and the write. Falling through to an insert keeps
-                // the write honest; a retry loop here would be a lock nobody needs.
-            }
-
-            var record = new MemoryRecord(
-                "mem-" + Guid.NewGuid().ToString("N"),
-                draft.Scope,
-                draft.Kind,
-                text,
-                evidence,
-                source,
-                at);
-            using var command = Command(
-                "INSERT INTO memory(id, scope, kind, text, evidence, source, at, repeats) " +
-                "VALUES($id, $scope, $kind, $text, $evidence, $source, $at, 1);");
-            command.Parameters.AddWithValue("$id", record.Id);
-            command.Parameters.AddWithValue("$scope", record.Scope);
-            command.Parameters.AddWithValue("$kind", (int)record.Kind);
-            command.Parameters.AddWithValue("$text", record.Text);
-            command.Parameters.AddWithValue("$evidence", (object?)record.Evidence ?? DBNull.Value);
-            command.Parameters.AddWithValue("$source", (object?)record.Source ?? DBNull.Value);
-            command.Parameters.AddWithValue("$at", Timestamp(record.At));
-            command.ExecuteNonQuery();
-            return Result<MemoryWrite>.Success(new MemoryWrite(record, Created: true));
-        });
-
-    /// <summary>The row that already says exactly this, if there is one. Newest first, so a repeat folds into the most recent.</summary>
-    private MemoryRecord? FindExact(string scope, MemoryKind kind, string text)
-    {
-        using var command = Command(
-            "SELECT id, scope, kind, text, evidence, source, at, repeats FROM memory " +
-            "WHERE scope=$scope AND kind=$kind AND text=$text ORDER BY at DESC, id DESC LIMIT 1;");
-        command.Parameters.AddWithValue("$scope", scope);
-        command.Parameters.AddWithValue("$kind", (int)kind);
-        command.Parameters.AddWithValue("$text", text);
-        var rows = ReadRows(command);
-        return rows.Count == 0 ? null : rows[0];
-    }
-
-    public ValueTask<Result<IReadOnlyList<MemoryHit>>> SearchAsync(string scope, string query, int limit,
-        DateTimeOffset now, CancellationToken cancellationToken) =>
-        RunAsync(cancellationToken, Result<IReadOnlyList<MemoryHit>>.Failure, "Memory could not be read.", () =>
-        {
-            if (!IsScope(scope))
-                return Result<IReadOnlyList<MemoryHit>>.Failure(new(ErrorCode.Invalid, $"Not a memory scope: {scope}"));
-            var terms = MemoryRanking.Terms(query);
-            var hits = ReadScope(scope)
-                .Select(record => new MemoryHit(record, MemoryRanking.Score(record, terms, now)))
-                // A query that matches nothing gets an empty answer rather than the newest rows dressed up as a
-                // match. Only "no query at all" means "whatever is recent".
-                .Where(hit => terms.Count == 0 || hit.Score > 0)
-                .OrderByDescending(hit => hit.Score)
-                .ThenByDescending(hit => hit.Record.At)
-                .Take(Math.Clamp(limit, 1, 500))
-                .ToList();
-            return Result<IReadOnlyList<MemoryHit>>.Success(hits);
-        });
-
-    public ValueTask<Result<IReadOnlyList<MemoryRecord>>> RecentAsync(string scope, int limit, CancellationToken cancellationToken) =>
-        RunAsync(cancellationToken, Result<IReadOnlyList<MemoryRecord>>.Failure, "Memory could not be read.", () =>
-        {
-            if (!IsScope(scope))
-                return Result<IReadOnlyList<MemoryRecord>>.Failure(new(ErrorCode.Invalid, $"Not a memory scope: {scope}"));
-            using var command = Command(
-                "SELECT id, scope, kind, text, evidence, source, at, repeats FROM memory WHERE scope=$scope " +
-                "ORDER BY at DESC, id DESC LIMIT $limit;");
-            command.Parameters.AddWithValue("$scope", scope);
-            command.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 1000));
-            return Result<IReadOnlyList<MemoryRecord>>.Success(ReadRows(command));
-        });
-
-    public ValueTask<Result<MemoryRecord?>> ReadEntryAsync(string scope, string id, CancellationToken cancellationToken) =>
-        RunAsync(cancellationToken, Result<MemoryRecord?>.Failure, "Memory could not be read.", () =>
-        {
-            if (!IsScope(scope))
-                return Result<MemoryRecord?>.Failure(new(ErrorCode.Invalid, $"Not a memory scope: {scope}"));
-            using var command = Command(
-                "SELECT id, scope, kind, text, evidence, source, at, repeats FROM memory WHERE scope=$scope AND id=$id;");
-            command.Parameters.AddWithValue("$scope", scope);
-            command.Parameters.AddWithValue("$id", id);
-            var rows = ReadRows(command);
-            // Absent comes back as Ok with a null value — same shape as a state key that was never written.
-            return Result<MemoryRecord?>.Success(rows.Count == 0 ? null : rows[0]);
-        });
-
-    public ValueTask<Result> ForgetAsync(string scope, string id, CancellationToken cancellationToken) =>
-        RunAsync(cancellationToken, Result.Failure, "Memory could not be deleted.", () =>
-        {
-            if (!IsScope(scope))
-                return Result.Failure(new(ErrorCode.Invalid, $"Not a memory scope: {scope}"));
-            using var command = Command("DELETE FROM memory WHERE scope=$scope AND id=$id;");
-            command.Parameters.AddWithValue("$scope", scope);
-            command.Parameters.AddWithValue("$id", id);
-            command.ExecuteNonQuery();
-            // Deleting a row that is not there is a success: "forget this" is a statement, not a request to check.
-            return Result.Success();
-        });
-
-    public ValueTask<Result<MemoryCounts>> CountEntriesAsync(string scope, CancellationToken cancellationToken) =>
-        RunAsync(cancellationToken, Result<MemoryCounts>.Failure, "Memory could not be counted.", () =>
-        {
-            if (!IsScope(scope))
-                return Result<MemoryCounts>.Failure(new(ErrorCode.Invalid, $"Not a memory scope: {scope}"));
-            using var command = Command("SELECT kind, COUNT(*) FROM memory WHERE scope=$scope GROUP BY kind;");
-            command.Parameters.AddWithValue("$scope", scope);
-            int fragments = 0, notes = 0;
-            using var reader = command.ExecuteReader();
-            while (reader.Read())
-            {
-                var count = reader.GetInt32(1);
-                if ((MemoryKind)reader.GetInt32(0) == MemoryKind.Note) notes += count;
-                else fragments += count;
-            }
-            return Result<MemoryCounts>.Success(new MemoryCounts(fragments, notes));
-        });
-
-    /// <summary>Every row of one scope, newest first, capped. The caller ranks; this only fetches.</summary>
-    private List<MemoryRecord> ReadScope(string scope)
-    {
-        using var command = Command(
-            "SELECT id, scope, kind, text, evidence, source, at, repeats FROM memory WHERE scope=$scope " +
-            "ORDER BY at DESC, id DESC LIMIT $limit;");
-        command.Parameters.AddWithValue("$scope", scope);
-        command.Parameters.AddWithValue("$limit", SearchCeiling);
-        return ReadRows(command);
-    }
-
-    private static List<MemoryRecord> ReadRows(SqliteCommand command)
-    {
-        var rows = new List<MemoryRecord>();
-        using var reader = command.ExecuteReader();
-        while (reader.Read())
-        {
-            rows.Add(new MemoryRecord(
-                reader.GetString(0),
-                reader.GetString(1),
-                (MemoryKind)reader.GetInt32(2),
-                reader.GetString(3),
-                reader.IsDBNull(4) ? null : reader.GetString(4),
-                reader.IsDBNull(5) ? null : reader.GetString(5),
-                DateTimeOffset.Parse(reader.GetString(6), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-                // Rows written before repeats existed read as one: nothing has been repeated zero times.
-                reader.IsDBNull(7) ? 1 : reader.GetInt32(7)));
-        }
-        return rows;
-    }
-
-    private static Error? Validate(string? scope, string? text, string? evidence)
-    {
-        if (!IsScope(scope)) return new(ErrorCode.Invalid, $"Not a memory scope: {scope}");
-        if (string.IsNullOrWhiteSpace(text)) return new(ErrorCode.Invalid, "Memory text must not be empty.");
-        if (text.Trim().Length > IMemoryStore.MaxTextLength)
-            return new(ErrorCode.Invalid, $"Memory text is longer than {IMemoryStore.MaxTextLength} characters.");
-        if (evidence is not null && evidence.Length > IMemoryStore.MaxEvidenceLength)
-            return new(ErrorCode.Invalid, $"Memory evidence is longer than {IMemoryStore.MaxEvidenceLength} characters.");
-        return null;
-    }
-
-    /// <summary>
-    /// A scope is a key a person can read, not an address — it carries whatever separator the owner uses, so this
-    /// only rules out the empty and the absurd.
-    /// </summary>
-    private static bool IsScope(string? scope) =>
-        scope is { Length: > 0 and <= 200 } && !scope.Any(char.IsControl);
-
     // ---- counts for the startup receipt --------------------------------------------------------
 
     public long CountMessages() => Count("message");
     public long CountStateKeys() => Count("state");
     public long CountAuditRecords() => Count("audit");
-    public long CountMemoryEntries() => Count("memory");
 
     private long Count(string table)
     {
@@ -789,6 +575,9 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             CREATE INDEX IF NOT EXISTS queued_message_owner_at ON queued_message(queue, owner, at);
             CREATE INDEX IF NOT EXISTS queued_message_platform ON queued_message(queue, platform_message_id);
 
+            -- Memory used to live here and is a directory now (docs/21): a group is a folder, its body is
+            -- block.md. The table stays because dropping it would delete whatever an older run wrote, and a
+            -- cleanup is not a reason to make data unrecoverable. Nothing reads it.
             CREATE TABLE IF NOT EXISTS memory(
                 id TEXT NOT NULL PRIMARY KEY,
                 scope TEXT NOT NULL,

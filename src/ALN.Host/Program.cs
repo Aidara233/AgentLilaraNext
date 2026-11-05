@@ -64,15 +64,21 @@ var fileAccess = new LocalFileSystemAccess(data.Root, [FileScopes.Memory]);
 // Memory is a module of its own: it registers its own line and its own tools, and nothing else knows it exists. It
 // reads and writes through the port above, so "the model may tidy memory with file tools" needs no special case:
 // they reach the same files by the same rules.
-var memoryModule = new MemoryModule(new FileMemoryLibrary(fileAccess), sessionExtensions);
+var memoryLibrary = new FileMemoryLibrary(fileAccess);
+var memoryModule = new MemoryModule(memoryLibrary, sessionExtensions);
 // The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.
 // The startup receipt: whoever restores something says what it restored, and the host prints it once.
 var restore = new RestoreReport();
+// Memory is not in the database any more, so its number is a directory listing rather than a count of rows. A
+// library that cannot be read at startup is not worth stopping for: the receipt says so and the host carries on.
+var memoryGroups = await memoryLibrary.GroupsAsync(CancellationToken.None);
 restore.Note("storage", $"sqlite {Path.GetFileName(storage.Path)}: {storage.CountMessages()} message(s), " +
-                        $"{storage.CountStateKeys()} state key(s), {storage.CountAuditRecords()} audit record(s), " +
-                        $"memory {storage.CountMemoryEntries()} entry(ies)");
+                        $"{storage.CountStateKeys()} state key(s), {storage.CountAuditRecords()} audit record(s)");
+restore.Note("memory", memoryGroups.Error is { } memoryError
+    ? $"unreadable: {memoryError.Message}"
+    : $"{memoryGroups.Value?.Count ?? 0} group(s) under {FileScopes.Memory}/");
 // Acknowledgements owed to Adapters: published is not handled, so the mailbox file is only settled after
 // the event round it produced is over.
 var acks = new InboundAckRegistry();
