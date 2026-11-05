@@ -214,7 +214,7 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
         var errors = new List<string>();
         if (_adapters is not null && _forceBindings is not null)
         {
-            foreach (var provision in manifest.Provides.Where(p => p.TypeId.StartsWith("adapter.", StringComparison.Ordinal)))
+            foreach (var provision in manifest.Provides.Where(p => IsAdapterType(p.TypeId)))
             {
                 var addresses = _adapters.List().Where(a => a.TypeId == provision.TypeId).Select(a => a.Address).ToArray();
                 foreach (var address in addresses)
@@ -236,12 +236,16 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
                 catch (Exception ex) { errors.Add($"{provision.TypeId}: forced instance removal failed: {ex.Message}"); }
             }
         }
-        else if (manifest.Provides.Any(p => p.TypeId.StartsWith("adapter.", StringComparison.Ordinal)))
+        else if (manifest.Provides.Any(p => IsAdapterType(p.TypeId)))
         {
             errors.Add("Adapter force cleanup is unavailable; an adapter instance may still reference the package.");
         }
         return errors;
     }
+
+    /// <summary>Whether a provisioned type answers the adapter contract. Asked of the type tree, never of the spelling
+    /// of the type id: a package may call its adapter type anything it likes (C-04, C-06).</summary>
+    private bool IsAdapterType(string typeId) => _types.IsAssignableTo(typeId, "adapter");
 
     public async ValueTask<Result<ModuleReloadReport>> ReplaceAsync(
         string packageId,
