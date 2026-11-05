@@ -161,7 +161,7 @@ public sealed class PromptLibraryTests : IDisposable
     {
         var path = Write(_shipped, "人设", "标准人设", "第一版人设");
         var model = new RecordingModel();
-        var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, prompts: Library());
+        var sessions = new SessionManager(_root, model, prompts: Library());
         var spec = new SessionSpec("default", "Answer briefly.", "1", new Dictionary<string, string> { ["人设"] = "标准人设" });
         var channel = new Address("channel", "conversation", "chat-1");
 
@@ -181,7 +181,7 @@ public sealed class PromptLibraryTests : IDisposable
     public async Task A_session_whose_prompt_group_disappeared_fails_loudly()
     {
         Write(_shipped, "人设", "标准人设", "文本");
-        var sessions = new SessionManager(Path.Combine(_root, "sessions"), new RecordingModel(), prompts: Library());
+        var sessions = new SessionManager(_root, new RecordingModel(), prompts: Library());
         var spec = new SessionSpec("default", "Answer briefly.", "1", new Dictionary<string, string> { ["人设"] = "被删掉的人设" });
 
         var turn = await sessions.TurnAsync("s-gone", spec, Guid.NewGuid(),
@@ -195,7 +195,7 @@ public sealed class PromptLibraryTests : IDisposable
     public async Task A_session_that_names_no_group_sends_no_system_message()
     {
         var model = new RecordingModel();
-        var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, prompts: Library());
+        var sessions = new SessionManager(_root, model, prompts: Library());
 
         var turn = await sessions.TurnAsync("s-bare", new SessionSpec("default", "Answer briefly.", "1"),
             Guid.NewGuid(), Turn(new Address("channel", "conversation", "chat-1")), null, default);

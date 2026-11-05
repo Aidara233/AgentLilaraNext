@@ -78,7 +78,7 @@ public sealed class SessionLifecycleTests : IDisposable
         Assert.True(second.Ok, second.Error?.Message);
 
         // One Session, not two: the second Open is a lookup, and the directory is the proof.
-        Assert.Single(Directory.GetDirectories(Path.Combine(_root, "sessions")));
+        Assert.Single(Directory.GetDirectories(Path.Combine(_root, "modules")));
         Assert.Equal(first.Value!.Spec, second.Value!.Spec);
         Assert.Equal(0, second.Value!.State.StepNumber);
     }
@@ -94,8 +94,7 @@ public sealed class SessionLifecycleTests : IDisposable
 
         Assert.True(opened.Ok, opened.Error?.Message);
         Assert.Equal("default", opened.Value!.Spec.ModelProfileId);
-        Assert.Equal("default", JsonSerializer.Deserialize<SessionSpec>(
-            await File.ReadAllBytesAsync(Path.Combine(SessionPath("s-profile"), "spec.json")), Json)!.ModelProfileId);
+        Assert.Equal("default", StoredSpec("s-profile").ModelProfileId);
     }
 
     [Fact]
@@ -124,11 +123,11 @@ public sealed class SessionLifecycleTests : IDisposable
         Assert.Null(kernel.Find(new ModuleId("s-node")));
     }
 
-    private SessionManager Sessions() => new(Path.Combine(_root, "sessions"), new ScriptedModel());
+    private SessionManager Sessions() => new(_root, new ScriptedModel());
 
     private ArchiveManager Bin() => new(_root);
 
-    private string SessionPath(string sessionId) => Path.Combine(_root, "sessions", sessionId);
+    private string SessionPath(string sessionId) => Path.Combine(_root, "modules", sessionId);
 
     private static SessionTurnInput Input(Address? channel, string text) => new(
         channel is null ? [] : [new($"m-{Guid.NewGuid():N}", "user", "alice", text, DateTimeOffset.UtcNow)],
@@ -254,8 +253,7 @@ public sealed class SessionLifecycleTests : IDisposable
         Assert.Equal(Spec.Objective, reopened.Value!.Spec.Objective);
         var continued = await reopened.Value.RunTurnAsync(Guid.NewGuid(), Input(Chat, "again"), null, default);
         Assert.True(continued.Ok, continued.Error?.Detail ?? continued.Error?.Message);
-        Assert.Equal(Spec.Objective, JsonSerializer.Deserialize<SessionSpec>(
-            await File.ReadAllBytesAsync(Path.Combine(SessionPath("s-live"), "spec.json")), Json)!.Objective);
+        Assert.Equal(Spec.Objective, StoredSpec("s-live").Objective);
         // And nobody is offered it for archiving because of the difference: it is a live Session either way.
         var afterDrift = await bin.CandidatesAsync(ArchiveKinds.Session, default);
         Assert.DoesNotContain("s-live", afterDrift.Value!.Select(candidate => candidate.Id));
@@ -344,7 +342,7 @@ public sealed class SessionLifecycleTests : IDisposable
         foreach (var ghost in ghosts)
             Assert.Equal(before[ghost], Snapshot(ghost));
 
-        var directories = Directory.GetDirectories(Path.Combine(_root, "sessions"));
+        var directories = Directory.GetDirectories(Path.Combine(_root, "modules"));
         Assert.Equal(ghosts.Length + 1, directories.Length);
         Assert.Equal("channel.conversation#chat-1", StoredState("s-fresh").Channel);
     }
@@ -376,12 +374,19 @@ public sealed class SessionLifecycleTests : IDisposable
         Assert.False(string.IsNullOrWhiteSpace(outcome.Message));
     }
 
+    /// <summary>The spec as it is written down: the module file's config, which is the Session's own document.</summary>
+    private SessionSpec StoredSpec(string sessionId) =>
+        JsonSerializer.Deserialize<SessionSpec>(JsonDocument.Parse(
+                File.ReadAllBytes(Path.Combine(SessionPath(sessionId), "module.json")))
+            .RootElement.GetProperty("config").GetRawText(), Json)!;
+
     /// <summary>A Session directory as an older run would have left it: real files, a recorded Channel.</summary>
     private string WriteGhostSession(int index)
     {
         var directory = SessionPath($"s-ghost{index}");
         Directory.CreateDirectory(directory);
-        File.WriteAllText(Path.Combine(directory, "spec.json"), "{\"objective\":\"ghost\",\"formatVersion\":\"1\"}");
+        File.WriteAllText(Path.Combine(directory, "module.json"),
+            $"{{\"id\":\"s-ghost{index}\",\"type\":\"session.chat\",\"config\":{{\"objective\":\"ghost\",\"formatVersion\":\"1\"}}}}");
         File.WriteAllText(Path.Combine(directory, "state.json"),
             "{\"status\":0,\"stepNumber\":3,\"revision\":3,\"locked\":false,\"usage\":{\"inputTokens\":1,\"outputTokens\":1}," +
             "\"schemaVersion\":2,\"channel\":\"channel.conversation#ghost\"}");

@@ -142,7 +142,7 @@ public sealed class ChannelDeltaTests : IDisposable
         var contributors = new SessionExtensionRegistry();
         Assert.True(contributors.Register(new ChannelDeltaSource(delta, new StubChannels(maxMessages: null))).Ok);
         var model = new ScriptedModel();
-        var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
+        var sessions = new SessionManager(_root, model, contributors);
         var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
         var spec = new SessionSpec("default", "Answer briefly.", "1");
 
@@ -199,7 +199,7 @@ public sealed class ChannelDeltaTests : IDisposable
         var contributors = new SessionExtensionRegistry();
         Assert.True(contributors.Register(new ChannelDeltaSource(delta, new StubChannels(maxMessages: null))).Ok);
         var model = new ScriptedModel();
-        var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
+        var sessions = new SessionManager(_root, model, contributors);
         var spec = new SessionSpec("default", "Answer briefly.", "1");
 
         var turn = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(),
@@ -217,7 +217,7 @@ public sealed class ChannelDeltaTests : IDisposable
 
         // The trimmed messages are still in the session: the window is a rendering choice, not a deletion.
         Assert.Contains("the very first thing",
-            await File.ReadAllTextAsync(Path.Combine(_root, "sessions", "s-1", "history.jsonl")), StringComparison.Ordinal);
+            await File.ReadAllTextAsync(Path.Combine(_root, "modules", "s-1", "history.jsonl")), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -228,7 +228,7 @@ public sealed class ChannelDeltaTests : IDisposable
         var contributors = new SessionExtensionRegistry();
         Assert.True(contributors.Register(new ChannelDeltaSource(delta, new StubChannels(maxMessages: null))).Ok);
         var model = new ScriptedModel();
-        var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
+        var sessions = new SessionManager(_root, model, contributors);
         var spec = new SessionSpec("default", "Answer briefly.", "1");
         var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
 
@@ -238,7 +238,7 @@ public sealed class ChannelDeltaTests : IDisposable
         // A well-formed entry written behind the manager's back: a process that re-read the file on every commit
         // would pick it up. The Session keeps its context in memory, so this must stay invisible — and because
         // commits append rather than rewrite, it must still be in the file afterwards.
-        var historyPath = Path.Combine(_root, "sessions", "s-1", "history.jsonl");
+        var historyPath = Path.Combine(_root, "modules", "s-1", "history.jsonl");
         await File.AppendAllTextAsync(historyPath,
             JsonSerializer.Serialize(new SessionHistoryEntry("ghost", "ghost", 9, "user", "从外部写进来的条目",
                 new DateTimeOffset(2026, 11, 1, 9, 0, 0, TimeSpan.Zero))) + "\n");
@@ -260,7 +260,7 @@ public sealed class ChannelDeltaTests : IDisposable
         var contributors = new SessionExtensionRegistry();
         Assert.True(contributors.Register(new ChannelDeltaSource(delta, new StubChannels(maxMessages: null))).Ok);
         var model = new ScriptedModel();
-        var root = Path.Combine(_root, "sessions");
+        var root = _root;
         var spec = new SessionSpec("default", "Answer briefly.", "1");
         var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
         var manager = new SessionManager(root, model, contributors);
@@ -269,7 +269,7 @@ public sealed class ChannelDeltaTests : IDisposable
 
         // What a crash between "breadcrumb written" and "entries appended" leaves behind: state is still at the old
         // revision, the entry is not in the file, and commit.pending.json says what was about to happen.
-        var directory = Path.Combine(root, "s-1");
+        var directory = Path.Combine(root, "modules", "s-1");
         var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
         var state = JsonSerializer.Deserialize<SessionState>(await File.ReadAllTextAsync(Path.Combine(directory, "state.json")), options)!;
         var pending = new
@@ -311,7 +311,7 @@ public sealed class ChannelDeltaTests : IDisposable
         var contributors = new SessionExtensionRegistry();
         Assert.True(contributors.Register(new ChannelDeltaSource(delta, new StubChannels(maxMessages: null))).Ok);
         var model = new ScriptedModel { Failures = 1 };
-        var sessions = new SessionManager(Path.Combine(_root, "sessions"), model, contributors);
+        var sessions = new SessionManager(_root, model, contributors);
         var spec = new SessionSpec("default", "Answer briefly.", "1");
         var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
 

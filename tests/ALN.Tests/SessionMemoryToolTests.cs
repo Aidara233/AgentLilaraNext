@@ -27,7 +27,7 @@ public sealed class SessionMemoryToolTests : IDisposable
     public SessionMemoryToolTests()
     {
         _store = new SqliteStore(Path.Combine(_root, "aln.db"));
-        _sessions = new SessionManager(Path.Combine(_root, "sessions"), new ScriptedModel([]), Extensions(_store));
+        _sessions = new SessionManager(_root, new ScriptedModel([]), Extensions(_store));
     }
 
     public void Dispose()

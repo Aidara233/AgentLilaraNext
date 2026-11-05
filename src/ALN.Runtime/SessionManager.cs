@@ -31,7 +31,16 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     public const int RecentChannelMessages = 40;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _root;
-    private readonly string _legacyRoot;
+    /// <summary>
+    /// A Session's directory is <c>modules/&lt;id&gt;/</c>, like every other node's (docs/22 §2). The id stays the
+    /// bare name it always was (<c>s-&lt;hash&gt;</c>): a prefix would be a new identity for every existing Session,
+    /// and an id is a name, not a shape (docs/22 §3).
+    /// </summary>
+    private const string ModulesDirectory = "modules";
+    /// <summary>The Session's spec, wrapped the way every module file is: <c>{"id","type","config"}</c>.</summary>
+    private const string ManifestFile = "module.json";
+    private string ModulesRoot => Path.Combine(_root, ModulesDirectory);
+
     private readonly IModelManager _models;
     private readonly ISignalLog _signalLog;
     private readonly ISessionExtensionRegistry _extensions;
@@ -60,7 +69,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         ArgumentNullException.ThrowIfNull(models);
         _root = Path.GetFullPath(dataRoot);
-        _legacyRoot = Path.Combine(_root, "chat");
+
         _models = models;
         _extensions = extensions ?? new SessionExtensionRegistry();
         _signalLog = signalLog ?? NullSignalLog.Instance;
@@ -1004,13 +1013,17 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
         return await RunTurnAsync(loaded.Value, activationId, input, tools, cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>Reads spec.json, or null when it is missing or unreadable. Used to describe a Session without loading it.</summary>
+    /// <summary>Reads a Session's spec, or null when it is missing or unreadable. Used to describe a Session without loading it.</summary>
     private static SessionSpec? TryReadSpec(string directory)
     {
-        var path = Path.Combine(directory, "spec.json");
+        var path = Path.Combine(directory, ManifestFile);
         try
         {
-            return File.Exists(path) ? JsonSerializer.Deserialize<SessionSpec>(File.ReadAllBytes(path), JsonOptions) : null;
+            if (!File.Exists(path)) return null;
+            using var document = JsonDocument.Parse(File.ReadAllBytes(path));
+            return document.RootElement.TryGetProperty("config", out var config)
+                ? config.Deserialize<SessionSpec>(JsonOptions)
+                : null;
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { return null; }
     }
@@ -1165,13 +1178,9 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
         {
             // Resolve once more inside the gate: a turn may have finished while this call was waiting, and the
             // directory it is about to move has to be the one on disk right now.
-            var source = Path.Combine(_root, sessionId);
+            var source = ResolveSessionDirectory(sessionId);
             if (!Directory.Exists(source))
-            {
-                if (!Directory.Exists(Path.Combine(_legacyRoot, sessionId)))
-                    return Result.Failure(new(ErrorCode.Invalid, $"Session not found: {sessionId}"));
-                source = ResolveSessionDirectory(sessionId);
-            }
+                return Result.Failure(new(ErrorCode.Invalid, $"Session not found: {sessionId}"));
             if (Directory.Exists(destinationDirectory) || File.Exists(destinationDirectory))
                 return Result.Failure(new(ErrorCode.Conflict, $"Archive destination already exists: {destinationDirectory}"));
             Directory.Move(source, destinationDirectory);
@@ -1196,13 +1205,13 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
         {
             if (!Directory.Exists(sourceDirectory))
                 return Result.Failure(new(ErrorCode.Invalid, $"Archived session data is missing: {sourceDirectory}"));
-            var target = Path.Combine(_root, sessionId);
+            var target = ResolveSessionDirectory(sessionId);
             // Two conversations must never become one: if the id has been rebuilt since, the restore is refused
             // and somebody decides what the older history is worth.
-            if (Directory.Exists(target) || Directory.Exists(Path.Combine(_legacyRoot, sessionId)))
+            if (Directory.Exists(target))
                 return Result.Failure(new(ErrorCode.Conflict,
                     $"A session with this id exists again; restoring would merge two histories: {sessionId}"));
-            Directory.CreateDirectory(_root);
+            Directory.CreateDirectory(ModulesRoot);
             Directory.Move(sourceDirectory, target);
             // Whatever this process remembered about that id is now wrong: the directory it pointed at is gone and
             // the one that just appeared was written by some other run.
@@ -1216,7 +1225,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     }
 
     /// <summary>
-    /// The directories this manager wrote: one per Session, current location first, the legacy one second.
+    /// The directories this manager wrote: one per Session, under the module tree like every other node.
     /// Nothing walks them at startup — only deletion and maintenance do, so an instance with a thousand
     /// forgotten Sessions still starts in the time it takes to read one row.
     /// </summary>
@@ -1225,17 +1234,38 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
         // Materialised, not lazy: callers delete the very directories this walk is sitting on, and a live
         // enumeration handle over a folder being emptied is a platform-specific accident waiting to happen.
         var sessions = new List<(string, string)>();
-        foreach (var root in new[] { _root, _legacyRoot })
+        var root = ModulesRoot;
+        if (!Directory.Exists(root)) return sessions;
+        foreach (var directory in Directory.EnumerateDirectories(root).Order(StringComparer.Ordinal))
         {
-            if (!Directory.Exists(root)) continue;
-            foreach (var directory in Directory.EnumerateDirectories(root).Order(StringComparer.Ordinal))
-            {
-                // Only names this manager could have written: a stray folder in the data root is not ours.
-                var id = Path.GetFileName(directory);
-                if (IsValidSessionId(id)) sessions.Add((id, directory));
-            }
+            // Only names this manager could have written: a stray folder in the data root is not ours.
+            var id = Path.GetFileName(directory);
+            if (IsValidSessionId(id) && IsSessionDirectory(directory)) sessions.Add((id, directory));
         }
         return sessions;
+    }
+
+    /// <summary>
+    /// Whether a directory in the module tree is one of this manager's.
+    ///
+    /// The tree is shared with adapters, channels and providers now, and a directory name alone is not enough: their
+    /// ids pass the same character test. Two marks are honest here — the module file says "session.chat", or the
+    /// Session's own <c>state.json</c> is there (no other kind of module writes one). The second is what keeps a
+    /// Session with a damaged spec visible to the bin instead of silently vanishing from the list.
+    /// </summary>
+    private static bool IsSessionDirectory(string directory)
+    {
+        if (File.Exists(Path.Combine(directory, "state.json"))) return true;
+        var manifest = Path.Combine(directory, ManifestFile);
+        if (!File.Exists(manifest)) return false;
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllBytes(manifest));
+            return document.RootElement.TryGetProperty("type", out var type) &&
+                   type.ValueKind == JsonValueKind.String &&
+                   string.Equals(type.GetString(), SessionTypeId, StringComparison.Ordinal);
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { return false; }
     }
 
     /// <summary>
@@ -1307,7 +1337,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     {
         cancellationToken.ThrowIfCancellationRequested();
         Directory.CreateDirectory(directory);
-        var specPath = Path.Combine(directory, "spec.json");
+        var specPath = Path.Combine(directory, ManifestFile);
         var statePath = Path.Combine(directory, "state.json");
         var historyPath = Path.Combine(directory, "history.jsonl");
         SessionSpec persistedSpec;
@@ -1316,7 +1346,10 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
             SessionSpec? readSpec;
             try
             {
-                readSpec = JsonSerializer.Deserialize<SessionSpec>(await File.ReadAllBytesAsync(specPath, cancellationToken).ConfigureAwait(false), JsonOptions);
+                using var document = JsonDocument.Parse(await File.ReadAllBytesAsync(specPath, cancellationToken).ConfigureAwait(false));
+                readSpec = document.RootElement.TryGetProperty("config", out var config)
+                    ? config.Deserialize<SessionSpec>(JsonOptions)
+                    : null;
             }
             catch (JsonException ex)
             {
@@ -1325,7 +1358,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
                 // somebody watching a chat that quietly stops answering.
                 return Result<LoadedSession>.Failure(new(ErrorCode.Invalid,
                     $"Stored session spec cannot be read by this build: {ex.Message} " +
-                    $"Move the session out of the way (archive.move kind=session) or delete sessions/{Path.GetFileName(directory)}; " +
+                    $"Move the session out of the way (archive.move kind=session) or delete modules/{Path.GetFileName(directory)}; " +
                     "the next message will start a fresh one.",
                     ex.Message));
             }
@@ -1343,7 +1376,14 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
                 return Result<LoadedSession>.Failure(new(ErrorCode.Invalid,
                     $"No Session is called {Path.GetFileName(directory)}."));
             persistedSpec = requestedSpec;
-            await WriteAtomicJsonAsync(specPath, persistedSpec, cancellationToken).ConfigureAwait(false);
+            // Wrapped the way every module file is: the spec is this Session's configuration, and the id/type are the
+            // node's, so one file answers both "what is this directory" and "what is in it".
+            await WriteAtomicJsonAsync(specPath, new
+            {
+                id = Path.GetFileName(directory),
+                type = SessionTypeId,
+                config = persistedSpec
+            }, cancellationToken).ConfigureAwait(false);
         }
 
         SessionState state;
@@ -1901,20 +1941,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     private static bool IsContextIdValue(string? value) => value is { Length: > 0 and <= 128 } &&
         value.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-' or ':');
 
-    private string ResolveSessionDirectory(string sessionId)
-    {
-        var current = Path.Combine(_root, sessionId);
-        var legacy = Path.Combine(_legacyRoot, sessionId);
-        var currentExists = Directory.Exists(current);
-        var legacyExists = Directory.Exists(legacy);
-        if (currentExists && legacyExists) throw new IOException("Session data exists in both old and new locations.");
-        if (currentExists || !legacyExists) return current;
-        Directory.CreateDirectory(_root);
-        Directory.Move(legacy, current);
-        if (Directory.Exists(_legacyRoot) && !Directory.EnumerateFileSystemEntries(_legacyRoot).Any())
-            Directory.Delete(_legacyRoot);
-        return current;
-    }
+    private string ResolveSessionDirectory(string sessionId) => Path.Combine(ModulesRoot, sessionId);
 
     private static bool IsValidSessionId(string value) => value is { Length: > 0 and <= 128 } && value.All(c =>
         c is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9' or '-' or '_');

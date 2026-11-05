@@ -77,7 +77,7 @@ var catalog = prompts.List();
 if (catalog.Groups.Count > 0 || catalog.Warnings.Count > 0)
     restore.Note("prompts", $"{catalog.Groups.Count} group(s), {catalog.Groups.Sum(group => group.Entries.Count)} prompt(s)" +
         (catalog.Warnings.Count == 0 ? "" : $"; skipped {catalog.Warnings.Count}: {string.Join("; ", catalog.Warnings)}"));
-var sessions = new SessionManager(Path.Combine(data.Root, "sessions"), modelManager, sessionExtensions, signalLog, prompts);
+var sessions = new SessionManager(data.Root, modelManager, sessionExtensions, signalLog, prompts);
 var reloadState = new ModuleReloadStateStore();
 var hostServices = new HostServiceProvider(
     (typeof(IAdapterManager), adapters),

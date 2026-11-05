@@ -19,7 +19,7 @@ public sealed class SessionRoundContextTests : IDisposable
     {
         Assert.True(_contributors.Register(new TimeContextSource(new FixedClock())).Ok);
         Assert.True(_contributors.Register(new ChannelInfoSource()).Ok);
-        _sessions = new SessionManager(Path.Combine(_root, "sessions"), _model, _contributors);
+        _sessions = new SessionManager(_root, _model, _contributors);
     }
 
     public void Dispose()
@@ -55,7 +55,7 @@ public sealed class SessionRoundContextTests : IDisposable
             Assert.Equal(1, CountOccurrences(content, "频道地址："));
         }
 
-        var history = File.ReadAllLines(Path.Combine(_root, "sessions", "s-chat-1", "history.jsonl"));
+        var history = File.ReadAllLines(Path.Combine(_root, "modules", "s-chat-1", "history.jsonl"));
         // Floating time never becomes timeline: it would be a stale timestamp in every later request.
         Assert.DoesNotContain(history, line => line.Contains("当前时间", StringComparison.Ordinal));
         var channelInfoEntries = history.Where(line => line.Contains("\"id\":\"channel-info\"", StringComparison.Ordinal)).ToArray();

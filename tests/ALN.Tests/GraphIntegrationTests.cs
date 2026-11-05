@@ -46,7 +46,7 @@ public sealed class GraphIntegrationTests : IDisposable
         _types = _adapterTypes;
         _adapters = new AdapterManager(_types, _bindings);
         _channels = new ChannelManager(_adapters, _events, _bindings);
-        _sessions = new SessionManager(Path.Combine(_root, "sessions"), _model);
+        _sessions = new SessionManager(_root, _model);
         // The graph finds its managers through the address book, exactly as the host wires it: names in, then the
         // instance owners observed so the graph can enumerate mount targets without knowing what kinds exist.
         _catalog = ModuleWiring.With(_adapters, _channels, _clock, _sessions);
@@ -219,7 +219,7 @@ public sealed class GraphIntegrationTests : IDisposable
         var texts = Directory.GetFiles(Path.Combine(_mailbox.Root, "outbox", "chat-1"), "*.json")
             .Select(ReadOutbound).Select(m => m.Text).Order(StringComparer.Ordinal).ToArray();
         Assert.Equal(["在的", "有什么事？"], texts);
-        var spoken = Directory.GetFiles(Path.Combine(_root, "sessions"), "history.jsonl", SearchOption.AllDirectories)
+        var spoken = Directory.GetFiles(Path.Combine(_root, "modules"), "history.jsonl", SearchOption.AllDirectories)
             .SelectMany(path => File.ReadAllLines(path))
             .Select(line => JsonSerializer.Deserialize<SessionHistoryEntry>(line,
                 new JsonSerializerOptions(JsonSerializerDefaults.Web))!)

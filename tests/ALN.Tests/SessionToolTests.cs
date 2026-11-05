@@ -87,7 +87,7 @@ public sealed class SessionToolTests : IDisposable
     private static SessionSpec Spec(params ModelToolDefinition[] tools) =>
         new("default", "Answer briefly.", "1", Tools: tools);
 
-    private SessionManager Manager(IModelManager model) => new(Path.Combine(_root, "sessions"), model);
+    private SessionManager Manager(IModelManager model) => new(_root, model);
 
     [Fact]
     public async Task Text_that_was_never_spoken_does_not_reach_the_conversation_and_the_turn_is_nudged()
@@ -106,7 +106,7 @@ public sealed class SessionToolTests : IDisposable
 
         // The brake is a brake on talking, not on working: it stops after the given number of tool-less steps.
         Assert.Equal(SessionManager.TextOnlyNudgeLimit + 1, model.Requests.Count);
-        var history = await File.ReadAllLinesAsync(Path.Combine(_root, "sessions", "s-1", "history.jsonl"));
+        var history = await File.ReadAllLinesAsync(Path.Combine(_root, "modules", "s-1", "history.jsonl"));
         // Kept in the timeline as the assistant's own record …
         Assert.Contains(history, line => line.Contains("I should answer this.", StringComparison.Ordinal));
         // … but never as something the conversation saw.
@@ -187,7 +187,7 @@ public sealed class SessionToolTests : IDisposable
 
         // The conversation's own view carries it: without this the model would lose its own words the moment it
         // stopped using "the turn's text" as its reply.
-        var entries = (await File.ReadAllLinesAsync(Path.Combine(_root, "sessions", "s-1", "history.jsonl")))
+        var entries = (await File.ReadAllLinesAsync(Path.Combine(_root, "modules", "s-1", "history.jsonl")))
             .Where(line => line.Length > 0)
             .Select(line => System.Text.Json.JsonSerializer.Deserialize<SessionHistoryEntry>(line,
                 new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web))!)
@@ -212,7 +212,7 @@ public sealed class SessionToolTests : IDisposable
             new SessionTurnInput([], null, null), new Toolbox(speak), default);
         Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
 
-        var lines = (await File.ReadAllLinesAsync(Path.Combine(_root, "sessions", "s-1", "history.jsonl")))
+        var lines = (await File.ReadAllLinesAsync(Path.Combine(_root, "modules", "s-1", "history.jsonl")))
             .Where(line => line.Length > 0).ToArray();
         Assert.Contains(lines, line => line.Contains(":tool:1:call-1", StringComparison.Ordinal));
         Assert.Contains(lines, line => line.Contains(":tool:1:call-2", StringComparison.Ordinal));
@@ -220,7 +220,7 @@ public sealed class SessionToolTests : IDisposable
         // One revision per round, not one per entry — the commit is the round. (Plus the activation entry that
         // opened the turn, which is its own commit by design.)
         var state = System.Text.Json.JsonSerializer.Deserialize<SessionState>(
-            await File.ReadAllTextAsync(Path.Combine(_root, "sessions", "s-1", "state.json")),
+            await File.ReadAllTextAsync(Path.Combine(_root, "modules", "s-1", "state.json")),
             new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web))!;
         Assert.Equal(2, state.StepNumber);
         Assert.Equal(state.StepNumber + 1, state.Revision);
@@ -232,10 +232,10 @@ public sealed class SessionToolTests : IDisposable
         var model = new ScriptedModel(
             [new ToolCallDelta(0, "call-2", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
         var sessions = Manager(model);
-        var directory = Path.Combine(_root, "sessions", "s-1");
+        var directory = Path.Combine(_root, "modules", "s-1");
         Directory.CreateDirectory(directory);
-        await File.WriteAllTextAsync(Path.Combine(directory, "spec.json"),
-            """{"modelProfileId":"default","objective":"Answer briefly.","formatVersion":"1"}""");
+        await File.WriteAllTextAsync(Path.Combine(directory, "module.json"),
+            """{"id":"s-1","type":"session.chat","config":{"modelProfileId":"default","objective":"Answer briefly.","formatVersion":"1"}}""");
         await File.WriteAllTextAsync(Path.Combine(directory, "state.json"),
             """{"status":1,"stepNumber":1,"revision":2,"locked":false,"usage":{"inputTokens":1,"outputTokens":1},"schemaVersion":2}""");
         // The shape an older build left behind: the call was written, its result never was.
@@ -257,7 +257,7 @@ public sealed class SessionToolTests : IDisposable
     private async Task<System.Text.Json.JsonElement> StateAsync(string sessionId = "s-1")
     {
         using var document = System.Text.Json.JsonDocument.Parse(
-            await File.ReadAllTextAsync(Path.Combine(_root, "sessions", sessionId, "state.json")));
+            await File.ReadAllTextAsync(Path.Combine(_root, "modules", sessionId, "state.json")));
         return document.RootElement.Clone();
     }
 
@@ -451,7 +451,7 @@ public sealed class SessionToolTests : IDisposable
         Assert.Equal("user", note.Role);
         Assert.Contains("等待到期", note.Content!, StringComparison.Ordinal);
         // On disk too: the turn after this one must still know why it happened.
-        var lines = await File.ReadAllLinesAsync(Path.Combine(_root, "wake", "s-wake", "history.jsonl"));
+        var lines = await File.ReadAllLinesAsync(Path.Combine(_root, "wake", "modules", "s-wake", "history.jsonl"));
         var firstTurn = JsonSerializer.Deserialize<SessionHistoryEntry>(lines[0], new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
         Assert.Contains("没有任何人说话", firstTurn.Content!, StringComparison.Ordinal);
     }
