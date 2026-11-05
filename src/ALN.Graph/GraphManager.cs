@@ -86,7 +86,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
             var m = package.Manifest;
             if (string.IsNullOrWhiteSpace(m.Id) || !candidate.TryAdd(m.Id, package) || m.Version < 1 ||
                 string.IsNullOrWhiteSpace(m.TargetType) || !_types.IsKnownAbstract(m.TargetType) || m.Events is null || m.Events.Length == 0 ||
-                m.Events.Any(e => e is not (EventNames.AdapterEnvelope or EventNames.ChannelMessageAccepted or EventNames.ClockPulse)) || string.IsNullOrWhiteSpace(m.EntryPoint) ||
+                m.Events.Any(e => e is not (EventNames.AdapterEnvelope or EventNames.ChannelMessageAccepted)) || string.IsNullOrWhiteSpace(m.EntryPoint) ||
                 m.MaxStatements is < 1 or > 1_000_000 || m.TimeoutMilliseconds is < 1 or > 60_000 ||
                 m.MemoryLimitBytes is < 1_048_576 or > 268_435_456)
                 return Result.Failure(new(ErrorCode.Invalid, $"Invalid script manifest: {m.Id}"));
@@ -665,12 +665,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
                     Mechanism = "emit",
                     Outcome = result.Ok ? "ok" : deadline.IsCancellationRequested ? "timeout" : "failed",
                     DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds,
-                    // A successful clock pulse is a wake-up, not a fact: at Debug, so a polling adapter cannot
-                    // flood the default graph with one record per tick per mounted script. A failed one stays
-                    // at Warn because that is the interesting half.
-                    Level = !result.Ok ? SignalLevel.Warn
-                        : routedEvent.Name == EventNames.ClockPulse ? SignalLevel.Debug
-                        : SignalLevel.Info,
+                    Level = result.Ok ? SignalLevel.Info : SignalLevel.Warn,
                     Detail = result.Ok ? null : new Dictionary<string, string>
                     {
                         ["event"] = routedEvent.Name,

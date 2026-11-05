@@ -1,8 +1,5 @@
 namespace ALN.Contracts;
 
-/// <summary>One scheduler step, as it is logged.</summary>
-public sealed record ClockPulse(Guid SubscriptionId, DateTimeOffset At);
-
 /// <summary>
 /// The scheduler: it knows how often to look, not who it is looking at.
 ///
@@ -11,6 +8,9 @@ public sealed record ClockPulse(Guid SubscriptionId, DateTimeOffset At);
 /// the clock a registry of adapter addresses, so "this adapter needs a heartbeat" lived in the clock rather than in
 /// the adapter. A sink now declares its rhythm by implementing <see cref="ITriggerSink"/>, and the clock is one
 /// <see cref="ITriggerSource"/> among several possible ones.
+///
+/// There is no pulse record either: a beat is a method call on the sink (<see cref="TriggerSignal"/>), not an event
+/// anything else can subscribe to. The record that used to be here was what a routed <c>clock.pulse</c> carried.
 /// </summary>
 public interface IClockManager
 {

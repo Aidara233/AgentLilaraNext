@@ -110,7 +110,6 @@ public static class ScriptEvents
 {
     public const string AdapterEnvelope = "adapter.envelope";
     public const string ChannelMessageAccepted = "channel.message.accepted";
-    public const string ClockPulse = "clock.pulse";
 }
 public static class ScriptCapabilities
 {

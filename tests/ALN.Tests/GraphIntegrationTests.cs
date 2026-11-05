@@ -17,8 +17,8 @@ public sealed class GraphIntegrationTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-channel-tests-" + Guid.NewGuid().ToString("N"));
     private readonly SqliteStore _audit;
-    // These tests assert on the whole dispatch graph, including the clock pulses that wake the polling
-    // adapter, so they ask for Debug explicitly. The default level leaves those out on purpose.
+    // These tests assert on the whole dispatch graph, down to every queue step, so they ask for Debug explicitly.
+    // The default level leaves the noisy half out on purpose.
     private readonly SignalLog _signals = SignalLog.Open(null, new SignalLogOptions(SignalLevel.Debug));
     private readonly AdapterTypeCatalog _adapterTypes = new();
     private readonly IModuleTypeCatalog _types;
@@ -584,9 +584,9 @@ public sealed class GraphIntegrationTests : IDisposable
     }
 
     private ScriptPackage AdapterIntake() => new(
-        new("adapter.channel-intake", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope, EventNames.ClockPulse], "onEvent",
+        new("adapter.channel-intake", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
             [ScriptCapabilities.ChannelAccept, ScriptCapabilities.SelfAdapterPoll], TrustDomain.Builtin),
-        "async function onEvent(event, ctx) { if (ctx.eventName === 'clock.pulse') { await ctx.self.adapter.poll(); return; } await ctx.channel.accept(); }");
+        "async function onEvent(event, ctx) { await ctx.channel.accept(); }");
 
     /// <summary>A manual script: nothing attaches it, so it only runs once somebody mounts it by instance.</summary>
     private static ScriptPackage ManualTagger(string id, string text) => new(

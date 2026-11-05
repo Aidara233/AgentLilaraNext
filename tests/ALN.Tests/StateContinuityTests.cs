@@ -595,9 +595,9 @@ public sealed class StateContinuityTests : IDisposable
 
     private static ScriptPackage Intake() => new(
         new("adapter.channel-intake", 1, "adapter", MountMode.Default,
-            [EventNames.AdapterEnvelope, EventNames.ClockPulse], "onEvent",
+            [EventNames.AdapterEnvelope], "onEvent",
             [ScriptCapabilities.ChannelAccept, ScriptCapabilities.SelfAdapterPoll], TrustDomain.Builtin),
-        "async function onEvent(event, ctx) { if (ctx.eventName === 'clock.pulse') { await ctx.self.adapter.poll(); return; } await ctx.channel.accept(); }");
+        "async function onEvent(event, ctx) { await ctx.channel.accept(); }");
 
     /// <summary>A manual script with one fixed answer: what a mount rule is for.</summary>
     private static ScriptPackage Echo(string id, string text) => new(

@@ -6,12 +6,6 @@
 // grow a Channel, bind an Adapter and start costing model calls on its own. The drop is logged so
 // "why is the bot silent" has an answer in the signals page instead of a shrug.
 async function onEvent(event, ctx) {
-  if (ctx.eventName === "clock.pulse") {
-    // Pull-model Adapters only; a push Adapter never receives this.
-    await ctx.self.adapter.poll();
-    return;
-  }
-
   const result = JSON.parse(await ctx.channel.accept());
   if (!result.acceptedChannels) {
     ctx.log.warn("no channel bound to this conversation; message dropped", {
