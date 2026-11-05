@@ -19,9 +19,9 @@ namespace ALN.Runtime;
 /// somewhere else would be the one instance whose directory says nothing — and the day something asks "what is in
 /// <c>modules/</c>", the answer would be a lie.
 /// </summary>
-public sealed class FileModelInstanceStore(string root) : IModelInstanceStore
+public sealed class FileModelInstanceStore(string root, IModuleTypeCatalog? types = null) : IModelInstanceStore
 {
-    /// <summary>The prefix every model provider type starts with; the store only reads files that name one.</summary>
+    /// <summary>Used where a provider's type is written into its file, never to recognise one when reading.</summary>
     private const string TypePrefix = "model.";
 
     private const int MaxFileBytes = 256 * 1024;
@@ -151,6 +151,8 @@ public sealed class FileModelInstanceStore(string root) : IModelInstanceStore
     /// An address is a module id, so it is checked the way a directory name is: one segment, no separators, not
     /// "..". The name is the identity; nothing here reads a category out of it.
     /// </summary>
+    private bool Belongs(string? type) => types is not null && type is not null && types.IsAssignableTo(type, "model");
+
     private static bool TryProvider(string provider, out string id)
     {
         id = provider?.Trim() ?? "";
@@ -160,7 +162,7 @@ public sealed class FileModelInstanceStore(string root) : IModelInstanceStore
                id.StartsWith(TypePrefix, StringComparison.Ordinal);
     }
 
-    private static async ValueTask<Result<ModelInstanceEntry?>> ReadFileAsync(string path, CancellationToken cancellationToken)
+    private async ValueTask<Result<ModelInstanceEntry?>> ReadFileAsync(string path, CancellationToken cancellationToken)
     {
         var bytes = await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
         if (bytes.Length > MaxFileBytes)
@@ -171,8 +173,7 @@ public sealed class FileModelInstanceStore(string root) : IModelInstanceStore
             var root = document.RootElement;
             if (!TryText(root, "id", out var id) || !TryText(root, "type", out var type))
                 return Result<ModelInstanceEntry?>.Failure(new(ErrorCode.Invalid, $"Model configuration needs \"id\" and \"type\": {path}"));
-            if (!type.StartsWith(TypePrefix, StringComparison.Ordinal))
-                return Result<ModelInstanceEntry?>.Success(null);
+            if (!Belongs(type)) return Result<ModelInstanceEntry?>.Success(null);
             if (!Address.TryParse(id, out var address) || !address.IsInstance)
                 return Result<ModelInstanceEntry?>.Failure(new(ErrorCode.Invalid, $"Model configuration names an address that cannot be one: {id} ({path})"));
             if (!root.TryGetProperty("config", out var config) || config.ValueKind != JsonValueKind.Object)
@@ -206,14 +207,14 @@ public sealed class FileModelInstanceStore(string root) : IModelInstanceStore
     }
 
     /// <summary>Whether a file that failed to parse is one this store should be loud about.</summary>
-    private static async ValueTask<bool> NamesModelTypeAsync(string path, CancellationToken cancellationToken)
+    private async ValueTask<bool> NamesModelTypeAsync(string path, CancellationToken cancellationToken)
     {
         try
         {
             using var document = JsonDocument.Parse(await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false));
             return document.RootElement.ValueKind == JsonValueKind.Object &&
                    TryText(document.RootElement, "type", out var type) &&
-                   type.StartsWith(TypePrefix, StringComparison.Ordinal);
+                   Belongs(type);
         }
         catch (JsonException) { return false; }
     }

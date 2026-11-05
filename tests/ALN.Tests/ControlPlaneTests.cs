@@ -10,6 +10,14 @@ namespace ALN.Tests;
 public sealed class ControlPlaneTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-control-" + Guid.NewGuid().ToString("N"));
+
+    /// <summary>The type tree the model store asks "is this record a provider's" — the store never guesses by name.</summary>
+    private static IModuleTypeCatalog ModelTypes()
+    {
+        var catalog = new AdapterTypeCatalog();
+        catalog.RegisterPackageTypes("test.pack", [new("model.openai-chat", "model"), new("channel.conversation", "channel")]);
+        return catalog;
+    }
     private readonly List<AuditRecord> _audit = [];
     private readonly SignalLog _signals = SignalLog.Open(null);
     private readonly ControlPlane _plane;
@@ -465,7 +473,7 @@ public sealed class ControlPlaneTests : IDisposable
     [Fact]
     public async Task A_saved_provider_is_written_to_disk_masked_on_the_way_back_and_enough_to_run()
     {
-        var store = new FileModelInstanceStore(_root);
+        var store = new FileModelInstanceStore(_root, ModelTypes());
         var models = new FakeModels(null);
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
         Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), models,
@@ -514,7 +522,7 @@ public sealed class ControlPlaneTests : IDisposable
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
         Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null),
             _signals, new FakeGraph(), new FakeParameters(),
-            modelInstances: new FileModelInstanceStore(_root)).Ok);
+            modelInstances: new FileModelInstanceStore(_root, ModelTypes())).Ok);
 
         foreach (var id in new[] { CoreActions.ModelsProviderSave, CoreActions.ModelsProviderDestroy,
                      CoreActions.ModelsProfileCreate, CoreActions.ModelsProfileRemove })

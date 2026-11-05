@@ -16,6 +16,13 @@ public sealed class ModelConfigurationTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-models-" + Guid.NewGuid().ToString("N"));
 
+    private static IModuleTypeCatalog Types()
+    {
+        var catalog = new AdapterTypeCatalog();
+        catalog.RegisterPackageTypes("test.pack", [new("model.openai-chat", "model"), new("channel.conversation", "channel")]);
+        return catalog;
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
@@ -65,7 +72,7 @@ public sealed class ModelConfigurationTests : IDisposable
     [Fact]
     public async Task The_store_writes_reads_and_deletes_one_module_directory_per_provider()
     {
-        var store = new FileModelInstanceStore(_root);
+        var store = new FileModelInstanceStore(_root, Types());
         var spec = new ModelInstanceSpec(Json("""{"endpoint":"https://api.example.com","apiKey":"sk-real"}"""),
             [new ModelProfile("default", new Address("model", "openai-chat", "one"), "deepseek-flash")]);
 
@@ -111,7 +118,7 @@ public sealed class ModelConfigurationTests : IDisposable
         Directory.CreateDirectory(other);
         await File.WriteAllTextAsync(Path.Combine(other, "module.json"),
             """{ "id": "channel.conversation#chat", "type": "channel.conversation" }""");
-        var store = new FileModelInstanceStore(_root);
+        var store = new FileModelInstanceStore(_root, Types());
 
         var loaded = await store.LoadAllAsync(default);
 
@@ -122,7 +129,7 @@ public sealed class ModelConfigurationTests : IDisposable
     [Fact]
     public async Task A_name_that_is_a_path_is_refused_rather_than_written_through()
     {
-        var store = new FileModelInstanceStore(_root);
+        var store = new FileModelInstanceStore(_root, Types());
 
         foreach (var provider in new[] { "model.openai-chat#../escape", "model.openai-chat#a/b", "chat#one", "", "..", "model.openai-chat" })
         {
@@ -136,7 +143,7 @@ public sealed class ModelConfigurationTests : IDisposable
     [Fact]
     public async Task Configuration_that_is_not_an_object_is_refused_by_the_store()
     {
-        var store = new FileModelInstanceStore(_root);
+        var store = new FileModelInstanceStore(_root, Types());
         var saved = await store.SaveAsync("model.openai-chat#one", new ModelInstanceSpec(Json("\"just a string\"")), default);
         Assert.Equal(ErrorCode.Invalid, saved.Error!.Code);
     }
@@ -144,7 +151,7 @@ public sealed class ModelConfigurationTests : IDisposable
     [Fact]
     public async Task A_disabled_instance_is_loaded_but_not_meant_to_run()
     {
-        var store = new FileModelInstanceStore(_root);
+        var store = new FileModelInstanceStore(_root, Types());
         Assert.True((await store.SaveAsync("model.openai-chat#off", new ModelInstanceSpec(Json("{}"), null, Enabled: false), default)).Ok);
 
         var entry = Assert.Single((await store.LoadAllAsync(default)).Value!);

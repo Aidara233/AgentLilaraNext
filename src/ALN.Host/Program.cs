@@ -144,7 +144,7 @@ if (!modelPackage.Ok)
     return 1;
 }
 // The store's root is the data root, not <root>/models: a provider is a module directory like everything else.
-var modelInstances = new FileModelInstanceStore(data.Root);
+var modelInstances = new FileModelInstanceStore(data.Root, adapterTypes);
 var modelConfiguration = await LoadModelConfigurationAsync(modelInstances);
 if (!modelConfiguration.Ok)
 {
