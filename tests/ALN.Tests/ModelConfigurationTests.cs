@@ -63,43 +63,71 @@ public sealed class ModelConfigurationTests : IDisposable
     }
 
     [Fact]
-    public async Task The_store_writes_reads_and_deletes_one_file_per_instance()
+    public async Task The_store_writes_reads_and_deletes_one_module_directory_per_provider()
     {
-        var store = new FileModelInstanceStore(Path.Combine(_root, "models"));
+        var store = new FileModelInstanceStore(_root);
         var spec = new ModelInstanceSpec(Json("""{"endpoint":"https://api.example.com","apiKey":"sk-real"}"""),
             [new ModelProfile("default", new Address("model", "openai-chat", "one"), "deepseek-flash")]);
 
-        Assert.True((await store.SaveAsync("chat", "one", spec, default)).Ok);
-        Assert.True(File.Exists(Path.Combine(_root, "models", "chat", "one.json")));
+        Assert.True((await store.SaveAsync("model.openai-chat#one", spec, default)).Ok);
+        // The directory is the node's id, and the file is the one the kernel would also read — that is the point of
+        // moving it here: a provider is not the one module whose directory says nothing (docs/22 §2).
+        var manifest = Path.Combine(_root, "modules", "model.openai-chat#one", "module.json");
+        Assert.True(File.Exists(manifest));
 
-        var read = await store.ReadAsync("chat", "one", default);
-        Assert.True(read.Ok, read.Error?.Message);
+        var read = await store.ReadAsync("model.openai-chat#one", default);
+        Assert.True(read.Error is null, read.Error?.Message);
         Assert.Equal("deepseek-flash", Assert.Single(read.Value!.Profiles!).ModelId);
 
-        // The file is the shape the startup loader reads: enabled/configuration/profiles, camelCase.
-        using var document = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(_root, "models", "chat", "one.json")));
-        Assert.True(document.RootElement.GetProperty("enabled").GetBoolean());
-        Assert.True(document.RootElement.TryGetProperty("configuration", out _));
+        // The file is the shape the loader reads: id, type, and the domain's payload under config.
+        using var document = JsonDocument.Parse(await File.ReadAllTextAsync(manifest));
+        Assert.Equal("model.openai-chat#one", document.RootElement.GetProperty("id").GetString());
+        Assert.Equal("model.openai-chat", document.RootElement.GetProperty("type").GetString());
+        var config = document.RootElement.GetProperty("config");
+        Assert.True(config.GetProperty("enabled").GetBoolean());
+        Assert.True(config.TryGetProperty("configuration", out _));
+        Assert.True(config.TryGetProperty("profiles", out _));
 
         var loaded = (await store.LoadAllAsync(default)).Value!;
         var entry = Assert.Single(loaded);
-        Assert.Equal(("chat", "one"), (entry.Category, entry.Instance));
+        Assert.Equal("model.openai-chat", entry.TypeId);
+        Assert.Equal("model.openai-chat#one", entry.Provider.ToString());
 
-        Assert.True((await store.DeleteAsync("chat", "one", default)).Ok);
-        Assert.True((await store.DeleteAsync("chat", "one", default)).Ok);
+        Assert.True((await store.DeleteAsync("model.openai-chat#one", default)).Ok);
+        Assert.True((await store.DeleteAsync("model.openai-chat#one", default)).Ok);
         Assert.Empty((await store.LoadAllAsync(default)).Value!);
-        Assert.Null((await store.ReadAsync("chat", "one", default)).Value);
+        // The configuration was the only thing in it, so the directory goes with it. A provider that left something
+        // else behind keeps its directory.
+        Assert.False(Directory.Exists(Path.Combine(_root, "modules", "model.openai-chat#one")));
+        Assert.Null((await store.ReadAsync("model.openai-chat#one", default)).Value);
+    }
+
+    [Fact]
+    public async Task Another_kind_of_module_in_the_same_tree_is_not_read_as_a_provider()
+    {
+        // The store looks at every module directory, and most of them are not providers. Reading one of those as
+        // model configuration would decide whose file it is by guessing, which is the same as being wrong sometimes.
+        var other = Path.Combine(_root, "modules", "channel.conversation#chat");
+        Directory.CreateDirectory(other);
+        await File.WriteAllTextAsync(Path.Combine(other, "module.json"),
+            """{ "id": "channel.conversation#chat", "type": "channel.conversation" }""");
+        var store = new FileModelInstanceStore(_root);
+
+        var loaded = await store.LoadAllAsync(default);
+
+        Assert.True(loaded.Error is null, loaded.Error?.Message);
+        Assert.Empty(loaded.Value!);
     }
 
     [Fact]
     public async Task A_name_that_is_a_path_is_refused_rather_than_written_through()
     {
-        var store = new FileModelInstanceStore(Path.Combine(_root, "models"));
+        var store = new FileModelInstanceStore(_root);
 
-        foreach (var (category, instance) in new[] { ("..", "one"), ("chat", "../escape"), ("chat", "a/b"), ("", "x") })
+        foreach (var provider in new[] { "model.openai-chat#../escape", "model.openai-chat#a/b", "chat#one", "", "..", "model.openai-chat" })
         {
-            var saved = await store.SaveAsync(category, instance, new ModelInstanceSpec(Json("{}")), default);
-            Assert.False(saved.Ok, $"{category}/{instance} should not be writable");
+            var saved = await store.SaveAsync(provider, new ModelInstanceSpec(Json("{}")), default);
+            Assert.False(saved.Ok, $"{provider} should not be writable");
             Assert.Equal(ErrorCode.Invalid, saved.Error!.Code);
         }
         Assert.False(Directory.Exists(Path.Combine(_root, "escape")));
@@ -108,16 +136,16 @@ public sealed class ModelConfigurationTests : IDisposable
     [Fact]
     public async Task Configuration_that_is_not_an_object_is_refused_by_the_store()
     {
-        var store = new FileModelInstanceStore(Path.Combine(_root, "models"));
-        var saved = await store.SaveAsync("chat", "one", new ModelInstanceSpec(Json("\"just a string\"")), default);
+        var store = new FileModelInstanceStore(_root);
+        var saved = await store.SaveAsync("model.openai-chat#one", new ModelInstanceSpec(Json("\"just a string\"")), default);
         Assert.Equal(ErrorCode.Invalid, saved.Error!.Code);
     }
 
     [Fact]
     public async Task A_disabled_instance_is_loaded_but_not_meant_to_run()
     {
-        var store = new FileModelInstanceStore(Path.Combine(_root, "models"));
-        Assert.True((await store.SaveAsync("chat", "off", new ModelInstanceSpec(Json("{}"), null, Enabled: false), default)).Ok);
+        var store = new FileModelInstanceStore(_root);
+        Assert.True((await store.SaveAsync("model.openai-chat#off", new ModelInstanceSpec(Json("{}"), null, Enabled: false), default)).Ok);
 
         var entry = Assert.Single((await store.LoadAllAsync(default)).Value!);
         Assert.False(entry.Spec.Enabled);

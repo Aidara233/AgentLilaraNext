@@ -31,7 +31,8 @@ public sealed record ModelProfile(
     SamplingSettings? DefaultSampling = null);
 
 /// <summary>
-/// One model provider instance as it is written on disk: <c>models/&lt;category&gt;/&lt;instance&gt;.json</c>.
+/// One model provider instance as it is written on disk: <c>modules/&lt;type&gt;#&lt;instance&gt;/module.json</c>, with
+/// the provider's own settings under <c>config.configuration</c> (docs/22 §2).
 ///
 /// The file, not the running manager, is the thing an operator edits — a key is rotated in a file and the process
 /// is restarted, because a provider holds its connection. Keeping the shape in the contracts is what lets the
@@ -42,10 +43,18 @@ public sealed record ModelProfile(
 /// <param name="Enabled">False keeps the file as documentation and loads nothing.</param>
 public sealed record ModelInstanceSpec(JsonElement Configuration, IReadOnlyList<ModelProfile>? Profiles = null, bool Enabled = true);
 
-/// <summary>One instance file, named the way the loader finds it.</summary>
-public sealed record ModelInstanceEntry(string Category, string Instance, ModelInstanceSpec Spec);
+/// <summary>One instance's file, named by the node it configures: <c>modules/model.openai-chat#one/module.json</c>.</summary>
+/// <param name="TypeId">The provider type the file declares — what the manager builds, not something derived from the id.</param>
+/// <param name="Provider">The instance address, which is also the module id and the directory name (docs/22 §2).</param>
+public sealed record ModelInstanceEntry(string TypeId, Address Provider, ModelInstanceSpec Spec);
 
-/// <summary>The model configuration tree, as files. Nothing here knows how to talk to a provider.</summary>
+/// <summary>
+/// The model configuration, as module directories. Nothing here knows how to talk to a provider.
+///
+/// Keyed by the provider's module id (its address) and not by category: a category is a grouping the settings page
+/// uses, while the file has to sit in the directory named after the node it configures. Two keys for one thing is
+/// how a save ends up writing a file the loader never reads.
+/// </summary>
 public interface IModelInstanceStore
 {
     ValueTask<Result<IReadOnlyList<ModelInstanceEntry>>> LoadAllAsync(CancellationToken cancellationToken);
@@ -54,13 +63,13 @@ public interface IModelInstanceStore
     /// Null when no such file — an absent instance is not an error, but note that <c>Ok</c> is false for a null Value
     /// (that is how Result<T> is defined): decide with <c>Error is null</c>, not with <c>Ok</c>.
     /// </summary>
-    ValueTask<Result<ModelInstanceSpec?>> ReadAsync(string category, string instance, CancellationToken cancellationToken);
+    ValueTask<Result<ModelInstanceSpec?>> ReadAsync(string provider, CancellationToken cancellationToken);
 
-    /// <summary>Writes the file, creating the category directory when needed.</summary>
-    ValueTask<Result> SaveAsync(string category, string instance, ModelInstanceSpec spec, CancellationToken cancellationToken);
+    /// <summary>Writes the file, creating the module directory when needed.</summary>
+    ValueTask<Result> SaveAsync(string provider, ModelInstanceSpec spec, CancellationToken cancellationToken);
 
-    /// <summary>Deletes the file. Deleting what is not there is a success, the same way forgetting a key is.</summary>
-    ValueTask<Result> DeleteAsync(string category, string instance, CancellationToken cancellationToken);
+    /// <summary>Deletes the file (and the directory it was the only thing in). Absent is a success.</summary>
+    ValueTask<Result> DeleteAsync(string provider, CancellationToken cancellationToken);
 }
 
 /// <summary>

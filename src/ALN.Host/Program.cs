@@ -141,7 +141,8 @@ if (!modelPackage.Ok)
     Console.Error.WriteLine(modelPackage.Error?.Message ?? "OpenAI Chat provider module failed to load.");
     return 1;
 }
-var modelInstances = new FileModelInstanceStore(Path.Combine(data.Root, "models"));
+// The store's root is the data root, not <root>/models: a provider is a module directory like everything else.
+var modelInstances = new FileModelInstanceStore(data.Root);
 var modelConfiguration = await LoadModelConfigurationAsync(modelInstances);
 if (!modelConfiguration.Ok)
 {
@@ -491,8 +492,11 @@ async Task<Result> LoadModelConfigurationAsync(IModelInstanceStore store)
     foreach (var entry in loaded.Value)
     {
         if (!entry.Spec.Enabled) continue;
-        var createdProvider = await modelManager.CreateAsync(entry.Category, entry.Instance,
-            entry.Spec.Configuration.GetRawText(), CancellationToken.None);
+        // The type comes from the file, not from a category lookup: the file is what somebody wrote, and a loader
+        // that re-derives the type here would be a second opinion about which provider this directory configures.
+        var createdProvider = await modelManager.CreateAsync(
+            new ModelProviderSpec(entry.Provider, entry.Spec.Configuration.GetRawText(), entry.TypeId),
+            CancellationToken.None);
         if (!createdProvider.Ok || createdProvider.Value is null) return Result.Failure(createdProvider.Error!);
         var providerAddress = createdProvider.Value.Address;
         foreach (var profile in entry.Spec.Profiles ?? [])

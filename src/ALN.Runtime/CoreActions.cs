@@ -645,7 +645,7 @@ public static class CoreActions
             if (modelInstances is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "No model instance store is configured."));
             var named = ReadModelName(arguments, out var error);
             if (named is null) return Result<JsonElement>.Failure(error!);
-            var stored = await modelInstances.ReadAsync(named.Value.Category, named.Value.Instance, ct).ConfigureAwait(false);
+            var stored = await modelInstances.ReadAsync(named.Value.Address, ct).ConfigureAwait(false);
             // "No such file" is Success(null), so the test is Error, not Ok: a nullable Value makes Ok false by itself.
             if (stored.Error is { } storedError) return Result<JsonElement>.Failure(storedError);
             var running = models.List().Any(provider => provider.Address.ToString() == named.Value.Address);
@@ -678,7 +678,7 @@ public static class CoreActions
             if (!arguments.TryGetProperty("configuration", out var configuration) || configuration.ValueKind != JsonValueKind.Object)
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "models.provider.save requires 'configuration' as a JSON object."));
 
-            var existing = await modelInstances.ReadAsync(named.Value.Category, named.Value.Instance, ct).ConfigureAwait(false);
+            var existing = await modelInstances.ReadAsync(named.Value.Address, ct).ConfigureAwait(false);
             if (existing.Error is { } existingError) return Result<JsonElement>.Failure(existingError);
             // A *** the caller could not read back means "leave it alone" — otherwise every save erases the key.
             var merged = existing.Value is null
@@ -710,7 +710,7 @@ public static class CoreActions
 
             var enabled = !arguments.TryGetProperty("enabled", out var enabledItem) || enabledItem.ValueKind != JsonValueKind.False;
             var spec = new ModelInstanceSpec(merged, profiles, enabled);
-            var saved = await modelInstances.SaveAsync(named.Value.Category, named.Value.Instance, spec, ct).ConfigureAwait(false);
+            var saved = await modelInstances.SaveAsync(named.Value.Address, spec, ct).ConfigureAwait(false);
             if (!saved.Ok) return Result<JsonElement>.Failure(saved.Error!);
 
             // A provider that is not running yet can be built right now, so a freshly added key is usable without a
@@ -740,7 +740,7 @@ public static class CoreActions
                 var destroyed = await models.DestroyAsync(new Address("model", named.Value.Kind, named.Value.Instance), ct).ConfigureAwait(false);
                 if (!destroyed.Ok) return Result<JsonElement>.Failure(destroyed.Error!);
             }
-            var deleted = await modelInstances.DeleteAsync(named.Value.Category, named.Value.Instance, ct).ConfigureAwait(false);
+            var deleted = await modelInstances.DeleteAsync(named.Value.Address, ct).ConfigureAwait(false);
             return deleted.Ok
                 ? Result<JsonElement>.Success(ToJson(new { address = named.Value.Address, destroyed = true, wasRunning = running }))
                 : Result<JsonElement>.Failure(deleted.Error!);
@@ -765,16 +765,16 @@ public static class CoreActions
 
             // The live registry is not the file: a profile that is not written down dies at the next restart, and
             // "it worked until we restarted" is the worst kind of configuration bug.
-            if (modelInstances is not null && Address.TryParse(provider.Value.ToString(), out var address) && address.Kind is { } kind && address.Instance is { } instance)
+            if (modelInstances is not null && provider.Value.IsInstance)
             {
-                var stored = await modelInstances.ReadAsync(CategoryOfKind(kind), instance, ct).ConfigureAwait(false);
+                var stored = await modelInstances.ReadAsync(provider.Value.ToString(), ct).ConfigureAwait(false);
                 if (stored.Error is null && stored.Value is { } spec)
                 {
                     // The provider is implied by the file it lives in, so the stored profile leaves it empty: a file that
                     // repeats its own address is a file that can disagree with its own directory.
                     var profiles = (spec.Profiles ?? []).Where(profile => profile.Id != id.Trim())
                         .Append(new ModelProfile(id.Trim(), default, model.Trim(), sampling)).ToArray();
-                    var saved = await modelInstances.SaveAsync(CategoryOfKind(kind), instance,
+                    var saved = await modelInstances.SaveAsync(provider.Value.ToString(),
                         spec with { Profiles = profiles }, ct).ConfigureAwait(false);
                     if (!saved.Ok) return Result<JsonElement>.Failure(saved.Error!);
                 }
@@ -796,7 +796,7 @@ public static class CoreActions
                     foreach (var entry in entries.Where(entry => (entry.Spec.Profiles ?? []).Any(profile => profile.Id == id.Trim())))
                     {
                         var profiles = (entry.Spec.Profiles ?? []).Where(profile => profile.Id != id.Trim()).ToArray();
-                        var saved = await modelInstances.SaveAsync(entry.Category, entry.Instance, entry.Spec with { Profiles = profiles }, ct)
+                        var saved = await modelInstances.SaveAsync(entry.Provider.ToString(), entry.Spec with { Profiles = profiles }, ct)
                             .ConfigureAwait(false);
                         if (!saved.Ok) return Result<JsonElement>.Failure(saved.Error!);
                     }

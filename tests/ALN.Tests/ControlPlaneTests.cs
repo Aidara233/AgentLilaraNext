@@ -438,7 +438,7 @@ public sealed class ControlPlaneTests : IDisposable
     [Fact]
     public async Task A_saved_provider_is_written_to_disk_masked_on_the_way_back_and_enough_to_run()
     {
-        var store = new FileModelInstanceStore(Path.Combine(_root, "models"));
+        var store = new FileModelInstanceStore(_root);
         var models = new FakeModels(null);
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
         Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), models,
@@ -475,8 +475,8 @@ public sealed class ControlPlaneTests : IDisposable
                 configuration = new { endpoint = "https://api.example.com", apiKey = "***" }
             }), default);
         Assert.True(resaved.Ok, resaved.Error?.Message);
-        using var stored = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(_root, "models", "chat", "one.json")));
-        Assert.Equal("sk-real", stored.RootElement.GetProperty("configuration").GetProperty("apiKey").GetString());
+        using var stored = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(_root, "modules", "model.openai-chat#one", "module.json")));
+        Assert.Equal("sk-real", stored.RootElement.GetProperty("config").GetProperty("configuration").GetProperty("apiKey").GetString());
         // This one was already running: its configuration lives in memory, so the honest answer is "restart".
         Assert.Equal("restart", resaved.Value.GetProperty("applied").GetString());
     }
@@ -487,7 +487,7 @@ public sealed class ControlPlaneTests : IDisposable
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
         Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null),
             _signals, new FakeGraph(), new FakeParameters(),
-            modelInstances: new FileModelInstanceStore(Path.Combine(_root, "models"))).Ok);
+            modelInstances: new FileModelInstanceStore(_root)).Ok);
 
         foreach (var id in new[] { CoreActions.ModelsProviderSave, CoreActions.ModelsProviderDestroy,
                      CoreActions.ModelsProfileCreate, CoreActions.ModelsProfileRemove })
