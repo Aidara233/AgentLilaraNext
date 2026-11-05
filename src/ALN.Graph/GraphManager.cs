@@ -71,7 +71,6 @@ public sealed class GraphManager : IGraphRuntime, IModule
 
     private IAdapterManager Adapters => Require<IAdapterManager>(ModuleNames.AdapterManager);
     private IChannelManager Channels => Require<IChannelManager>(ModuleNames.ChannelManager);
-    private IClockManager Clock => Require<IClockManager>(ModuleNames.Clock);
     private IModelManager? Models => Maybe<IModelManager>(ModuleNames.ModelManager, "model");
     private ISessionManager? Sessions => Maybe<ISessionManager>(ModuleNames.SessionManager, "session");
 
@@ -648,7 +647,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
                 Result result;
                 using (SignalScope.Enter(invocationId, routedEvent.EventId))
                 {
-                    var api = new ScriptApi(Adapters, Channels, Clock, _audit, _signalLog, Models, Sessions, mount, routedEvent,
+                    var api = new ScriptApi(Adapters, Channels, _audit, _signalLog, Models, Sessions, mount, routedEvent,
                         stateScopes[handlerIndex], _state, deadline.Token);
                     result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
                 }
@@ -722,7 +721,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
     }
 
 
-    private sealed class ScriptApi(IAdapterManager adapters, IChannelManager channels, IClockManager clock, IAuditSink audit,
+    private sealed class ScriptApi(IAdapterManager adapters, IChannelManager channels, IAuditSink audit,
         ISignalLog signalLog, IModelManager? models, ISessionManager? sessions, MountedScript mount, RoutedEvent current,
         string? stateScope, IStateStore? state, CancellationToken ct) : IScriptApi
     {

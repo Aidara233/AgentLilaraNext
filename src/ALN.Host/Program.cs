@@ -360,6 +360,10 @@ foreach (var issue in receipt.Issues)
     Console.Error.WriteLine($"startup issue: {issue.Path} — {issue.Message}");
 restore.Note("graph", $"{receipt.Ready}/{receipt.Nodes.Count} ready, {receipt.WiredEdges} edge(s) wired" +
     (receipt.Degraded == 0 ? "" : $", degraded {receipt.Degraded}"));
+// A trigger is not an edge, so it does not show up in the line above; printing it is what keeps "who pushes this
+// adapter" from being a fact only the clock knows (docs/22 §1.4).
+foreach (var rhythm in receipt.Rhythms)
+    restore.Note("rhythm", rhythm.Line);
 // What the address book can answer for once everything is running, instances included. A catalog whose instances
 // are only in somebody else's dictionary would look identical from the outside — until something asks.
 var liveInstances = modules.List()
@@ -386,7 +390,7 @@ if (receipt.Ready == 0)
 // The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
 // WebUI itself — it exposes actions, and a separate project consumes them.
 var controlPlane = new ControlPlane(auditSink, signalLog);
-var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes, modelInstances);
+var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes, modelInstances, graphStatus: () => kernel.Status);
 if (!actionsRegistered.Ok)
 {
     Console.Error.WriteLine(actionsRegistered.Error?.Message ?? "Action registration failed.");

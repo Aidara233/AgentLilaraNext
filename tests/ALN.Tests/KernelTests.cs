@@ -602,12 +602,40 @@ public sealed class KernelTests : IDisposable
         Assert.True(kernel.Declare(ticker).Ok);
         Assert.True(kernel.Declare(new PassiveNode(new ModuleId("Clock"), source), typeId: "clock").Ok);
 
-        Assert.True((await kernel.StartAsync(default)).Ok);
+        var receipt = await Start(kernel);
 
         Assert.Equal([new ModuleId("adapter.file#one")], source.Attached);
         Assert.Empty(source.DetachedIds);
+        // A trigger is not an edge, so it is its own line: what a reader cannot see anywhere else is who pushes
+        // whom, and at what pace.
+        var rhythm = Assert.Single(receipt.Rhythms);
+        Assert.Equal(new ModuleId("adapter.file#one"), rhythm.Sink);
+        Assert.Equal(TimeSpan.FromMilliseconds(200), rhythm.Interval);
+        Assert.Equal("Clock", rhythm.Source);
+        Assert.Equal("adapter.file#one 200ms by Clock", rhythm.Line);
+
         Assert.True((await kernel.RemoveAsync(new ModuleId("adapter.file#one"), default)).Ok);
         Assert.Contains(new ModuleId("adapter.file#one"), source.DetachedIds);
+        Assert.Empty(kernel.Rhythms);
+    }
+
+    [Fact]
+    public async Task A_source_that_refuses_a_sink_leaves_no_rhythm_behind()
+    {
+        // The receipt is the kernel's claim about calls it actually made. A refused attach that still showed up as
+        // "on a schedule" would be the one lie a reader would never catch: the schedule would just look quiet.
+        var source = new CountingSource { Refuse = true };
+        var signals = new RecordingSignals();
+        var kernel = new Kernel(new ModuleManifestStore(_root), _types, signals);
+        Assert.True(kernel.Declare(new TickingModule(new("adapter.file#one"))).Ok);
+        Assert.True(kernel.Declare(new PassiveNode(new ModuleId("Clock"), source), typeId: "clock").Ok);
+
+        var receipt = await Start(kernel);
+
+        Assert.Empty(receipt.Rhythms);
+        Assert.Empty(kernel.Rhythms);
+        // Refused, not silent: the same rule as a bad edge.
+        Assert.Contains(signals.Records, record => record.Name == "trigger" && record.Level == SignalLevel.Warn);
     }
 
     [Fact]
@@ -629,15 +657,34 @@ public sealed class KernelTests : IDisposable
         Assert.Empty(pushOnly.Attached);
     }
 
+    [Fact]
+    public async Task The_live_graph_is_what_the_receipt_said_and_not_only_a_startup_memory()
+    {
+        // A degraded system looks exactly like a whole one from outside, so the number has to be readable after the
+        // startup log is gone — otherwise "health check" means "somebody reads the log".
+        Add(new TestMaster(new("master")), "test.master", slaves: ["gone"]);
+        var kernel = new Kernel(_root, _types);
+
+        var receipt = await Start(kernel);
+
+        Assert.Equal(receipt.Degraded, kernel.Status.Degraded);
+        Assert.Equal(receipt.Nodes.Count, kernel.Status.Nodes);
+        Assert.Equal(receipt.Ready, kernel.Status.Ready);
+        var edge = Assert.Single(kernel.Status.BadEdges);
+        Assert.Equal(BadEdgeReason.MissingModule, edge.Reason);
+    }
+
     private sealed class CountingSource : ITriggerSource
     {
         public string Source => "Clock";
         public bool CanScheduleOverride { get; init; } = true;
         public bool CanSchedule => CanScheduleOverride;
+        public bool Refuse { get; init; }
         public List<ModuleId> Attached { get; } = [];
         public List<ModuleId> DetachedIds { get; } = [];
         public Result Attach(ModuleId sink, ITriggerSink trigger)
         {
+            if (Refuse) return Result.Failure(new(ErrorCode.Invalid, "not taking this one"));
             Attached.Add(sink);
             return Result.Success();
         }

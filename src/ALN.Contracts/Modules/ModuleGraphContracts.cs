@@ -143,6 +143,34 @@ public sealed record ModuleIssue(string Path, string Message);
 /// <summary>One node as the receipt reports it: what it is, where it got to, and why it stopped.</summary>
 public sealed record ModuleNodeInfo(ModuleId Id, string Type, ModulePhase Phase, string? Failure = null);
 
+/// <summary>
+/// The graph as it stands right now, for surfaces that cannot see the startup receipt — <c>system.info</c> is the
+/// one that matters, because a health check that has to read the log is not a health check (docs/22 §5.2).
+///
+/// It is a snapshot of the same four numbers the receipt carries, plus the rhythm lines: a runtime addition or
+/// removal changes them, and the point of asking later is to see that change.
+/// </summary>
+public sealed record ModuleGraphStatus(
+    int Nodes,
+    int Ready,
+    int Degraded,
+    IReadOnlyList<RhythmInfo> Rhythms,
+    IReadOnlyList<BadEdge> BadEdges);
+
+/// <summary>
+/// One sink that is actually on a schedule, and what pushes it (docs/22 §1.4).
+///
+/// A trigger is not an edge, so the receipt cannot draw it — but "this adapter looks at its inbox every 200ms, and
+/// the clock is what makes it" is the kind of fact that has no other place to live: it is not in a file (nobody
+/// declares it), and it changes while the process runs (a script may become the one pushing). So it is reported,
+/// next to the edges, as a run-time fact instead of being modelled as a relation.
+/// </summary>
+public sealed record RhythmInfo(ModuleId Sink, TimeSpan Interval, string Source)
+{
+    /// <summary>The one line a reader gets: <c>adapter.file#file-1 200ms by Clock</c>.</summary>
+    public string Line => $"{Sink} {Interval.TotalMilliseconds:0}ms by {Source}";
+}
+
 /// <summary>A strongly connected component with more than one member: modules that can only be ready together.</summary>
 public sealed record CycleInfo(IReadOnlyList<ModuleId> Members);
 
@@ -150,13 +178,16 @@ public sealed record CycleInfo(IReadOnlyList<ModuleId> Members);
 /// What one startup produced. Four separate sections, never collapsed into a single ok/not-ok (docs/22 §5.2):
 /// a system that came up minus two edges is a different system from the one that was written down, and the only
 /// way to know which one is running is for the startup to say so.
+///
+/// <see cref="Rhythms"/> is the fifth: not an edge, not a node, but the thing that makes a polling module move.
 /// </summary>
 public sealed record ModuleReceipt(
     IReadOnlyList<ModuleNodeInfo> Nodes,
     int WiredEdges,
     IReadOnlyList<BadEdge> BadEdges,
     IReadOnlyList<CycleInfo> Cycles,
-    IReadOnlyList<ModuleIssue> Issues)
+    IReadOnlyList<ModuleIssue> Issues,
+    IReadOnlyList<RhythmInfo> Rhythms)
 {
     public int Ready => Nodes.Count(node => node.Phase == ModulePhase.Ready);    public int Failed => Nodes.Count(node => node.Phase is ModulePhase.Failed or ModulePhase.Error);
 

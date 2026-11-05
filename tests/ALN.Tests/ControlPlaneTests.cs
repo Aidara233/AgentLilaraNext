@@ -101,6 +101,44 @@ public sealed class ControlPlaneTests : IDisposable
     }
 
     [Fact]
+    public async Task System_info_reports_the_live_graph_in_the_same_words_as_the_receipt()
+    {
+        var status = new ModuleGraphStatus(9, 8, 1,
+            [new(new ModuleId("adapter.file#one"), TimeSpan.FromMilliseconds(200), "Clock")],
+            [new(new ModuleId("channel.conversation#chat"), new ModuleId("adapter.file#gone"), BadEdgeReason.MissingModule, "No module answers to it.")]);
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null), _signals,
+            new FakeGraph(), new FakeParameters(), graphStatus: () => status).Ok);
+
+        var info = await Raw(plane);
+        Assert.Equal(9, info.GetProperty("nodes").GetInt32());
+        Assert.Equal(8, info.GetProperty("ready").GetInt32());
+        // The number a health check can look at, when nobody is reading the startup log any more.
+        Assert.Equal(1, info.GetProperty("degraded").GetInt32());
+        // The line, not a re-formatted number: the schedule already decided how to say this.
+        Assert.Equal("adapter.file#one 200ms by Clock",
+            Assert.Single(info.GetProperty("rhythm").EnumerateArray()).GetString());
+        var edge = Assert.Single(info.GetProperty("badEdges").EnumerateArray());
+        Assert.Equal("missingModule", edge.GetProperty("reason").GetString());
+        Assert.Equal("adapter.file#gone", edge.GetProperty("slave").GetString());
+
+        // Nothing scheduled and a healthy graph is an empty list and a zero, never a missing property: a client must
+        // not have to special-case "the core forgot to say".
+        status = new(3, 3, 0, [], []);
+        var quiet = await Raw(plane);
+        Assert.Empty(quiet.GetProperty("rhythm").EnumerateArray());
+        Assert.Equal(0, quiet.GetProperty("degraded").GetInt32());
+    }
+
+    private async Task<JsonElement> Raw(ControlPlane plane)
+    {
+        var result = await plane.InvokeAsync(User("system.read"), CoreActions.SystemInfo, default, default);
+        Assert.True(result.Ok, result.Error?.Message);
+        using var document = JsonDocument.Parse(result.Value.GetRawText());
+        return document.RootElement.Clone();
+    }
+
+    [Fact]
     public void Api_settings_authenticate_by_digest_and_never_store_the_token()
     {
         Directory.CreateDirectory(Path.Combine(_root, "api"));

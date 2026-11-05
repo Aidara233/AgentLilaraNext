@@ -59,19 +59,41 @@ public static class CoreActions
     public static Result RegisterAll(ControlPlane plane, IAdapterManager adapters, IChannelManager channels,
         IModelManager models, ISignalLog signals, IGraphRuntime graph, IParameterRegistry parameters,
         IModuleCatalog? modules = null, ISessionManager? sessions = null, IArchiveRegistry? archive = null,
-        IPromptLibrary? prompts = null, IModuleTypeCatalog? moduleTypes = null, IModelInstanceStore? modelInstances = null)
+        IPromptLibrary? prompts = null, IModuleTypeCatalog? moduleTypes = null, IModelInstanceStore? modelInstances = null,
+        Func<ModuleGraphStatus>? graphStatus = null)
     {
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
             (new(SystemInfo, "Core version, uptime and counts.", Capabilities.SystemRead, false),
-                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+                (_, _) =>
                 {
-                    core = "ALN",
-                    running = true,
-                    adapters = adapters.List().Count,
-                    channels = channels.List().Count,
-                    profiles = models.ListProfiles().Count
-                })))),
+                    // The live graph, when there is one to ask. Null fields say "nobody wired this process to a
+                    // kernel", which is a different answer from zero and has to stay distinguishable.
+                    var status = graphStatus?.Invoke();
+                    return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+                    {
+                        core = "ALN",
+                        running = true,
+                        adapters = adapters.List().Count,
+                        channels = channels.List().Count,
+                        profiles = models.ListProfiles().Count,
+                        nodes = status?.Nodes,
+                        ready = status?.Ready,
+                        // The one number a health check can look at (docs/22 §5.2): a system that came up minus two
+                        // edges behaves exactly like a whole one, and only this count says so.
+                        degraded = status?.Degraded,
+                        // Who is being pushed on a schedule, in the same words the startup receipt prints: a client
+                        // that re-formats "200ms" would be a second opinion about a number the schedule decided.
+                        rhythm = (status?.Rhythms ?? []).Select(beat => beat.Line).ToArray(),
+                        badEdges = (status?.BadEdges ?? []).Select(edge => new
+                        {
+                            master = edge.Master.ToString(),
+                            slave = edge.Slave.ToString(),
+                            reason = JsonNamingPolicy.CamelCase.ConvertName(edge.Reason.ToString()),
+                            detail = edge.Detail
+                        }).ToArray()
+                    })));
+                }),
 
             (new(AdaptersList, "List adapters without credentials.", Capabilities.AdaptersRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(

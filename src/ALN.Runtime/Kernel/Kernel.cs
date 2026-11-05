@@ -30,6 +30,12 @@ public sealed class Kernel
     // Edges made after startup. The receipt counts them, because "nine edges" that silently becomes eleven is a
     // number a reader would trust and should not.
     private int _runtimeEdges;
+    // Who is on a schedule right now: sink → the sources that accepted it. Recorded because the graph cannot draw
+    // a trigger as an edge (docs/22 §1.4) but a reader still has to be able to see who is pushing whom.
+    private readonly Dictionary<ModuleId, List<(ModuleId Id, string Name)>> _rhythms = new();
+    // Edges that never became calls, kept after the receipt was handed out. A bad edge that only exists in one
+    // return value is invisible to anybody asking the process how it is doing ten minutes later (docs/22 §5.2).
+    private IReadOnlyList<BadEdge> _badEdges = [];
 
     public Kernel(string dataRoot, IModuleFactoryRegistry types, ISignalLog? signals = null, TimeSpan? stopTimeout = null)
         : this(new ModuleManifestStore(dataRoot), types, signals, stopTimeout)
@@ -49,6 +55,55 @@ public sealed class Kernel
     public IReadOnlyList<ModuleNodeInfo> Nodes
     {
         get { lock (_gate) return _nodes.Values.Select(node => node.Info()).ToArray(); }
+    }
+
+    /// <summary>
+    /// The same numbers the receipt carries, read now instead of at startup (docs/22 §5.2): how many nodes there
+    /// are, how many work, how much is known to be wrong, and who is on a schedule.
+    /// </summary>
+    public ModuleGraphStatus Status
+    {
+        get
+        {
+            var rhythms = Rhythms;
+            lock (_gate)
+            {
+                return new(_nodes.Count,
+                    _nodes.Values.Count(node => node.Phase == ModulePhase.Ready),
+                    _badEdges.Count + _issues.Count +
+                    _nodes.Values.Count(node => node.Phase is ModulePhase.Failed or ModulePhase.Error),
+                    rhythms,
+                    _badEdges);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Who is being pushed on a schedule, and by what (docs/22 §1.4).
+    ///
+    /// Read from the kernel's own record of what it managed to attach, not from the sources: a source that refused
+    /// a sink is exactly the case worth reporting, and asking the source would report the opposite ("I serve
+    /// nobody") in a shape indistinguishable from "nobody asked". The interval is read live from the sink, because
+    /// that is the declaration the schedule was built from and a module may change it.
+    /// </summary>
+    public IReadOnlyList<RhythmInfo> Rhythms
+    {
+        get
+        {
+            lock (_gate)
+            {
+                var rhythms = new List<RhythmInfo>();
+                foreach (var (sink, sources) in _rhythms)
+                {
+                    // Only while it is actually working: a stopped sink is still in the graph, and "on a schedule"
+                    // about a module that is not running would be the receipt inventing a fact.
+                    if (!_nodes.TryGetValue(sink, out var node) || node.Phase != ModulePhase.Ready) continue;
+                    if (SinkOf(node)?.PreferredInterval is not { } interval) continue;
+                    foreach (var source in sources) rhythms.Add(new(sink, interval, source.Name));
+                }
+                return rhythms;
+            }
+        }
     }
 
     /// <summary>The module behind an id, for callers that already know which one they mean (docs/22 §3.5).</summary>
@@ -106,7 +161,7 @@ public sealed class Kernel
 
     public async ValueTask<Result<ModuleReceipt>> StartAsync(CancellationToken cancellationToken)
     {
-        lock (_gate) { _nodes.Clear(); _issues = []; _runtimeEdges = 0; }
+        lock (_gate) { _nodes.Clear(); _issues = []; _runtimeEdges = 0; _rhythms.Clear(); _badEdges = []; }
         foreach (var declared in Declared()) lock (_gate) _nodes[declared.Manifest.Id] = declared;
 
         // 0 — Scan: everything the disk says, plus one line per directory that is not a module.
@@ -205,9 +260,9 @@ public sealed class Kernel
         }
 
         await AttachTriggersAsync(cancellationToken).ConfigureAwait(false);
-        lock (_gate) _issues = issues;
+        lock (_gate) { _issues = issues; _badEdges = badEdges.ToArray(); }
         return Result<ModuleReceipt>.Success(new(Snapshot().Select(node => node.Info()).ToArray(), wired + _runtimeEdges,
-            badEdges, cycles, issues));
+            badEdges, cycles, issues, Rhythms));
     }
 
     /// <summary>
@@ -324,6 +379,14 @@ public sealed class Kernel
             // turns into a loop that nobody can stop.
             Record(node, nameof(IKernelModule.OnErrorAsync), ex.Message, ex);
         }
+    }
+
+    /// <summary>Keeps the bad edges an operation produced, so a later question sees them too.</summary>
+    private void KeepBadEdges(IEnumerable<BadEdge> edges)
+    {
+        var extra = edges as IReadOnlyList<BadEdge> ?? edges.ToArray();
+        if (extra.Count == 0) return;
+        lock (_gate) _badEdges = [.. _badEdges, .. extra];
     }
 
     private void Record(KernelNode node, string method, string message, Exception? exception)
@@ -527,6 +590,7 @@ public sealed class Kernel
         // verdicts, because they are two different mistakes: a named dependency that does not exist is a broken
         // configuration, while a slave that is not there is a dropped edge (reported above, and the node may still
         // work without it).
+        KeepBadEdges(badEdges);
         var missingDependency = (node.Manifest.Dependencies ?? [])
             .FirstOrDefault(id => Snapshot().All(candidate => candidate.Manifest.Id != id));
         if (missingDependency != default)
@@ -575,6 +639,7 @@ public sealed class Kernel
                     if (slave.Id == id)
                         dropped.Add(new(other.Manifest.Id, id, BadEdgeReason.MissingModule, "Removed while still declared as a slave."));
         }
+        KeepBadEdges(dropped);
         return Result<IReadOnlyList<BadEdge>>.Success(dropped);
     }
 
@@ -616,6 +681,7 @@ public sealed class Kernel
         if (!accepted.Ok)
         {
             var edge = new BadEdge(masterId, instance.Id, BadEdgeReason.RejectedByMaster, accepted.Error?.Message ?? "Rejected.");
+            KeepBadEdges([edge]);
             lock (_gate) _nodes.Remove(instance.Id);
             return Result<ModuleAddition>.Success(new(node.Info(), [edge]));
         }
@@ -712,7 +778,17 @@ public sealed class Kernel
                 Result attached;
                 try { attached = SourceOf(source)!.Attach(node.Manifest.Id, sink); }
                 catch (Exception ex) { attached = Result.Failure(new(ErrorCode.Internal, "Attach threw.", ex.Message)); }
-                if (attached.Ok) continue;
+                if (attached.Ok)
+                {
+                    // Recorded only on success: the receipt is the kernel's claim about calls it actually made.
+                    lock (_gate)
+                    {
+                        if (!_rhythms.TryGetValue(node.Manifest.Id, out var beats)) _rhythms[node.Manifest.Id] = beats = [];
+                        var beat = (source.Manifest.Id, SourceOf(source)!.Source);
+                        if (!beats.Contains(beat)) beats.Add(beat);
+                    }
+                    continue;
+                }
                 _signals.Write(new()
                 {
                     Id = Guid.NewGuid(),
@@ -737,6 +813,12 @@ public sealed class Kernel
     /// <summary>Takes a departing node off every schedule. The source keeps working for everybody else.</summary>
     private void DetachTriggers(ModuleId id)
     {
+        lock (_gate)
+        {
+            // Both directions: it may be the sink that left, or the source that all those beats named.
+            _rhythms.Remove(id);
+            foreach (var beats in _rhythms.Values) beats.RemoveAll(beat => beat.Id == id);
+        }
         foreach (var node in Snapshot())
         {
             if (SourceOf(node) is not { } source) continue;
