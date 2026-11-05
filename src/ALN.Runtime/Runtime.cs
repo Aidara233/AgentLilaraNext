@@ -119,7 +119,7 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, IModuleWirin
 
     private readonly Dictionary<ModuleId, LiveAdapter> _adapters = new();
 
-    private static ModuleId IdOf(Address address) => new(address.ToString());
+    private static ModuleId IdOf(Address address) => address.ToModuleId();
     private readonly IModuleTypeCatalog _types;
     private readonly IInstanceBindings _bindings;
     private readonly IAdapterFactoryRegistry? _factories;

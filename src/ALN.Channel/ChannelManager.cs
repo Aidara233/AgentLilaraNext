@@ -60,7 +60,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     /// apart to look something up.</summary>
     private readonly Dictionary<ModuleId, ChannelInstance> _channels = new();
 
-    private static ModuleId IdOf(Address address) => new(address.ToString());
+    private static ModuleId IdOf(Address address) => address.ToModuleId();
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);

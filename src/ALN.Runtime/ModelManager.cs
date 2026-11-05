@@ -28,7 +28,7 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
 
     public void UseInstanceNodes(IInstanceNodeHost nodes) => _nodes = nodes ?? throw new ArgumentNullException(nameof(nodes));
 
-    private static ModuleId IdOf(Address address) => new(address.ToString());
+    private static ModuleId IdOf(Address address) => address.ToModuleId();
 
     private readonly object _gate = new();
     private readonly Dictionary<string, (string PackageId, IModelProviderFactory Factory)> _factories = new(StringComparer.Ordinal);

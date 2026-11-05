@@ -608,7 +608,7 @@ public static class CoreActions
             string? kind = null;
             if (TryReadText(arguments, "address", out var addressText) && addressText.Trim().Length > 0)
             {
-                if (!Address.TryParse(addressText.Trim(), out var address) || !address.IsInstance || address.Module != "model")
+                if (!Address.TryParse(addressText.Trim(), out var address) || !address.IsInstance)
                 {
                     error = new(ErrorCode.Invalid, $"Not a model provider address: {addressText}");
                     return null;

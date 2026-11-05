@@ -5,6 +5,12 @@ public readonly record struct Address(string Module, string? Kind = null, string
     /// <summary>Two-part spelling kept for <see cref="ToString"/> and for the spec files. Reading a type or a
     /// category out of it is what the constitution forbids (C-04/C-06): ask the module, not its name.</summary>
     public string TypeId => Kind is null ? Module : $"{Module}.{Kind}";
+
+    /// <summary>
+    /// The one place an address becomes a module id: the id is the address's spelling, joined here and not read back
+    /// apart anywhere. Callers that need to know what a module is ask the module, not this string.
+    /// </summary>
+    public ModuleId ToModuleId() => new(ToString());
     public override string ToString() => Instance is null ? TypeId : $"{TypeId}#{Instance}";
     public bool IsInstance => !string.IsNullOrWhiteSpace(Module) && !string.IsNullOrWhiteSpace(Kind) && !string.IsNullOrWhiteSpace(Instance);
 

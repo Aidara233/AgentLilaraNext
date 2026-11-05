@@ -57,7 +57,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
         _state = state; _report = report ?? NullRestoreReporter.Instance;
     }
 
-    private static ModuleId IdOf(Address address) => new(address.ToString());
+    private static ModuleId IdOf(Address address) => address.ToModuleId();
 
     /// <summary>The one module that answers to that name, by the contract name it was registered under.</summary>
     private T Require<T>(string id) where T : class =>
