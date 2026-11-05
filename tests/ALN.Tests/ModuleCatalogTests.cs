@@ -30,6 +30,14 @@ public sealed class ModuleCatalogTests
         Assert.NotNull(catalog.Find(new("elsewhere")));
         Assert.Equal("Fake.Manager", catalog.Describe(new("elsewhere"))!.TypeId);
         Assert.Null(catalog.Find(new("nobody")));
+
+        // The list view follows the same rule: the source adds rows nothing else lists, and never a second row for a
+        // name that is already there.
+        catalog.UseRows(() => [fromSource, new CatalogEntry(new ModuleId("attached"), "Dup", "fake", ModuleRole.Instance)]);
+        var listed = catalog.List();
+        Assert.Equal(2, listed.Count);
+        Assert.Single(listed, row => row.Id.Value == "attached");
+        Assert.Single(listed, row => row.Id.Value == "elsewhere");
     }
 
     [Module("Fake.Manager", Category = "fake", Role = ModuleRole.Manager, Singleton = true)]

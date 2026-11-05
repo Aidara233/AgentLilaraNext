@@ -28,6 +28,15 @@ public sealed class ModuleCatalog : ICatalog
     /// <summary>Whether a fallback source was installed. A catalog with none is the old behaviour exactly.</summary>
     public bool HasSource => _source is not null;
 
+    private Func<IReadOnlyList<CatalogEntry>>? _rowSource;
+
+    /// <summary>
+    /// Where to get the whole list when the entries and owners are not the whole story — the same table the single
+    /// lookup falls back to. Rows for a name already listed are ignored, so the two views cannot disagree about how
+    /// many modules exist.
+    /// </summary>
+    public void UseRows(Func<IReadOnlyList<CatalogEntry>> rows) => _rowSource = rows;
+
     private sealed record Entry(IModule Module, string TypeId, string Category, ModuleRole Role);
 
     public IModule? Find(ModuleId id) => Locate(id)?.Module;
@@ -88,7 +97,17 @@ public sealed class ModuleCatalog : ICatalog
         IEnumerable<CatalogEntry> rows = own.Select(entry => new CatalogEntry(entry.Module.Id, entry.TypeId, entry.Category, entry.Role));
         foreach (var index in indexes) rows = rows.Concat(index.Entries());
 
-        return rows
+        var listed = rows.ToList();
+        if (_rowSource is { } table)
+        {
+            // Same rule as the single lookup: a row is added only when nothing above already lists that name. A module
+            // held by an owner and also on the graph is one row, not two.
+            var known = new HashSet<string>(listed.Select(row => row.Id.Value), StringComparer.OrdinalIgnoreCase);
+            foreach (var row in table())
+                if (known.Add(row.Id.Value)) listed.Add(row);
+        }
+
+        return listed
             .Where(row => category is null || string.Equals(row.Category, category, StringComparison.OrdinalIgnoreCase))
             .Where(row => typeId is null || string.Equals(row.TypeId, typeId, StringComparison.OrdinalIgnoreCase))
             .ToArray();

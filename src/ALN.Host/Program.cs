@@ -288,6 +288,9 @@ var kernel = new Kernel(data.Root, factories, signalLog, hostOwnsTypes: factorie
 modules.UseSource(id => kernel.Describe(id) is { } row && kernel.Find(id) is { } found && found is IModule module
     ? new LocatedModule(module, row)
     : null);
+modules.UseRows(() => kernel.Instances
+    .Select(info => new CatalogEntry(info.Id, info.Type, info.Category, info.Role))
+    .ToArray());
 // One table, one loop: these are the modules the host builds itself, so nothing on disk could produce them. Every
 // one of them is a master that holds instances (or, for memory, a store) — none of them has phases worth ordering.
 var declaredModules = new DeclaredModule[]
