@@ -699,12 +699,12 @@ public sealed class Kernel
     private async ValueTask AttachTriggersAsync(CancellationToken cancellationToken)
     {
         var nodes = Snapshot();
-        var sources = nodes.Where(node => SourceOf(node) is not null).ToArray();
+        var sources = nodes.Where(node => SourceOf(node) is { CanSchedule: true }).ToArray();
         if (sources.Length == 0) return;
 
         foreach (var node in nodes)
         {
-            var sink = node.Module as ITriggerSink ?? (node.Module as ITriggerBearer)?.Trigger;
+            var sink = SinkOf(node);
             if (sink is null || sink.PreferredInterval is null) continue;
             foreach (var source in sources)
             {
@@ -744,9 +744,18 @@ public sealed class Kernel
         }
     }
 
-    /// <summary>The node's trigger source, whether the module is one itself or only carries one.</summary>
+    /// <summary>
+    /// The node's capability, whether the node implements it itself or only carries the module that does.
+    ///
+    /// Everything the kernel knows about triggers goes through these two lookups, which is why it has no idea a clock
+    /// exists: a schedule source is just a node whose module implements ITriggerSource, and a sink is just a node
+    /// whose module (or carried module) implements ITriggerSink.
+    /// </summary>
+    private static ITriggerSink? SinkOf(KernelNode node) =>
+        node.Module as ITriggerSink ?? (node.Module as IModuleCarrier)?.Target as ITriggerSink;
+
     private static ITriggerSource? SourceOf(KernelNode node) =>
-        node.Module as ITriggerSource ?? (node.Module as ITriggerSourceBearer)?.TriggerSource;
+        node.Module as ITriggerSource ?? (node.Module as IModuleCarrier)?.Target as ITriggerSource;
 
     private KernelNode[] Snapshot()
     {

@@ -47,6 +47,13 @@ public interface ITriggerSource
     /// <summary>The name that appears in <see cref="TriggerSignal.Source"/>. Not an address, not parsed.</summary>
     string Source { get; }
 
+    /// <summary>
+    /// True when this source owns a rhythm. A sink with an interval is attached only to sources that say so; a
+    /// source that cannot schedule gets nothing from that declaration, because "wants a beat" is not "wants every
+    /// source in the process to beat it" — that mistake is how one adapter ends up triggering twice per interval.
+    /// </summary>
+    bool CanSchedule { get; }
+
     Result Attach(ModuleId sink, ITriggerSink trigger);
 
     Result Detach(ModuleId sink);

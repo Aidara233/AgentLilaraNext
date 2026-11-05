@@ -40,6 +40,9 @@ public sealed class ClockSource : IClockManager, ITriggerSource, IModule
 
     public string Source => SourceName;
 
+    /// <inheritdoc />
+    public bool CanSchedule => true;
+
     /// <summary>How many sinks are on a rhythm right now. Reported, never used to decide anything.</summary>
     public int BeatCount
     {

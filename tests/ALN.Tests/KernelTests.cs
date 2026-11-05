@@ -610,9 +610,30 @@ public sealed class KernelTests : IDisposable
         Assert.Contains(new ModuleId("adapter.file#one"), source.DetachedIds);
     }
 
+    [Fact]
+    public async Task Only_sources_that_own_a_rhythm_receive_a_sink_that_asked_for_a_beat()
+    {
+        // A source that cannot schedule gets nothing from "I want a beat": otherwise an adapter with a clock and a
+        // relay script would be triggered twice per interval, which is the double-subscription bug in another suit.
+        var schedule = new CountingSource();
+        var pushOnly = new CountingSource { CanScheduleOverride = false };
+        var ticker = new TickingModule(new("adapter.file#one"));
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(ticker).Ok);
+        Assert.True(kernel.Declare(new PassiveNode(new ModuleId("Clock"), schedule), typeId: "clock").Ok);
+        Assert.True(kernel.Declare(new PassiveNode(new ModuleId("Relay"), pushOnly), typeId: "relay").Ok);
+
+        Assert.True((await kernel.StartAsync(default)).Ok);
+
+        Assert.Single(schedule.Attached);
+        Assert.Empty(pushOnly.Attached);
+    }
+
     private sealed class CountingSource : ITriggerSource
     {
         public string Source => "Clock";
+        public bool CanScheduleOverride { get; init; } = true;
+        public bool CanSchedule => CanScheduleOverride;
         public List<ModuleId> Attached { get; } = [];
         public List<ModuleId> DetachedIds { get; } = [];
         public Result Attach(ModuleId sink, ITriggerSink trigger)
