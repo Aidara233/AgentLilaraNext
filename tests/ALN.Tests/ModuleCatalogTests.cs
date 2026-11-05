@@ -5,6 +5,33 @@ namespace ALN.Tests;
 
 public sealed class ModuleCatalogTests
 {
+    [Module("Fake.Plain", Category = "fake", Role = ModuleRole.Instance)]
+    private sealed class FakePlain(ModuleId id) : IModule
+    {
+        public ModuleId Id { get; } = id;
+    }
+
+    [Fact]
+    public void A_source_answers_only_when_nothing_attached_and_no_owner_answers()
+    {
+        // The fallback exists so the catalog can see what the kernel holds without the two being registered twice. What
+        // it must never do is start shadowing what is already here — an attached entry stays the first answer.
+        var catalog = new ModuleCatalog();
+        var attached = new FakePlain(new("attached"));
+        Assert.True(catalog.Attach(attached).Ok);
+
+        var fromSource = new CatalogEntry(new ModuleId("elsewhere"), "Fake.Manager", "fake", ModuleRole.Instance);
+        catalog.UseSource(id => id.Value == "elsewhere"
+            ? new LocatedModule(new FakePlain(id), fromSource)
+            : null);
+
+        Assert.True(catalog.HasSource);
+        Assert.Same(attached, catalog.Find(new("attached")));
+        Assert.NotNull(catalog.Find(new("elsewhere")));
+        Assert.Equal("Fake.Manager", catalog.Describe(new("elsewhere"))!.TypeId);
+        Assert.Null(catalog.Find(new("nobody")));
+    }
+
     [Module("Fake.Manager", Category = "fake", Role = ModuleRole.Manager, Singleton = true)]
     private sealed class FakeManager(ModuleId id) : IModule
     {

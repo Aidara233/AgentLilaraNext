@@ -16,6 +16,17 @@ public sealed class ModuleCatalog : ICatalog
     private readonly Dictionary<string, Entry> _byKey = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<IModuleIndex> _indexes = [];
     private readonly object _gate = new();
+    private Func<ModuleId, LocatedModule?>? _source;
+
+    /// <summary>
+    /// Where to look when nothing is attached and no owner answers — in practice the kernel's instance table, which is
+    /// the truth for what exists. Attached entries and owners still answer first, so this changes nothing that already
+    /// worked; it only lets the catalog see instances nobody registered here.
+    /// </summary>
+    public void UseSource(Func<ModuleId, LocatedModule?> source) => _source = source;
+
+    /// <summary>Whether a fallback source was installed. A catalog with none is the old behaviour exactly.</summary>
+    public bool HasSource => _source is not null;
 
     private sealed record Entry(IModule Module, string TypeId, string Category, ModuleRole Role);
 
@@ -58,6 +69,9 @@ public sealed class ModuleCatalog : ICatalog
                     $"Two owners hold {id}: {found.Module.GetType().Name} and {candidate.Module.GetType().Name}.");
             found = candidate;
         }
+        // Last resort: the instance table. Only when nobody above answered, so an attached entry or an owner always
+        // wins and this cannot start shadowing them.
+        if (found is null && _source is { } source) found = source(id);
         return found;
     }
 
