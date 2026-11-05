@@ -139,6 +139,109 @@ public sealed class ControlPlaneTests : IDisposable
     }
 
     [Fact]
+    public void A_grant_written_as_graph_still_reaches_the_module_actions()
+    {
+        // Role files in the wild say graph.control, and the actions those grants guarded are modules.* now. Losing
+        // mount rights because nobody edited a json file is exactly the kind of silent downgrade this vocabulary has
+        // to not do.
+        Assert.True(new Actor("ops", ActorKind.User, ["graph.control"]).Allows(Capabilities.ModulesControl));
+        Assert.True(new Actor("ops", ActorKind.User, ["graph.read"]).Allows(Capabilities.ModulesRead));
+        // One-way on purpose: the new name does not buy the old one, so the forwarding can be deleted later.
+        Assert.False(new Actor("ops", ActorKind.User, ["modules.control"]).Allows(Capabilities.GraphControl));
+    }
+
+    [Fact]
+    public async Task The_edge_actions_are_called_modules_edge_now_and_the_old_names_still_answer()
+    {
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null), _signals,
+            new FakeGraph(), new FakeParameters()).Ok);
+
+        var viaOld = await plane.InvokeAsync(Actor.System, CoreActions.GraphList, default, default);
+        var viaNew = await plane.InvokeAsync(Actor.System, CoreActions.EdgesList, default, default);
+
+        Assert.True(viaOld.Ok, viaOld.Error?.Message);
+        Assert.True(viaNew.Ok, viaNew.Error?.Message);
+        // Same handler, not a second implementation that will drift: the answers are identical.
+        Assert.Equal(viaNew.Value.GetRawText(), viaOld.Value.GetRawText());
+    }
+
+    [Fact]
+    public async Task Unloading_a_module_from_the_control_plane_puts_its_directory_in_the_bin_by_default()
+    {
+        var root = Path.Combine(_root, "graph");
+        var types = new ModuleFactoryRegistry();
+        Assert.True(types.Register("test.plain", manifest => Result<IKernelModule>.Success(new NoopModule(manifest.Id))).Ok);
+        WriteModule(root, "thing");
+        var kernel = new Kernel(root, types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null), _signals,
+            new FakeGraph(), new FakeParameters(), kernel: kernel).Ok);
+
+        var unloaded = await plane.InvokeAsync(Actor.System, CoreActions.ModulesUnload,
+            JsonSerializer.SerializeToElement(new { id = "thing" }), default);
+
+        Assert.True(unloaded.Ok, unloaded.Error?.Message);
+        Assert.Null(kernel.Find(new ModuleId("thing")));
+        // Archive is the default because "gone" has meant the bin everywhere else here.
+        Assert.False(Directory.Exists(Path.Combine(root, "modules", "thing")));
+        Assert.NotEmpty(Directory.GetDirectories(Path.Combine(root, "archive", "modules")));
+
+        // Keeping the directory is the explicit choice.
+        WriteModule(root, "kept");
+        Assert.True((await plane.InvokeAsync(Actor.System, CoreActions.ModulesLoad,
+            JsonSerializer.SerializeToElement(new { id = "kept" }), default)).Ok);
+        var kept = await plane.InvokeAsync(Actor.System, CoreActions.ModulesUnload,
+            JsonSerializer.SerializeToElement(new { id = "kept", archive = false }), default);
+        Assert.True(kept.Ok, kept.Error?.Message);
+        Assert.True(Directory.Exists(Path.Combine(root, "modules", "kept")));
+    }
+
+    [Fact]
+    public async Task Listing_modules_lists_the_graph_and_listing_packages_lists_the_packages()
+    {
+        var root = Path.Combine(_root, "graph");
+        var types = new ModuleFactoryRegistry();
+        Assert.True(types.Register("test.plain", manifest => Result<IKernelModule>.Success(new NoopModule(manifest.Id))).Ok);
+        WriteModule(root, "thing");
+        var kernel = new Kernel(root, types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null), _signals,
+            new FakeGraph(), new FakeParameters(), kernel: kernel).Ok);
+
+        var graph = await plane.InvokeAsync(Actor.System, CoreActions.ModulesList, default, default);
+        var packages = await plane.InvokeAsync(Actor.System, CoreActions.PackagesList, default, default);
+
+        Assert.True(graph.Ok, graph.Error?.Message);
+        Assert.Equal("thing", Assert.Single(graph.Value.GetProperty("nodes").EnumerateArray()).GetProperty("id").GetString());
+        Assert.True(packages.Ok, packages.Error?.Message);
+        // Two different questions, two different answers: the graph is what runs, the package list is what was loaded.
+        Assert.True(packages.Value.TryGetProperty("modules", out _));
+        Assert.False(packages.Value.TryGetProperty("nodes", out _));
+    }
+
+    /// <summary>Writes one module's own file, which is all the kernel reads.</summary>
+    private static void WriteModule(string root, string id)
+    {
+        var directory = Path.Combine(root, "modules", id);
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(Path.Combine(directory, "module.json"),
+            JsonSerializer.Serialize(new { id, type = "test.plain" }));
+    }
+
+    private sealed class NoopModule(ModuleId id) : IKernelModule
+    {
+        public ModuleId Id { get; } = id;
+        public ValueTask<Result> InitializeAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> ReadyAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> StopAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> AbortAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> OnErrorAsync(ModuleError error, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+    }
+
+    [Fact]
     public void Api_settings_authenticate_by_digest_and_never_store_the_token()
     {
         Directory.CreateDirectory(Path.Combine(_root, "api"));

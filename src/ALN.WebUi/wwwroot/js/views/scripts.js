@@ -2,7 +2,7 @@
 
    Two different switches, kept visibly separate because they are not the same thing:
    - enabled: whether the script is in the catalog at all (`scripts.set`);
-   - mounted: which instance it runs on (`graph.mount` / `graph.unmount`). A "manual" script runs
+   - mounted: which instance it runs on (`modules.edge.mount` / `modules.edge.unmount`). A "manual" script runs
      nowhere until somebody mounts it. */
 
 import { h, panel, dataTable, badge } from '../ui.js';
@@ -32,8 +32,8 @@ const scriptColumns = (ctx) => [
         class: 'act',
         type: 'button',
         text: '挂载…',
-        disabled: !ctx.allowed('graph.mount'),
-        title: ctx.allowed('graph.mount') ? '' : '缺少能力 graph.control',
+        disabled: !ctx.allowed('modules.edge.mount'),
+        title: ctx.allowed('modules.edge.mount') ? '' : '缺少能力 modules.control',
         onclick: () => openMount(ctx, row.id),
       }),
       h('button', {
@@ -41,7 +41,7 @@ const scriptColumns = (ctx) => [
         type: 'button',
         text: row.enabled ? '停用' : '启用',
         disabled: !ctx.allowed('scripts.set'),
-        title: ctx.allowed('scripts.set') ? '' : '缺少能力 graph.control',
+        title: ctx.allowed('scripts.set') ? '' : '缺少能力 modules.control',
         onclick: async () => {
           if (row.enabled && !window.confirm(`停用 ${row.id}？挂在这个脚本上的规则会停止工作。`)) return;
           await perform(ctx, {
@@ -68,11 +68,11 @@ const ruleColumns = (ctx) => [
       class: 'act danger',
       type: 'button',
       text: '卸载',
-      disabled: !ctx.allowed('graph.unmount'),
-      title: ctx.allowed('graph.unmount') ? '' : '缺少能力 graph.control',
+      disabled: !ctx.allowed('modules.edge.unmount'),
+      title: ctx.allowed('modules.edge.unmount') ? '' : '缺少能力 modules.control',
       onclick: async () => {
         if (!window.confirm(`删除挂载规则 ${row.id}？`)) return;
-        await perform(ctx, { action: 'graph.unmount', args: { rule: row.id }, done: `规则 ${row.id} 已删除` });
+        await perform(ctx, { action: 'modules.edge.unmount', args: { rule: row.id }, done: `规则 ${row.id} 已删除` });
       },
     }),
   },
@@ -108,7 +108,7 @@ function openMount(ctx, id) {
     submit: '挂载',
     onSubmit: async (values, dialog) => {
       await perform(ctx, {
-        action: 'graph.mount',
+        action: 'modules.edge.mount',
         args: { script: id, target: values.target },
         done: `${id} → ${values.target} 已挂载`,
       });
@@ -120,7 +120,7 @@ function openMount(ctx, id) {
 export async function mountScripts(root, ctx) {
   const listed = (await ctx.api.invoke('scripts.list')) ?? {};
   const scripts = listed.scripts ?? [];
-  const graphed = ctx.allowed('graph.list') ? (await ctx.api.invoke('graph.list')) ?? {} : {};
+  const graphed = ctx.allowed('modules.edge.list') ? (await ctx.api.invoke('modules.edge.list')) ?? {} : {};
 
   root.append(
     panel(`脚本（${scripts.length}）`,

@@ -27,18 +27,27 @@ public static class CoreActions
     public const string ChannelsCreate = "channels.create";
     public const string ChannelsDestroy = "channels.destroy";
     public const string ChannelsSend = "channels.send";
+    // The three edge actions were graph.* until the graph grew modules (docs/15). They live under modules.edge now, and
+    // the old names stay registered for one release, pointing at the same handlers: a client that says graph.mount
+    // should get a mount, not a lesson in naming.
+    public const string EdgesList = "modules.edge.list";
+    public const string EdgesMount = "modules.edge.mount";
+    public const string EdgesUnmount = "modules.edge.unmount";
     public const string GraphList = "graph.list";
     public const string GraphMount = "graph.mount";
-    public const string ParamsList = "params.list";
-    public const string ParamsSet = "params.set";
     public const string GraphUnmount = "graph.unmount";
-    public const string ModelsList = "models.list";
+    public const string ParamsList = "params.list";
+    public const string ParamsSet = "params.set";    public const string ModelsList = "models.list";
     public const string ModelsProviderGet = "models.provider.get";
     public const string ModelsProviderSave = "models.provider.save";
     public const string ModelsProviderDestroy = "models.provider.destroy";
     public const string ModelsProfileCreate = "models.profile.create";
     public const string ModelsProfileRemove = "models.profile.remove";
     public const string ModulesList = "modules.list";
+    public const string ModulesLoad = "modules.load";
+    public const string ModulesUnload = "modules.unload";
+    /// <summary>The module <b>packages</b> loaded into this process. Formerly modules.list, which now means the graph.</summary>
+    public const string PackagesList = "packages.list";
     public const string ModuleTypes = "system.types";
     public const string ScriptsList = "scripts.list";
     public const string ScriptsSet = "scripts.set";
@@ -60,7 +69,7 @@ public static class CoreActions
         IModelManager models, ISignalLog signals, IGraphRuntime graph, IParameterRegistry parameters,
         IModuleCatalog? modules = null, ISessionManager? sessions = null, IArchiveRegistry? archive = null,
         IPromptLibrary? prompts = null, IModuleTypeCatalog? moduleTypes = null, IModelInstanceStore? modelInstances = null,
-        Func<ModuleGraphStatus>? graphStatus = null)
+        Func<ModuleGraphStatus>? graphStatus = null, Kernel? kernel = null)
     {
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
@@ -85,13 +94,7 @@ public static class CoreActions
                         // Who is being pushed on a schedule, in the same words the startup receipt prints: a client
                         // that re-formats "200ms" would be a second opinion about a number the schedule decided.
                         rhythm = (status?.Rhythms ?? []).Select(beat => beat.Line).ToArray(),
-                        badEdges = (status?.BadEdges ?? []).Select(edge => new
-                        {
-                            master = edge.Master.ToString(),
-                            slave = edge.Slave.ToString(),
-                            reason = JsonNamingPolicy.CamelCase.ConvertName(edge.Reason.ToString()),
-                            detail = edge.Detail
-                        }).ToArray()
+                        badEdges = (status?.BadEdges ?? []).Select(EdgeOf).ToArray()
                     })));
                 }),
 
@@ -139,42 +142,17 @@ public static class CoreActions
             (new(ChannelsCreate, "Create one channel instance: {\"type\", \"instance\", \"name\", \"bindings\": [{\"adapter\", \"conversation\"}], \"maxMessages\"}.", Capabilities.ChannelsControl, true), CreateChannel),
             (new(ChannelsDestroy, "Destroy one channel instance and forget its spec.", Capabilities.ChannelsControl, true), DestroyChannel),
 
-            (new(GraphList, "List mounted scripts, durable mount rules, and which rules are still waiting.", Capabilities.GraphRead, false),
-                (_, _) =>
-                {
-                    var pending = graph.PendingRules.Select(rule => rule.Id).ToHashSet(StringComparer.Ordinal);
-                    return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
-                    {
-                        mounted = graph.Mounted.Select(m => new
-                        {
-                            script = m.Package.Manifest.Id,
-                            version = m.Package.Manifest.Version,
-                            targetType = m.Package.Manifest.TargetType,
-                            events = m.Package.Manifest.Events,
-                            trustDomain = m.Package.Manifest.TrustDomain.ToString(),
-                            target = m.Target.ToString(),
-                            rule = m.RuleId,
-                            remaining = m.Remaining
-                        }),
-                        rules = graph.Rules.Select(rule => new
-                        {
-                            id = rule.Id,
-                            script = rule.ScriptId,
-                            scope = JsonNamingPolicy.CamelCase.ConvertName(rule.Scope.Kind.ToString()),
-                            selector = rule.Scope.Selector,
-                            source = rule.Source,
-                            budget = rule.Budget,
-                            remaining = rule.Remaining,
-                            stateScope = JsonNamingPolicy.CamelCase.ConvertName(rule.StateScope.ToString()),
-                            pending = pending.Contains(rule.Id)
-                        })
-                    })));
-                }),
+            (new(EdgesList, "List mounted scripts, durable mount rules, and which rules are still waiting.", Capabilities.ModulesRead, false), ListEdges),
+            // One release of forwarding: same handler, same capability, so an old client keeps working and gets the
+            // new body. The description says where it went, because that is the only place a caller will look.
+            (new(GraphList, "Deprecated: use modules.edge.list.", Capabilities.ModulesRead, false), ListEdges),
 
             // Manual scripts are the per-instance policy switch: a script declared "mount": "manual" is
             // not attached to anything by its lifecycle, so this is the only way it ever runs.
-            (new(GraphMount, "Mount a manual script onto one instance.", Capabilities.GraphControl, true), MountScript),
-            (new(GraphUnmount, "Unmount a script from one instance.", Capabilities.GraphControl, true), UnmountScript),
+            (new(EdgesMount, "Mount a manual script onto one instance.", Capabilities.ModulesControl, true), MountScript),
+            (new(GraphMount, "Deprecated: use modules.edge.mount.", Capabilities.ModulesControl, true), MountScript),
+            (new(EdgesUnmount, "Unmount a script from one instance.", Capabilities.ModulesControl, true), UnmountScript),
+            (new(GraphUnmount, "Deprecated: use modules.edge.unmount.", Capabilities.ModulesControl, true), UnmountScript),
 
             (new(ParamsList, "List every tunable the running components expose, with its current value.", Capabilities.ParamsRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
@@ -256,7 +234,7 @@ public static class CoreActions
                         @abstract = type.IsAbstract
                     })
                 })))),
-            (new(ModulesList, "Module packages loaded into this process, with what each provides.", Capabilities.SystemRead, false),
+            (new(PackagesList, "Module packages loaded into this process, with what each provides.", Capabilities.SystemRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
                 {
                     modules = modules?.Loaded.Select(manifest => new
@@ -270,6 +248,73 @@ public static class CoreActions
                     }) ?? [],
                     contracts = ModuleContracts.Version
                 })))),
+            // The graph, not the packages: which nodes exist right now, where each one got to, and what was added or
+            // removed since startup. A module is a node here (docs/22 §3), and the package it came from is a different
+            // question with a different answer (packages.list).
+            (new(ModulesList, "Modules in the graph right now: id, type, phase, and what is not working.", Capabilities.ModulesRead, false),
+                (_, _) =>
+                {
+                    if (kernel is null) return ValueTask.FromResult(Unavailable("There is no kernel to ask."));
+                    var status = kernel.Status;
+                    return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+                    {
+                        nodes = kernel.Nodes.Select(node => new
+                        {
+                            id = node.Id.ToString(),
+                            type = node.Type,
+                            phase = JsonNamingPolicy.CamelCase.ConvertName(node.Phase.ToString()),
+                            failure = node.Failure
+                        }),
+                        ready = status.Ready,
+                        degraded = status.Degraded,
+                        rhythm = status.Rhythms.Select(beat => beat.Line),
+                        badEdges = status.BadEdges.Select(EdgeOf)
+                    })));
+                }),
+            // Loading is reading a module's own file and adding it to the running graph; it is not "scan the disk again".
+            // A module that is already there is a conflict, not a reload: replacing one while it works is a different
+            // operation with different questions (what happens to what it holds), and it has not been answered yet.
+            (new(ModulesLoad, "Load one module from its own module.json into the running graph: {\"id\"}.", Capabilities.ModulesControl, true),
+                async (arguments, ct) =>
+                {
+                    if (kernel is null) return Unavailable("There is no kernel to load anything into.");
+                    if (!TryReadText(arguments, "id", out var id) || id.Trim().Length == 0)
+                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "modules.load requires 'id'."));
+                    var loaded = await kernel.LoadAsync(new ModuleId(id.Trim()), ct).ConfigureAwait(false);
+                    if (!loaded.Ok) return Result<JsonElement>.Failure(loaded.Error!);
+                    var addition = loaded.Value!;
+                    return Result<JsonElement>.Success(ToJson(new
+                    {
+                        id = addition.Node.Id.ToString(),
+                        type = addition.Node.Type,
+                        phase = JsonNamingPolicy.CamelCase.ConvertName(addition.Node.Phase.ToString()),
+                        failure = addition.Node.Failure,
+                        wiredEdges = addition.WiredEdges,
+                        badEdges = addition.BadEdges.Select(EdgeOf)
+                    }));
+                }),
+            // Unloading takes the node out and puts the directory in the bin, because that is what "gone" has meant
+            // everywhere else here; keeping it is the explicit choice (archive: false), not the default.
+            (new(ModulesUnload, "Take one module out of the graph. archive defaults to true: its directory goes to the bin.", Capabilities.ModulesControl, true),
+                async (arguments, ct) =>
+                {
+                    if (kernel is null) return Unavailable("There is no kernel to unload anything from.");
+                    if (!TryReadText(arguments, "id", out var id) || id.Trim().Length == 0)
+                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "modules.unload requires 'id'."));
+                    var archive = !(arguments.ValueKind == JsonValueKind.Object &&
+                                    arguments.TryGetProperty("archive", out var flag) && flag.ValueKind == JsonValueKind.False);
+                    var unloaded = await kernel.UnloadAsync(new ModuleId(id.Trim()), archive, ct).ConfigureAwait(false);
+                    if (!unloaded.Ok) return Result<JsonElement>.Failure(unloaded.Error!);
+                    return Result<JsonElement>.Success(ToJson(new
+                    {
+                        id = id.Trim(),
+                        unloaded = true,
+                        archived = archive,
+                        // Edges that still pointed at it: reported, not repaired. Their files say something the graph
+                        // no longer has, and rewriting somebody else's file is not this action's business.
+                        droppedEdges = unloaded.Value!.Select(EdgeOf)
+                    }));
+                }),
             (new(ModelsList, "List provider instances and profiles without configuration or keys.", Capabilities.ModelsRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
                 {
@@ -366,6 +411,49 @@ public static class CoreActions
             if (!registered.Ok) return registered;
         }
         return Result.Success();
+
+        ValueTask<Result<JsonElement>> ListEdges(JsonElement arguments, CancellationToken ct)
+        {
+            var pending = graph.PendingRules.Select(rule => rule.Id).ToHashSet(StringComparer.Ordinal);
+            return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+            {
+                mounted = graph.Mounted.Select(m => new
+                {
+                    script = m.Package.Manifest.Id,
+                    version = m.Package.Manifest.Version,
+                    targetType = m.Package.Manifest.TargetType,
+                    events = m.Package.Manifest.Events,
+                    trustDomain = m.Package.Manifest.TrustDomain.ToString(),
+                    target = m.Target.ToString(),
+                    rule = m.RuleId,
+                    remaining = m.Remaining
+                }),
+                rules = graph.Rules.Select(rule => new
+                {
+                    id = rule.Id,
+                    script = rule.ScriptId,
+                    scope = JsonNamingPolicy.CamelCase.ConvertName(rule.Scope.Kind.ToString()),
+                    selector = rule.Scope.Selector,
+                    source = rule.Source,
+                    budget = rule.Budget,
+                    remaining = rule.Remaining,
+                    stateScope = JsonNamingPolicy.CamelCase.ConvertName(rule.StateScope.ToString()),
+                    pending = pending.Contains(rule.Id)
+                })
+            })));
+        }
+
+        /// <summary>One bad edge as a client reads it: what, on what, and which kind of wrong.</summary>
+        static object EdgeOf(BadEdge edge) => new
+        {
+            master = edge.Master.ToString(),
+            slave = edge.Slave.ToString(),
+            reason = JsonNamingPolicy.CamelCase.ConvertName(edge.Reason.ToString()),
+            detail = edge.Detail
+        };
+
+        /// <summary>"This process has no graph to talk about" — a different answer from "the graph says zero".</summary>
+        static Result<JsonElement> Unavailable(string message) => Result<JsonElement>.Failure(new(ErrorCode.Unavailable, message));
 
         async ValueTask<Result<JsonElement>> DestroyAdapter(JsonElement arguments, CancellationToken ct)
         {

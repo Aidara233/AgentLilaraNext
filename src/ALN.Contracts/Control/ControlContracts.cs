@@ -18,9 +18,21 @@ public sealed record Actor(string Id, ActorKind Kind, IReadOnlyList<string> Capa
     {
         if (string.IsNullOrEmpty(capability)) return false;
         foreach (var granted in Capabilities)
+        {
             if (Matches(granted, capability)) return true;
+            // graph.read / graph.control keep working for the release the action names are being forwarded for: the
+            // actions those grants guarded are modules.* now, and a role file that says "graph.control" must not
+            // quietly lose the right to mount. One-way on purpose — a new grant cannot buy an old name.
+            if (FormerName(capability) is { } former && Matches(granted, former)) return true;
+        }
         return false;
     }
+
+    /// <summary>The capability a modules.* name was called before the graph grew modules.</summary>
+    private static string? FormerName(string capability) =>
+        capability.StartsWith("modules.", StringComparison.Ordinal)
+            ? "graph." + capability["modules.".Length..]
+            : null;
 
     /// <summary>
     /// One '*' anywhere: "adapters.*", "*.read" or "*". Anything richer invites patterns nobody
@@ -70,6 +82,10 @@ public static class Capabilities
     public const string MessagesWrite = "messages.write";
     public const string GraphRead = "graph.read";
     public const string GraphControl = "graph.control";
+    /// <summary>The module graph: which nodes exist, and the edges between them (formerly graph.read).</summary>
+    public const string ModulesRead = "modules.read";
+    /// <summary>Changing the graph: load, unload, mount, unmount (formerly graph.control).</summary>
+    public const string ModulesControl = "modules.control";
     public const string ParamsRead = "params.read";
     public const string ParamsWrite = "params.write";
     public const string ModelsRead = "models.read";
