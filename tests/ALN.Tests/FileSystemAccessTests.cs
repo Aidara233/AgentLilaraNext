@@ -269,4 +269,62 @@ public sealed class FileSystemAccessTests : IDisposable
         Assert.Null(read.Value);
         Assert.Equal(ErrorCode.Invalid, read.Error!.Code);
     }
+
+    [Fact]
+    public async Task A_walk_reaches_deep_directories_and_reports_an_empty_one_as_empty()
+    {
+        var access = Open();
+        Assert.True((await access.WriteAsync("memory", "组/分册/2026/11/记录.md", "深", default)).Ok);
+        Assert.True((await access.ListAsync("memory", "组", default)).Ok);
+        Directory.CreateDirectory(Path.Combine(_root, "memory", "空组"));
+
+        var tree = await access.TreeAsync("memory", "组", default);
+        Assert.True(tree.Ok, tree.Error?.Message);
+        Assert.Equal(["分册", "分册/2026", "分册/2026/11", "分册/2026/11/记录.md"],
+            tree.Value!.Select(node => node.Path));
+
+        var empty = await access.TreeAsync("memory", "空组", default);
+        Assert.True(empty.Ok);
+        Assert.Empty(empty.Value!);
+        Assert.Empty((await access.ListAsync("memory", "空组", default)).Value!);
+    }
+
+    [Fact]
+    public async Task A_refused_write_does_not_damage_the_file_that_was_there()
+    {
+        // The failure a caller can actually cause is a bad path, not a bad disk. It must not be able to reach the
+        // file at all — a half-applied edit would be worse than no edit.
+        var access = Open();
+        Assert.True((await access.WriteAsync("memory", "组/block.md", "原文", default)).Ok);
+
+        var refused = await access.WriteAsync("memory", "../escape.md", "篡改", default);
+        Assert.False(refused.Ok);
+        Assert.Equal(ErrorCode.Invalid, refused.Error!.Code);
+        Assert.Equal("原文", (await access.ReadAsync("memory", "组/block.md", default)).Value!.Text);
+    }
+
+    [Fact]
+    public async Task A_link_inside_a_scope_is_refused_because_it_could_point_anywhere()
+    {
+        // Creating a link needs a privilege this machine may not grant, so the case is conditional — but the rule it
+        // checks is not: a scope must not contain an entry that resolves somewhere else.
+        var access = Open();
+        var target = Path.Combine(_root, "outside");
+        Directory.CreateDirectory(target);
+        await File.WriteAllTextAsync(Path.Combine(target, "secret.txt"), "不该读到");
+        var link = Path.Combine(_root, "memory", "链接");
+        try
+        {
+            if (!Directory.Exists(link)) Directory.CreateSymbolicLink(link, target);
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+        {
+            return;   // no privilege to make one here; the refuse rule is exercised where one can be made
+        }
+
+        var listing = await access.ListAsync("memory", "", default);
+        Assert.False(listing.Ok);
+        Assert.Equal(ErrorCode.Invalid, listing.Error!.Code);
+        Assert.Contains("link", listing.Error.Message, StringComparison.OrdinalIgnoreCase);
+    }
 }
