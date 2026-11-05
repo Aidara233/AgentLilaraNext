@@ -270,4 +270,24 @@ public sealed class PersistenceTests : IDisposable
         Assert.True(inner.TryRead(out var queued));
         Assert.Equal(EventNames.AdapterEnvelope, queued.Name);
     }
+
+    [Fact]
+    public async Task The_name_and_the_remark_are_recorded_with_the_message()
+    {
+        // A name is not derivable from an id later: the adapter that knew it may be gone, and the person may have
+        // renamed. So the label that was true when the message arrived is written down beside the identity.
+        var messages = OpenStore();
+        var sink = new RecordingEventSink(new EventQueue(capacity: 8), messages);
+        var envelope = new AdapterEnvelope(Adapter, "qq", "group-123456", "p2", "在吗", DateTimeOffset.UtcNow,
+            Sender: "20000", SenderName: "小明", SenderRemark: "老王");
+
+        Assert.True((await sink.PublishAsync(new(EventNames.AdapterEnvelope, Adapter, envelope.EventId,
+            JsonSerializer.Serialize(envelope, new JsonSerializerOptions(JsonSerializerDefaults.Web))), default)).Ok);
+
+        var stored = Assert.Single((await messages.ReadAsync(Adapter, default)).Value!);
+        Assert.Equal("20000", stored.Sender);
+        Assert.Equal("小明", stored.SenderName);
+        Assert.Equal("老王", stored.SenderRemark);
+        Assert.Equal("小明(老王)", ChannelMessage.Compose(stored.SenderName, stored.Sender, stored.SenderRemark));
+    }
 }

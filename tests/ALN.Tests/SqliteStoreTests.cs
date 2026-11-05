@@ -186,6 +186,53 @@ public sealed class SqliteStoreTests : IDisposable
 
     private const string InboundScope = "qq.inbound";
 
+    [Fact]
+    public async Task A_file_written_before_names_existed_gains_the_columns()
+    {
+        // The migration is the only place where somebody's history meets a new column, and the rule is "add in
+        // place": nobody is asked to throw their conversation away. So an old-shaped file is built by hand here.
+        Directory.CreateDirectory(_root);
+        var path = Path.Combine(_root, "aln.db");
+        using (var before = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            before.Open();
+            using var command = before.CreateCommand();
+            command.CommandText = """
+                CREATE TABLE message(
+                    id TEXT NOT NULL PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    conversation TEXT NOT NULL,
+                    platform_message_id TEXT NULL,
+                    sender TEXT NULL,
+                    text TEXT NOT NULL,
+                    at TEXT NOT NULL,
+                    direction INTEGER NOT NULL DEFAULT 0,
+                    reply_to TEXT NULL);
+                INSERT INTO message(id, owner, conversation, platform_message_id, sender, text, at, direction)
+                VALUES('old', 'channel.conversation#chat-1', 'chat-1', 'p0', 'alice', '写在有名字之前',
+                       '2026-01-02T03:04:05.0000000+00:00', 0);
+                PRAGMA user_version = 5;
+                """;
+            command.ExecuteNonQuery();
+        }
+
+        var store = new SqliteStore(path);
+        _stores.Add(store);
+
+        // The old row survives without a name, which means it keeps showing the id — what it showed before.
+        var old = Assert.Single((await store.ReadAsync(Owner, default)).Value!);
+        Assert.Equal("alice", old.Sender);
+        Assert.Null(old.SenderName);
+        Assert.Null(old.SenderRemark);
+
+        // And rows written now can carry one, in both directions.
+        var named = Message("new", "p1", "有名字之后") with { SenderName = "小明", SenderRemark = "老王" };
+        Assert.True((await store.AppendAsync(named, default)).Ok);
+        var stored = (await store.ReadAsync(Owner, default)).Value!.Single(message => message.Id == "new");
+        Assert.Equal("小明", stored.SenderName);
+        Assert.Equal("老王", stored.SenderRemark);
+    }
+
     private static StoredMessage Message(string id, string platformId, string text, Address? owner = null,
         DateTimeOffset? at = null) =>
         new(id, owner ?? Owner, "chat-1", platformId, "alice", text, at ?? new(2026, 1, 2, 3, 4, 5, TimeSpan.Zero));

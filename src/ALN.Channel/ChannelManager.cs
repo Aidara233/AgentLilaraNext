@@ -386,7 +386,8 @@ public sealed class ChannelManager(IEventSink events, IInstanceBindings bindings
                     // The channel keeps its own history; the mailbox folder is transport, not storage.
                     var recorded = await _messages.AppendAsync(new StoredMessage(envelope.EventId.ToString("D"),
                         channel.Address, envelope.PlatformConversationId, envelope.PlatformMessageId,
-                        envelope.Sender, envelope.Text, envelope.At), token).ConfigureAwait(false);
+                        envelope.Sender, envelope.Text, envelope.At, SenderName: senderName, SenderRemark: senderRemark),
+                        token).ConfigureAwait(false);
                     if (recorded.Error?.Code == ErrorCode.Conflict)
                     {
                         // The same platform message, already recorded. The wake-up for a first delivery

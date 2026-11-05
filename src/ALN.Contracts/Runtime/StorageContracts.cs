@@ -19,7 +19,15 @@ public sealed record StoredMessage(
     /// For an outbound row: which inbound message it answers. This is what makes "has this message been
     /// answered?" a question with an answer, and therefore what keeps a replayed round from replying twice.
     /// </summary>
-    string? ReplyTo = null);
+    string? ReplyTo = null,
+    /// <summary>
+    /// What the platform called the sender when this row was written. Recorded because a name cannot be recovered
+    /// later: the adapter may be gone, the person may have renamed, and a transcript read tomorrow should still say
+    /// who said this. <see cref="Sender"/> stays the identity; this is the label that went with it.
+    /// </summary>
+    string? SenderName = null,
+    /// <summary>The remark this account had given the sender, when it had one. An extra, never a substitute.</summary>
+    string? SenderRemark = null);
 
 /// <summary>Per-owner message history, append-only.</summary>
 public interface IMessageStore

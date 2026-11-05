@@ -22,7 +22,8 @@ public sealed class RecordingEventSink(IEventSink inner, IMessageStore messages)
                 if (envelope is not null)
                     await messages.AppendAsync(new StoredMessage(envelope.EventId.ToString("N"), envelope.Adapter,
                         envelope.PlatformConversationId, envelope.PlatformMessageId, envelope.Sender, envelope.Text,
-                        envelope.At), cancellationToken).ConfigureAwait(false);
+                        envelope.At, SenderName: envelope.SenderName, SenderRemark: envelope.SenderRemark),
+                        cancellationToken).ConfigureAwait(false);
             }
             catch (JsonException) { /* a malformed envelope is still dispatched; recording must not block it */ }
         }

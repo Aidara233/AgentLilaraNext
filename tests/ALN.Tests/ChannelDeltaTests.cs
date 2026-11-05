@@ -166,6 +166,33 @@ public sealed class ChannelDeltaTests : IDisposable
     }
 
     [Fact]
+    public async Task The_transcript_shows_the_name_and_the_remark_the_message_was_recorded_with()
+    {
+        // This is the path that actually reaches the model: the delta, not the activation event. So the name has to
+        // survive being written down and read back — an id in the transcript is a number the model cannot use.
+        var (store, delta) = Create();
+        var at = new DateTimeOffset(2026, 11, 1, 8, 0, 0, TimeSpan.Zero);
+        Assert.True((await store.AppendAsync(new StoredMessage("m1", Channel, "group-123456", "m1", "20000", "在吗", at,
+            SenderName: "小明", SenderRemark: "老王"), default)).Ok);
+
+        var contributors = new SessionExtensionRegistry();
+        Assert.True(contributors.Register(new ChannelDeltaSource(delta, new StubChannels(maxMessages: null))).Ok);
+        var model = new ScriptedModel();
+        var sessions = new SessionManager(_root, model, contributors);
+        var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
+
+        var turn = await sessions.TurnAsync("s-1", new SessionSpec("default", "Answer briefly.", "1"), Guid.NewGuid(),
+            new SessionTurnInput([], Channel, binding), null, default);
+
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+        var user = Assert.Single(model.Requests).Messages
+            .FirstOrDefault(m => m.Content?.Contains("<channel_context>", StringComparison.Ordinal) == true);
+        Assert.NotNull(user);
+        Assert.Contains("sender=\"小明(老王)\"", user!.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("sender=\"20000\"", user.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task A_window_caps_what_one_turn_carries_and_reports_the_rest_as_omitted()
     {
         var (store, delta) = Create();

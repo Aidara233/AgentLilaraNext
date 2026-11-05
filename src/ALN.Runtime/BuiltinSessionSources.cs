@@ -133,7 +133,11 @@ public sealed class ChannelDeltaSource(IChannelDeltaSource source, IChannelManag
             entries.Add(new SessionTimelineContribution($"omitted-{value.Messages[0].Id}", "system",
                 $"省略更早的 {value.Omitted} 条消息（频道窗口上限）。", value.Messages[0].At));
         foreach (var message in value.Messages)
-            entries.Add(new SessionTimelineContribution(message.Id, message.Sender, message.Text, message.At));
+            entries.Add(new SessionTimelineContribution(message.Id,
+                // The name recorded with the message, then the id. Outbound rows have neither name nor sender, and
+                // the composer already answers that case with an empty string.
+                ChannelMessage.Compose(message.SenderName, message.Sender, message.SenderRemark),
+                message.Text, message.At));
 
         // The cursor moves when this turn has been written down, not now: a turn that dies still owes these
         // messages to the next one.
