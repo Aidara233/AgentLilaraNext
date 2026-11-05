@@ -110,8 +110,8 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
 
     public async ValueTask<Result<ChannelInfo>> CreateAsync(ChannelSpec spec, CancellationToken cancellationToken)
     {
-        if (spec.Address.Module != "channel" || spec.Address.Kind != "conversation" || string.IsNullOrWhiteSpace(spec.Address.Instance))
-            return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "Channel address must be channel.conversation#<id>."));
+        if (spec.Address.Instance is null || string.IsNullOrWhiteSpace(spec.TypeId))
+            return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "A Channel instance needs an instance id and the type it implements."));
         if (string.IsNullOrWhiteSpace(spec.Name) || spec.Bindings is null || spec.Bindings.Count == 0)
             return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "Channel requires a name and at least one Adapter binding."));
         // A window bounds what one turn may carry; zero and negatives are not "no window", they are a bug in

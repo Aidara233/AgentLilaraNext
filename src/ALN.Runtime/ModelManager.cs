@@ -40,8 +40,9 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
 
     public Result RegisterFactory(string packageId, IModelProviderFactory factory)
     {
+        // A provider factory is a model provider because it says which category it serves and what type it is —
+        // not because its type id starts with anything in particular (C-04, C-06).
         if (string.IsNullOrWhiteSpace(packageId) || factory is null || string.IsNullOrWhiteSpace(factory.TypeId) ||
-            !factory.TypeId.StartsWith("model.", StringComparison.Ordinal) || factory.TypeId == "model" ||
             factory.Describe is null || factory.Describe.TypeId != factory.TypeId || string.IsNullOrWhiteSpace(factory.Describe.Category))
             return Result.Failure(new(ErrorCode.Invalid, "Model provider factory registration is invalid."));
         lock (_gate)
@@ -88,7 +89,7 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
 
     public async ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken)
     {
-        if (!spec.Address.IsInstance || spec.Address.Module != "model" || string.IsNullOrWhiteSpace(spec.ConfigurationJson))
+        if (!spec.Address.IsInstance || string.IsNullOrWhiteSpace(spec.TypeId) || string.IsNullOrWhiteSpace(spec.ConfigurationJson))
             return Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "Model provider instance configuration is invalid."));
         try { using var _ = JsonDocument.Parse(spec.ConfigurationJson); }
         catch (JsonException ex) { return Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "Model provider configuration is not valid JSON.", ex.Message)); }

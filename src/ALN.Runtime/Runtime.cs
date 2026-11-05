@@ -212,7 +212,7 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, IModuleWirin
     private async ValueTask<Result<IChatAdapter>> CreateCoreAsync(AdapterSpec spec,
         Func<AdapterSpec, Result<IChatAdapter>> factory, CancellationToken cancellationToken)
     {
-        if (spec.Address.Module != "adapter" || spec.Address.Kind is null || spec.Address.Instance is null || !_types.IsConcrete(spec.TypeId))
+        if (spec.Address.Instance is null || !_types.IsConcrete(spec.TypeId) || !_types.IsAssignableTo(spec.TypeId, "adapter"))
             return Result<IChatAdapter>.Failure(new(ErrorCode.Invalid, "Only registered concrete Adapter types with an instance id can be created."));
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
