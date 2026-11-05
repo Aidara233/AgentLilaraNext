@@ -41,7 +41,15 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     private const string ManifestFile = "module.json";
     private string ModulesRoot => Path.Combine(_root, ModulesDirectory);
 
-    private readonly IModelManager _models;
+    private readonly IModelManager? _models;
+    private readonly ICatalog? _catalog;
+
+    /// <summary>The model manager, by name when a catalog was given — modules do not hold each other.</summary>
+    private IModelManager Models =>
+        _catalog?.Find(new ModuleId(ModuleNames.ModelManager)) as IModelManager
+        ?? _models
+        ?? throw new InvalidOperationException("No model manager answered, and none was handed in.");
+
     private readonly ISignalLog _signalLog;
     private readonly ISessionExtensionRegistry _extensions;
     private readonly IPromptLibrary? _prompts;
@@ -63,14 +71,21 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
 
     public void UseInstanceHost(IInstanceHost instances) => _instances = instances ?? throw new ArgumentNullException(nameof(instances));
 
-    public SessionManager(string dataRoot, IModelManager models, ISessionExtensionRegistry? extensions = null,
-        ISignalLog? signalLog = null, IPromptLibrary? prompts = null)
+    /// <summary>
+    /// Either a model manager, or a catalog to find one in. The catalog is the shape that scales: a session asks for
+    /// the model manager by name when it needs it, instead of being built around one (C-19), which is also what takes
+    /// this manager out of the host's construction order.
+    /// </summary>
+    public SessionManager(string dataRoot, IModelManager? models = null, ISessionExtensionRegistry? extensions = null,
+        ISignalLog? signalLog = null, IPromptLibrary? prompts = null, ICatalog? catalog = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
-        ArgumentNullException.ThrowIfNull(models);
+        if (models is null && catalog is null)
+            throw new ArgumentException("A session manager needs a model manager, or a catalog to find one in.", nameof(models));
         _root = Path.GetFullPath(dataRoot);
 
         _models = models;
+        _catalog = catalog;
         _extensions = extensions ?? new SessionExtensionRegistry();
         _signalLog = signalLog ?? NullSignalLog.Instance;
         _prompts = prompts;
@@ -318,7 +333,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     /// </summary>
     private Result<SessionSpec> ResolveProfile(SessionSpec spec)
     {
-        var profiles = _models.ListProfiles();
+        var profiles = Models.ListProfiles();
         if (profiles.Count == 0)
             return Result<SessionSpec>.Failure(new(ErrorCode.Unavailable,
                 "Session spec names no model profile and no profile is registered."));
@@ -743,7 +758,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
                 var modelRecordId = Guid.NewGuid();
                 var modelParentId = SignalScope.CurrentId;
                 using var modelScope = SignalScope.Enter(modelRecordId, activationId);
-                var modelStarted = await _models.CompleteAsync(record.Spec.ModelProfileId,
+                var modelStarted = await Models.CompleteAsync(record.Spec.ModelProfileId,
                     new ModelRequest(messages, visible.Count > 0 ? visible : null), cancellationToken).ConfigureAwait(false);
                 if (!modelStarted.Ok || modelStarted.Value is null)
                     return Result<SessionTurnResult>.Failure(modelStarted.Error ?? new(ErrorCode.Unavailable, "Model profile is unavailable."));
