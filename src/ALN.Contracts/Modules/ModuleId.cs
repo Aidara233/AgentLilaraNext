@@ -16,8 +16,12 @@ namespace ALN.Contracts;
 /// <c>.</c> or <c>..</c>, not a Windows reserved device name. Invalid input is <b>refused</b>, never rewritten —
 /// silently turning "a/b" into "a_b" would let two different names collide on disk.
 /// Uniqueness is case-insensitive because the file systems are; equality of the value itself stays ordinal.
+///
+/// Deliberately <b>not</b> a record: a record struct allows <c>id with { Value = … }</c>, which is exactly the
+/// rename this type exists to make impossible. An instance's id is fixed at creation; there is no member here
+/// that produces the same id with a different value.
 /// </remarks>
-public readonly record struct ModuleId(string Value) : IComparable<ModuleId>
+public readonly struct ModuleId : IEquatable<ModuleId>, IComparable<ModuleId>
 {
     private static readonly string[] Reserved =
     [
@@ -26,11 +30,22 @@ public readonly record struct ModuleId(string Value) : IComparable<ModuleId>
         "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"
     ];
 
+    public ModuleId(string value) => Value = value;
+
+    public string Value { get; }
+
     public bool IsEmpty => string.IsNullOrWhiteSpace(Value);
 
     /// <summary>
-    /// Builds the readable form once, at creation, from the owner's own type and a fresh suffix. Generation is
-    /// allowed; reading the pieces back out is not.
+    /// The default id of a new instance: the type's own prefix, a separator, and a fresh suffix. Readable for a
+    /// human, meaningless to the code — nothing here may be parsed back out.
+    /// </summary>
+    public static ModuleId NewFor(string typeId) => Create(typeId, NewSuffix());
+
+    /// <summary>
+    /// Builds the readable form once, at creation, from the owner's own type and a suffix the caller chose. An
+    /// instance may be named by hand instead (a person typing "qq" in a config file is not a parsing problem), so
+    /// the suffix is whatever the caller asked for — it is validated as a name, never interpreted.
     /// </summary>
     public static ModuleId Create(string typeId, string? suffix = null) =>
         new(string.IsNullOrWhiteSpace(suffix) ? typeId : $"{typeId}#{suffix}");
@@ -59,7 +74,17 @@ public readonly record struct ModuleId(string Value) : IComparable<ModuleId>
     public static ModuleId Parse(string text) =>
         TryParse(text, out var id) ? id : throw new ArgumentException($"Not a legal module id: {text}", nameof(text));
 
+    public bool Equals(ModuleId other) => string.Equals(Value, other.Value, StringComparison.Ordinal);
+
+    public override bool Equals(object? obj) => obj is ModuleId other && Equals(other);
+
+    public override int GetHashCode() => Value is null ? 0 : StringComparer.Ordinal.GetHashCode(Value);
+
     public int CompareTo(ModuleId other) => string.CompareOrdinal(Value, other.Value);
+
+    public static bool operator ==(ModuleId left, ModuleId right) => left.Equals(right);
+
+    public static bool operator !=(ModuleId left, ModuleId right) => !left.Equals(right);
 
     public override string ToString() => Value ?? string.Empty;
 }
