@@ -262,10 +262,14 @@ public sealed class Kernel
         // 2.5 — Requirements: a module that finds its peers by name says which names it will ask for. Checked once,
         // here, so a missing peer fails the module at startup instead of failing the first message that needed it.
         // Nothing is ordered by this: the question is only "does somebody answer to that name", never "who first".
-        foreach (var instance in initialized.Where(instance => instance.Module is IRequireModules))
+        foreach (var instance in initialized)
         {
-            var requires = ((IRequireModules)instance.Module).Requires;
-            foreach (var name in requires)
+            // The requirement may be declared by the module itself or by the thing a carrier wraps: the host hands
+            // over carriers (a passive instance has no phases of its own), and the names belong to the module inside.
+            var subject = instance.Module is IModuleCarrier carrier ? carrier.Target : instance.Module;
+            if (subject is not IRequireModules requiring)
+                continue;
+            foreach (var name in requiring.Requires)
             {
                 var id = new ModuleId(name);
                 KernelInstance? peer;

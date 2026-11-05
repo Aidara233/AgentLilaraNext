@@ -132,6 +132,23 @@ public sealed class SessionLifecycleTests : IDisposable
     }
 
     [Fact]
+    public async Task A_session_manager_that_resolves_by_name_needs_a_model_manager_to_answer()
+    {
+        // The manager says which names it will look up, and the kernel checks them before ready — so a catalog with no
+        // model manager is a startup failure of the session manager, not a failure on the first turn.
+        var sessions = new SessionManager(Path.Combine(_root, "requires"), catalog: new ModuleCatalog());
+        var kernel = new Kernel(Path.Combine(_root, "requires-graph"), new ModuleFactoryRegistry());
+        Assert.True(kernel.Declare(new PassiveInstance(sessions.Id, sessions), typeId: ModuleNames.SessionManager).Ok);
+
+        var receipt = await kernel.StartAsync(default);
+
+        Assert.True(receipt.Ok, receipt.Error?.Message);
+        var failed = receipt.Value!.Instances.Single(instance => instance.Id.Value == sessions.Id.Value);
+        Assert.Equal(ModulePhase.Failed, failed.Phase);
+        Assert.Contains(ModuleNames.ModelManager, failed.Failure ?? "", StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task A_loaded_session_is_a_node_and_stops_being_one_when_it_is_put_away()
     {
         // "This manager holds this Session" used to exist only inside the manager's dictionary. A mount that named a

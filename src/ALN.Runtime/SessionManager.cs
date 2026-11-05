@@ -12,7 +12,7 @@ namespace ALN.Runtime;
 
 /// <summary>Runs one serialized model step per activation and persists completed turns.</summary>
 [Module(SessionManagerId, Category = "session", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWiring, IInstanceSink, IModule
+public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWiring, IInstanceSink, IModule, IRequireModules
 {
     public const string SessionManagerId = ModuleNames.SessionManager;
     public const string SessionTypeId = "session.chat";
@@ -43,6 +43,13 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
 
     private readonly IModelManager? _models;
     private readonly ICatalog? _catalog;
+
+    /// <summary>
+    /// The names this manager will look up. Declared only when it resolves them by name: with a model manager handed
+    /// in directly there is nothing to look up, so claiming the name would make the kernel demand a module this
+    /// instance does not use.
+    /// </summary>
+    public IReadOnlyList<string> Requires => _catalog is null ? [] : [ModuleNames.ModelManager];
 
     /// <summary>The model manager, by name when a catalog was given — modules do not hold each other.</summary>
     private IModelManager Models =>
