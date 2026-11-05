@@ -214,7 +214,24 @@ public sealed class ModuleManifestStore(string root)
 public sealed class ModuleFactoryRegistry : IModuleFactoryRegistry
 {
     private readonly Dictionary<string, Func<ModuleManifest, Result<IKernelModule>>> _factories = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _owned = new(StringComparer.Ordinal);
     private readonly object _gate = new();
+
+    /// <summary>
+    /// Declares a type whose instances somebody else builds — a manager, which creates, starts and stops them. The
+    /// file is then that instance's configuration, not a module the kernel should build. This is what replaces "the
+    /// host owns this type" being a predicate written next to the kernel: who builds a type is a fact about the type.
+    /// </summary>
+    public Result RegisterOwned(string typeId)
+    {
+        if (string.IsNullOrWhiteSpace(typeId))
+            return Result.Failure(new(ErrorCode.Invalid, "A module type needs a name."));
+        lock (_gate) _owned.Add(typeId);
+        return Result.Success();
+    }
+
+    /// <summary>Whether this type's instances are built by their manager rather than by the kernel.</summary>
+    public bool IsOwned(string? typeId) => typeId is not null && _owned.Contains(typeId);
 
     public Result Register(string typeId, Func<ModuleManifest, Result<IKernelModule>> factory)
     {

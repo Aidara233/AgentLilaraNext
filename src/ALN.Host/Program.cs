@@ -281,10 +281,17 @@ var deadlineSweepTask = sessions.RunDeadlineSweepAsync(deadlines, TimeProvider.S
 // and what to do about a module that fails. The host does not know what a wave is.
 // The kernel is told which types this process builds itself: every instance has a module.json too (docs/22 §2), and
 // its type belongs to a manager, so the loader must not treat the directory as a module it failed to understand.
-var kernel = new Kernel(data.Root, new ModuleFactoryRegistry(), signalLog, hostOwnsTypes: typeId =>
-    adapterTypes.IsConcrete(typeId) ||
-    string.Equals(typeId, SessionManager.SessionTypeId, StringComparison.Ordinal) ||
-    modelManager.ListTypes().Any(type => string.Equals(type.TypeId, typeId, StringComparison.Ordinal)));
+// The kernel is told which types this process builds itself. That used to be a predicate written here, next to the
+// kernel; now it is a fact registered on the factory table: a type whose instances a manager builds is "owned", so
+// the loader reads its file as that instance's configuration instead of reporting a module it failed to understand.
+var factories = new ModuleFactoryRegistry();
+foreach (var type in adapterTypes.ListTypes().Where(type => adapterTypes.IsConcrete(type.TypeId)))
+    factories.RegisterOwned(type.TypeId);
+foreach (var type in modelManager.ListTypes())
+    factories.RegisterOwned(type.TypeId);
+factories.RegisterOwned(SessionManager.SessionTypeId);
+
+var kernel = new Kernel(data.Root, factories, signalLog, hostOwnsTypes: factories.IsOwned);
 foreach (var declared in new (ILifecycleParticipant Participant, string TypeId)[]
          {
              (adapters, ModuleNames.AdapterManager),
