@@ -308,10 +308,10 @@ if (!memoryDeclared.Ok)
     queue.Complete();
     return 1;
 }
-// The model manager holds provider instances, so it is a master and has to be a node. It has no phases of its own —
+// The model manager holds provider instances, so it is a master and has to be a instance. It has no phases of its own —
 // the host builds providers from their files — so it is a carrier, and the kernel finds its wiring through the
 // carrier door like it finds everything else.
-var modelManagerDeclared = kernel.Declare(new PassiveNode(new ModuleId(ModuleNames.ModelManager), modelManager), typeId: ModuleNames.ModelManager);
+var modelManagerDeclared = kernel.Declare(new PassiveInstance(new ModuleId(ModuleNames.ModelManager), modelManager), typeId: ModuleNames.ModelManager);
 if (!modelManagerDeclared.Ok)
 {
     Console.Error.WriteLine(modelManagerDeclared.Error?.Message ?? "Model manager declaration failed.");
@@ -319,9 +319,9 @@ if (!modelManagerDeclared.Ok)
     queue.Complete();
     return 1;
 }
-// Sessions, for the same reason as models: the manager holds them, so a Session is a node the moment it is loaded.
+// Sessions, for the same reason as models: the manager holds them, so a Session is a instance the moment it is loaded.
 // No phase of its own either — a Session is loaded on demand, never by a wave.
-var sessionManagerDeclared = kernel.Declare(new PassiveNode(new ModuleId(ModuleNames.SessionManager), sessions), typeId: ModuleNames.SessionManager);
+var sessionManagerDeclared = kernel.Declare(new PassiveInstance(new ModuleId(ModuleNames.SessionManager), sessions), typeId: ModuleNames.SessionManager);
 if (!sessionManagerDeclared.Ok)
 {
     Console.Error.WriteLine(sessionManagerDeclared.Error?.Message ?? "Session manager declaration failed.");
@@ -332,18 +332,18 @@ if (!sessionManagerDeclared.Ok)
 // Instances are announced to the graph by the manager that holds them, so "what is mounted on this Channel" stops
 // being a question only the manager can answer (docs/23 §4 step 1). Installed before startup, because reviving a
 // stored Channel happens *during* startup — wiring it afterwards would announce only the ones created later.
-if (channels is IInstanceNodeSink sink)
-    sink.UseInstanceNodes(new InstanceNodeHost(kernel, new ModuleId(ModuleNames.ChannelManager)));
+if (channels is IInstanceSink sink)
+    sink.UseInstanceHost(new InstanceHost(kernel, new ModuleId(ModuleNames.ChannelManager)));
 // The same for Adapters - and it has to be here, not after startup: reviving the stored ones happens inside the
-// kernel's Ready phase, and an Adapter that is not a node never gets attached to the clock.
-if (adapters is IInstanceNodeSink adapterNodes)
-    adapterNodes.UseInstanceNodes(new InstanceNodeHost(kernel, new ModuleId(ModuleNames.AdapterManager)));
+// kernel's Ready phase, and an Adapter that is not a instance never gets attached to the clock.
+if (adapters is IInstanceSink adapterNodes)
+    adapterNodes.UseInstanceHost(new InstanceHost(kernel, new ModuleId(ModuleNames.AdapterManager)));
 // Model providers were built from their files long before the graph existed, so nothing announced them at the time.
 // Announcing them now — before startup — makes them ordinary declarations: startup initializes, wires and starts
 // them, and the receipt counts their edges like everybody else's.
-var modelNodeHost = new InstanceNodeHost(kernel, new ModuleId(ModuleNames.ModelManager));
-if (modelManager is IInstanceNodeSink modelNodes)
-    modelNodes.UseInstanceNodes(modelNodeHost);
+var modelNodeHost = new InstanceHost(kernel, new ModuleId(ModuleNames.ModelManager));
+if (modelManager is IInstanceSink modelNodes)
+    modelNodes.UseInstanceHost(modelNodeHost);
 foreach (var provider in modelManager.Entries())
 {
     var announced = await modelNodeHost.AttachAsync(new ModuleId(ModuleNames.ModelManager), provider.Id,
@@ -356,11 +356,11 @@ foreach (var provider in modelManager.Entries())
 }
 // Sessions are announced by their manager when it loads one, so the sink is installed before startup — a revived
 // Session is loaded inside a Ready phase, not after it.
-if (sessions is IInstanceNodeSink sessionNodes)
-    sessionNodes.UseInstanceNodes(new InstanceNodeHost(kernel, new ModuleId(ModuleNames.SessionManager)));
-// The clock is a node too, so the graph can answer "who is on a schedule". It has no phases of its own - the host
+if (sessions is IInstanceSink sessionNodes)
+    sessionNodes.UseInstanceHost(new InstanceHost(kernel, new ModuleId(ModuleNames.SessionManager)));
+// The clock is a instance too, so the graph can answer "who is on a schedule". It has no phases of its own - the host
 // runs its loop - so it is a passive carrier rather than a participant.
-var clockDeclared = kernel.Declare(new PassiveNode(new ModuleId(ModuleNames.Clock), clock), typeId: ModuleNames.Clock);
+var clockDeclared = kernel.Declare(new PassiveInstance(new ModuleId(ModuleNames.Clock), clock), typeId: ModuleNames.Clock);
 if (!clockDeclared.Ok)
 {
     Console.Error.WriteLine(clockDeclared.Error?.Message ?? "Clock module declaration failed.");
@@ -397,7 +397,7 @@ if (waiting.Ok && waiting.Value is not null)
         ? "no Session is waiting on a deadline"
         : $"{declared.Length} Session(s) waiting, earliest {declared.Min():O}");
 }
-foreach (var outcome in receipt.Nodes.Where(node => node.Phase != ModulePhase.Ready))
+foreach (var outcome in receipt.Instances.Where(instance => instance.Phase != ModulePhase.Ready))
     Console.Error.WriteLine($"startup {outcome.Phase}: {outcome.Id} — {outcome.Failure}");
 foreach (var edge in receipt.BadEdges)
     Console.Error.WriteLine($"startup bad edge: {edge.Master} -> {edge.Slave} ({edge.Reason}): {edge.Detail}");
@@ -405,7 +405,7 @@ foreach (var cycle in receipt.Cycles)
     Console.Error.WriteLine($"startup cycle (ready together): {string.Join(" <-> ", cycle.Members)}");
 foreach (var issue in receipt.Issues)
     Console.Error.WriteLine($"startup issue: {issue.Path} — {issue.Message}");
-restore.Note("graph", $"{receipt.Ready}/{receipt.Nodes.Count} ready, {receipt.WiredEdges} edge(s) wired" +
+restore.Note("graph", $"{receipt.Ready}/{receipt.Instances.Count} ready, {receipt.WiredEdges} edge(s) wired" +
     (receipt.Degraded == 0 ? "" : $", degraded {receipt.Degraded}"));
 // A trigger is not an edge, so it does not show up in the line above; printing it is what keeps "who pushes this
 // adapter" from being a fact only the clock knows (docs/22 §1.4).

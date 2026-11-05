@@ -86,7 +86,7 @@ public static class CoreActions
                         adapters = adapters.List().Count,
                         channels = channels.List().Count,
                         profiles = models.ListProfiles().Count,
-                        nodes = status?.Nodes,
+                        instances = status?.Instances,
                         ready = status?.Ready,
                         // The one number a health check can look at (docs/22 §5.2): a system that came up minus two
                         // edges behaves exactly like a whole one, and only this count says so.
@@ -248,8 +248,8 @@ public static class CoreActions
                     }) ?? [],
                     contracts = ModuleContracts.Version
                 })))),
-            // The graph, not the packages: which nodes exist right now, where each one got to, and what was added or
-            // removed since startup. A module is a node here (docs/22 §3), and the package it came from is a different
+            // The graph, not the packages: which instances exist right now, where each one got to, and what was added or
+            // removed since startup. A module is a instance here (docs/22 §3), and the package it came from is a different
             // question with a different answer (packages.list).
             (new(ModulesList, "Modules in the graph right now: id, type, phase, and what is not working.", Capabilities.ModulesRead, false),
                 (_, _) =>
@@ -258,12 +258,12 @@ public static class CoreActions
                     var status = kernel.Status;
                     return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
                     {
-                        nodes = kernel.Nodes.Select(node => new
+                        instances = kernel.Instances.Select(instance => new
                         {
-                            id = node.Id.ToString(),
-                            type = node.Type,
-                            phase = JsonNamingPolicy.CamelCase.ConvertName(node.Phase.ToString()),
-                            failure = node.Failure
+                            id = instance.Id.ToString(),
+                            type = instance.Type,
+                            phase = JsonNamingPolicy.CamelCase.ConvertName(instance.Phase.ToString()),
+                            failure = instance.Failure
                         }),
                         ready = status.Ready,
                         degraded = status.Degraded,
@@ -285,15 +285,15 @@ public static class CoreActions
                     var addition = loaded.Value!;
                     return Result<JsonElement>.Success(ToJson(new
                     {
-                        id = addition.Node.Id.ToString(),
-                        type = addition.Node.Type,
-                        phase = JsonNamingPolicy.CamelCase.ConvertName(addition.Node.Phase.ToString()),
-                        failure = addition.Node.Failure,
+                        id = addition.Instance.Id.ToString(),
+                        type = addition.Instance.Type,
+                        phase = JsonNamingPolicy.CamelCase.ConvertName(addition.Instance.Phase.ToString()),
+                        failure = addition.Instance.Failure,
                         wiredEdges = addition.WiredEdges,
                         badEdges = addition.BadEdges.Select(EdgeOf)
                     }));
                 }),
-            // Unloading takes the node out and puts the directory in the bin, because that is what "gone" has meant
+            // Unloading takes the instance out and puts the directory in the bin, because that is what "gone" has meant
             // everywhere else here; keeping it is the explicit choice (archive: false), not the default.
             (new(ModulesUnload, "Take one module out of the graph. archive defaults to true: its directory goes to the bin.", Capabilities.ModulesControl, true),
                 async (arguments, ct) =>

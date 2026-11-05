@@ -115,7 +115,7 @@ public sealed class ModuleManifestStore(string root)
             if (types is not null && !types.IsRegistered(raw.Type))
             {
                 // Not the loader's to build: the host owns this type, so the file is that instance's configuration
-                // and the manager will announce the node when it holds it. Skipped silently — an issue here would be
+                // and the manager will announce the instance when it holds it. Skipped silently — an issue here would be
                 // one line per instance, which is the same as no receipt at all.
                 if (hostOwns is not null && hostOwns(raw.Type)) continue;
                 issues.Add(new(path, $"Unknown module type: {raw.Type}"));

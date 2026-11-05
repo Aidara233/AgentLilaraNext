@@ -12,7 +12,7 @@ public enum ModulePhase
     Loaded,
     /// <summary>Turned off in its manifest: it stays in the graph, and never reaches Ready.</summary>
     Disabled,
-    /// <summary>It built its own things. Its edges cannot be trusted before every node has reached this.</summary>
+    /// <summary>It built its own things. Its edges cannot be trusted before every instance has reached this.</summary>
     Initialized,
     /// <summary>Its edges are wired and its master has let it start working.</summary>
     Ready,
@@ -140,8 +140,8 @@ public sealed record BadEdge(ModuleId Master, ModuleId Slave, BadEdgeReason Reas
 /// <summary>A problem found while reading the disk: a directory that is not a module, a broken manifest, a duplicate.</summary>
 public sealed record ModuleIssue(string Path, string Message);
 
-/// <summary>One node as the receipt reports it: what it is, where it got to, and why it stopped.</summary>
-public sealed record ModuleNodeInfo(ModuleId Id, string Type, ModulePhase Phase, string? Failure = null);
+/// <summary>One instance as the receipt reports it: what it is, where it got to, and why it stopped.</summary>
+public sealed record InstanceInfo(ModuleId Id, string Type, ModulePhase Phase, string? Failure = null);
 
 /// <summary>
 /// The graph as it stands right now, for surfaces that cannot see the startup receipt — <c>system.info</c> is the
@@ -151,7 +151,7 @@ public sealed record ModuleNodeInfo(ModuleId Id, string Type, ModulePhase Phase,
 /// removal changes them, and the point of asking later is to see that change.
 /// </summary>
 public sealed record ModuleGraphStatus(
-    int Nodes,
+    int Instances,
     int Ready,
     int Degraded,
     IReadOnlyList<RhythmInfo> Rhythms,
@@ -179,27 +179,27 @@ public sealed record CycleInfo(IReadOnlyList<ModuleId> Members);
 /// a system that came up minus two edges is a different system from the one that was written down, and the only
 /// way to know which one is running is for the startup to say so.
 ///
-/// <see cref="Rhythms"/> is the fifth: not an edge, not a node, but the thing that makes a polling module move.
+/// <see cref="Rhythms"/> is the fifth: not an edge, not a instance, but the thing that makes a polling module move.
 /// </summary>
 public sealed record ModuleReceipt(
-    IReadOnlyList<ModuleNodeInfo> Nodes,
+    IReadOnlyList<InstanceInfo> Instances,
     int WiredEdges,
     IReadOnlyList<BadEdge> BadEdges,
     IReadOnlyList<CycleInfo> Cycles,
     IReadOnlyList<ModuleIssue> Issues,
     IReadOnlyList<RhythmInfo> Rhythms)
 {
-    public int Ready => Nodes.Count(node => node.Phase == ModulePhase.Ready);    public int Failed => Nodes.Count(node => node.Phase is ModulePhase.Failed or ModulePhase.Error);
+    public int Ready => Instances.Count(instance => instance.Phase == ModulePhase.Ready);    public int Failed => Instances.Count(instance => instance.Phase is ModulePhase.Failed or ModulePhase.Error);
 
     /// <summary>Everything that makes this startup different from a clean one, in one number for health checks.</summary>
     public int Degraded => BadEdges.Count + Issues.Count + Failed;
 
-    public bool AllReady => Nodes.Count > 0 && Ready == Nodes.Count;
+    public bool AllReady => Instances.Count > 0 && Ready == Instances.Count;
 }
 
 /// <summary>
-/// What adding a node at runtime produced (docs/22, D1): where the node got to, the edges that did not become calls,
-/// and how many did. A node that arrives late can be refused for reasons that did not exist at startup — the slave
+/// What adding a instance at runtime produced (docs/22, D1): where the instance got to, the edges that did not become calls,
+/// and how many did. A instance that arrives late can be refused for reasons that did not exist at startup — the slave
 /// it wanted is gone, the master it needed never got ready — so the answer carries them instead of only a success.
 /// </summary>
-public sealed record ModuleAddition(ModuleNodeInfo Node, IReadOnlyList<BadEdge> BadEdges, int WiredEdges = 0);
+public sealed record ModuleAddition(InstanceInfo Instance, IReadOnlyList<BadEdge> BadEdges, int WiredEdges = 0);

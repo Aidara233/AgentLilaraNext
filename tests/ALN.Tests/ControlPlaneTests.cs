@@ -111,7 +111,7 @@ public sealed class ControlPlaneTests : IDisposable
             new FakeGraph(), new FakeParameters(), graphStatus: () => status).Ok);
 
         var info = await Raw(plane);
-        Assert.Equal(9, info.GetProperty("nodes").GetInt32());
+        Assert.Equal(9, info.GetProperty("instances").GetInt32());
         Assert.Equal(8, info.GetProperty("ready").GetInt32());
         // The number a health check can look at, when nobody is reading the startup log any more.
         Assert.Equal(1, info.GetProperty("degraded").GetInt32());
@@ -215,11 +215,11 @@ public sealed class ControlPlaneTests : IDisposable
         var packages = await plane.InvokeAsync(Actor.System, CoreActions.PackagesList, default, default);
 
         Assert.True(graph.Ok, graph.Error?.Message);
-        Assert.Equal("thing", Assert.Single(graph.Value.GetProperty("nodes").EnumerateArray()).GetProperty("id").GetString());
+        Assert.Equal("thing", Assert.Single(graph.Value.GetProperty("instances").EnumerateArray()).GetProperty("id").GetString());
         Assert.True(packages.Ok, packages.Error?.Message);
         // Two different questions, two different answers: the graph is what runs, the package list is what was loaded.
         Assert.True(packages.Value.TryGetProperty("modules", out _));
-        Assert.False(packages.Value.TryGetProperty("nodes", out _));
+        Assert.False(packages.Value.TryGetProperty("instances", out _));
     }
 
     /// <summary>Writes one module's own file, which is all the kernel reads.</summary>

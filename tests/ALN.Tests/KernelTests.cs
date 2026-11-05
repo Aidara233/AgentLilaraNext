@@ -134,8 +134,8 @@ public sealed class KernelTests : IDisposable
         var error = Assert.Single(broken.Errors);
         Assert.Equal(nameof(IKernelModule.InitializeAsync), error.Method);
         Assert.Contains("cannot open its file", error.Message, StringComparison.Ordinal);
-        Assert.Equal(ModulePhase.Failed, receipt.Nodes.Single(node => node.Id.Value == "broken").Phase);
-        Assert.Equal(ModulePhase.Ready, receipt.Nodes.Single(node => node.Id.Value == "healthy").Phase);
+        Assert.Equal(ModulePhase.Failed, receipt.Instances.Single(instance => instance.Id.Value == "broken").Phase);
+        Assert.Equal(ModulePhase.Ready, receipt.Instances.Single(instance => instance.Id.Value == "healthy").Phase);
         Assert.False(receipt.AllReady);
     }
 
@@ -156,7 +156,7 @@ public sealed class KernelTests : IDisposable
         // Two records: the failure, and the hook that failed to receive it. Nothing propagates further.
         Assert.Equal(2, signals.Records.Count);
         Assert.All(signals.Records, record => Assert.Equal(SignalLevel.Error, record.Level));
-        Assert.Equal(ModulePhase.Ready, receipt.Nodes.Single(node => node.Id.Value == "healthy").Phase);
+        Assert.Equal(ModulePhase.Ready, receipt.Instances.Single(instance => instance.Id.Value == "healthy").Phase);
     }
 
     [Fact]
@@ -169,7 +169,7 @@ public sealed class KernelTests : IDisposable
 
         var receipt = await Start();
 
-        Assert.Equal(ModulePhase.Ready, receipt.Nodes.Single(node => node.Id.Value == "foo").Phase);
+        Assert.Equal(ModulePhase.Ready, receipt.Instances.Single(instance => instance.Id.Value == "foo").Phase);
         Assert.Equal(1, receipt.WiredEdges);
         Assert.Equal([new ModuleId("bar")], foo.Wired);
     }
@@ -185,7 +185,7 @@ public sealed class KernelTests : IDisposable
         var receipt = await Start();
 
         Assert.Empty(off.Calls);
-        Assert.Equal(ModulePhase.Disabled, receipt.Nodes.Single(node => node.Id.Value == "off").Phase);
+        Assert.Equal(ModulePhase.Disabled, receipt.Instances.Single(instance => instance.Id.Value == "off").Phase);
         var edge = Assert.Single(receipt.BadEdges);
         Assert.Equal(BadEdgeReason.DisabledModule, edge.Reason);
     }
@@ -206,7 +206,7 @@ public sealed class KernelTests : IDisposable
         Assert.True((await kernel.StopAsync(default)).Ok);
 
         Assert.Equal(["master", "slave"], order);
-        Assert.Equal(ModulePhase.Stopped, kernel.Nodes.Single(node => node.Id.Value == "master").Phase);
+        Assert.Equal(ModulePhase.Stopped, kernel.Instances.Single(instance => instance.Id.Value == "master").Phase);
     }
 
     [Fact]
@@ -220,9 +220,9 @@ public sealed class KernelTests : IDisposable
         var first = await Start(kernel);
         var second = await Start(kernel);
 
-        string Shape(ModuleReceipt receipt) => string.Join("|", receipt.Nodes
-            .OrderBy(node => node.Id.Value, StringComparer.Ordinal)
-            .Select(node => $"{node.Id}:{node.Type}:{node.Phase}")) + $"|{receipt.WiredEdges}|{receipt.BadEdges.Count}|{receipt.Cycles.Count}";
+        string Shape(ModuleReceipt receipt) => string.Join("|", receipt.Instances
+            .OrderBy(instance => instance.Id.Value, StringComparer.Ordinal)
+            .Select(instance => $"{instance.Id}:{instance.Type}:{instance.Phase}")) + $"|{receipt.WiredEdges}|{receipt.BadEdges.Count}|{receipt.Cycles.Count}";
         Assert.Equal(Shape(first), Shape(second));
     }
 
@@ -261,7 +261,7 @@ public sealed class KernelTests : IDisposable
         var started = await kernel.StartAsync(default);
 
         Assert.True(started.Ok);
-        Assert.Equal(ModulePhase.Ready, started.Value!.Nodes.Single(node => node.Id.Value == "adapters").Phase);
+        Assert.Equal(ModulePhase.Ready, started.Value!.Instances.Single(instance => instance.Id.Value == "adapters").Phase);
         Assert.Equal(["initialize", "ready"], declared.Calls);
     }
 
@@ -292,9 +292,9 @@ public sealed class KernelTests : IDisposable
         var started = await kernel.StartAsync(default);
 
         Assert.True(started.Ok);
-        var nodes = started.Value!.Nodes;
-        Assert.Equal(ModulePhase.Failed, nodes.Single(node => node.Id.Value == "channels").Phase);
-        Assert.Equal(ModulePhase.Ready, nodes.Single(node => node.Id.Value == "adapters").Phase);
+        var instances = started.Value!.Instances;
+        Assert.Equal(ModulePhase.Failed, instances.Single(instance => instance.Id.Value == "channels").Phase);
+        Assert.Equal(ModulePhase.Ready, instances.Single(instance => instance.Id.Value == "adapters").Phase);
         Assert.Equal(1, started.Value.Degraded);
     }
 
@@ -365,18 +365,18 @@ public sealed class KernelTests : IDisposable
             typeId: "test.master", cancellationToken: default);
 
         Assert.True(added.Ok, added.Error?.Message);
-        Assert.Equal(ModulePhase.Ready, added.Value!.Node.Phase);
+        Assert.Equal(ModulePhase.Ready, added.Value!.Instance.Phase);
         Assert.Equal(1, added.Value.WiredEdges);
         Assert.Equal([new ModuleId("target")], late.Wired);
-        Assert.Contains(kernel.Nodes, node => node.Id.Value == "late");
-        // Adding the same name twice is a conflict, not a second node.
+        Assert.Contains(kernel.Instances, instance => instance.Id.Value == "late");
+        // Adding the same name twice is a conflict, not a second instance.
         Assert.False((await kernel.AddAsync(new TestModule(new("late")), cancellationToken: default)).Ok);
     }
 
     [Fact]
     public async Task A_module_added_late_that_needs_something_missing_is_reported_not_refused()
     {
-        // A slave that is not there is a bad edge, exactly like at startup: the node exists, said what it wanted,
+        // A slave that is not there is a bad edge, exactly like at startup: the instance exists, said what it wanted,
         // and the answer says which edge never became a call.
         Add(new TestModule(new("only")), "test.plain");
         var kernel = new Kernel(_root, _types);
@@ -387,7 +387,7 @@ public sealed class KernelTests : IDisposable
             typeId: "test.master", cancellationToken: default);
 
         Assert.True(added.Ok, added.Error?.Message);
-        Assert.Equal(ModulePhase.Ready, added.Value!.Node.Phase);
+        Assert.Equal(ModulePhase.Ready, added.Value!.Instance.Phase);
         var edge = Assert.Single(added.Value.BadEdges);
         Assert.Equal(BadEdgeReason.MissingModule, edge.Reason);
         Assert.Equal(0, added.Value.WiredEdges);
@@ -407,8 +407,8 @@ public sealed class KernelTests : IDisposable
         var added = await kernel.AddAsync(late, dependencies: [new ModuleId("broken")], cancellationToken: default);
 
         Assert.True(added.Ok, added.Error?.Message);
-        Assert.Equal(ModulePhase.Failed, added.Value!.Node.Phase);
-        Assert.Contains("broken", added.Value.Node.Failure!, StringComparison.Ordinal);
+        Assert.Equal(ModulePhase.Failed, added.Value!.Instance.Phase);
+        Assert.Contains("broken", added.Value.Instance.Failure!, StringComparison.Ordinal);
         Assert.Empty(late.Calls.Skip(1));
     }
 
@@ -429,7 +429,7 @@ public sealed class KernelTests : IDisposable
         Assert.True(removed.Ok, removed.Error?.Message);
         Assert.Equal(["slave"], stopped);
         Assert.Null(kernel.Find(new ModuleId("slave")));
-        Assert.DoesNotContain(kernel.Nodes, node => node.Id.Value == "slave");
+        Assert.DoesNotContain(kernel.Instances, instance => instance.Id.Value == "slave");
         // The master's file still lists it, so the edge is reported rather than rewritten behind its back.
         var edge = Assert.Single(removed.Value!);
         Assert.Equal(BadEdgeReason.MissingModule, edge.Reason);
@@ -449,8 +449,8 @@ public sealed class KernelTests : IDisposable
         var loaded = await kernel.LoadAsync(new ModuleId("later"), default);
 
         Assert.True(loaded.Ok, loaded.Error?.Message);
-        Assert.Equal(ModulePhase.Ready, loaded.Value!.Node.Phase);
-        // Asking for something with no readable file is an error that says so, not an empty node.
+        Assert.Equal(ModulePhase.Ready, loaded.Value!.Instance.Phase);
+        // Asking for something with no readable file is an error that says so, not an empty instance.
         Assert.False((await kernel.LoadAsync(new ModuleId("absent"), default)).Ok);
     }
 
@@ -497,7 +497,7 @@ public sealed class KernelTests : IDisposable
     }
 
     private static string Failures(ModuleReceipt receipt) =>
-        string.Join(" | ", receipt.Nodes.Where(node => node.Phase != ModulePhase.Ready).Select(node => $"{node.Id}:{node.Phase}:{node.Failure}"));
+        string.Join(" | ", receipt.Instances.Where(instance => instance.Phase != ModulePhase.Ready).Select(instance => $"{instance.Id}:{instance.Phase}:{instance.Failure}"));
 
     /// <summary>Writes the module's own file and makes its type resolvable. Slaves are given by id.</summary>
     private void Add(TestModule module, string typeId, IReadOnlyList<string>? slaves = null, bool enabled = true)
@@ -579,14 +579,14 @@ public sealed class KernelTests : IDisposable
         var kernel = new Kernel(_root, _types);
         Assert.True(kernel.Declare(manager, typeId: ModuleNames.ChannelManager).Ok);
         Assert.True((await kernel.StartAsync(default)).Ok);
-        var host = new InstanceNodeHost(kernel, new ModuleId("ChannelManager"));
+        var host = new InstanceHost(kernel, new ModuleId("ChannelManager"));
         var instance = new ModuleId("channel.conversation#chat-1");
 
         var attached = await host.AttachAsync(new ModuleId("ChannelManager"), instance, "channel.conversation", ["message.accepted"], default);
 
         Assert.True(attached.Ok, attached.Error?.Message);
-        Assert.Equal(ModulePhase.Ready, kernel.Nodes.Single(node => node.Id == instance).Phase);
-        Assert.Equal("channel.conversation", kernel.Nodes.Single(node => node.Id == instance).Type);
+        Assert.Equal(ModulePhase.Ready, kernel.Instances.Single(candidate => candidate.Id == instance).Phase);
+        Assert.Equal("channel.conversation", kernel.Instances.Single(candidate => candidate.Id == instance).Type);
         // The manager was asked to accept it, which is what makes this an edge rather than a bookmark.
         Assert.Equal([instance], manager.Wired);
 
@@ -624,7 +624,7 @@ public sealed class KernelTests : IDisposable
         Assert.Equal(new ModuleId("shared-1"), Assert.Single(first.Wired));
         Assert.Equal(new ModuleId("shared-1"), Assert.Single(second.Wired));
         Assert.Single(instance.Calls, call => call == "initialize");
-        Assert.Equal(ModulePhase.Ready, kernel.Nodes.Single(node => node.Id == instance.Id).Phase);
+        Assert.Equal(ModulePhase.Ready, kernel.Instances.Single(held => held.Id == instance.Id).Phase);
     }
 
     [Fact]
@@ -665,7 +665,7 @@ public sealed class KernelTests : IDisposable
 
         Assert.True(released.Ok, released.Error?.Message);
         Assert.NotNull(kernel.Find(instance.Id));
-        Assert.Equal(ModulePhase.Ready, kernel.Nodes.Single(node => node.Id == instance.Id).Phase);
+        Assert.Equal(ModulePhase.Ready, kernel.Instances.Single(held => held.Id == instance.Id).Phase);
         Assert.Equal(before, instance.Calls.Count);     // nothing stopped, nothing re-initialized
         // Releasing again is still fine: a manager tearing down is allowed to say so twice.
         Assert.True((await kernel.ReleaseAsync(first.Id, instance.Id, default)).Ok);
@@ -675,12 +675,12 @@ public sealed class KernelTests : IDisposable
     public async Task A_manager_only_accepts_the_instances_it_holds()
     {
         // The master judges: a Channel manager that does not have this Channel refuses the edge, and the refusal is
-        // reported rather than leaving a node nobody owns.
+        // reported rather than leaving a instance nobody owns.
         var manager = new TestMaster(new("ChannelManager")) { Accept = (_, _, _) => Result.Failure(new(ErrorCode.Invalid, "not mine")) };
         var kernel = new Kernel(_root, _types);
         Assert.True(kernel.Declare(manager, typeId: ModuleNames.ChannelManager).Ok);
         Assert.True((await kernel.StartAsync(default)).Ok);
-        var host = new InstanceNodeHost(kernel, new ModuleId("ChannelManager"));
+        var host = new InstanceHost(kernel, new ModuleId("ChannelManager"));
         var instance = new ModuleId("channel.conversation#chat-1");
 
         var attached = await host.AttachAsync(new ModuleId("ChannelManager"), instance, "channel.conversation", null, default);
@@ -698,7 +698,7 @@ public sealed class KernelTests : IDisposable
         var ticker = new TickingModule(new("adapter.file#one"));
         var kernel = new Kernel(_root, _types);
         Assert.True(kernel.Declare(ticker).Ok);
-        Assert.True(kernel.Declare(new PassiveNode(new ModuleId("Clock"), source), typeId: "clock").Ok);
+        Assert.True(kernel.Declare(new PassiveInstance(new ModuleId("Clock"), source), typeId: "clock").Ok);
 
         var receipt = await Start(kernel);
 
@@ -726,7 +726,7 @@ public sealed class KernelTests : IDisposable
         var signals = new RecordingSignals();
         var kernel = new Kernel(new ModuleManifestStore(_root), _types, signals);
         Assert.True(kernel.Declare(new TickingModule(new("adapter.file#one"))).Ok);
-        Assert.True(kernel.Declare(new PassiveNode(new ModuleId("Clock"), source), typeId: "clock").Ok);
+        Assert.True(kernel.Declare(new PassiveInstance(new ModuleId("Clock"), source), typeId: "clock").Ok);
 
         var receipt = await Start(kernel);
 
@@ -746,8 +746,8 @@ public sealed class KernelTests : IDisposable
         var ticker = new TickingModule(new("adapter.file#one"));
         var kernel = new Kernel(_root, _types);
         Assert.True(kernel.Declare(ticker).Ok);
-        Assert.True(kernel.Declare(new PassiveNode(new ModuleId("Clock"), schedule), typeId: "clock").Ok);
-        Assert.True(kernel.Declare(new PassiveNode(new ModuleId("Relay"), pushOnly), typeId: "relay").Ok);
+        Assert.True(kernel.Declare(new PassiveInstance(new ModuleId("Clock"), schedule), typeId: "clock").Ok);
+        Assert.True(kernel.Declare(new PassiveInstance(new ModuleId("Relay"), pushOnly), typeId: "relay").Ok);
 
         Assert.True((await kernel.StartAsync(default)).Ok);
 
@@ -766,7 +766,7 @@ public sealed class KernelTests : IDisposable
         var receipt = await Start(kernel);
 
         Assert.Equal(receipt.Degraded, kernel.Status.Degraded);
-        Assert.Equal(receipt.Nodes.Count, kernel.Status.Nodes);
+        Assert.Equal(receipt.Instances.Count, kernel.Status.Instances);
         Assert.Equal(receipt.Ready, kernel.Status.Ready);
         var edge = Assert.Single(kernel.Status.BadEdges);
         Assert.Equal(BadEdgeReason.MissingModule, edge.Reason);
@@ -776,18 +776,18 @@ public sealed class KernelTests : IDisposable
     public async Task An_instance_announced_before_startup_is_initialized_wired_and_counted_like_any_other_node()
     {
         // Providers are built from their files before the graph exists. If adoption only worked after startup, those
-        // would be the one kind of instance the receipt never mentions — and "which nodes are there" would be
+        // would be the one kind of instance the receipt never mentions — and "which instances are there" would be
         // answered differently by the receipt and by the running graph.
         var manager = new TestMaster(new("ModelManager"));
         var kernel = new Kernel(_root, _types);
-        Assert.True(kernel.Declare(new PassiveNode(manager.Id, manager), typeId: "manager").Ok);
-        var host = new InstanceNodeHost(kernel, manager.Id);
+        Assert.True(kernel.Declare(new PassiveInstance(manager.Id, manager), typeId: "manager").Ok);
+        var host = new InstanceHost(kernel, manager.Id);
 
         var announced = await host.AttachAsync(manager.Id, new ModuleId("model.chat#one"), "model.openai-chat", null, default);
 
         Assert.True(announced.Ok, announced.Error?.Message);
         var receipt = await Start(kernel);
-        Assert.Equal(ModulePhase.Ready, receipt.Nodes.Single(node => node.Id.Value == "model.chat#one").Phase);
+        Assert.Equal(ModulePhase.Ready, receipt.Instances.Single(instance => instance.Id.Value == "model.chat#one").Phase);
         Assert.Equal(1, receipt.WiredEdges);
         // The master judges even here: the instance is wired through it, not just written down next to it.
         Assert.Equal([new ModuleId("model.chat#one")], manager.Wired);
@@ -797,18 +797,18 @@ public sealed class KernelTests : IDisposable
     public async Task An_instance_announced_while_the_graph_is_starting_gets_its_phases_and_is_in_the_receipt()
     {
         // A manager revives its instances in Ready — inside startup, not after it. Treating that announcement as a
-        // declaration is not a small mix-up: the node lands in no phase at all, the receipt comes up short by exactly
+        // declaration is not a small mix-up: the instance lands in no phase at all, the receipt comes up short by exactly
         // the instances that were revived, and nothing says so. (That is what the real host did when this was wrong.)
         var manager = new TestMaster(new("ChannelManager"));
         var kernel = new Kernel(_root, _types);
         Assert.True(kernel.Declare(manager, typeId: "manager").Ok);
-        var host = new InstanceNodeHost(kernel, manager.Id);
+        var host = new InstanceHost(kernel, manager.Id);
         manager.Ready = () => host.AttachAsync(manager.Id, new ModuleId("channel.conversation#chat"),
             "channel.conversation", ["message.accepted"], default);
 
         var receipt = await Start(kernel);
 
-        var instance = receipt.Nodes.Single(node => node.Id.Value == "channel.conversation#chat");
+        var instance = receipt.Instances.Single(instance => instance.Id.Value == "channel.conversation#chat");
         Assert.Equal(ModulePhase.Ready, instance.Phase);
         Assert.Equal(1, receipt.WiredEdges);
         Assert.Equal([new ModuleId("channel.conversation#chat")], manager.Wired);

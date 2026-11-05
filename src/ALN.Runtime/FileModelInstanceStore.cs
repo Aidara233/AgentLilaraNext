@@ -14,9 +14,9 @@ namespace ALN.Runtime;
 /// record the loader deserializes is what a save writes back, so a round trip through the settings page cannot
 /// quietly drop a field.
 ///
-/// Why the directory and not <c>models/&lt;category&gt;/&lt;instance&gt;.json</c>: an instance is a node, a node's
-/// directory is named by its id, and there is exactly one file per node. A provider whose configuration lived
-/// somewhere else would be the one node whose directory says nothing — and the day something asks "what is in
+/// Why the directory and not <c>models/&lt;category&gt;/&lt;instance&gt;.json</c>: an instance is a instance, a instance's
+/// directory is named by its id, and there is exactly one file per instance. A provider whose configuration lived
+/// somewhere else would be the one instance whose directory says nothing — and the day something asks "what is in
 /// <c>modules/</c>", the answer would be a lie.
 /// </summary>
 public sealed class FileModelInstanceStore(string root) : IModelInstanceStore
@@ -70,7 +70,7 @@ public sealed class FileModelInstanceStore(string root) : IModelInstanceStore
         if (!File.Exists(path)) return Result<ModelInstanceSpec?>.Success(null);
         var read = await ReadFileAsync(path, cancellationToken).ConfigureAwait(false);
         if (read.Error is { } error) return Result<ModelInstanceSpec?>.Failure(error);
-        // Not a model provider's file, or one that names a different node than the directory it sits in: either way
+        // Not a model provider's file, or one that names a different instance than the directory it sits in: either way
         // there is no configuration for this address, and inventing one would configure the wrong thing.
         if (read.Value is null) return Result<ModelInstanceSpec?>.Success(null);
         return string.Equals(read.Value.Provider.ToString(), id, StringComparison.Ordinal)

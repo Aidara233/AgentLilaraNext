@@ -7,7 +7,7 @@ namespace ALN.Runtime;
 /// <summary>Core registry and router for provider kinds, provider instances and model profiles.</summary>
 [Module(ModelManagerId, Category = "model", Role = ModuleRole.Manager, Singleton = true)]
 public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? signalLog = null)
-    : IModelManager, IModuleIndex, IModulePackageResourceRegistry, IModuleWiring, IInstanceNodeSink, IModule
+    : IModelManager, IModuleIndex, IModulePackageResourceRegistry, IModuleWiring, IInstanceSink, IModule
 {
     public const string ModelManagerId = ModuleNames.ModelManager;
     public ModuleId Id { get; } = new(ModelManagerId);
@@ -26,7 +26,7 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
                 : Result.Failure(new(ErrorCode.Invalid, $"{slaveId} is not one of this manager's model providers."));
     }
 
-    public void UseInstanceNodes(IInstanceNodeHost nodes) => _nodes = nodes ?? throw new ArgumentNullException(nameof(nodes));
+    public void UseInstanceHost(IInstanceHost instances) => _instances = instances ?? throw new ArgumentNullException(nameof(instances));
 
     private static ModuleId IdOf(Address address) => address.ToModuleId();
 
@@ -36,7 +36,7 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
     // descriptor carries it, and that descriptor came from the factory registered under that very type.
     private readonly Dictionary<ModuleId, (string PackageId, IModelProvider Provider, int InFlight)> _providers = new();
     private readonly Dictionary<string, ModelProfile> _profiles = new(StringComparer.Ordinal);
-    private IInstanceNodeHost? _nodes;
+    private IInstanceHost? _instances;
 
     public Result RegisterFactory(string packageId, IModelProviderFactory factory)
     {
@@ -124,12 +124,12 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
             }
             _providers.Add(created.Value.Id, (packageId, created.Value, 0));
         }
-        // Now a node, so a mount that names this provider points at something the graph knows (docs/23 §4 step 1).
+        // Now a instance, so a mount that names this provider points at something the graph knows (docs/23 §4 step 1).
         // A provider that exists but is invisible is the shape nobody can reason about later, so a refusal here
-        // rolls the creation back instead of leaving a working provider with no node.
-        if (_nodes is not null)
+        // rolls the creation back instead of leaving a working provider with no instance.
+        if (_instances is not null)
         {
-            var announced = await _nodes.AttachAsync(new ModuleId(ModelManagerId), created.Value.Id,
+            var announced = await _instances.AttachAsync(new ModuleId(ModelManagerId), created.Value.Id,
                 created.Value.Describe.TypeId, null, cancellationToken).ConfigureAwait(false);
             if (!announced.Ok)
             {
@@ -175,10 +175,10 @@ public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? s
             instance = registration.Provider;
             _providers.Remove(IdOf(provider));
         }
-        // Out of the graph before the provider is disposed: a node whose target is gone is worse than no node.
+        // Out of the graph before the provider is disposed: a instance whose target is gone is worse than no instance.
         // Data is not touched here — whether this provider's configuration is deleted is the caller's decision.
-        if (_nodes is not null)
-            await _nodes.ForgetAsync(new ModuleId(ModelManagerId), IdOf(provider), CancellationToken.None).ConfigureAwait(false);
+        if (_instances is not null)
+            await _instances.ForgetAsync(new ModuleId(ModelManagerId), IdOf(provider), CancellationToken.None).ConfigureAwait(false);
         try { await instance.DisposeAsync().ConfigureAwait(false); return Result.Success(); }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (Exception ex) { return Result.Failure(new(ErrorCode.Internal, "Model provider disposal failed.", ex.Message)); }

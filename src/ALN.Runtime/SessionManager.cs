@@ -12,7 +12,7 @@ namespace ALN.Runtime;
 
 /// <summary>Runs one serialized model step per activation and persists completed turns.</summary>
 [Module(SessionManagerId, Category = "session", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWiring, IInstanceNodeSink, IModule
+public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWiring, IInstanceSink, IModule
 {
     public const string SessionManagerId = ModuleNames.SessionManager;
     public const string SessionTypeId = "session.chat";
@@ -32,7 +32,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _root;
     /// <summary>
-    /// A Session's directory is <c>modules/&lt;id&gt;/</c>, like every other node's (docs/22 §2). The id stays the
+    /// A Session's directory is <c>modules/&lt;id&gt;/</c>, like every other instance's (docs/22 §2). The id stays the
     /// bare name it always was (<c>s-&lt;hash&gt;</c>): a prefix would be a new identity for every existing Session,
     /// and an id is a name, not a shape (docs/22 §3).
     /// </summary>
@@ -47,12 +47,12 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     private readonly IPromptLibrary? _prompts;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SessionRecord> _loaded = new(StringComparer.Ordinal);
-    private IInstanceNodeHost? _nodes;
+    private IInstanceHost? _instances;
 
     /// <summary>
     /// The master side of the edge: this manager holds the Sessions it has loaded. A Session on disk that was never
-    /// loaded is not held — it becomes a node when it is loaded, which is the only moment anybody asked about it.
-    /// (A thousand forgotten directories never become a thousand nodes.)
+    /// loaded is not held — it becomes a instance when it is loaded, which is the only moment anybody asked about it.
+    /// (A thousand forgotten directories never become a thousand instances.)
     /// </summary>
     public Result WireSlave(ModuleId slaveId, IReadOnlyList<string> kinds, IKernelModule instance)
     {
@@ -61,7 +61,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
             : Result.Failure(new(ErrorCode.Invalid, $"{slaveId} is not one of this manager's loaded Sessions."));
     }
 
-    public void UseInstanceNodes(IInstanceNodeHost nodes) => _nodes = nodes ?? throw new ArgumentNullException(nameof(nodes));
+    public void UseInstanceHost(IInstanceHost instances) => _instances = instances ?? throw new ArgumentNullException(nameof(instances));
 
     public SessionManager(string dataRoot, IModelManager models, ISessionExtensionRegistry? extensions = null,
         ISignalLog? signalLog = null, IPromptLibrary? prompts = null)
@@ -153,22 +153,22 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
             var record = new SessionRecord(loaded.Value.Spec, directory) { State = recovered.Value.State };
             record.Adopt(recovered.Value.History);
             _loaded[sessionId] = record;
-            // Now a node: "this Session is held" becomes something the graph can draw an edge to (docs/23 §4 step 1).
+            // Now a instance: "this Session is held" becomes something the graph can draw an edge to (docs/23 §4 step 1).
             //
             // A refusal is reported, not fatal, and that is the one place this differs from creating a Channel. A
             // Channel that cannot be announced has not been created yet — rolling back costs nothing. A Session that
             // cannot be announced has a directory and possibly history; refusing to load it would turn a graph
             // problem into a lost conversation, which is a strictly worse failure.
-            if (_nodes is not null)
+            if (_instances is not null)
             {
-                var announced = await _nodes.AttachAsync(new ModuleId(SessionManagerId), new ModuleId(sessionId),
+                var announced = await _instances.AttachAsync(new ModuleId(SessionManagerId), new ModuleId(sessionId),
                     SessionTypeId, null, cancellationToken).ConfigureAwait(false);
                 if (!announced.Ok)
                     _signalLog.Write(new()
                     {
                         Id = Guid.NewGuid(),
                         Group = "session",
-                        Name = "node",
+                        Name = "instance",
                         From = sessionId,
                         To = SessionManagerId,
                         Mechanism = "session.adopt",
@@ -1185,7 +1185,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
                 return Result.Failure(new(ErrorCode.Conflict, $"Archive destination already exists: {destinationDirectory}"));
             Directory.Move(source, destinationDirectory);
             _loaded.TryRemove(sessionId, out _);
-            await DetachNodeAsync(sessionId).ConfigureAwait(false);
+            await DetachInstanceAsync(sessionId).ConfigureAwait(false);
             return Result.Success();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1216,7 +1216,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
             // Whatever this process remembered about that id is now wrong: the directory it pointed at is gone and
             // the one that just appeared was written by some other run.
             _loaded.TryRemove(sessionId, out _);
-            await DetachNodeAsync(sessionId).ConfigureAwait(false);
+            await DetachInstanceAsync(sessionId).ConfigureAwait(false);
             return Result.Success();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1225,7 +1225,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     }
 
     /// <summary>
-    /// The directories this manager wrote: one per Session, under the module tree like every other node.
+    /// The directories this manager wrote: one per Session, under the module tree like every other instance.
     /// Nothing walks them at startup — only deletion and maintenance do, so an instance with a thousand
     /// forgotten Sessions still starts in the time it takes to read one row.
     /// </summary>
@@ -1272,10 +1272,10 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     /// Takes a Session out of the graph. Absent is what detaching wanted, so this never fails a caller: the directory
     /// is already gone (or about to be) by the time we get here, and that is the fact worth having.
     /// </summary>
-    private async ValueTask DetachNodeAsync(string sessionId)
+    private async ValueTask DetachInstanceAsync(string sessionId)
     {
-        if (_nodes is null) return;
-        await _nodes.ForgetAsync(new ModuleId(SessionManagerId), new ModuleId(sessionId), CancellationToken.None)
+        if (_instances is null) return;
+        await _instances.ForgetAsync(new ModuleId(SessionManagerId), new ModuleId(sessionId), CancellationToken.None)
             .ConfigureAwait(false);
     }
 
@@ -1288,7 +1288,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
         {
             if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
             _loaded.TryRemove(id, out _);
-            await DetachNodeAsync(id).ConfigureAwait(false);
+            await DetachInstanceAsync(id).ConfigureAwait(false);
             return Result.Success();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1377,7 +1377,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
                     $"No Session is called {Path.GetFileName(directory)}."));
             persistedSpec = requestedSpec;
             // Wrapped the way every module file is: the spec is this Session's configuration, and the id/type are the
-            // node's, so one file answers both "what is this directory" and "what is in it".
+            // instance's, so one file answers both "what is this directory" and "what is in it".
             await WriteAtomicJsonAsync(specPath, new
             {
                 id = Path.GetFileName(directory),

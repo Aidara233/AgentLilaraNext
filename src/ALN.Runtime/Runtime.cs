@@ -106,7 +106,7 @@ public sealed class AdapterTypeCatalog : IModuleTypeRegistry
 }
 
 [Module(AdapterManagerId, Category = "adapter", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class AdapterManager : IAdapterManager, IModuleIndex, IModuleWiring, IInstanceNodeSink, ILifecycleParticipant, IModule
+public sealed class AdapterManager : IAdapterManager, IModuleIndex, IModuleWiring, IInstanceSink, ILifecycleParticipant, IModule
 {
     public const string AdapterManagerId = ModuleNames.AdapterManager;
     public ModuleId Id { get; } = new(AdapterManagerId);
@@ -129,7 +129,7 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, IModuleWirin
     private readonly object _gate = new();
     // Adapters that declare tunables register themselves here, the same way Channels do.
     private readonly IParameterRegistry? _parameters;
-    private IInstanceNodeHost? _nodes;
+    private IInstanceHost? _instances;
 
     public AdapterManager(IModuleTypeCatalog types, IInstanceBindings bindings, IAdapterFactoryRegistry? factories = null,
         IAdapterSpecStore? specs = null, IEventSink? events = null, IParameterRegistry? parameters = null)
@@ -149,7 +149,7 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, IModuleWirin
     public void UseEvents(IEventSink events) => _events = events ?? throw new ArgumentNullException(nameof(events));
 
     /// <inheritdoc />
-    public void UseInstanceNodes(IInstanceNodeHost nodes) => _nodes = nodes ?? throw new ArgumentNullException(nameof(nodes));
+    public void UseInstanceHost(IInstanceHost instances) => _instances = instances ?? throw new ArgumentNullException(nameof(instances));
 
     /// <summary>
     /// The master side of the edge: the graph offers an instance and this manager says whether it holds it. It only
@@ -251,11 +251,11 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, IModuleWirin
                 }
             }
             // Announced to the graph, so "what is connected to this manager" stops being a fact only the dictionary
-            // knows. The node carries the Adapter's own trigger capability: an Adapter that wants a rhythm says so by
+            // knows. The instance carries the Adapter's own trigger capability: an Adapter that wants a rhythm says so by
             // implementing ITriggerSink, and a wrapper must not hide that.
-            if (_nodes is not null)
+            if (_instances is not null)
             {
-                var announced = await _nodes.AttachAsync(new ModuleId(ModuleNames.AdapterManager),
+                var announced = await _instances.AttachAsync(new ModuleId(ModuleNames.AdapterManager),
                     new ModuleId(spec.Address.ToString()), spec.TypeId, [EventNames.AdapterEnvelope], cancellationToken,
                     adapter as ITriggerSink).ConfigureAwait(false);
                 if (!announced.Ok)
@@ -410,8 +410,8 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, IModuleWirin
                 lock (_gate) _adapters.Remove(IdOf(address));
                 _parameters?.Unregister(address.ToString());
                 // Out of the graph too: a removed Adapter that is still on a schedule is a module that exists on paper.
-                if (_nodes is not null)
-                    await _nodes.ForgetAsync(new ModuleId(ModuleNames.AdapterManager), address.ToModuleId(),
+                if (_instances is not null)
+                    await _instances.ForgetAsync(new ModuleId(ModuleNames.AdapterManager), address.ToModuleId(),
                         CancellationToken.None).ConfigureAwait(false);
             }
             return Result.Success();

@@ -43,7 +43,7 @@ public sealed record ModelProfile(
 /// <param name="Enabled">False keeps the file as documentation and loads nothing.</param>
 public sealed record ModelInstanceSpec(JsonElement Configuration, IReadOnlyList<ModelProfile>? Profiles = null, bool Enabled = true);
 
-/// <summary>One instance's file, named by the node it configures: <c>modules/model.openai-chat#one/module.json</c>.</summary>
+/// <summary>One instance's file, named by the instance it configures: <c>modules/model.openai-chat#one/module.json</c>.</summary>
 /// <param name="TypeId">The provider type the file declares — what the manager builds, not something derived from the id.</param>
 /// <param name="Provider">The instance address, which is also the module id and the directory name (docs/22 §2).</param>
 public sealed record ModelInstanceEntry(string TypeId, Address Provider, ModelInstanceSpec Spec);
@@ -52,7 +52,7 @@ public sealed record ModelInstanceEntry(string TypeId, Address Provider, ModelIn
 /// The model configuration, as module directories. Nothing here knows how to talk to a provider.
 ///
 /// Keyed by the provider's module id (its address) and not by category: a category is a grouping the settings page
-/// uses, while the file has to sit in the directory named after the node it configures. Two keys for one thing is
+/// uses, while the file has to sit in the directory named after the instance it configures. Two keys for one thing is
 /// how a save ends up writing a file the loader never reads.
 /// </summary>
 public interface IModelInstanceStore

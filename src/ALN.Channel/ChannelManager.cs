@@ -9,8 +9,8 @@ namespace ALN.Channel;
 public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, IInstanceBindings bindings,
     IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
     IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IQueuedMessageStore? queue = null,
-    ISessionManager? sessions = null, IArchiveRegistry? archive = null, IInstanceNodeHost? nodes = null)
-    : IChannelManager, IModuleIndex, IModuleWiring, IInstanceNodeSink, ILifecycleParticipant, IModule
+    ISessionManager? sessions = null, IArchiveRegistry? archive = null, IInstanceHost? instances = null)
+    : IChannelManager, IModuleIndex, IModuleWiring, IInstanceSink, ILifecycleParticipant, IModule
 {
     /// <inheritdoc />
     public string Category => "channel";
@@ -19,7 +19,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     /// Wires the port the manager announces its instances through. Set after construction because the graph does not
     /// exist yet when the package that provides this manager is loaded.
     /// </summary>
-    public void UseInstanceNodes(IInstanceNodeHost nodes) => _nodes = nodes ?? throw new ArgumentNullException(nameof(nodes));
+    public void UseInstanceHost(IInstanceHost instances) => _instances = instances ?? throw new ArgumentNullException(nameof(instances));
 
     /// <summary>
     /// The master side of the edge: the graph offers an instance and this manager says whether it holds it. It only
@@ -55,7 +55,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     private readonly IQueuedMessageStore? _queue = queue;
     private readonly ISessionManager? _sessions = sessions;
     private readonly IArchiveRegistry? _archive = archive;
-    private IInstanceNodeHost? _nodes = nodes;
+    private IInstanceHost? _instances = instances;
     /// <summary>Instances by name. The address lives on the instance; the name is the key, so nothing has to take one
     /// apart to look something up.</summary>
     private readonly Dictionary<ModuleId, ChannelInstance> _channels = new();
@@ -153,12 +153,12 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                 lock (_gate) _channels.Remove(IdOf(spec.Address));
                 return Result<ChannelInfo>.Failure(mounted.Error!);
             }
-            // The Channel is now a node with an edge to this manager, so anything that asks the graph "what is
+            // The Channel is now a instance with an edge to this manager, so anything that asks the graph "what is
             // mounted on this instance" gets an answer. Failing here is a real failure: a Channel that exists but
             // is invisible is exactly the shape nobody can reason about later.
-            if (_nodes is not null)
+            if (_instances is not null)
             {
-                var announced = await _nodes.AttachAsync(new ModuleId(ModuleNames.ChannelManager),
+                var announced = await _instances.AttachAsync(new ModuleId(ModuleNames.ChannelManager),
                     new ModuleId(spec.Address.ToString()), spec.TypeId, ["message.accepted"], cancellationToken).ConfigureAwait(false);
                 if (!announced.Ok)
                 {
@@ -290,9 +290,9 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             // up with no tunables at all (while a restart replayed the old Channel's saved overrides into it).
             _parameters?.Unregister(address.ToString());
             // Out of the graph too. Data is left alone on purpose: whether this Channel's history goes to the bin
-            // is decided below, and it is a different question from whether the node still exists.
-            if (_nodes is not null)
-                await _nodes.ForgetAsync(new ModuleId(ModuleNames.ChannelManager), address.ToModuleId(),
+            // is decided below, and it is a different question from whether the instance still exists.
+            if (_instances is not null)
+                await _instances.ForgetAsync(new ModuleId(ModuleNames.ChannelManager), address.ToModuleId(),
                     CancellationToken.None).ConfigureAwait(false);
             if (_specs is not null)
             {

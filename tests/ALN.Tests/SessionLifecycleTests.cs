@@ -104,14 +104,14 @@ public sealed class SessionLifecycleTests : IDisposable
         // Session therefore pointed at something the graph had never heard of (docs/23 §4 step 1).
         var sessions = Sessions();
         var kernel = new Kernel(Path.Combine(_root, "graph"), new ModuleFactoryRegistry());
-        Assert.True(kernel.Declare(new PassiveNode(sessions.Id, sessions), typeId: ModuleNames.SessionManager).Ok);
-        sessions.UseInstanceNodes(new InstanceNodeHost(kernel, sessions.Id));
+        Assert.True(kernel.Declare(new PassiveInstance(sessions.Id, sessions), typeId: ModuleNames.SessionManager).Ok);
+        sessions.UseInstanceHost(new InstanceHost(kernel, sessions.Id));
         Assert.True((await kernel.StartAsync(default)).Ok);
 
         var opened = await sessions.OpenAsync("s-node", Spec, default);
         Assert.True(opened.Ok, opened.Error?.Message);
 
-        var node = kernel.Nodes.Single(candidate => candidate.Id.Value == "s-node");
+        var node = kernel.Instances.Single(candidate => candidate.Id.Value == "s-node");
         Assert.Equal(ModulePhase.Ready, node.Phase);
         Assert.Equal(SessionManager.SessionTypeId, node.Type);
 

@@ -5,7 +5,7 @@ using ALN.Contracts.Sessions;
 namespace ALN.Runtime;
 
 /// <summary>
-/// Memory as a module: one node, two ways into a round (docs/22, C2).
+/// Memory as a module: one instance, two ways into a round (docs/22, C2).
 ///
 /// It exists to stop memory being a piece of the session manager. Memory has its own storage, its own lifetime and
 /// its own failures; the only thing it needs from the rest of the system is a place to say "here is a line for this

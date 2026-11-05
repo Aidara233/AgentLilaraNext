@@ -82,7 +82,7 @@ public static class Capabilities
     public const string MessagesWrite = "messages.write";
     public const string GraphRead = "graph.read";
     public const string GraphControl = "graph.control";
-    /// <summary>The module graph: which nodes exist, and the edges between them (formerly graph.read).</summary>
+    /// <summary>The module graph: which instances exist, and the edges between them (formerly graph.read).</summary>
     public const string ModulesRead = "modules.read";
     /// <summary>Changing the graph: load, unload, mount, unmount (formerly graph.control).</summary>
     public const string ModulesControl = "modules.control";

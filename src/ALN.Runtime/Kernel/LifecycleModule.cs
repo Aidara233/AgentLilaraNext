@@ -3,7 +3,7 @@ using ALN.Contracts;
 namespace ALN.Runtime;
 
 /// <summary>
-/// Turns something that already speaks the older <see cref="ILifecycleParticipant"/> protocol into a kernel node.
+/// Turns something that already speaks the older <see cref="ILifecycleParticipant"/> protocol into a kernel instance.
 ///
 /// It exists so that the managers do not have to be rewritten in one commit to be driven by the kernel. What it
 /// deliberately does <b>not</b> do is invent work: a manager's own startup happens in the Start signal it already
@@ -11,7 +11,7 @@ namespace ALN.Runtime;
 /// anything is wired, it implements <see cref="IKernelModule"/> itself and this adapter disappears from its path.
 ///
 /// The id is a parameter because a manager's participant name ("channels") is not the name the rest of the process
-/// calls it by (<see cref="ModuleNames.ChannelManager"/>), and an instance edge has to name the same node the
+/// calls it by (<see cref="ModuleNames.ChannelManager"/>), and an instance edge has to name the same instance the
 /// receipt shows.
 /// </summary>
 public sealed class LifecycleModule(ILifecycleParticipant participant, ModuleId? id = null) : IKernelModule, IModuleWiring
@@ -19,7 +19,7 @@ public sealed class LifecycleModule(ILifecycleParticipant participant, ModuleId?
     public ModuleId Id { get; } = id ?? new ModuleId(participant.Name);
 
     /// <summary>
-    /// The manager behind this node, when it is the manager itself. A manager that holds instances announces them
+    /// The manager behind this instance, when it is the manager itself. A manager that holds instances announces them
     /// through the graph, and the graph asks the master to accept each one — the master here is the manager, not
     /// this adapter.
     /// </summary>

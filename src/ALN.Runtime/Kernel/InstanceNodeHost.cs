@@ -10,7 +10,7 @@ namespace ALN.Runtime;
 /// (a manager used without a kernel, which is how most tests build one) instead of forcing every manager to know
 /// whether a graph exists.
 /// </summary>
-public sealed class InstanceNodeHost(Kernel kernel, ModuleId master) : IInstanceNodeHost
+public sealed class InstanceHost(Kernel kernel, ModuleId master) : IInstanceHost
 {
     public string Category => master.Value;
 
@@ -22,7 +22,7 @@ public sealed class InstanceNodeHost(Kernel kernel, ModuleId master) : IInstance
         if (masterId != master)
             return Result.Failure(new(ErrorCode.Denied, $"This host announces instances for {master}, not {masterId}."));
 
-        var adopted = await kernel.AdoptAsync(master, new InstanceNode(instance, trigger), kinds, typeId, cancellationToken)
+        var adopted = await kernel.AdoptAsync(master, new Instance(instance, trigger), kinds, typeId, cancellationToken)
             .ConfigureAwait(false);
         if (!adopted.Ok) return Result.Failure(adopted.Error!);
         // A refused edge means the master would not take it: the instance still exists, but the graph now says so

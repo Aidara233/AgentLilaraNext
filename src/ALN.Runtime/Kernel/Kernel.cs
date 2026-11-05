@@ -24,8 +24,8 @@ public sealed class Kernel
     private readonly TimeSpan _stopTimeout;
     private readonly ModuleDataRoot _data;
     private readonly Func<string, bool>? _hostOwnsTypes;
-    private readonly Dictionary<ModuleId, KernelNode> _nodes = new();
-    private readonly Dictionary<ModuleId, KernelNode> _declared = new();
+    private readonly Dictionary<ModuleId, KernelInstance> _instances = new();
+    private readonly Dictionary<ModuleId, KernelInstance> _declared = new();
     private readonly object _gate = new();
     private IReadOnlyList<ModuleIssue> _issues = [];
     // Edges made after startup. The receipt counts them, because "nine edges" that silently becomes eleven is a
@@ -39,7 +39,7 @@ public sealed class Kernel
     private IReadOnlyList<BadEdge> _badEdges = [];
     // Where the phases are. "Before startup" and "inside startup" are different answers for an announcement: before it
     // the graph does not exist and the instance is a declaration; inside it the graph exists and the instance has to
-    // walk its own phases now — filing it as a declaration there is how a node ends up in no phase at all.
+    // walk its own phases now — filing it as a declaration there is how a instance ends up in no phase at all.
     private KernelRunState _state;
 
     public Kernel(string dataRoot, IModuleFactoryRegistry types, ISignalLog? signals = null, TimeSpan? stopTimeout = null,
@@ -59,14 +59,14 @@ public sealed class Kernel
         _data = new ModuleDataRoot(store.Root);
     }
 
-    /// <summary>Every node the last start produced, in receipt form. Asking twice does not re-run anything.</summary>
-    public IReadOnlyList<ModuleNodeInfo> Nodes
+    /// <summary>Every instance the last start produced, in receipt form. Asking twice does not re-run anything.</summary>
+    public IReadOnlyList<InstanceInfo> Instances
     {
-        get { lock (_gate) return _nodes.Values.Select(node => node.Info()).ToArray(); }
+        get { lock (_gate) return _instances.Values.Select(instance => instance.Info()).ToArray(); }
     }
 
     /// <summary>
-    /// The same numbers the receipt carries, read now instead of at startup (docs/22 §5.2): how many nodes there
+    /// The same numbers the receipt carries, read now instead of at startup (docs/22 §5.2): how many instances there
     /// are, how many work, how much is known to be wrong, and who is on a schedule.
     /// </summary>
     public ModuleGraphStatus Status
@@ -76,10 +76,10 @@ public sealed class Kernel
             var rhythms = Rhythms;
             lock (_gate)
             {
-                return new(_nodes.Count,
-                    _nodes.Values.Count(node => node.Phase == ModulePhase.Ready),
+                return new(_instances.Count,
+                    _instances.Values.Count(instance => instance.Phase == ModulePhase.Ready),
                     _badEdges.Count + _issues.Count +
-                    _nodes.Values.Count(node => node.Phase is ModulePhase.Failed or ModulePhase.Error),
+                    _instances.Values.Count(instance => instance.Phase is ModulePhase.Failed or ModulePhase.Error),
                     rhythms,
                     _badEdges);
             }
@@ -105,8 +105,8 @@ public sealed class Kernel
                 {
                     // Only while it is actually working: a stopped sink is still in the graph, and "on a schedule"
                     // about a module that is not running would be the receipt inventing a fact.
-                    if (!_nodes.TryGetValue(sink, out var node) || node.Phase != ModulePhase.Ready) continue;
-                    if (SinkOf(node)?.PreferredInterval is not { } interval) continue;
+                    if (!_instances.TryGetValue(sink, out var instance) || instance.Phase != ModulePhase.Ready) continue;
+                    if (SinkOf(instance)?.PreferredInterval is not { } interval) continue;
                     foreach (var source in sources) rhythms.Add(new(sink, interval, source.Name));
                 }
                 return rhythms;
@@ -117,13 +117,13 @@ public sealed class Kernel
     /// <summary>The module behind an id, for callers that already know which one they mean (docs/22 §3.5).</summary>
     public IKernelModule? Find(ModuleId id)
     {
-        lock (_gate) return _nodes.TryGetValue(id, out var node) ? node.Module : null;
+        lock (_gate) return _instances.TryGetValue(id, out var instance) ? instance.Module : null;
     }
 
     /// <summary>By type or category: the "who can do this" question, which an id cannot answer (docs/22 §3.5).</summary>
     public IReadOnlyList<IKernelModule> OfType(string typeId)
     {
-        lock (_gate) return _nodes.Values.Where(node => node.Manifest.Type == typeId).Select(node => node.Module).ToArray();
+        lock (_gate) return _instances.Values.Where(instance => instance.Manifest.Type == typeId).Select(instance => instance.Module).ToArray();
     }
 
     /// <summary>The one module of a type that is declared a singleton. Two answers is an error, not a coin toss.</summary>
@@ -149,7 +149,7 @@ public sealed class Kernel
     }
 
     /// <summary>
-    /// Adds a node the host built itself, before startup. This is how the core's own managers reach the graph
+    /// Adds a instance the host built itself, before startup. This is how the core's own managers reach the graph
     /// while their manifests are still code rather than files: the moment a module has a directory, it comes from
     /// <see cref="ModuleManifestStore"/> instead, and the two must not both claim the same id.
     /// </summary>
@@ -162,15 +162,15 @@ public sealed class Kernel
             if (_declared.ContainsKey(module.Id))
                 return Result.Failure(new(ErrorCode.Conflict, $"Module is already declared: {module.Id}"));
             var manifest = new ModuleManifest(module.Id, typeId ?? module.Id.Value, true, null, slaves ?? [], dependencies ?? []);
-            _declared[module.Id] = new KernelNode(manifest, module);
+            _declared[module.Id] = new KernelInstance(manifest, module);
         }
         return Result.Success();
     }
 
     public async ValueTask<Result<ModuleReceipt>> StartAsync(CancellationToken cancellationToken)
     {
-        lock (_gate) { _nodes.Clear(); _issues = []; _runtimeEdges = 0; _rhythms.Clear(); _badEdges = []; _state = KernelRunState.Starting; }
-        foreach (var declared in Declared()) lock (_gate) _nodes[declared.Manifest.Id] = declared;
+        lock (_gate) { _instances.Clear(); _issues = []; _runtimeEdges = 0; _rhythms.Clear(); _badEdges = []; _state = KernelRunState.Starting; }
+        foreach (var declared in Declared()) lock (_gate) _instances[declared.Manifest.Id] = declared;
 
         // 0 — Scan: everything the disk says, plus one line per directory that is not a module.
         var scan = await _store.ScanAsync(_types, _hostOwnsTypes, cancellationToken).ConfigureAwait(false);
@@ -178,9 +178,9 @@ public sealed class Kernel
 
         foreach (var manifest in scan.Manifests)
         {
-            if (_nodes.ContainsKey(manifest.Id))
+            if (_instances.ContainsKey(manifest.Id))
             {
-                // Declared in code and on disk: the code wins, and the collision is reported. Two nodes with one
+                // Declared in code and on disk: the code wins, and the collision is reported. Two instances with one
                 // name is the shape that makes "which one did I just stop" unanswerable.
                 issues.Add(new ModuleIssue(manifest.Id.Value, $"Declared by the host and also present on disk: {manifest.Id}."));
                 continue;
@@ -191,47 +191,47 @@ public sealed class Kernel
                 issues.Add(new ModuleIssue(manifest.Id.Value, created.Error?.Message ?? "Module could not be created."));
                 continue;
             }
-            lock (_gate) _nodes[manifest.Id] = new KernelNode(manifest, created.Value);
+            lock (_gate) _instances[manifest.Id] = new KernelInstance(manifest, created.Value);
         }
 
         // 1 — Initialize: everything at once, and nobody moves on until everyone is done. Not "done successfully":
         // a module that failed still counts as done, because a barrier that waits only for success is not a barrier.
-        var initialized = new List<KernelNode>();
+        var initialized = new List<KernelInstance>();
         var pending = new List<Task>();
-        foreach (var node in Snapshot())
+        foreach (var instance in Snapshot())
         {
-            if (!node.Manifest.Enabled)
+            if (!instance.Manifest.Enabled)
             {
-                node.Phase = ModulePhase.Disabled;
+                instance.Phase = ModulePhase.Disabled;
                 continue;
             }
-            pending.Add(InitializeAsync(node, cancellationToken));
+            pending.Add(InitializeAsync(instance, cancellationToken));
         }
         await Task.WhenAll(pending).ConfigureAwait(false);
-        foreach (var node in Snapshot().Where(node => node.Phase == ModulePhase.Initialized)) initialized.Add(node);
+        foreach (var instance in Snapshot().Where(instance => instance.Phase == ModulePhase.Initialized)) initialized.Add(instance);
 
         // 2 — Wire: edges now have objects on both ends, so "does it exist" and "does it take slaves" have answers.
         var badEdges = new List<BadEdge>();
         var wired = 0;
-        foreach (var node in initialized.Where(node => node.Manifest.Slaves is { Count: > 0 }))
+        foreach (var instance in initialized.Where(instance => instance.Manifest.Slaves is { Count: > 0 }))
         {
-            if (WiringOf(node) is not { } master)
+            if (WiringOf(instance) is not { } master)
             {
-                foreach (var slave in node.Manifest.Slaves!)
-                    badEdges.Add(new(node.Manifest.Id, slave.Id, BadEdgeReason.MasterDoesNotWire,
-                        $"{node.Manifest.Id} declares slaves but does not implement {nameof(IModuleWiring)}."));
+                foreach (var slave in instance.Manifest.Slaves!)
+                    badEdges.Add(new(instance.Manifest.Id, slave.Id, BadEdgeReason.MasterDoesNotWire,
+                        $"{instance.Manifest.Id} declares slaves but does not implement {nameof(IModuleWiring)}."));
                 continue;
             }
-            foreach (var slave in node.Manifest.Slaves!)
+            foreach (var slave in instance.Manifest.Slaves!)
             {
-                var resolved = Resolve(slave.Id, badEdges, node.Manifest.Id);
+                var resolved = Resolve(slave.Id, badEdges, instance.Manifest.Id);
                 if (resolved is null) continue;
                 Result accepted;
                 try { accepted = master.WireSlave(slave.Id, slave.Kinds, resolved.Module); }
                 catch (Exception ex) { accepted = Result.Failure(new(ErrorCode.Internal, "Wire threw.", ex.Message)); }
                 if (!accepted.Ok)
                 {
-                    badEdges.Add(new(node.Manifest.Id, slave.Id, BadEdgeReason.RejectedByMaster,
+                    badEdges.Add(new(instance.Manifest.Id, slave.Id, BadEdgeReason.RejectedByMaster,
                         accepted.Error?.Message ?? "Rejected."));
                     continue;
                 }
@@ -242,34 +242,34 @@ public sealed class Kernel
         // 3 — Ready: dependencies first, and modules that depend on each other at the same time.
         var components = Components(initialized);
         var cycles = components.Where(component => component.Count > 1)
-            .Select(component => new CycleInfo(component.Select(node => node.Manifest.Id).ToArray()))
+            .Select(component => new CycleInfo(component.Select(instance => instance.Manifest.Id).ToArray()))
             .ToArray();
         var unfinishable = new HashSet<ModuleId>();
         foreach (var component in InDependencyOrder(components))
         {
             var blocked = component
-                .SelectMany(node => DependenciesOf(node))
+                .SelectMany(instance => DependenciesOf(instance))
                 .FirstOrDefault(dependency => unfinishable.Contains(dependency));
             if (blocked != default)
             {
-                foreach (var node in component)
+                foreach (var instance in component)
                 {
-                    node.Phase = ModulePhase.Failed;
-                    node.Failure = $"Not started: {blocked} did not become ready.";
-                    unfinishable.Add(node.Manifest.Id);
+                    instance.Phase = ModulePhase.Failed;
+                    instance.Failure = $"Not started: {blocked} did not become ready.";
+                    unfinishable.Add(instance.Manifest.Id);
                 }
                 continue;
             }
 
             var ready = new List<Task>();
-            foreach (var node in component) ready.Add(ReadyAsync(node, cancellationToken));
+            foreach (var instance in component) ready.Add(ReadyAsync(instance, cancellationToken));
             await Task.WhenAll(ready).ConfigureAwait(false);
-            foreach (var node in component.Where(node => node.Phase != ModulePhase.Ready)) unfinishable.Add(node.Manifest.Id);
+            foreach (var instance in component.Where(instance => instance.Phase != ModulePhase.Ready)) unfinishable.Add(instance.Manifest.Id);
         }
 
         await AttachTriggersAsync(cancellationToken).ConfigureAwait(false);
         lock (_gate) { _issues = issues; _badEdges = badEdges.ToArray(); _state = KernelRunState.Running; }
-        return Result<ModuleReceipt>.Success(new(Snapshot().Select(node => node.Info()).ToArray(), wired + _runtimeEdges,
+        return Result<ModuleReceipt>.Success(new(Snapshot().Select(instance => instance.Info()).ToArray(), wired + _runtimeEdges,
             badEdges, cycles, issues, Rhythms));
     }
 
@@ -279,10 +279,10 @@ public sealed class Kernel
     /// </summary>
     public async ValueTask<Result> StopAsync(CancellationToken cancellationToken)
     {
-        var components = Components(Snapshot().Where(node => node.Phase == ModulePhase.Ready));
+        var components = Components(Snapshot().Where(instance => instance.Phase == ModulePhase.Ready));
         foreach (var component in Enumerable.Reverse(InDependencyOrder(components)))
         {
-            await Task.WhenAll(component.Select(node => StopOneAsync(node, cancellationToken))).ConfigureAwait(false);
+            await Task.WhenAll(component.Select(instance => StopOneAsync(instance, cancellationToken))).ConfigureAwait(false);
         }
         return Result.Success();
     }
@@ -292,100 +292,100 @@ public sealed class Kernel
     /// </summary>
     public ValueTask AbortAsync(CancellationToken cancellationToken)
     {
-        foreach (var node in Snapshot().Where(node => node.Phase is not (ModulePhase.Stopped or ModulePhase.Disabled)))
+        foreach (var instance in Snapshot().Where(instance => instance.Phase is not (ModulePhase.Stopped or ModulePhase.Disabled)))
         {
             // Deliberately not awaited: abort is what happens when waiting is no longer affordable.
-            _ = AbortOneAsync(node, cancellationToken);
+            _ = AbortOneAsync(instance, cancellationToken);
         }
         return ValueTask.CompletedTask;
     }
 
-    private async Task InitializeAsync(KernelNode node, CancellationToken cancellationToken)
+    private async Task InitializeAsync(KernelInstance instance, CancellationToken cancellationToken)
     {
-        var result = await InvokeAsync(node, nameof(IKernelModule.InitializeAsync),
-            token => node.Module.InitializeAsync(token), cancellationToken).ConfigureAwait(false);
-        node.Phase = result.Ok ? ModulePhase.Initialized : ModulePhase.Failed;
-        node.Failure = result.Ok ? null : Describe(result);
+        var result = await InvokeAsync(instance, nameof(IKernelModule.InitializeAsync),
+            token => instance.Module.InitializeAsync(token), cancellationToken).ConfigureAwait(false);
+        instance.Phase = result.Ok ? ModulePhase.Initialized : ModulePhase.Failed;
+        instance.Failure = result.Ok ? null : Describe(result);
     }
 
-    private async Task ReadyAsync(KernelNode node, CancellationToken cancellationToken)
+    private async Task ReadyAsync(KernelInstance instance, CancellationToken cancellationToken)
     {
-        var result = await InvokeAsync(node, nameof(IKernelModule.ReadyAsync),
-            token => node.Module.ReadyAsync(token), cancellationToken).ConfigureAwait(false);
-        node.Phase = result.Ok ? ModulePhase.Ready : ModulePhase.Failed;
-        node.Failure = result.Ok ? null : Describe(result);
+        var result = await InvokeAsync(instance, nameof(IKernelModule.ReadyAsync),
+            token => instance.Module.ReadyAsync(token), cancellationToken).ConfigureAwait(false);
+        instance.Phase = result.Ok ? ModulePhase.Ready : ModulePhase.Failed;
+        instance.Failure = result.Ok ? null : Describe(result);
     }
 
-    private async Task StopOneAsync(KernelNode node, CancellationToken cancellationToken)
+    private async Task StopOneAsync(KernelInstance instance, CancellationToken cancellationToken)
     {
-        node.Phase = ModulePhase.Stopping;
+        instance.Phase = ModulePhase.Stopping;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(_stopTimeout);
-        var result = await InvokeAsync(node, nameof(IKernelModule.StopAsync),
-            token => node.Module.StopAsync(token), timeout.Token).ConfigureAwait(false);
-        node.Phase = result.Ok ? ModulePhase.Stopped : ModulePhase.Failed;
-        node.Failure = result.Ok ? null : Describe(result);
+        var result = await InvokeAsync(instance, nameof(IKernelModule.StopAsync),
+            token => instance.Module.StopAsync(token), timeout.Token).ConfigureAwait(false);
+        instance.Phase = result.Ok ? ModulePhase.Stopped : ModulePhase.Failed;
+        instance.Failure = result.Ok ? null : Describe(result);
     }
 
-    private async Task AbortOneAsync(KernelNode node, CancellationToken cancellationToken)
+    private async Task AbortOneAsync(KernelInstance instance, CancellationToken cancellationToken)
     {
-        node.Phase = ModulePhase.Stopping;
+        instance.Phase = ModulePhase.Stopping;
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(_stopTimeout);
-            await node.Module.AbortAsync(timeout.Token).ConfigureAwait(false);
+            await instance.Module.AbortAsync(timeout.Token).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             // Nothing is waiting for this call, so there is nobody to hand the exception to. Recording it is the
             // whole of what abort can offer.
-            Record(node, nameof(IKernelModule.AbortAsync), ex.Message, ex);
+            Record(instance, nameof(IKernelModule.AbortAsync), ex.Message, ex);
         }
-        node.Phase = ModulePhase.Stopped;
+        instance.Phase = ModulePhase.Stopped;
     }
 
     /// <summary>
     /// Calls one phase method and hands whatever it throws to the module's own error hook. If the hook fails too,
     /// the failure is recorded and swallowed: by then there is nobody left to tell (docs/22 §6).
     /// </summary>
-    private async ValueTask<Result> InvokeAsync(KernelNode node, string method,
+    private async ValueTask<Result> InvokeAsync(KernelInstance instance, string method,
         Func<CancellationToken, ValueTask<Result>> call, CancellationToken cancellationToken)
     {
         try
         {
             var result = await call(cancellationToken).ConfigureAwait(false);
-            if (!result.Ok) await ReportErrorAsync(node, new(method, result.Error?.Message ?? "Failed."), CancellationToken.None).ConfigureAwait(false);
+            if (!result.Ok) await ReportErrorAsync(instance, new(method, result.Error?.Message ?? "Failed."), CancellationToken.None).ConfigureAwait(false);
             return result;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            node.Phase = ModulePhase.Failed;
-            node.Failure = $"{method} was cancelled.";
+            instance.Phase = ModulePhase.Failed;
+            instance.Failure = $"{method} was cancelled.";
             throw;
         }
         catch (Exception ex)
         {
-            await ReportErrorAsync(node, new(method, ex.Message, ex), CancellationToken.None).ConfigureAwait(false);
+            await ReportErrorAsync(instance, new(method, ex.Message, ex), CancellationToken.None).ConfigureAwait(false);
             return Result.Failure(new(ErrorCode.Internal, $"{method} threw: {ex.Message}", ex.Message));
         }
     }
 
-    private async ValueTask ReportErrorAsync(KernelNode node, ModuleError error, CancellationToken cancellationToken)
+    private async ValueTask ReportErrorAsync(KernelInstance instance, ModuleError error, CancellationToken cancellationToken)
     {
-        Record(node, error.Method, error.Message, error.Exception);
+        Record(instance, error.Method, error.Message, error.Exception);
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(_stopTimeout);
-            var handled = await node.Module.OnErrorAsync(error, timeout.Token).ConfigureAwait(false);
-            if (!handled.Ok) Record(node, nameof(IKernelModule.OnErrorAsync), handled.Error?.Message ?? "Error hook failed.", null);
+            var handled = await instance.Module.OnErrorAsync(error, timeout.Token).ConfigureAwait(false);
+            if (!handled.Ok) Record(instance, nameof(IKernelModule.OnErrorAsync), handled.Error?.Message ?? "Error hook failed.", null);
         }
         catch (Exception ex)
         {
             // The hook threw or hung. One record, then nothing: retrying an error path is how a diagnostic failure
             // turns into a loop that nobody can stop.
-            Record(node, nameof(IKernelModule.OnErrorAsync), ex.Message, ex);
+            Record(instance, nameof(IKernelModule.OnErrorAsync), ex.Message, ex);
         }
     }
 
@@ -397,106 +397,106 @@ public sealed class Kernel
         lock (_gate) _badEdges = [.. _badEdges, .. extra];
     }
 
-    private void Record(KernelNode node, string method, string message, Exception? exception)
+    private void Record(KernelInstance instance, string method, string message, Exception? exception)
     {
-        node.Phase = node.Phase == ModulePhase.Ready ? ModulePhase.Error : ModulePhase.Failed;
-        node.Failure ??= $"{method}: {message}";
+        instance.Phase = instance.Phase == ModulePhase.Ready ? ModulePhase.Error : ModulePhase.Failed;
+        instance.Failure ??= $"{method}: {message}";
         _signals.Write(new()
         {
             Id = Guid.NewGuid(),
             ParentId = SignalScope.CurrentId,
             Group = "kernel",
             Name = "module",
-            From = node.Manifest.Id.Value,
+            From = instance.Manifest.Id.Value,
             To = "kernel",
             Mechanism = $"kernel.{method}",
             Outcome = "failed",
             Level = SignalLevel.Error,
             Detail = new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["type"] = node.Manifest.Type,
+                ["type"] = instance.Manifest.Type,
                 ["error"] = message,
                 ["exception"] = exception?.GetType().Name ?? ""
             }
         });
     }
 
-    private KernelNode? Resolve(ModuleId id, List<BadEdge> badEdges, ModuleId master)
+    private KernelInstance? Resolve(ModuleId id, List<BadEdge> badEdges, ModuleId master)
     {
-        KernelNode? node;
-        lock (_gate) _nodes.TryGetValue(id, out node);
-        if (node is null)
+        KernelInstance? instance;
+        lock (_gate) _instances.TryGetValue(id, out instance);
+        if (instance is null)
         {
             badEdges.Add(new(master, id, BadEdgeReason.MissingModule, $"No module answers to \"{id}\"."));
             return null;
         }
-        if (!node.Manifest.Enabled || node.Phase == ModulePhase.Disabled)
+        if (!instance.Manifest.Enabled || instance.Phase == ModulePhase.Disabled)
         {
             badEdges.Add(new(master, id, BadEdgeReason.DisabledModule, $"\"{id}\" is disabled."));
             return null;
         }
-        if (node.Phase is not (ModulePhase.Initialized or ModulePhase.Ready))
+        if (instance.Phase is not (ModulePhase.Initialized or ModulePhase.Ready))
         {
-            badEdges.Add(new(master, id, BadEdgeReason.MasterFailed, $"\"{id}\" did not initialize: {node.Failure}"));
+            badEdges.Add(new(master, id, BadEdgeReason.MasterFailed, $"\"{id}\" did not initialize: {instance.Failure}"));
             return null;
         }
-        return node;
+        return instance;
     }
 
-    private IEnumerable<ModuleId> DependenciesOf(KernelNode node)
+    private IEnumerable<ModuleId> DependenciesOf(KernelInstance instance)
     {
-        foreach (var dependency in node.Manifest.Dependencies ?? []) yield return dependency;
-        foreach (var slave in node.Manifest.Slaves ?? []) if (slave.RequireAll) yield return slave.Id;
+        foreach (var dependency in instance.Manifest.Dependencies ?? []) yield return dependency;
+        foreach (var slave in instance.Manifest.Slaves ?? []) if (slave.RequireAll) yield return slave.Id;
     }
 
     /// <summary>Strongly connected components (Tarjan), so that a cycle is one runnable unit instead of a deadlock.</summary>
-    private List<List<KernelNode>> Components(IEnumerable<KernelNode> nodes)
+    private List<List<KernelInstance>> Components(IEnumerable<KernelInstance> instances)
     {
-        var all = nodes.ToArray();
+        var all = instances.ToArray();
         var index = new Dictionary<ModuleId, int>();
         var low = new Dictionary<ModuleId, int>();
         var onStack = new HashSet<ModuleId>();
-        var stack = new Stack<KernelNode>();
-        var components = new List<List<KernelNode>>();
+        var stack = new Stack<KernelInstance>();
+        var components = new List<List<KernelInstance>>();
         var counter = 0;
 
-        IEnumerable<KernelNode> Next(KernelNode node) =>
-            DependenciesOf(node).Select(id => all.FirstOrDefault(candidate => candidate.Manifest.Id == id)).OfType<KernelNode>();
+        IEnumerable<KernelInstance> Next(KernelInstance instance) =>
+            DependenciesOf(instance).Select(id => all.FirstOrDefault(candidate => candidate.Manifest.Id == id)).OfType<KernelInstance>();
 
-        void Visit(KernelNode node)
+        void Visit(KernelInstance instance)
         {
-            index[node.Manifest.Id] = counter;
-            low[node.Manifest.Id] = counter;
+            index[instance.Manifest.Id] = counter;
+            low[instance.Manifest.Id] = counter;
             counter++;
-            stack.Push(node);
-            onStack.Add(node.Manifest.Id);
+            stack.Push(instance);
+            onStack.Add(instance.Manifest.Id);
 
-            foreach (var next in Next(node))
+            foreach (var next in Next(instance))
             {
                 if (!index.ContainsKey(next.Manifest.Id))
                 {
                     Visit(next);
-                    low[node.Manifest.Id] = Math.Min(low[node.Manifest.Id], low[next.Manifest.Id]);
+                    low[instance.Manifest.Id] = Math.Min(low[instance.Manifest.Id], low[next.Manifest.Id]);
                 }
                 else if (onStack.Contains(next.Manifest.Id))
                 {
-                    low[node.Manifest.Id] = Math.Min(low[node.Manifest.Id], index[next.Manifest.Id]);
+                    low[instance.Manifest.Id] = Math.Min(low[instance.Manifest.Id], index[next.Manifest.Id]);
                 }
             }
 
-            if (low[node.Manifest.Id] != index[node.Manifest.Id]) return;
-            var component = new List<KernelNode>();
-            KernelNode member;
+            if (low[instance.Manifest.Id] != index[instance.Manifest.Id]) return;
+            var component = new List<KernelInstance>();
+            KernelInstance member;
             do
             {
                 member = stack.Pop();
                 onStack.Remove(member.Manifest.Id);
                 component.Add(member);
-            } while (member.Manifest.Id != node.Manifest.Id);
+            } while (member.Manifest.Id != instance.Manifest.Id);
             components.Add(component);
         }
 
-        foreach (var node in all.Where(node => !index.ContainsKey(node.Manifest.Id))) Visit(node);
+        foreach (var instance in all.Where(instance => !index.ContainsKey(instance.Manifest.Id))) Visit(instance);
         return components;
     }
 
@@ -504,15 +504,15 @@ public sealed class Kernel
     /// Orders components so that whatever a component depends on comes first. On the condensed graph this is a
     /// plain topological sort, which exists by construction: SCCs of a directed graph cannot form a cycle.
     /// </summary>
-    private List<List<KernelNode>> InDependencyOrder(List<List<KernelNode>> components)
+    private List<List<KernelInstance>> InDependencyOrder(List<List<KernelInstance>> components)
     {
-        var owner = new Dictionary<ModuleId, List<KernelNode>>();
+        var owner = new Dictionary<ModuleId, List<KernelInstance>>();
         foreach (var component in components)
-            foreach (var node in component) owner[node.Manifest.Id] = component;
+            foreach (var instance in component) owner[instance.Manifest.Id] = component;
 
-        var ordered = new List<List<KernelNode>>(components.Count);
-        var done = new HashSet<List<KernelNode>>();
-        var remaining = new List<List<KernelNode>>(components);
+        var ordered = new List<List<KernelInstance>>(components.Count);
+        var done = new HashSet<List<KernelInstance>>();
+        var remaining = new List<List<KernelInstance>>(components);
         while (remaining.Count > 0)
         {
             var progressed = false;
@@ -521,7 +521,7 @@ public sealed class Kernel
                 var waitsFor = component
                     .SelectMany(DependenciesOf)
                     .Select(id => owner.TryGetValue(id, out var ownerComponent) ? ownerComponent : null)
-                    .OfType<List<KernelNode>>()
+                    .OfType<List<KernelInstance>>()
                     .Where(other => !ReferenceEquals(other, component))
                     .Distinct()
                     .ToArray();
@@ -539,47 +539,47 @@ public sealed class Kernel
     }
 
     /// <summary>
-    /// Adds a node while the graph is running (docs/22, D1): initialize it, wire the slaves it declares, then let it
+    /// Adds a instance while the graph is running (docs/22, D1): initialize it, wire the slaves it declares, then let it
     /// start — but only if what it says it needs is already ready.
     ///
     /// This is not the startup path with fewer phases. Startup waits for everyone because nobody can be trusted
-    /// before everyone has built themselves; a node that arrives later finds the graph already established, so the
+    /// before everyone has built themselves; a instance that arrives later finds the graph already established, so the
     /// only thing it may assume is that whatever is ready now is ready.
     /// </summary>
     public async ValueTask<Result<ModuleAddition>> AddAsync(IKernelModule module, IReadOnlyList<ModuleSlave>? slaves = null,
         IReadOnlyList<ModuleId>? dependencies = null, string? typeId = null, CancellationToken cancellationToken = default)
     {
         if (module is null) return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, "A module cannot be null."));
-        KernelNode node;
+        KernelInstance instance;
         lock (_gate)
         {
-            if (_nodes.ContainsKey(module.Id))
+            if (_instances.ContainsKey(module.Id))
                 return Result<ModuleAddition>.Failure(new(ErrorCode.Conflict, $"A module already answers to \"{module.Id}\"."));
-            node = new KernelNode(new ModuleManifest(module.Id, typeId ?? module.Id.Value, true, null,
+            instance = new KernelInstance(new ModuleManifest(module.Id, typeId ?? module.Id.Value, true, null,
                 slaves ?? [], dependencies ?? []), module);
-            _nodes[module.Id] = node;
+            _instances[module.Id] = instance;
         }
 
-        await InitializeAsync(node, cancellationToken).ConfigureAwait(false);
-        if (node.Phase != ModulePhase.Initialized)
-            return Result<ModuleAddition>.Success(new(node.Info(), []));
+        await InitializeAsync(instance, cancellationToken).ConfigureAwait(false);
+        if (instance.Phase != ModulePhase.Initialized)
+            return Result<ModuleAddition>.Success(new(instance.Info(), []));
 
         var badEdges = new List<BadEdge>();
         var wired = 0;
-        if (node.Manifest.Slaves is { Count: > 0 })
+        if (instance.Manifest.Slaves is { Count: > 0 })
         {
-            if (WiringOf(node) is { } master)
+            if (WiringOf(instance) is { } master)
             {
-                foreach (var slave in node.Manifest.Slaves!)
+                foreach (var slave in instance.Manifest.Slaves!)
                 {
-                    var resolved = Resolve(slave.Id, badEdges, node.Manifest.Id);
+                    var resolved = Resolve(slave.Id, badEdges, instance.Manifest.Id);
                     if (resolved is null) continue;
                     Result accepted;
                     try { accepted = master.WireSlave(slave.Id, slave.Kinds, resolved.Module); }
                     catch (Exception ex) { accepted = Result.Failure(new(ErrorCode.Internal, "Wire threw.", ex.Message)); }
                     if (!accepted.Ok)
                     {
-                        badEdges.Add(new(node.Manifest.Id, slave.Id, BadEdgeReason.RejectedByMaster,
+                        badEdges.Add(new(instance.Manifest.Id, slave.Id, BadEdgeReason.RejectedByMaster,
                             accepted.Error?.Message ?? "Rejected."));
                         continue;
                     }
@@ -588,61 +588,61 @@ public sealed class Kernel
             }
             else
             {
-                foreach (var slave in node.Manifest.Slaves!)
-                    badEdges.Add(new(node.Manifest.Id, slave.Id, BadEdgeReason.MasterDoesNotWire,
-                        $"{node.Manifest.Id} declares slaves but does not implement {nameof(IModuleWiring)}."));
+                foreach (var slave in instance.Manifest.Slaves!)
+                    badEdges.Add(new(instance.Manifest.Id, slave.Id, BadEdgeReason.MasterDoesNotWire,
+                        $"{instance.Manifest.Id} declares slaves but does not implement {nameof(IModuleWiring)}."));
             }
         }
 
         // What it declared it needs has to be ready *now*: there is no later wave to wait for. Two different
         // verdicts, because they are two different mistakes: a named dependency that does not exist is a broken
-        // configuration, while a slave that is not there is a dropped edge (reported above, and the node may still
+        // configuration, while a slave that is not there is a dropped edge (reported above, and the instance may still
         // work without it).
         KeepBadEdges(badEdges);
-        var missingDependency = (node.Manifest.Dependencies ?? [])
+        var missingDependency = (instance.Manifest.Dependencies ?? [])
             .FirstOrDefault(id => Snapshot().All(candidate => candidate.Manifest.Id != id));
         if (missingDependency != default)
         {
-            node.Phase = ModulePhase.Failed;
-            node.Failure = $"Not started: declared dependency \"{missingDependency}\" does not exist.";
-            return Result<ModuleAddition>.Success(new(node.Info(), badEdges, wired));
+            instance.Phase = ModulePhase.Failed;
+            instance.Failure = $"Not started: declared dependency \"{missingDependency}\" does not exist.";
+            return Result<ModuleAddition>.Success(new(instance.Info(), badEdges, wired));
         }
-        var unready = DependenciesOf(node)
+        var unready = DependenciesOf(instance)
             .Select(id => Snapshot().FirstOrDefault(candidate => candidate.Manifest.Id == id))
             .FirstOrDefault(candidate => candidate is not null && candidate.Phase != ModulePhase.Ready);
         if (unready is not null)
         {
-            node.Phase = ModulePhase.Failed;
-            node.Failure = $"Not started: {unready.Manifest.Id} is {unready.Phase}.";
-            return Result<ModuleAddition>.Success(new(node.Info(), badEdges, wired));
+            instance.Phase = ModulePhase.Failed;
+            instance.Failure = $"Not started: {unready.Manifest.Id} is {unready.Phase}.";
+            return Result<ModuleAddition>.Success(new(instance.Info(), badEdges, wired));
         }
 
-        await ReadyAsync(node, cancellationToken).ConfigureAwait(false);
+        await ReadyAsync(instance, cancellationToken).ConfigureAwait(false);
         await AttachTriggersAsync(cancellationToken).ConfigureAwait(false);
-        return Result<ModuleAddition>.Success(new(node.Info(), badEdges, wired));
+        return Result<ModuleAddition>.Success(new(instance.Info(), badEdges, wired));
     }
 
     /// <summary>
-    /// Stops a node and takes it out of the graph, reporting every edge that pointed at it (docs/22, D1).
+    /// Stops a instance and takes it out of the graph, reporting every edge that pointed at it (docs/22, D1).
     ///
     /// The edges are reported rather than repaired: a master that still lists this id in its manifest has a file
     /// that no longer matches the graph, and rewriting somebody else's file is not this method's business.
     /// </summary>
     public async ValueTask<Result<IReadOnlyList<BadEdge>>> RemoveAsync(ModuleId id, CancellationToken cancellationToken)
     {
-        KernelNode? node;
-        lock (_gate) _nodes.TryGetValue(id, out node);
-        if (node is null) return Result<IReadOnlyList<BadEdge>>.Failure(new(ErrorCode.Invalid, $"No module answers to \"{id}\"."));
+        KernelInstance? instance;
+        lock (_gate) _instances.TryGetValue(id, out instance);
+        if (instance is null) return Result<IReadOnlyList<BadEdge>>.Failure(new(ErrorCode.Invalid, $"No module answers to \"{id}\"."));
 
-        await StopOneAsync(node, cancellationToken).ConfigureAwait(false);
+        await StopOneAsync(instance, cancellationToken).ConfigureAwait(false);
         DetachTriggers(id);
 
         var dropped = new List<BadEdge>();
         lock (_gate)
         {
-            _nodes.Remove(id);
+            _instances.Remove(id);
             _declared.Remove(id);
-            foreach (var other in _nodes.Values)
+            foreach (var other in _instances.Values)
                 foreach (var slave in (other.Manifest.Slaves ?? []).Where(slave => slave.Id == id).ToArray())
                 {
                     // The instance is gone, so no edge may keep pointing at it: the edge is dropped here and the
@@ -663,101 +663,101 @@ public sealed class Kernel
     /// this adds is that the relation becomes <b>visible</b> — before it, the only place "this manager holds this
     /// instance" existed was a dictionary inside the manager, which nobody outside could read.
     /// </summary>
-    public async ValueTask<Result<ModuleAddition>> AdoptAsync(ModuleId masterId, IKernelModule instance,
+    public async ValueTask<Result<ModuleAddition>> AdoptAsync(ModuleId masterId, IKernelModule module,
         IReadOnlyList<string>? kinds = null, string? typeId = null, CancellationToken cancellationToken = default)
     {
-        if (instance is null) return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, "An instance cannot be null."));
-        var edge = new ModuleSlave(instance.Id, kinds ?? [], RequireAll: false);
-        KernelNode master;
-        KernelNode node;
+        if (module is null) return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, "An module cannot be null."));
+        var edge = new ModuleSlave(module.Id, kinds ?? [], RequireAll: false);
+        KernelInstance master;
+        KernelInstance instance;
         bool alreadyThere;
         lock (_gate)
         {
             // Before startup the master may only be *declared*: the graph does not exist yet, and refusing here
             // would be answering a question startup has not asked. A provider built from its file belongs to this
             // case — it is held before anything runs.
-            if (!_nodes.TryGetValue(masterId, out master!) && !_declared.TryGetValue(masterId, out master!))
+            if (!_instances.TryGetValue(masterId, out master!) && !_declared.TryGetValue(masterId, out master!))
                 return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, $"No module answers to \"{masterId}\"."));
 
-            // C-16: an instance may have more than one master, so a second one is not a conflict — holding the same
+            // C-16: an module may have more than one master, so a second one is not a conflict — holding the same
             // object twice is what "two masters" means. Two *different* objects under one id still is (C-14).
-            var same = _nodes.TryGetValue(instance.Id, out var live) ? live
-                : _declared.TryGetValue(instance.Id, out var declared) ? declared : null;
-            if (same is not null && !ReferenceEquals(same.Module, instance))
-                return Result<ModuleAddition>.Failure(new(ErrorCode.Conflict, $"A module already answers to \"{instance.Id}\"."));
+            var same = _instances.TryGetValue(module.Id, out var live) ? live
+                : _declared.TryGetValue(module.Id, out var declared) ? declared : null;
+            if (same is not null && !ReferenceEquals(same.Module, module))
+                return Result<ModuleAddition>.Failure(new(ErrorCode.Conflict, $"A module already answers to \"{module.Id}\"."));
 
             if (same is not null)
             {
-                node = same;
+                instance = same;
                 alreadyThere = true;
             }
             else
             {
-                // The edge lives on the master, and only there: the master is what holds the instance and what has to
-                // accept it during Wire. Writing the master into the instance's own slave list would make the instance a
+                // The edge lives on the master, and only there: the master is what holds the module and what has to
+                // accept it during Wire. Writing the master into the module's own slave list would make the module a
                 // master too — the kernel would then ask it to wire its "slave", and report the refusal as a bad edge.
-                node = new KernelNode(new ModuleManifest(instance.Id, typeId ?? instance.Id.Value), instance);
+                instance = new KernelInstance(new ModuleManifest(module.Id, typeId ?? module.Id.Value), module);
                 alreadyThere = false;
                 if (_state == KernelRunState.BeforeStart)
                 {
                     // Nothing to phase through yet: this is a declaration that happens to come from a manager. Startup
                     // will initialize, wire and start it like any other, so the receipt counts the edge and the master
                     // still has to accept it.
-                    _declared[instance.Id] = node;
+                    _declared[module.Id] = instance;
                     master.AdoptSlave(edge);
-                    return Result<ModuleAddition>.Success(new(node.Info(), []));
+                    return Result<ModuleAddition>.Success(new(instance.Info(), []));
                 }
-                _nodes[instance.Id] = node;
+                _instances[module.Id] = instance;
             }
         }
 
         if (alreadyThere)
         {
-            // The instance is already in the graph: its phases are the core's business and are not re-run. All this
+            // The module is already in the graph: its phases are the core's business and are not re-run. All this
             // master gets is an edge, and the edge is wired the same way it would be at startup — asked, refused,
             // refused as a bad edge.
-            if (node.Phase is not (ModulePhase.Initialized or ModulePhase.Ready))
+            if (instance.Phase is not (ModulePhase.Initialized or ModulePhase.Ready))
             {
                 // Still starting: the Wire pass will reach this edge because it is on the master's list now.
                 lock (_gate) master.AdoptSlave(edge);
-                return Result<ModuleAddition>.Success(new(node.Info(), []));
+                return Result<ModuleAddition>.Success(new(instance.Info(), []));
             }
             if (WiringOf(master) is not { } second)
             {
-                var dropped = new BadEdge(masterId, instance.Id, BadEdgeReason.MasterDoesNotWire,
+                var dropped = new BadEdge(masterId, module.Id, BadEdgeReason.MasterDoesNotWire,
                     $"{masterId} declares slaves but does not implement {nameof(IModuleWiring)}.");
                 KeepBadEdges([dropped]);
-                return Result<ModuleAddition>.Success(new(node.Info(), [dropped]));
+                return Result<ModuleAddition>.Success(new(instance.Info(), [dropped]));
             }
             Result refused;
-            try { refused = second.WireSlave(instance.Id, kinds ?? [], instance); }
+            try { refused = second.WireSlave(module.Id, kinds ?? [], module); }
             catch (Exception ex) { refused = Result.Failure(new(ErrorCode.Internal, "Wire threw.", ex.Message)); }
             if (!refused.Ok)
             {
-                var bad = new BadEdge(masterId, instance.Id, BadEdgeReason.RejectedByMaster, refused.Error?.Message ?? "Rejected.");
+                var bad = new BadEdge(masterId, module.Id, BadEdgeReason.RejectedByMaster, refused.Error?.Message ?? "Rejected.");
                 KeepBadEdges([bad]);
-                return Result<ModuleAddition>.Success(new(node.Info(), [bad]));
+                return Result<ModuleAddition>.Success(new(instance.Info(), [bad]));
             }
             lock (_gate) master.AdoptSlave(edge);
-            return Result<ModuleAddition>.Success(new(node.Info(), [], 1));
+            return Result<ModuleAddition>.Success(new(instance.Info(), [], 1));
         }
 
         if (WiringOf(master) is not { } wiring)
             return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, $"{masterId} does not hold instances."));
 
-        await InitializeAsync(node, cancellationToken).ConfigureAwait(false);
-        if (node.Phase != ModulePhase.Initialized)
-            return Result<ModuleAddition>.Success(new(node.Info(), []));
+        await InitializeAsync(instance, cancellationToken).ConfigureAwait(false);
+        if (instance.Phase != ModulePhase.Initialized)
+            return Result<ModuleAddition>.Success(new(instance.Info(), []));
 
         Result accepted;
-        try { accepted = wiring.WireSlave(instance.Id, kinds ?? [], instance); }
+        try { accepted = wiring.WireSlave(module.Id, kinds ?? [], module); }
         catch (Exception ex) { accepted = Result.Failure(new(ErrorCode.Internal, "Wire threw.", ex.Message)); }
         if (!accepted.Ok)
         {
-            var bad = new BadEdge(masterId, instance.Id, BadEdgeReason.RejectedByMaster, accepted.Error?.Message ?? "Rejected.");
+            var bad = new BadEdge(masterId, module.Id, BadEdgeReason.RejectedByMaster, accepted.Error?.Message ?? "Rejected.");
             KeepBadEdges([bad]);
-            lock (_gate) _nodes.Remove(instance.Id);
-            return Result<ModuleAddition>.Success(new(node.Info(), [bad]));
+            lock (_gate) _instances.Remove(module.Id);
+            return Result<ModuleAddition>.Success(new(instance.Info(), [bad]));
         }
 
         // The edge is recorded on the master too, so the next receipt shows it as a declared slave rather than as
@@ -768,9 +768,9 @@ public sealed class Kernel
             _runtimeEdges++;
         }
 
-        await ReadyAsync(node, cancellationToken).ConfigureAwait(false);
+        await ReadyAsync(instance, cancellationToken).ConfigureAwait(false);
         await AttachTriggersAsync(cancellationToken).ConfigureAwait(false);
-        return Result<ModuleAddition>.Success(new(node.Info(), [], 1));
+        return Result<ModuleAddition>.Success(new(instance.Info(), [], 1));
     }
 
     /// <summary>
@@ -782,7 +782,7 @@ public sealed class Kernel
     {
         lock (_gate)
         {
-            if (_nodes.TryGetValue(masterId, out var master) || _declared.TryGetValue(masterId, out master))
+            if (_instances.TryGetValue(masterId, out var master) || _declared.TryGetValue(masterId, out master))
                 master.ReleaseSlave(instanceId);
         }
         return ValueTask.FromResult(Result.Success());
@@ -790,7 +790,7 @@ public sealed class Kernel
 
     /// <summary>
     /// Loads one module from its own file while the graph is running (docs/22, D2): read the manifest, build the
-    /// module, then add it the way a late node is added.
+    /// module, then add it the way a late instance is added.
     ///
     /// It reads the file rather than taking a manifest as an argument because the file is the truth about what a
     /// module is; a caller that passed one would be describing a module that may not be the one on disk.
@@ -831,7 +831,7 @@ public sealed class Kernel
     }
 
     /// <summary>
-    /// Hooks every node that wants a rhythm onto every node that can provide one.
+    /// Hooks every instance that wants a rhythm onto every instance that can provide one.
     ///
     /// After Ready, because a schedule should start against modules that are working, and again whenever the graph
     /// changes: a sink that arrives later still gets its beat. A source that refuses is recorded, not fatal — the same
@@ -839,26 +839,26 @@ public sealed class Kernel
     /// </summary>
     private async ValueTask AttachTriggersAsync(CancellationToken cancellationToken)
     {
-        var nodes = Snapshot();
-        var sources = nodes.Where(node => SourceOf(node) is { CanSchedule: true }).ToArray();
+        var instances = Snapshot();
+        var sources = instances.Where(instance => SourceOf(instance) is { CanSchedule: true }).ToArray();
         if (sources.Length == 0) return;
 
-        foreach (var node in nodes)
+        foreach (var instance in instances)
         {
-            var sink = SinkOf(node);
+            var sink = SinkOf(instance);
             if (sink is null || sink.PreferredInterval is null) continue;
             foreach (var source in sources)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 Result attached;
-                try { attached = SourceOf(source)!.Attach(node.Manifest.Id, sink); }
+                try { attached = SourceOf(source)!.Attach(instance.Manifest.Id, sink); }
                 catch (Exception ex) { attached = Result.Failure(new(ErrorCode.Internal, "Attach threw.", ex.Message)); }
                 if (attached.Ok)
                 {
                     // Recorded only on success: the receipt is the kernel's claim about calls it actually made.
                     lock (_gate)
                     {
-                        if (!_rhythms.TryGetValue(node.Manifest.Id, out var beats)) _rhythms[node.Manifest.Id] = beats = [];
+                        if (!_rhythms.TryGetValue(instance.Manifest.Id, out var beats)) _rhythms[instance.Manifest.Id] = beats = [];
                         var beat = (source.Manifest.Id, SourceOf(source)!.Source);
                         if (!beats.Contains(beat)) beats.Add(beat);
                     }
@@ -870,7 +870,7 @@ public sealed class Kernel
                     ParentId = SignalScope.CurrentId,
                     Group = "kernel",
                     Name = "trigger",
-                    From = node.Manifest.Id.Value,
+                    From = instance.Manifest.Id.Value,
                     To = source.Manifest.Id.Value,
                     Mechanism = "kernel.trigger.attach",
                     Outcome = "failed",
@@ -885,7 +885,7 @@ public sealed class Kernel
         await ValueTask.CompletedTask;
     }
 
-    /// <summary>Takes a departing node off every schedule. The source keeps working for everybody else.</summary>
+    /// <summary>Takes a departing instance off every schedule. The source keeps working for everybody else.</summary>
     private void DetachTriggers(ModuleId id)
     {
         lock (_gate)
@@ -894,40 +894,40 @@ public sealed class Kernel
             _rhythms.Remove(id);
             foreach (var beats in _rhythms.Values) beats.RemoveAll(beat => beat.Id == id);
         }
-        foreach (var node in Snapshot())
+        foreach (var instance in Snapshot())
         {
-            if (SourceOf(node) is not { } source) continue;
+            if (SourceOf(instance) is not { } source) continue;
             try { source.Detach(id); } catch { /* a source that cannot forget one sink must not block a removal */ }
         }
     }
 
     /// <summary>
-    /// The node's capability, whether the node implements it itself or only carries the module that does.
+    /// The instance's capability, whether the instance implements it itself or only carries the module that does.
     ///
     /// Everything the kernel knows about triggers goes through these two lookups, which is why it has no idea a clock
-    /// exists: a schedule source is just a node whose module implements ITriggerSource, and a sink is just a node
+    /// exists: a schedule source is just a instance whose module implements ITriggerSource, and a sink is just a instance
     /// whose module (or carried module) implements ITriggerSink.
     /// </summary>
-    private static ITriggerSink? SinkOf(KernelNode node) =>
-        node.Module as ITriggerSink ?? (node.Module as IModuleCarrier)?.Target as ITriggerSink;
+    private static ITriggerSink? SinkOf(KernelInstance instance) =>
+        instance.Module as ITriggerSink ?? (instance.Module as IModuleCarrier)?.Target as ITriggerSink;
 
-    private static ITriggerSource? SourceOf(KernelNode node) =>
-        node.Module as ITriggerSource ?? (node.Module as IModuleCarrier)?.Target as ITriggerSource;
+    private static ITriggerSource? SourceOf(KernelInstance instance) =>
+        instance.Module as ITriggerSource ?? (instance.Module as IModuleCarrier)?.Target as ITriggerSource;
 
     /// <summary>
-    /// The same door for the master side: a node that holds slaves may be the manager itself or a carrier around it
-    /// (a manager the host runs outside the phase machine is a <see cref="PassiveNode"/>). One lookup, so a new kind
+    /// The same door for the master side: a instance that holds slaves may be the manager itself or a carrier around it
+    /// (a manager the host runs outside the phase machine is a <see cref="PassiveInstance"/>). One lookup, so a new kind
     /// of wrapper never means a new place for the kernel to forget.
     /// </summary>
-    private static IModuleWiring? WiringOf(KernelNode node) =>
-        node.Module as IModuleWiring ?? (node.Module as IModuleCarrier)?.Target as IModuleWiring;
+    private static IModuleWiring? WiringOf(KernelInstance instance) =>
+        instance.Module as IModuleWiring ?? (instance.Module as IModuleCarrier)?.Target as IModuleWiring;
 
-    private KernelNode[] Snapshot()
+    private KernelInstance[] Snapshot()
     {
-        lock (_gate) return _nodes.Values.ToArray();
+        lock (_gate) return _instances.Values.ToArray();
     }
 
-    private KernelNode[] Declared()
+    private KernelInstance[] Declared()
     {
         lock (_gate) return _declared.Values.ToArray();
     }
@@ -940,13 +940,13 @@ public sealed class Kernel
     {
         /// <summary>Declarations only: nothing has a phase yet.</summary>
         BeforeStart,
-        /// <summary>Inside <see cref="StartAsync"/>: the nodes exist, so an instance walks its own phases now.</summary>
+        /// <summary>Inside <see cref="StartAsync"/>: the instances exist, so an instance walks its own phases now.</summary>
         Starting,
         /// <summary>Startup finished; additions and removals are the only way in.</summary>
         Running
     }
 
-    private sealed class KernelNode(ModuleManifest manifest, IKernelModule module)
+    private sealed class KernelInstance(ModuleManifest manifest, IKernelModule module)
     {
         public ModuleManifest Manifest { get; private set; } = manifest;
         public IKernelModule Module { get; } = module;
@@ -964,6 +964,6 @@ public sealed class Kernel
         public void ReleaseSlave(ModuleId id) =>
             Manifest = Manifest with { Slaves = (Manifest.Slaves ?? []).Where(slave => slave.Id != id).ToArray() };
 
-        public ModuleNodeInfo Info() => new(Manifest.Id, Manifest.Type, Phase, Failure);
+        public InstanceInfo Info() => new(Manifest.Id, Manifest.Type, Phase, Failure);
     }
 }

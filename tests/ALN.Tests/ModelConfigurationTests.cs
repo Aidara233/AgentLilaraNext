@@ -70,7 +70,7 @@ public sealed class ModelConfigurationTests : IDisposable
             [new ModelProfile("default", new Address("model", "openai-chat", "one"), "deepseek-flash")]);
 
         Assert.True((await store.SaveAsync("model.openai-chat#one", spec, default)).Ok);
-        // The directory is the node's id, and the file is the one the kernel would also read — that is the point of
+        // The directory is the instance's id, and the file is the one the kernel would also read — that is the point of
         // moving it here: a provider is not the one module whose directory says nothing (docs/22 §2).
         var manifest = Path.Combine(_root, "modules", "model.openai-chat#one", "module.json");
         Assert.True(File.Exists(manifest));
@@ -154,22 +154,22 @@ public sealed class ModelConfigurationTests : IDisposable
     [Fact]
     public async Task A_provider_is_a_node_while_it_is_held_and_stops_being_one_when_it_is_destroyed()
     {
-        // A mount that names a provider points at a node; a provider that only exists in the manager's dictionary is
+        // A mount that names a provider points at a instance; a provider that only exists in the manager's dictionary is
         // a target the graph cannot draw an edge to (docs/23 §4 step 1).
         var models = new ModelManager();
-        Assert.True(models.RegisterFactory("test.models", new NodeStubFactory()).Ok);
+        Assert.True(models.RegisterFactory("test.models", new InstanceStubFactory()).Ok);
         var kernel = new Kernel(_root, new ModuleFactoryRegistry());
-        Assert.True(kernel.Declare(new PassiveNode(models.Id, models), typeId: ModuleNames.ModelManager).Ok);
-        models.UseInstanceNodes(new InstanceNodeHost(kernel, models.Id));
+        Assert.True(kernel.Declare(new PassiveInstance(models.Id, models), typeId: ModuleNames.ModelManager).Ok);
+        models.UseInstanceHost(new InstanceHost(kernel, models.Id));
         Assert.True((await kernel.StartAsync(default)).Ok);
 
         var address = new Address("model", "stub", "one");
         var created = await models.CreateAsync(new(address, "{}", "model.stub"), default);
         Assert.True(created.Ok, created.Error?.Message);
 
-        var node = kernel.Nodes.Single(candidate => candidate.Id.Value == "model.stub#one");
-        Assert.Equal(ModulePhase.Ready, node.Phase);
-        Assert.Equal("model.stub", node.Type);
+        var instance = kernel.Instances.Single(candidate => candidate.Id.Value == "model.stub#one");
+        Assert.Equal(ModulePhase.Ready, instance.Phase);
+        Assert.Equal("model.stub", instance.Type);
         // Accepted, so nothing about this edge is in the "never became a call" list.
         Assert.Empty(kernel.Status.BadEdges);
 
@@ -178,15 +178,15 @@ public sealed class ModelConfigurationTests : IDisposable
         Assert.Null(kernel.Find(new ModuleId("model.stub#one")));
     }
 
-    private sealed class NodeStubFactory : IModelProviderFactory
+    private sealed class InstanceStubFactory : IModelProviderFactory
     {
         public string TypeId => "model.stub";
         public ModelProviderDescriptor Describe { get; } = new("model.stub", "chat", "Stub", ModelCapabilities.Streaming);
         public ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken) =>
-            ValueTask.FromResult(Result<IModelProvider>.Success(new NodeStubProvider(spec.Address)));
+            ValueTask.FromResult(Result<IModelProvider>.Success(new InstanceStubProvider(spec.Address)));
     }
 
-    private sealed class NodeStubProvider(Address address) : IModelProvider
+    private sealed class InstanceStubProvider(Address address) : IModelProvider
     {
         public Address Address { get; } = address;
         public ModuleId Id => new(Address.ToString());
