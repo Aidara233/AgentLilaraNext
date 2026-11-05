@@ -152,7 +152,8 @@ public sealed record BadEdge(ModuleId Master, ModuleId Slave, BadEdgeReason Reas
 public sealed record ModuleIssue(string Path, string Message);
 
 /// <summary>One instance as the receipt reports it: what it is, where it got to, and why it stopped.</summary>
-public sealed record InstanceInfo(ModuleId Id, string Type, ModulePhase Phase, string? Failure = null);
+public sealed record InstanceInfo(ModuleId Id, string Type, ModulePhase Phase, string? Failure = null,
+    string Category = "", ModuleRole Role = ModuleRole.Instance);
 
 /// <summary>
 /// The graph as it stands right now, for surfaces that cannot see the startup receipt — <c>system.info</c> is the

@@ -282,6 +282,12 @@ foreach (var type in modelManager.ListTypes())
 factories.RegisterOwned(SessionManager.SessionTypeId);
 
 var kernel = new Kernel(data.Root, factories, signalLog, hostOwnsTypes: factories.IsOwned);
+// The kernel's table is the truth for what exists. The catalog looks there last — after its own entries and the
+// declared owners — so nothing that answers today changes answer, and a module on the graph is findable without being
+// registered twice.
+modules.UseSource(id => kernel.Describe(id) is { } row && kernel.Find(id) is { } found && found is IModule module
+    ? new LocatedModule(module, row)
+    : null);
 // One table, one loop: these are the modules the host builds itself, so nothing on disk could produce them. Every
 // one of them is a master that holds instances (or, for memory, a store) — none of them has phases worth ordering.
 var declaredModules = new DeclaredModule[]

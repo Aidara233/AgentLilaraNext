@@ -1,3 +1,4 @@
+using System.Reflection;
 using ALN.Contracts;
 
 namespace ALN.Runtime;
@@ -115,6 +116,20 @@ public sealed class Kernel
     }
 
     /// <summary>The module behind an id, for callers that already know which one they mean (docs/22 §3.5).</summary>
+    /// <summary>
+    /// The catalog's row for an instance, or null when nothing answers. Built from whatever declared the instance:
+    /// the type from its manifest, the category and role from the module's own [Module]. The kernel does not invent
+    /// either — a row that guessed would be worse than no row.
+    /// </summary>
+    public CatalogEntry? Describe(ModuleId id)
+    {
+        KernelInstance? instance;
+        lock (_gate) _instances.TryGetValue(id, out instance);
+        if (instance is null) return null;
+        var info = instance.Info();
+        return new CatalogEntry(info.Id, info.Type, info.Category, info.Role);
+    }
+
     public IKernelModule? Find(ModuleId id)
     {
         lock (_gate) return _instances.TryGetValue(id, out var instance) ? instance.Module : null;
@@ -1059,6 +1074,15 @@ public sealed class Kernel
         public void ReleaseSlave(ModuleId id) =>
             Manifest = Manifest with { Slaves = (Manifest.Slaves ?? []).Where(slave => slave.Id != id).ToArray() };
 
-        public InstanceInfo Info() => new(Manifest.Id, Manifest.Type, Phase, Failure);
+        /// <summary>
+        /// What this instance is, as its own code declares it. Read from the module's [Module] attribute once per call
+        /// rather than stored: the attribute is on the type, and a second copy of it here could drift from the type.
+        /// </summary>
+        public InstanceInfo Info()
+        {
+            var declared = Module.GetType().GetCustomAttribute<ModuleAttribute>();
+            return new InstanceInfo(Manifest.Id, Manifest.Type, Phase, Failure,
+                declared?.Category ?? "", declared?.Role ?? ModuleRole.Instance);
+        }
     }
 }
