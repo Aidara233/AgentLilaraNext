@@ -18,14 +18,20 @@ public sealed class ModuleCatalogTests
         // remark is all there is, and when neither exists the text is empty rather than "()".
         var binding = new ChannelBinding(new Address("adapter.file", "one"), "conversation-1");
         var channel = new Address("channel", "conversation", "main");
-        ChannelMessage Make(string? name, string? remark) =>
-            new(Guid.NewGuid(), channel, binding, null, "text", DateTimeOffset.UnixEpoch, name, false, remark);
+        ChannelMessage Make(string? sender, string? remark, string? name = null) =>
+            new(Guid.NewGuid(), channel, binding, null, "text", DateTimeOffset.UnixEpoch, sender, false, remark, name);
 
         Assert.Equal("小林(同事)", Make("小林", "同事").DisplaySender);
         Assert.Equal("小林", Make("小林", null).DisplaySender);
         Assert.Equal("阿岚", Make("阿岚", null).DisplaySender);
         Assert.Equal("备注", Make(null, "备注").DisplaySender);   // 只有备注时，它就是全部，不加括号
         Assert.Equal("", Make(null, null).DisplaySender);
+
+        // The id is what the platform calls them; the name is what people call them. The name wins, and the id is not
+        // shown beside it — the remark takes that place, because it is the one a reader is missing.
+        Assert.Equal("小林(同事)", Make("20000", "同事", "小林").DisplaySender);
+        Assert.Equal("小林", Make("20000", null, "小林").DisplaySender);
+        Assert.Equal("20000(备注)", Make("20000", "备注", " ").DisplaySender);   // a blank name is not a name; the id takes its place
     }
 
     [Fact]

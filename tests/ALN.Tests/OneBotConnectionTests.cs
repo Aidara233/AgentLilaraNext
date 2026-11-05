@@ -126,6 +126,76 @@ public sealed class OneBotConnectionTests
         Assert.Throws<ArgumentException>(() => new QqAdapter(spec, new RecordingSink(), new NullLogger()));
     }
 
+    [Fact]
+    public async Task The_adapter_can_say_how_the_platform_names_somebody()
+    {
+        // The name is per place and the remark is per account, so the answer is assembled from two different questions:
+        // the group card (or the nickname outside a group) plus the remark the friend list holds.
+        await using var bot = await FakeOneBot.StartAsync();
+        var sink = new RecordingSink();
+        var log = new ListLogger();
+        var adapter = CreateAdapter(bot.WebSocketUri, sink, log);
+
+        try
+        {
+            var started = await adapter.StartAsync(default);
+            Assert.True(started.Ok, started.Error?.Detail ?? started.Error?.Message);
+            await WaitUntilAsync(() => adapter.Connected, TimeSpan.FromSeconds(5), () =>
+                $"the adapter never connected ({bot.WebSocketUri}): {log.Text} | server: {bot.ServerError ?? "no error"}");
+
+            var inGroup = await adapter.ResolveAsync("20000", "group-123456", default);
+            Assert.NotNull(inGroup);
+            Assert.Equal("小明明", inGroup!.Primary);   // the group card, not the nickname
+            Assert.Equal("老王", inGroup.Remark);
+            Assert.Equal("小明明(老王)", inGroup.ToString());
+
+            var elsewhere = await adapter.ResolveAsync("20000", "user-20000", default);
+            Assert.NotNull(elsewhere);
+            Assert.Equal("小明", elsewhere!.Primary);   // outside a group there is no card to ask for
+
+            // Somebody this account knows nothing about: null, because the caller's own fallback (the id) is a better
+            // answer than the id handed back as if it were a name.
+            Assert.Null(await adapter.ResolveAsync("99999", "group-123456", default));
+        }
+        finally
+        {
+            await adapter.StopAsync(default);
+        }
+    }
+
+    [Fact]
+    public async Task An_envelope_carries_the_name_from_the_event_and_the_remark_from_the_friend_list()
+    {
+        await using var bot = await FakeOneBot.StartAsync();
+        var sink = new RecordingSink();
+        var log = new ListLogger();
+        var adapter = CreateAdapter(bot.WebSocketUri, sink, log);
+
+        try
+        {
+            var started = await adapter.StartAsync(default);
+            Assert.True(started.Ok, started.Error?.Detail ?? started.Error?.Message);
+            await WaitUntilAsync(() => adapter.Connected, TimeSpan.FromSeconds(5), () =>
+                $"the adapter never connected ({bot.WebSocketUri}): {log.Text} | server: {bot.ServerError ?? "no error"}");
+
+            // Fetch the remarks before the message, so the assertion is about the message path and not about a race
+            // with the background fetch that the first message would have started.
+            Assert.NotNull(await adapter.ResolveAsync("20000", "group-123456", default));
+
+            bot.PushTextMessage(groupId: 123456, userId: 20000, messageId: 5150, text: "备注呢");
+            var envelope = await sink.First.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal("20000", envelope.Sender);        // the id, unchanged: a name is not an identity
+            Assert.Equal("测试", envelope.SenderName);     // what the event said
+            Assert.Equal("老王", envelope.SenderRemark);   // what the account calls them
+            Assert.Equal("测试(老王)", ChannelMessage.Compose(envelope.SenderName, envelope.Sender, envelope.SenderRemark));
+        }
+        finally
+        {
+            await adapter.StopAsync(default);
+        }
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout, Func<string> describe)
     {
         var deadline = DateTime.UtcNow + timeout;
@@ -285,6 +355,10 @@ public sealed class OneBotConnectionTests
                             status = "ok", retcode = 0, data = new { message_id = 9999 }, echo
                         }));
                     }
+                    else if (name is "get_friend_list" or "get_group_member_info" or "get_stranger_info")
+                    {
+                        await WriteAsync(NameAnswer(name, action.GetProperty("params"), echo));
+                    }
                 }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -296,6 +370,27 @@ public sealed class OneBotConnectionTests
 
         /// <summary>Raw frames the adapter sent, kept for failure messages.</summary>
         public ConcurrentQueue<string> Received { get; } = new();
+
+        /// <summary>
+        /// The three name actions, answered the way a bridge does: a remark only exists for a friend, a card only exists
+        /// inside a group, and somebody this account does not know gets an empty object rather than a made-up name.
+        /// </summary>
+        private static string NameAnswer(string action, JsonElement parameters, string? echo)
+        {
+            long? user = parameters.TryGetProperty("user_id", out var id) && id.TryGetInt64(out var parsed) ? parsed : null;
+            object data = action switch
+            {
+                "get_friend_list" => new object[]
+                {
+                    new { user_id = 20000, nickname = "小明", remark = "老王" },
+                    new { user_id = 20001, nickname = "小红", remark = "" }
+                },
+                "get_group_member_info" when user == 20000 => new { user_id = 20000, nickname = "小明", card = "小明明" },
+                "get_stranger_info" when user == 20000 => new { user_id = 20000, nickname = "小明" },
+                _ => new { }
+            };
+            return JsonSerializer.Serialize(new { status = "ok", retcode = 0, data, echo });
+        }
 
         public string? ServerError { get; set; }
 

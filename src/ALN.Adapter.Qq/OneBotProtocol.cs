@@ -14,6 +14,12 @@ public sealed record OneBotResponse(bool Ok, string? MessageId, long RetCode, st
 /// <summary>Who the listener is logged in as, learned from the platform rather than configured.</summary>
 public sealed record OneBotLogin(long UserId, string? Nickname);
 
+/// <summary>One row of the account's friend list: who they are, and what this account calls them.</summary>
+/// <param name="Nickname">The name the person chose for themselves.</param>
+/// <param name="Remark">The name this account gave them. Belongs to us, not to them, and is often the only name
+/// that means anything to whoever reads the transcript.</param>
+public sealed record OneBotFriend(long UserId, string? Nickname, string? Remark);
+
 /// <summary>
 /// OneBot v11 wire formats, as pure functions. Everything here is testable without a socket, which is
 /// the point: the socket is thin, the mapping rules are where the bugs live (self echoes, CQ codes,
@@ -161,6 +167,57 @@ public static partial class OneBotProtocol
         JsonSerializer.Serialize(new { action = "get_login_info", @params = new { }, echo }, Json);
 
     /// <summary>
+    /// <c>get_friend_list</c>: the one call that carries remarks. Remarks are a property of the account, not of a
+    /// place, so one answer covers every conversation — which is why it is worth fetching once and keeping.
+    /// </summary>
+    public static string BuildFriendList(string echo) =>
+        JsonSerializer.Serialize(new { action = "get_friend_list", @params = new { }, echo }, Json);
+
+    /// <summary>Parses the <c>data</c> array of a <c>get_friend_list</c> answer. Rows without a usable id are dropped.</summary>
+    public static IReadOnlyList<OneBotFriend> ReadFriendList(JsonElement data)
+    {
+        if (data.ValueKind != JsonValueKind.Array) return [];
+        var friends = new List<OneBotFriend>(data.GetArrayLength());
+        foreach (var entry in data.EnumerateArray())
+        {
+            if (entry.ValueKind != JsonValueKind.Object) continue;
+            if (!TryLong(entry, "user_id", out var userId) || userId <= 0) continue;
+            friends.Add(new OneBotFriend(userId,
+                Blank(TryString(entry, "nickname", out var nickname) ? nickname : null),
+                Blank(TryString(entry, "remark", out var remark) ? remark : null)));
+        }
+        return friends;
+    }
+
+    /// <summary>
+    /// <c>get_group_member_info</c>: the display name inside one group. It has to be asked per group because the card
+    /// is per group — a person can be "组长" in one and their own nickname in another, and both are correct.
+    /// </summary>
+    public static string BuildGroupMemberInfo(string echo, long groupId, long userId) =>
+        JsonSerializer.Serialize(new
+        {
+            action = "get_group_member_info",
+            @params = new { group_id = groupId, user_id = userId, no_cache = false },
+            echo
+        }, Json);
+
+    /// <summary><c>get_stranger_info</c>: the name to use where there is no group context to ask in.</summary>
+    public static string BuildStrangerInfo(string echo, long userId) =>
+        JsonSerializer.Serialize(new
+        {
+            action = "get_stranger_info",
+            @params = new { user_id = userId, no_cache = false },
+            echo
+        }, Json);
+
+    /// <summary>Parses the <c>data</c> object of a <c>get_group_member_info</c> answer: the card, then the nickname.</summary>
+    public static string? ReadMemberName(JsonElement data) => MemberName(data);
+
+    /// <summary>Parses the <c>data</c> object of a <c>get_stranger_info</c> answer.</summary>
+    public static string? ReadStrangerName(JsonElement data) =>
+        data.ValueKind == JsonValueKind.Object && TryString(data, "nickname", out var nickname) ? Blank(nickname) : null;
+
+    /// <summary>
     /// Parses the <c>data</c> object of a <c>get_login_info</c> answer (the caller already unwrapped the
     /// envelope, so this is the account object itself).
     /// </summary>
@@ -232,11 +289,24 @@ public static partial class OneBotProtocol
     private static string? ReadSenderName(JsonElement root)
     {
         if (!root.TryGetProperty("sender", out var sender) || sender.ValueKind != JsonValueKind.Object) return null;
-        // Card is the per-group display name; nickname is the account-wide one. Group context wins.
+        return MemberName(sender);
+    }
+
+    /// <summary>
+    /// How a person is displayed in one place: the group card first, the account nickname second. One rule, in one
+    /// place, because it is asked about a pushed event's <c>sender</c> object and about a
+    /// <c>get_group_member_info</c> answer, which are the same question with different wrappers.
+    /// </summary>
+    private static string? MemberName(JsonElement person)
+    {
+        if (person.ValueKind != JsonValueKind.Object) return null;
         foreach (var key in new[] { "card", "nickname" })
-            if (TryString(sender, key, out var value) && !string.IsNullOrWhiteSpace(value)) return value;
+            if (TryString(person, key, out var value) && Blank(value) is { } name) return name;
         return null;
     }
+
+    /// <summary>Empty and whitespace are "the platform did not say", not a name made of spaces.</summary>
+    private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
     private static string ReadText(JsonElement root)
     {

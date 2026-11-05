@@ -99,6 +99,11 @@ public sealed record ModuleError(string Method, string Message, Exception? Excep
 /// referencing every module's contract to be able to judge. So the master judges, and a refusal is a bad edge
 /// with the master's own reason in it (docs/22 §5).
 /// </summary>
+public interface IModuleWiring
+{
+    Result WireSlave(ModuleId slaveId, IReadOnlyList<string> kinds, IKernelModule instance);
+}
+
 /// <summary>
 /// How a platform names a person: a display name, and a remark that belongs to you rather than to them. The two are
 /// kept apart because they answer different questions — who this is, and what you call them — and a single field would
@@ -114,17 +119,18 @@ public sealed record TargetName(string Primary, string? Remark = null)
 /// An adapter that can say how a platform names somebody. The default order is the platform's own display name first
 /// (a group card if there is one, then the account's nickname), the account id as the last resort, and the remark
 /// carried alongside — always shown when it exists, never instead of the name.
+///
+/// It exists as a contract rather than as a field on <see cref="AdapterEnvelope"/> because a name is not always in the
+/// event: a stored message, an id from a config file, or an event type that carries no sender object all need the same
+/// answer, and only the adapter can go and ask.
 /// </summary>
 public interface ITargetNaming
 {
     /// <param name="targetId">The platform's identifier for the person.</param>
     /// <param name="scope">Where they were seen, when names are per place — a group, for instance. Null when not.</param>
+    /// <returns>Null when the adapter knows nothing beyond the id it was handed: the caller's own fallback is then the
+    /// better answer, and inventing a <see cref="TargetName"/> out of the input would look like a resolved name.</returns>
     ValueTask<TargetName?> ResolveAsync(string targetId, string? scope, CancellationToken cancellationToken);
-}
-
-public interface IModuleWiring
-{
-    Result WireSlave(ModuleId slaveId, IReadOnlyList<string> kinds, IKernelModule instance);
 }
 
 /// <summary>

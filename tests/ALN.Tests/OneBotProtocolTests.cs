@@ -259,4 +259,66 @@ public sealed class OneBotProtocolTests
         Assert.Equal(10000, OneBotProtocol.ReadSelfId(Parse(heartbeat)));
         Assert.Null(OneBotProtocol.ReadMessage(Parse(heartbeat), selfId: null));
     }
+
+    [Fact]
+    public void A_senders_name_is_the_group_card_first_and_the_nickname_second()
+    {
+        // Two wrappers, one rule: the same question is asked about a pushed event's sender object and about a
+        // get_group_member_info answer, so both go through the same reading.
+        Assert.Equal("蓝", OneBotProtocol.ReadMemberName(Parse("""{ "user_id": 20000, "nickname": "阿蓝", "card": "蓝" }""")));
+        Assert.Equal("阿蓝", OneBotProtocol.ReadMemberName(Parse("""{ "user_id": 20000, "nickname": "阿蓝", "card": "" }""")));
+        Assert.Equal("阿蓝", OneBotProtocol.ReadMemberName(Parse("""{ "user_id": 20000, "nickname": "阿蓝", "card": "  " }""")));
+        Assert.Null(OneBotProtocol.ReadMemberName(Parse("""{ "user_id": 20000 }""")));
+        Assert.Null(OneBotProtocol.ReadMemberName(Parse("""[]""")));
+
+        Assert.Equal("阿蓝", OneBotProtocol.ReadStrangerName(Parse("""{ "user_id": 20000, "nickname": "阿蓝" }""")));
+        Assert.Null(OneBotProtocol.ReadStrangerName(Parse("""{ "user_id": 20000, "nickname": " " }""")));
+        Assert.Null(OneBotProtocol.ReadStrangerName(Parse("""{ "status": "failed" }""")));
+    }
+
+    [Fact]
+    public void A_friend_list_is_read_for_the_remark_this_account_gave_each_person()
+    {
+        // The remark is what makes a transcript readable: "小明" says who they are to themselves, "老王" says who they
+        // are to us. Rows that cannot be tied to an account are dropped rather than kept as nameless.
+        var friends = OneBotProtocol.ReadFriendList(Parse("""
+            [
+              { "user_id": 20000, "nickname": "小明", "remark": "老王" },
+              { "user_id": 20001, "nickname": "小红", "remark": "" },
+              { "user_id": 20002, "nickname": "  ", "remark": " 旧友 " },
+              { "nickname": "没有 id", "remark": "无名" },
+              { "user_id": 0, "nickname": "零" },
+              "不是一个对象"
+            ]
+            """));
+
+        Assert.Equal(3, friends.Count);
+        Assert.Equal(new OneBotFriend(20000, "小明", "老王"), friends[0]);
+        Assert.Equal(new OneBotFriend(20001, "小红", null), friends[1]);      // an empty remark is not a remark
+        Assert.Equal(new OneBotFriend(20002, null, "旧友"), friends[2]);      // trimmed, and a blank nickname is null
+        Assert.Empty(OneBotProtocol.ReadFriendList(Parse("""{ "status": "ok" }""")));
+    }
+
+    [Theory]
+    [InlineData("get_friend_list", null)]
+    [InlineData("get_group_member_info", 20000L)]
+    [InlineData("get_stranger_info", 20000L)]
+    public void The_name_actions_carry_the_ids_they_have_to(string action, long? id)
+    {
+        const string echo = "e1";
+        var json = action switch
+        {
+            "get_friend_list" => OneBotProtocol.BuildFriendList(echo),
+            "get_group_member_info" => OneBotProtocol.BuildGroupMemberInfo(echo, 123456, 20000),
+            _ => OneBotProtocol.BuildStrangerInfo(echo, 20000)
+        };
+        var root = Parse(json);
+
+        Assert.Equal(action, root.GetProperty("action").GetString());
+        Assert.Equal(echo, root.GetProperty("echo").GetString());
+        var parameters = root.GetProperty("params");
+        if (id is { } expected) Assert.Equal(expected, parameters.GetProperty("user_id").GetInt64());
+        if (action == "get_group_member_info") Assert.Equal(123456, parameters.GetProperty("group_id").GetInt64());
+        if (action != "get_friend_list") Assert.False(parameters.GetProperty("no_cache").GetBoolean());
+    }
 }

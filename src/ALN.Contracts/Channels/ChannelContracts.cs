@@ -107,16 +107,29 @@ public sealed record ChannelInfo(Address Address, string Name, IReadOnlyList<Cha
     string? ModelProfile = null);
 public sealed record ChannelMessage(Guid MessageId, Address Channel, ChannelBinding Binding,
     string? PlatformMessageId, string Text, DateTimeOffset At, string? Sender = null, bool MentionsSelf = false,
-    string? SenderRemark = null)
+    string? SenderRemark = null,
+    /// <summary>The name the platform uses for the sender (group card, then nickname), when one was found. Kept apart
+    /// from <see cref="Sender"/>, which is the platform's identifier: a name changes and an id does not, and only one
+    /// of them is safe to answer somebody by.</summary>
+    string? SenderName = null)
 {
     /// <summary>
-    /// How to address the sender in text: the name that was found (group card, nickname or the account id) and, when
-    /// there is one, the remark in brackets after it. The remark never replaces the name — it is an extra thing to know
-    /// about the same person, so both stay visible.
+    /// How to address the sender in text: the name that was found (group card, nickname or the account id, in that
+    /// order) and, when there is one, the remark in brackets after it. The remark never replaces the name — it is an
+    /// extra thing to know about the same person, so both stay visible.
     /// </summary>
-    public string DisplaySender =>
-        Sender is null ? (SenderRemark ?? "") :
-        SenderRemark is null ? Sender : $"{Sender}({SenderRemark})";
+    public string DisplaySender => Compose(SenderName, Sender, SenderRemark);
+
+    /// <summary>
+    /// The one rule for "how do we call this person", kept in one place because the same question is asked by the
+    /// Channel (what to inject) and by the Adapter (what to put on the envelope).
+    /// </summary>
+    public static string Compose(string? name, string? id, string? remark)
+    {
+        var primary = string.IsNullOrWhiteSpace(name) ? id : name;
+        if (string.IsNullOrWhiteSpace(primary)) return remark ?? "";
+        return string.IsNullOrWhiteSpace(remark) ? primary : $"{primary}({remark})";
+    }
 }
 
 /// <summary>Messages accepted for one Channel that a Session has not consumed yet.</summary>

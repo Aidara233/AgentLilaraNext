@@ -54,7 +54,12 @@ public enum AdapterDirection { Inbound, Outbound, Both }
 public enum AdapterState { Created, Running, Stopped, Faulted, Destroyed }
 public sealed record AdapterDescriptor(string PlatformId, string AccountId, AdapterDirection Direction);
 public sealed record AdapterEnvelope(Address Adapter, string PlatformId, string PlatformConversationId,
-    string? PlatformMessageId, string Text, DateTimeOffset At, string? Sender = null, bool MentionsSelf = false,
+    string? PlatformMessageId, string Text, DateTimeOffset At,
+    /// <summary>The platform's identifier for the sender. Not a name: it does not change when somebody renames.</summary>
+    string? Sender = null, bool MentionsSelf = false,
+    /// <summary>What the platform calls the sender, when the event carried it (a group card, then a nickname).</summary>
+    string? SenderName = null,
+    /// <summary>What you call the sender — a remark that belongs to the account rather than to the platform.</summary>
     string? SenderRemark = null)
 {
     public Guid EventId { get; init; } = Guid.NewGuid();

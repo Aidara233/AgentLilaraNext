@@ -351,8 +351,31 @@ public sealed class ChannelManager(IEventSink events, IInstanceBindings bindings
             if (adapterManager is null || !adapterManager.Get(binding.Adapter).Ok)
                 return Result<int>.Failure(new(ErrorCode.Unavailable,
                     $"Bound Adapter is not available, message not delivered: {binding.Adapter}"));
+            // The event usually carries a name; when it does not, the Adapter is the only layer that can go and ask. It is
+            // asked for by name (C-19) and its answer is best effort: a Channel that dropped a message because it could
+            // not learn what to call the sender would be a Channel that values a label over the message.
+            var senderName = envelope.SenderName;
+            var senderRemark = envelope.SenderRemark;
+            if (string.IsNullOrWhiteSpace(senderName) && !string.IsNullOrWhiteSpace(envelope.Sender) &&
+                _catalog.Find(binding.Adapter.ToModuleId()) is ITargetNaming naming)
+            {
+                try
+                {
+                    if (await naming.ResolveAsync(envelope.Sender, envelope.PlatformConversationId, cancellationToken)
+                            .ConfigureAwait(false) is { } resolved)
+                    {
+                        senderName = resolved.Primary;
+                        senderRemark ??= resolved.Remark;
+                    }
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                catch (Exception ex)
+                {
+                    _report.Note("channels", $"the adapter could not name the sender of a message ({ex.Message}); using the id");
+                }
+            }
             var message = new ChannelMessage(envelope.EventId, channel.Address, binding, envelope.PlatformMessageId,
-                envelope.Text, envelope.At, envelope.Sender, envelope.MentionsSelf, envelope.SenderRemark);
+                envelope.Text, envelope.At, envelope.Sender, envelope.MentionsSelf, senderRemark, senderName);
             // One fact, one transaction: the history row and the "accepted but unfinished" marker are written
             // together. Half of them is either a message nobody will look at or a marker naming nothing.
             var duplicate = false;

@@ -148,6 +148,26 @@ app.Map("/", async context =>
             case "get_login_info":
                 await WriteAsync(new { status = "ok", retcode = 0, data = new { user_id = self, nickname = "fake" }, echo });
                 break;
+            // The name actions: the sender of the pushed message is a friend whose nickname is "测试人员" and whose
+            // remark is "测试备注", and inside this group their card is "群里的测试人员". This is what lets a person
+            // reading the transcript see who said what instead of a number.
+            case "get_friend_list":
+                await WriteAsync(new
+                {
+                    status = "ok", retcode = 0, echo,
+                    data = new[] { new { user_id = user, nickname = "测试人员", remark = "测试备注" } }
+                });
+                break;
+            case "get_group_member_info":
+                await WriteAsync(new
+                {
+                    status = "ok", retcode = 0, echo,
+                    data = new { user_id = user, nickname = "测试人员", card = "群里的测试人员" }
+                });
+                break;
+            case "get_stranger_info":
+                await WriteAsync(new { status = "ok", retcode = 0, echo, data = new { user_id = user, nickname = "测试人员" } });
+                break;
             default:
                 Console.WriteLine($"<- {action} {root.GetRawText()}");
                 await WriteAsync(new { status = "failed", retcode = 1404, data = (object?)null, echo });

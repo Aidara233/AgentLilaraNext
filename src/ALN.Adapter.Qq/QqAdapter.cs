@@ -14,7 +14,7 @@ namespace ALN.Adapter.Qq;
 /// v1 scope: group text in, group text out. Private chats, images, mentions and rate-limit pacing are
 /// not implemented — see docs/16.
 /// </summary>
-public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, IParameterTarget
+public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, IParameterTarget, ITargetNaming
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private const int SeenCapacity = 512;
@@ -23,6 +23,7 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
     private readonly IModuleLogger _log;
     private readonly Uri _endpoint;
     private readonly OneBotConnection _connection;
+    private readonly QqNames _names;
     private readonly InboundJournal _journal;
     private readonly IInboundAcks? _acks;
     private readonly HashSet<string> _seen = new(StringComparer.Ordinal);
@@ -51,6 +52,7 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
 
         settings.TryGetValue("accessToken", out var token);
         _connection = new OneBotConnection(_endpoint, string.IsNullOrWhiteSpace(token) ? null : token, log);
+        _names = new QqNames(_connection, log);
         _detail = $"未连接（{_endpoint}）";
     }
 
@@ -64,6 +66,14 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
     public string? HealthDetail => _connection.IsConnected
         ? $"已连接 {_endpoint}" + (DisplayName is { Length: > 0 } name ? $"（{name} / {AccountId}）" : string.Empty)
         : _detail ?? _connection.LastError;
+
+    /// <summary>
+    /// How this platform names somebody: the group card when the question is about a group, the nickname otherwise, and
+    /// the remark this account gave them. See <see cref="QqNames"/> for why it can answer from what it already knows
+    /// and when it has to go and ask.
+    /// </summary>
+    public ValueTask<TargetName?> ResolveAsync(string targetId, string? scope, CancellationToken cancellationToken) =>
+        _names.ResolveAsync(targetId, scope, cancellationToken);
 
     public override async ValueTask<Result> StartAsync(CancellationToken cancellationToken)
     {
@@ -183,8 +193,12 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
         if (inbound is null) return;
         if (inbound.MessageId is { Length: > 0 } id && !MarkSeen(id)) return;
 
+        // The name comes with the event; the remark does not. So the remark is read out of what the friend list already
+        // said, and the list is asked for in the background if it was never fetched: publishing never waits for either.
+        _names.Nudge();
         var envelope = new AdapterEnvelope(Address, Descriptor.PlatformId, inbound.ConversationId,
-            inbound.MessageId, inbound.Text, inbound.At, inbound.SenderId, inbound.MentionsSelf);
+            inbound.MessageId, inbound.Text, inbound.At, inbound.SenderId, inbound.MentionsSelf,
+            inbound.SenderName, _names.Remembered(inbound.SenderId));
         // A failed journal must not swallow the message: it is still worth publishing, just without the
         // promise that a crash would bring it back.
         var journaled = await _journal.RememberAsync(envelope, CancellationToken.None).ConfigureAwait(false);
