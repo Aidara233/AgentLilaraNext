@@ -71,6 +71,30 @@ public sealed class KernelTests : IDisposable
     }
 
     [Fact]
+    public async Task Two_masters_may_hold_the_same_slave()
+    {
+        // C-16: an instance may have more than one master. It is declared once and held twice, and the phases it
+        // goes through are the core's waves — so it initializes and becomes ready once, no matter how many masters
+        // hold it. A master wires its edge; it does not drive its slaves through startup.
+        var shared = new TestModule(new("shared"));
+        var left = new TestMaster(new("left"));
+        var right = new TestMaster(new("right"));
+        Add(shared, "test.plain");
+        Add(left, "test.master", slaves: ["shared"]);
+        Add(right, "test.master", slaves: ["shared"]);
+
+        var receipt = await Start();
+
+        Assert.Empty(receipt.BadEdges);
+        Assert.Equal(2, receipt.WiredEdges);
+        Assert.Equal(new ModuleId("shared"), Assert.Single(left.Wired));
+        Assert.Equal(new ModuleId("shared"), Assert.Single(right.Wired));
+        Assert.Single(shared.Calls, call => call == "initialize");
+        Assert.Single(shared.Calls, call => call == "ready");
+        Assert.True(receipt.AllReady, Failures(receipt));
+    }
+
+    [Fact]
     public async Task A_startup_with_broken_edges_completes_and_reports_each_one()
     {
         var missing = new TestMaster(new("missing"));
