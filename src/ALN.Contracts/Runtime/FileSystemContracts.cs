@@ -62,7 +62,13 @@ public interface IFileSystemAccess
     /// </summary>
     ValueTask<Result<IReadOnlyList<FileNode>>> TreeAsync(string scope, string path, CancellationToken cancellationToken);
 
-    /// <summary>Null when there is no such file. A directory where a file was expected is an error, not a null.</summary>
+    /// <summary>
+    /// Null when there is no such file. A directory where a file was expected is an error, not a null.
+    ///
+    /// Watch the shape: absence comes back as a result whose <c>Error</c> is null and whose <c>Value</c> is null, and
+    /// <c>Result&lt;T&gt;.Ok</c> is false for a null value. So absence is read off <c>Error</c>, not off <c>Ok</c> — the
+    /// same rule the state store follows for a key that was never written.
+    /// </summary>
     ValueTask<Result<FileText?>> ReadAsync(string scope, string path, CancellationToken cancellationToken);
 
     /// <summary>Stat without reading. Null when nothing is there.</summary>
@@ -89,6 +95,16 @@ public interface IFileSystemAccess
     /// protected from later, so it has to be asked for.
     /// </summary>
     ValueTask<Result> DeleteAsync(string scope, string path, bool recursive, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// The scopes this build knows how to fill. A scope is a name a person will read in a configuration file, so the
+/// names live where both the host and the modules can see them; adding one is a registration, not a path.
+/// </summary>
+public static class FileScopes
+{
+    /// <summary>The memory library: groups of fragments and one block each (docs/21).</summary>
+    public const string Memory = "memory";
 }
 
 /// <summary>

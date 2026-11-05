@@ -59,6 +59,10 @@ var channelInfoSource = sessionExtensions.Register(new ChannelInfoSource());
 if (!channelInfoSource.Ok) { Console.Error.WriteLine(channelInfoSource.Error?.Message); return 1; }
 // Memory is a module of its own: it registers its own line and its own tools, and nothing else knows it exists.
 var memoryModule = new MemoryModule(storage, sessionExtensions);
+// Everything a model may reach on disk goes through this one port, and the scopes it knows are registered here and
+// nowhere else. The memory library is the first; another is added by registering it here and naming it in that
+// module's own module.json — never by a module inventing a path.
+var fileAccess = new LocalFileSystemAccess(data.Root, [FileScopes.Memory]);
 // The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.
@@ -275,6 +279,10 @@ var deadlineSweepTask = sessions.RunDeadlineSweepAsync(deadlines, TimeProvider.S
 // kernel; now it is a fact registered on the factory table: a type whose instances a manager builds is "owned", so
 // the loader reads its file as that instance's configuration instead of reporting a module it failed to understand.
 var factories = new ModuleFactoryRegistry();
+// The file system module is built from its own file, like every other module that a person configures: the factory
+// gets the manifest and decides what its config means. The whitelist is therefore an edit, not a recompile.
+factories.Register(FileSystemModule.TypeId,
+    manifest => FileSystemModule.FromManifest(manifest, fileAccess, sessionExtensions));
 foreach (var type in adapterTypes.ListTypes().Where(type => adapterTypes.IsConcrete(type.TypeId)))
     factories.RegisterOwned(type.TypeId);
 foreach (var type in modelManager.ListTypes())
@@ -354,6 +362,18 @@ var clockDeclared = kernel.Declare(new PassiveInstance(new ModuleId(ModuleNames.
 if (!clockDeclared.Ok)
 {
     Console.Error.WriteLine(clockDeclared.Error?.Message ?? "Clock module declaration failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
+// The file system module reads its whitelist from its own file, so the file has to exist before the scan. Written
+// once and never rewritten (C-03): from then on the whitelist is whatever a person left there.
+var fileSystemFile = await new ModuleManifestStore(data.Root).WriteIfMissingAsync(
+    new ModuleManifest(new ModuleId(FileSystemModule.TypeId), FileSystemModule.TypeId, Enabled: true,
+        ConfigJson: FileSystemModule.DefaultConfig), CancellationToken.None);
+if (!fileSystemFile.Ok)
+{
+    Console.Error.WriteLine(fileSystemFile.Error?.Message ?? "File system module declaration failed.");
     shutdown.Cancel();
     queue.Complete();
     return 1;
