@@ -313,6 +313,16 @@ if (!modelManagerDeclared.Ok)
     queue.Complete();
     return 1;
 }
+// Sessions, for the same reason as models: the manager holds them, so a Session is a node the moment it is loaded.
+// No phase of its own either — a Session is loaded on demand, never by a wave.
+var sessionManagerDeclared = kernel.Declare(new PassiveNode(new ModuleId(ModuleNames.SessionManager), sessions), typeId: ModuleNames.SessionManager);
+if (!sessionManagerDeclared.Ok)
+{
+    Console.Error.WriteLine(sessionManagerDeclared.Error?.Message ?? "Session manager declaration failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
 // Instances are announced to the graph by the manager that holds them, so "what is mounted on this Channel" stops
 // being a question only the manager can answer (docs/23 §4 step 1). Installed before startup, because reviving a
 // stored Channel happens *during* startup — wiring it afterwards would announce only the ones created later.
@@ -338,6 +348,10 @@ foreach (var provider in modelManager.Entries())
     queue.Complete();
     return 1;
 }
+// Sessions are announced by their manager when it loads one, so the sink is installed before startup — a revived
+// Session is loaded inside a Ready phase, not after it.
+if (sessions is IInstanceNodeSink sessionNodes)
+    sessionNodes.UseInstanceNodes(new InstanceNodeHost(kernel, new ModuleId(ModuleNames.SessionManager)));
 // The clock is a node too, so the graph can answer "who is on a schedule". It has no phases of its own - the host
 // runs its loop - so it is a passive carrier rather than a participant.
 var clockDeclared = kernel.Declare(new PassiveNode(new ModuleId(ModuleNames.Clock), clock), typeId: ModuleNames.Clock);

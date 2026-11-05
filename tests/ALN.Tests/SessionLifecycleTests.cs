@@ -98,6 +98,32 @@ public sealed class SessionLifecycleTests : IDisposable
             await File.ReadAllBytesAsync(Path.Combine(SessionPath("s-profile"), "spec.json")), Json)!.ModelProfileId);
     }
 
+    [Fact]
+    public async Task A_loaded_session_is_a_node_and_stops_being_one_when_it_is_put_away()
+    {
+        // "This manager holds this Session" used to exist only inside the manager's dictionary. A mount that named a
+        // Session therefore pointed at something the graph had never heard of (docs/23 §4 step 1).
+        var sessions = Sessions();
+        var kernel = new Kernel(Path.Combine(_root, "graph"), new ModuleFactoryRegistry());
+        Assert.True(kernel.Declare(new PassiveNode(sessions.Id, sessions), typeId: ModuleNames.SessionManager).Ok);
+        sessions.UseInstanceNodes(new InstanceNodeHost(kernel, sessions.Id));
+        Assert.True((await kernel.StartAsync(default)).Ok);
+
+        var opened = await sessions.OpenAsync("s-node", Spec, default);
+        Assert.True(opened.Ok, opened.Error?.Message);
+
+        var node = kernel.Nodes.Single(candidate => candidate.Id.Value == "s-node");
+        Assert.Equal(ModulePhase.Ready, node.Phase);
+        Assert.Equal(SessionManager.SessionTypeId, node.Type);
+
+        // Put away, so no longer held — and a node that stayed behind would be an edge pointing at a moved directory.
+        var destination = Path.Combine(_root, "bin", "s-node");
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        var moved = await sessions.ArchiveAsync("s-node", destination, default);
+        Assert.True(moved.Ok, moved.Error?.Message);
+        Assert.Null(kernel.Find(new ModuleId("s-node")));
+    }
+
     private SessionManager Sessions() => new(Path.Combine(_root, "sessions"), new ScriptedModel());
 
     private ArchiveManager Bin() => new(_root);

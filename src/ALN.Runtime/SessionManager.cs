@@ -12,7 +12,7 @@ namespace ALN.Runtime;
 
 /// <summary>Runs one serialized model step per activation and persists completed turns.</summary>
 [Module(SessionManagerId, Category = "session", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
+public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWiring, IInstanceNodeSink, IModule
 {
     public const string SessionManagerId = ModuleNames.SessionManager;
     public const string SessionTypeId = "session.chat";
@@ -38,6 +38,21 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
     private readonly IPromptLibrary? _prompts;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SessionRecord> _loaded = new(StringComparer.Ordinal);
+    private IInstanceNodeHost? _nodes;
+
+    /// <summary>
+    /// The master side of the edge: this manager holds the Sessions it has loaded. A Session on disk that was never
+    /// loaded is not held — it becomes a node when it is loaded, which is the only moment anybody asked about it.
+    /// (A thousand forgotten directories never become a thousand nodes.)
+    /// </summary>
+    public Result WireSlave(ModuleId slaveId, IReadOnlyList<string> kinds, IKernelModule instance)
+    {
+        return _loaded.ContainsKey(slaveId.Value)
+            ? Result.Success()
+            : Result.Failure(new(ErrorCode.Invalid, $"{slaveId} is not one of this manager's loaded Sessions."));
+    }
+
+    public void UseInstanceNodes(IInstanceNodeHost nodes) => _nodes = nodes ?? throw new ArgumentNullException(nameof(nodes));
 
     public SessionManager(string dataRoot, IModelManager models, ISessionExtensionRegistry? extensions = null,
         ISignalLog? signalLog = null, IPromptLibrary? prompts = null)
@@ -129,6 +144,33 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
             var record = new SessionRecord(loaded.Value.Spec, directory) { State = recovered.Value.State };
             record.Adopt(recovered.Value.History);
             _loaded[sessionId] = record;
+            // Now a node: "this Session is held" becomes something the graph can draw an edge to (docs/23 §4 step 1).
+            //
+            // A refusal is reported, not fatal, and that is the one place this differs from creating a Channel. A
+            // Channel that cannot be announced has not been created yet — rolling back costs nothing. A Session that
+            // cannot be announced has a directory and possibly history; refusing to load it would turn a graph
+            // problem into a lost conversation, which is a strictly worse failure.
+            if (_nodes is not null)
+            {
+                var announced = await _nodes.AttachAsync(new ModuleId(SessionManagerId), new ModuleId(sessionId),
+                    SessionTypeId, null, cancellationToken).ConfigureAwait(false);
+                if (!announced.Ok)
+                    _signalLog.Write(new()
+                    {
+                        Id = Guid.NewGuid(),
+                        Group = "session",
+                        Name = "node",
+                        From = sessionId,
+                        To = SessionManagerId,
+                        Mechanism = "session.adopt",
+                        Outcome = "failed",
+                        Level = SignalLevel.Warn,
+                        Detail = new Dictionary<string, string>(StringComparer.Ordinal)
+                        {
+                            ["error"] = announced.Error?.Message ?? "refused"
+                        }
+                    });
+            }
             return Result<SessionRecord>.Success(record);
         }
         finally { gate.Release(); }
@@ -1134,6 +1176,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
                 return Result.Failure(new(ErrorCode.Conflict, $"Archive destination already exists: {destinationDirectory}"));
             Directory.Move(source, destinationDirectory);
             _loaded.TryRemove(sessionId, out _);
+            await DetachNodeAsync(sessionId).ConfigureAwait(false);
             return Result.Success();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1164,6 +1207,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
             // Whatever this process remembered about that id is now wrong: the directory it pointed at is gone and
             // the one that just appeared was written by some other run.
             _loaded.TryRemove(sessionId, out _);
+            await DetachNodeAsync(sessionId).ConfigureAwait(false);
             return Result.Success();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1194,6 +1238,17 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
         return sessions;
     }
 
+    /// <summary>
+    /// Takes a Session out of the graph. Absent is what detaching wanted, so this never fails a caller: the directory
+    /// is already gone (or about to be) by the time we get here, and that is the fact worth having.
+    /// </summary>
+    private async ValueTask DetachNodeAsync(string sessionId)
+    {
+        if (_nodes is null) return;
+        await _nodes.DetachAsync(new ModuleId(SessionManagerId), new ModuleId(sessionId), CancellationToken.None)
+            .ConfigureAwait(false);
+    }
+
     /// <summary>Deletes one Session directory with its gate held, so a turn in flight is not pulled apart.</summary>
     private async ValueTask<Result> DeleteSessionAsync(string id, string directory, CancellationToken cancellationToken)
     {
@@ -1203,6 +1258,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModule
         {
             if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
             _loaded.TryRemove(id, out _);
+            await DetachNodeAsync(id).ConfigureAwait(false);
             return Result.Success();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
