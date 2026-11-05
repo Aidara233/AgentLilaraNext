@@ -213,7 +213,9 @@ public sealed class PersistenceTests : IDisposable
         Assert.True(types.RegisterPackageTypes("test.adapter", [new("adapter.file", "adapter")]).Ok);
         var bindings = new StubBindings();
         var events = new EventQueue(8);
-        var channels = new ALN.Channel.ChannelManager(new AdapterManager(types, bindings), events, bindings);
+        var channelCatalog = new ModuleCatalog();
+        channelCatalog.Attach(new AdapterManager(types, bindings));
+        var channels = new ALN.Channel.ChannelManager(events, bindings, channelCatalog);
         var adapter = new Address("adapter", "file", "later-1");
         var spec = new ChannelSpec(new("channel", "conversation", "chat-1"), "chat-1", [new ChannelBinding(adapter, "chat-1")],
             "channel.conversation");

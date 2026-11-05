@@ -18,6 +18,15 @@ namespace ALN.Tests;
 /// </summary>
 public sealed class SessionLifecycleTests : IDisposable
 {
+    /// <summary>A catalog holding exactly the peers a test wants answered by name.</summary>
+    private static ModuleCatalog CatalogWith(params object[] modules)
+    {
+        var catalog = new ModuleCatalog();
+        foreach (var module in modules)
+            if (module is IModule attachable) catalog.Attach(attachable);
+        return catalog;
+    }
+
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-session-life-" + Guid.NewGuid().ToString("N"));
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static readonly Address Chat = new("channel", "conversation", "chat-1");
@@ -431,7 +440,7 @@ public sealed class SessionLifecycleTests : IDisposable
     /// <summary>A Channel that exists, so destroying it is a real destroy and not a "not found".</summary>
     private static async Task<ChannelManager> ChannelsServing(ISessionManager sessions, IArchiveRegistry archive, Address channel)
     {
-        var channels = new ChannelManager(new StubAdapters(), new EventQueue(8), new StubBindings(), sessions: sessions,
+        var channels = new ChannelManager(new EventQueue(8), new StubBindings(), CatalogWith(new StubAdapters(), sessions),
             archive: archive);
         var created = await channels.CreateAsync(new(channel, channel.Instance!, [FileBinding], "channel.conversation"), default);
         Assert.True(created.Ok, created.Error?.Detail ?? created.Error?.Message);

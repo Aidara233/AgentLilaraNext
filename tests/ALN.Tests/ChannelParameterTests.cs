@@ -65,7 +65,9 @@ public sealed class ChannelParameterTests : IDisposable
     private ALN.Channel.ChannelManager NewChannels(IParameterRegistry parameters)
     {
         var bindings = new StubBindings();
-        return new(new AdapterManager(new AdapterTypeCatalog(), bindings), new EventQueue(8), bindings, parameters: parameters);
+        var catalog = new ModuleCatalog();
+        catalog.Attach(new AdapterManager(new AdapterTypeCatalog(), bindings));
+        return new(new EventQueue(8), bindings, catalog, parameters: parameters);
     }
 
     private sealed record FixedTarget(string ParameterScope) : IParameterTarget

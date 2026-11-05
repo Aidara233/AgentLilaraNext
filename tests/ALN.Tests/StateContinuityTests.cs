@@ -22,6 +22,14 @@ namespace ALN.Tests;
 /// </summary>
 public sealed class StateContinuityTests : IDisposable
 {
+    /// <summary>A catalog holding exactly the peers a test wants answered by name.</summary>
+    private static ModuleCatalog CatalogWith(params IModule[] modules)
+    {
+        var catalog = new ModuleCatalog();
+        foreach (var module in modules) catalog.Attach(module);
+        return catalog;
+    }
+
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-continuity-" + Guid.NewGuid().ToString("N"));
     private static readonly Address ChatOne = new("channel", "conversation", "chat-1");
     private static readonly Address ChatTwo = new("channel", "conversation", "chat-2");
@@ -473,7 +481,7 @@ public sealed class StateContinuityTests : IDisposable
             Assert.True(_types.RegisterPackageTypes("test.adapter.file", [new("adapter.file", "adapter")]).Ok);
             Assert.True(_types.RegisterPackageTypes("test.channel", [new("channel.conversation", "channel")]).Ok);
             Adapters = new AdapterManager(_types, _bindings);
-            Channels = new ChannelManager(Adapters, Events, _bindings,
+            Channels = new ChannelManager(Events, _bindings, CatalogWith(Adapters),
                 new FileChannelSpecStore(Path.Combine(root, "channels")), Storage, Parameters, Storage, Report, Storage, Storage);
             Catalog = ModuleWiring.With(Adapters, Channels, Clock);
             Graph = new GraphManager(Catalog, _types, new JintScriptExecutor(), Storage, Signals, state: Storage, report: Report);

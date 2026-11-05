@@ -68,7 +68,9 @@ public sealed class SignalLogTests : IDisposable
         var events = new EventQueue(8);
         var clock = new ALN.Clock.ClockSource(events);
         // Channel manager is not reachable on this path; denial happens before any resource is touched.
-        var channels = new ALN.Channel.ChannelManager(adapters, events, bindings);
+        var channelCatalog = new ModuleCatalog();
+        channelCatalog.Attach(adapters);
+        var channels = new ALN.Channel.ChannelManager(events, bindings, channelCatalog);
         var graph = new GraphManager(ModuleWiring.With(adapters, channels, clock), types, new JintScriptExecutor(), audit, signals);
         bindings.Bind(graph);
 

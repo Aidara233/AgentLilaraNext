@@ -6,11 +6,11 @@ using ALN.Contracts.Sessions;
 namespace ALN.Channel;
 
 [Module(ChannelManagerId, Category = "channel", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, IInstanceBindings bindings,
+public sealed class ChannelManager(IEventSink events, IInstanceBindings bindings, ICatalog catalog,
     IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
     IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IQueuedMessageStore? queue = null,
-    ISessionManager? sessions = null, IArchiveRegistry? archive = null, IInstanceHost? instances = null)
-    : IChannelManager, IModuleIndex, IModuleWiring, IInstanceSink, ILifecycleParticipant, IModule
+    IArchiveRegistry? archive = null, IInstanceHost? instances = null)
+    : IChannelManager, IModuleIndex, IModuleWiring, IInstanceSink, ILifecycleParticipant, IModule, IRequireModules
 {
     /// <inheritdoc />
     public string Category => "channel";
@@ -42,7 +42,11 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     /// <summary>Accepted messages whose event round has not finished: the list a restart replays.</summary>
     public const string PendingScope = "channel.pending";
 
-    private readonly IAdapterManager _adapters = adapters;
+    /// <summary>The peers this manager will ask for by name. Nothing is ordered by this list: it is only a claim
+    /// that somebody answers, checked by the kernel before the graph is declared ready.</summary>
+    public IReadOnlyList<string> Requires => [ModuleNames.AdapterManager, ModuleNames.SessionManager];
+
+    private readonly ICatalog _catalog = catalog;
     private readonly IEventSink _events = events;
     private readonly IInstanceBindings _bindings = bindings;
     private readonly IChannelSpecStore? _specs = specs;
@@ -53,7 +57,6 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
     private readonly IAtomicWork? _atomic = atomic;
     // Accepted-but-unfinished markers are their own rows: one per message, not a list rewritten per message.
     private readonly IQueuedMessageStore? _queue = queue;
-    private readonly ISessionManager? _sessions = sessions;
     private readonly IArchiveRegistry? _archive = archive;
     private IInstanceHost? _instances = instances;
     /// <summary>Instances by name. The address lives on the instance; the name is the key, so nothing has to take one
@@ -310,9 +313,10 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             // is immutable, so a Channel re-created at the same address would inherit one it can never use.
             // They go to the bin, not the void — deleting a Channel is not a decision to forget a conversation.
             // Best effort on purpose: the Channel is already gone, so a failure here is not "the destroy failed".
-            if (_sessions is not null && _archive is not null)
+            var sessions = _catalog.Find(new ModuleId(ModuleNames.SessionManager)) as ISessionManager;
+            if (sessions is not null && _archive is not null)
             {
-                var listed = await _sessions.ListAsync(cancellationToken).ConfigureAwait(false);
+                var listed = await sessions.ListAsync(cancellationToken).ConfigureAwait(false);
                 var ids = listed.Value?
                     .Where(session => string.Equals(session.Channel, address.ToString(), StringComparison.Ordinal))
                     .Select(session => session.Id)
@@ -320,8 +324,8 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
                 if (ids is { Length: > 0 })
                     await _archive.ArchiveAsync(ArchiveKinds.Session, ids, dryRun: false, cancellationToken).ConfigureAwait(false);
             }
-            else if (_sessions is not null)
-                await _sessions.DeleteChannelAsync(address.ToString(), cancellationToken).ConfigureAwait(false);
+            else if (sessions is not null)
+                await sessions.DeleteChannelAsync(address.ToString(), cancellationToken).ConfigureAwait(false);
             return Result.Success();
         }
         catch (OperationCanceledException) { throw; }
@@ -341,8 +345,10 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             cancellationToken.ThrowIfCancellationRequested();
             var binding = channel.Bindings.Single(b => b.Adapter == envelope.Adapter && b.PlatformConversationId == envelope.PlatformConversationId);
             // Delivery is where availability actually matters: the Channel may have been created
-            // before its Adapter, so this is the first moment we can honestly check it.
-            if (!_adapters.Get(binding.Adapter).Ok)
+            // before its Adapter, so this is the first moment we can honestly check it. The Adapter manager is asked
+            // for by name — modules do not hold each other (C-19).
+            var adapterManager = _catalog.Find(new ModuleId(ModuleNames.AdapterManager)) as IAdapterManager;
+            if (adapterManager is null || !adapterManager.Get(binding.Adapter).Ok)
                 return Result<int>.Failure(new(ErrorCode.Unavailable,
                     $"Bound Adapter is not available, message not delivered: {binding.Adapter}"));
             var message = new ChannelMessage(envelope.EventId, channel.Address, binding, envelope.PlatformMessageId,

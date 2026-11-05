@@ -45,7 +45,9 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.True(_adapterTypes.RegisterPackageTypes("test.channel", [new("channel.conversation", "channel")]).Ok);
         _types = _adapterTypes;
         _adapters = new AdapterManager(_types, _bindings);
-        _channels = new ChannelManager(_adapters, _events, _bindings);
+        var catalog = new ModuleCatalog();
+        catalog.Attach(_adapters);
+        _channels = new ChannelManager(_events, _bindings, catalog);
         _sessions = new SessionManager(_root, _model);
         // The graph finds its managers through the address book, exactly as the host wires it: names in, then the
         // instance owners observed so the graph can enumerate mount targets without knowing what kinds exist.
