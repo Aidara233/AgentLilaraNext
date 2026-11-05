@@ -294,46 +294,30 @@ foreach (var type in modelManager.ListTypes())
 factories.RegisterOwned(SessionManager.SessionTypeId);
 
 var kernel = new Kernel(data.Root, factories, signalLog, hostOwnsTypes: factories.IsOwned);
-foreach (var declared in new (ILifecycleParticipant Participant, string TypeId)[]
-         {
-             (adapters, ModuleNames.AdapterManager),
-             // No dependency between adapters and channels: availability is checked when a message is delivered,
-             // so neither manager has to wait for the other.
-             ((ILifecycleParticipant)channels!, ModuleNames.ChannelManager)
-         })
+// One table, one loop: these are the modules the host builds itself, so nothing on disk could produce them. Every
+// one of them is a master that holds instances (or, for memory, a store) — none of them has phases worth ordering.
+var declaredModules = new DeclaredModule[]
 {
-    var declaration = kernel.Declare(new LifecycleModule(declared.Participant, new ModuleId(declared.TypeId)), typeId: declared.TypeId);
-    if (declaration.Ok) continue;
-    Console.Error.WriteLine(declaration.Error?.Message ?? "Module declaration failed.");
-    shutdown.Cancel();
-    queue.Complete();
-    return 1;
-}
-var memoryDeclared = kernel.Declare(memoryModule, typeId: MemoryModule.TypeId);
-if (!memoryDeclared.Ok)
+    new(new LifecycleModule(adapters, new ModuleId(ModuleNames.AdapterManager)), ModuleNames.AdapterManager,
+        "Adapter manager"),
+    // No dependency between adapters and channels: availability is checked when a message is delivered, so neither
+    // manager has to wait for the other.
+    new(new LifecycleModule((ILifecycleParticipant)channels!, new ModuleId(ModuleNames.ChannelManager)), ModuleNames.ChannelManager,
+        "Channel manager"),
+    new(memoryModule, MemoryModule.TypeId, "Memory"),
+    // The model manager holds provider instances, so it is a master and has to be an instance. It has no phases of its
+    // own — providers are built from their files — so it is a carrier.
+    new(new PassiveInstance(new ModuleId(ModuleNames.ModelManager), modelManager), ModuleNames.ModelManager,
+        "Model manager"),
+    // Sessions, for the same reason as models: the manager holds them, so a Session is an instance the moment it is
+    // loaded. No phase of its own either — a Session is loaded on demand, never by a wave.
+    new(new PassiveInstance(new ModuleId(ModuleNames.SessionManager), sessions), ModuleNames.SessionManager,
+        "Session manager")
+};
+var declaredCore = HostComposition.Declare(kernel, declaredModules);
+if (!declaredCore.Ok)
 {
-    Console.Error.WriteLine(memoryDeclared.Error?.Message ?? "Memory module declaration failed.");
-    shutdown.Cancel();
-    queue.Complete();
-    return 1;
-}
-// The model manager holds provider instances, so it is a master and has to be a instance. It has no phases of its own —
-// the host builds providers from their files — so it is a carrier, and the kernel finds its wiring through the
-// carrier door like it finds everything else.
-var modelManagerDeclared = kernel.Declare(new PassiveInstance(new ModuleId(ModuleNames.ModelManager), modelManager), typeId: ModuleNames.ModelManager);
-if (!modelManagerDeclared.Ok)
-{
-    Console.Error.WriteLine(modelManagerDeclared.Error?.Message ?? "Model manager declaration failed.");
-    shutdown.Cancel();
-    queue.Complete();
-    return 1;
-}
-// Sessions, for the same reason as models: the manager holds them, so a Session is a instance the moment it is loaded.
-// No phase of its own either — a Session is loaded on demand, never by a wave.
-var sessionManagerDeclared = kernel.Declare(new PassiveInstance(new ModuleId(ModuleNames.SessionManager), sessions), typeId: ModuleNames.SessionManager);
-if (!sessionManagerDeclared.Ok)
-{
-    Console.Error.WriteLine(sessionManagerDeclared.Error?.Message ?? "Session manager declaration failed.");
+    Console.Error.WriteLine(declaredCore.Error?.Message ?? "Module declaration failed.");
     shutdown.Cancel();
     queue.Complete();
     return 1;
