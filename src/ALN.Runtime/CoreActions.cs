@@ -477,9 +477,11 @@ public static class CoreActions
             if (!TryReadText(arguments, "type", out var typeId) || typeId.Trim().Length == 0)
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "adapters.create requires 'type'."));
             var type = typeId.Trim();
-            if (!type.StartsWith("adapter.", StringComparison.Ordinal))
+            if (moduleTypes is not { } adapterTypes)
+                return Unavailable("No type tree in this process; adapter types cannot be checked.");
+            if (!adapterTypes.IsAssignableTo(type, "adapter"))
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Not an adapter type: {type}"));
-            if (moduleTypes is { } catalog && !catalog.IsConcrete(type))
+            if (!adapterTypes.IsConcrete(type))
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Adapter type is not registered in this process: {type}"));
             if (!TryReadText(arguments, "instance", out var instance) || instance.Trim().Length == 0)
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "adapters.create requires 'instance'."));
@@ -533,9 +535,11 @@ public static class CoreActions
             if (!TryReadText(arguments, "type", out var typeId) || typeId.Trim().Length == 0)
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.create requires 'type'."));
             var type = typeId.Trim();
-            if (!type.StartsWith("channel.", StringComparison.Ordinal))
+            if (moduleTypes is not { } channelTypes)
+                return Unavailable("No type tree in this process; channel types cannot be checked.");
+            if (!channelTypes.IsAssignableTo(type, "channel"))
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Not a channel type: {type}"));
-            if (moduleTypes is { } catalog && !catalog.IsConcrete(type))
+            if (!channelTypes.IsConcrete(type))
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Channel type is not registered in this process: {type}"));
             if (!TryReadText(arguments, "instance", out var instance) || instance.Trim().Length == 0)
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.create requires 'instance'."));
