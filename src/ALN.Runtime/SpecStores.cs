@@ -27,7 +27,7 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
                 spec.Descriptor.Direction.ToString(), spec.Settings), JsonOptions, cancellationToken);
 
     public ValueTask<Result> DeleteAsync(Address address, CancellationToken cancellationToken) =>
-        SpecTree.DeleteAsync(root, new ModuleId(address.ToString()), cancellationToken);
+        SpecTree.DeleteAsync(root, address.ToModuleId(), cancellationToken);
 
     public async ValueTask<Result<IReadOnlyList<AdapterSpec>>> LoadAllAsync(CancellationToken cancellationToken)
     {
@@ -73,7 +73,7 @@ public sealed class FileChannelSpecStore(string root) : IChannelSpecStore
                 spec.MaxMessages), JsonOptions, cancellationToken);
 
     public ValueTask<Result> DeleteAsync(Address address, CancellationToken cancellationToken) =>
-        SpecTree.DeleteAsync(root, new ModuleId(address.ToString()), cancellationToken);
+        SpecTree.DeleteAsync(root, address.ToModuleId(), cancellationToken);
 
     public async ValueTask<Result<IReadOnlyList<ChannelSpec>>> LoadAllAsync(CancellationToken cancellationToken)
     {

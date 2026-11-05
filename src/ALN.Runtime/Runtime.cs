@@ -411,7 +411,7 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, IModuleWirin
                 _parameters?.Unregister(address.ToString());
                 // Out of the graph too: a removed Adapter that is still on a schedule is a module that exists on paper.
                 if (_nodes is not null)
-                    await _nodes.DetachAsync(new ModuleId(ModuleNames.AdapterManager), new ModuleId(address.ToString()),
+                    await _nodes.DetachAsync(new ModuleId(ModuleNames.AdapterManager), address.ToModuleId(),
                         CancellationToken.None).ConfigureAwait(false);
             }
             return Result.Success();

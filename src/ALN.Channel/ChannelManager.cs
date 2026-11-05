@@ -292,7 +292,7 @@ public sealed class ChannelManager(IAdapterManager adapters, IEventSink events, 
             // Out of the graph too. Data is left alone on purpose: whether this Channel's history goes to the bin
             // is decided below, and it is a different question from whether the node still exists.
             if (_nodes is not null)
-                await _nodes.DetachAsync(new ModuleId(ModuleNames.ChannelManager), new ModuleId(address.ToString()),
+                await _nodes.DetachAsync(new ModuleId(ModuleNames.ChannelManager), address.ToModuleId(),
                     CancellationToken.None).ConfigureAwait(false);
             if (_specs is not null)
             {
