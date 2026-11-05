@@ -40,8 +40,8 @@ var moduleLoggers = new SignalModuleLoggerFactory(signalLog);
 var queue = new EventQueue(capacity: 256);
 // The address book. Not a module itself: if it were, finding a module would require a module.
 var modules = new ModuleCatalog();
-var adapterSpecs = new FileAdapterSpecStore(Path.Combine(data.Root, "adapters"));
-var channelSpecs = new FileChannelSpecStore(Path.Combine(data.Root, "channels"));
+var adapterSpecs = new FileAdapterSpecStore(data.Root);
+var channelSpecs = new FileChannelSpecStore(data.Root);
 var adapterTypes = new AdapterTypeCatalog();
 var bindings = new InstanceBindingsProxy();
 var adapterFactories = new AdapterFactoryRegistry();

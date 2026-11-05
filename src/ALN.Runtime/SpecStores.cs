@@ -5,7 +5,12 @@ using ALN.Runtime.Hosting;
 
 namespace ALN.Runtime;
 
-/// <summary>Adapter specs: one directory per instance, named after its id, holding <c>spec.json</c>.</summary>
+/// <summary>
+/// Adapter specs: one module directory per instance, named after its id, holding <c>module.json</c> (docs/22 §2).
+///
+/// The address is the id, so it is not repeated inside the payload: a file that names itself twice is a file that
+/// can disagree with its own directory.
+/// </summary>
 public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
@@ -17,9 +22,9 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
     private const string TypePrefix = "adapter.";
 
     public ValueTask<Result> SaveAsync(AdapterSpec spec, CancellationToken cancellationToken) =>
-        SpecTree.WriteAsync(root, new ModuleId(spec.Address.ToString()), new AdapterSpecDocument(
-                spec.Address.ToString(), spec.Descriptor.PlatformId, spec.Descriptor.AccountId,
-                spec.Descriptor.Direction.ToString(), spec.Settings, spec.TypeId), JsonOptions, cancellationToken);
+        SpecTree.WriteAsync(root, new ModuleId(spec.Address.ToString()), spec.TypeId,
+            new AdapterSpecDocument(spec.Descriptor.PlatformId, spec.Descriptor.AccountId,
+                spec.Descriptor.Direction.ToString(), spec.Settings), JsonOptions, cancellationToken);
 
     public ValueTask<Result> DeleteAsync(Address address, CancellationToken cancellationToken) =>
         SpecTree.DeleteAsync(root, new ModuleId(address.ToString()), cancellationToken);
@@ -34,15 +39,15 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
         var specs = new List<AdapterSpec>();
         foreach (var entry in entries.Value!)
         {
-            if (!Address.TryParse(entry.Document.Address, out var address))
+            if (!Address.TryParse(entry.Id.Value, out var address) || !address.IsInstance)
                 return Result<IReadOnlyList<AdapterSpec>>.Failure(new(ErrorCode.Invalid,
-                    $"Stored Adapter address is invalid: {entry.Document.Address} ({entry.Path})"));
-            if (!Enum.TryParse<AdapterDirection>(entry.Document.Direction, ignoreCase: true, out var direction))
+                    $"Stored Adapter id is not an instance address: {entry.Id} ({entry.Path})"));
+            if (!Enum.TryParse<AdapterDirection>(entry.Config.Direction, ignoreCase: true, out var direction))
                 return Result<IReadOnlyList<AdapterSpec>>.Failure(new(ErrorCode.Invalid,
-                    $"Stored Adapter direction is invalid: {entry.Document.Direction} ({entry.Path})"));
+                    $"Stored Adapter direction is invalid: {entry.Config.Direction} ({entry.Path})"));
             specs.Add(new AdapterSpec(address,
-                new AdapterDescriptor(entry.Document.PlatformId, entry.Document.AccountId, direction),
-                entry.Document.Type!, entry.Document.Settings));
+                new AdapterDescriptor(entry.Config.PlatformId, entry.Config.AccountId, direction),
+                entry.Type, entry.Config.Settings));
         }
         return Result<IReadOnlyList<AdapterSpec>>.Success(specs);
     }
@@ -50,11 +55,11 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
     /// <summary>
     /// <c>Settings</c> is written only when present, so a spec that doesn't need any stays a short file.
     /// </summary>
-    public sealed record AdapterSpecDocument(string Address, string PlatformId, string AccountId, string Direction,
-        IReadOnlyDictionary<string, string>? Settings = null, string? Type = null);
+    public sealed record AdapterSpecDocument(string PlatformId, string AccountId, string Direction,
+        IReadOnlyDictionary<string, string>? Settings = null);
 }
 
-/// <summary>Channel specs: one directory per channel, named after its id, holding <c>spec.json</c>.</summary>
+/// <summary>Channel specs: one module directory per channel, named after its id, holding <c>module.json</c>.</summary>
 public sealed class FileChannelSpecStore(string root) : IChannelSpecStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
@@ -62,10 +67,10 @@ public sealed class FileChannelSpecStore(string root) : IChannelSpecStore
     private const string TypePrefix = "channel.";
 
     public ValueTask<Result> SaveAsync(ChannelSpec spec, CancellationToken cancellationToken) =>
-        SpecTree.WriteAsync(root, new ModuleId(spec.Address.ToString()), new ChannelSpecDocument(
-                spec.Address.ToString(), spec.Name,
+        SpecTree.WriteAsync(root, new ModuleId(spec.Address.ToString()), spec.TypeId, new ChannelSpecDocument(
+                spec.Name,
                 spec.Bindings.Select(b => new ChannelBindingDocument(b.Adapter.ToString(), b.PlatformConversationId)).ToArray(),
-                spec.MaxMessages, spec.TypeId), JsonOptions, cancellationToken);
+                spec.MaxMessages), JsonOptions, cancellationToken);
 
     public ValueTask<Result> DeleteAsync(Address address, CancellationToken cancellationToken) =>
         SpecTree.DeleteAsync(root, new ModuleId(address.ToString()), cancellationToken);
@@ -80,24 +85,24 @@ public sealed class FileChannelSpecStore(string root) : IChannelSpecStore
         var specs = new List<ChannelSpec>();
         foreach (var entry in entries.Value!)
         {
-            if (!Address.TryParse(entry.Document.Address, out var address))
+            if (!Address.TryParse(entry.Id.Value, out var address) || !address.IsInstance)
                 return Result<IReadOnlyList<ChannelSpec>>.Failure(new(ErrorCode.Invalid,
-                    $"Stored Channel address is invalid: {entry.Document.Address} ({entry.Path})"));
+                    $"Stored Channel id is not an instance address: {entry.Id} ({entry.Path})"));
             var bindings = new List<ChannelBinding>();
-            foreach (var binding in entry.Document.Bindings ?? [])
+            foreach (var binding in entry.Config.Bindings ?? [])
             {
                 if (!Address.TryParse(binding.Adapter, out var adapter))
                     return Result<IReadOnlyList<ChannelSpec>>.Failure(new(ErrorCode.Invalid,
                         $"Stored Channel binding address is invalid: {binding.Adapter} ({entry.Path})"));
                 bindings.Add(new ChannelBinding(adapter, binding.PlatformConversationId));
             }
-            specs.Add(new ChannelSpec(address, entry.Document.Name,
-                bindings, entry.Document.Type!, entry.Document.MaxMessages));
+            specs.Add(new ChannelSpec(address, entry.Config.Name,
+                bindings, entry.Type, entry.Config.MaxMessages));
         }
         return Result<IReadOnlyList<ChannelSpec>>.Success(specs);
     }
 
     public sealed record ChannelBindingDocument(string Adapter, string PlatformConversationId);
-    public sealed record ChannelSpecDocument(string Address, string Name, ChannelBindingDocument[]? Bindings,
-        int? MaxMessages = null, string? Type = null);
+    public sealed record ChannelSpecDocument(string Name, ChannelBindingDocument[]? Bindings,
+        int? MaxMessages = null);
 }

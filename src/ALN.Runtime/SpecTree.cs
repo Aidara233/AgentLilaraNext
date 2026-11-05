@@ -6,34 +6,49 @@ using ALN.Runtime.Hosting;
 namespace ALN.Runtime;
 
 /// <summary>
-/// Spec documents on disk: one directory per module instance, named after the id, holding a <c>spec.json</c>.
+/// Spec documents on disk: one module directory per instance, named after its id, holding <c>module.json</c>
+/// (docs/22 §2).
 ///
-/// <b>The path says nothing about what a module is.</b> There is no category directory and no type directory —
-/// a spec's type lives in the file, on the line that says <c>"type"</c>, and a store decides what to read by
-/// looking there. The only thing the path carries is the name, which is why nothing has to be kept in sync
-/// between where a file sits and what it contains.
+/// <b>The path says nothing about what a module is.</b> There is no category directory and no type directory — a
+/// spec's type lives in the file, on the line that says <c>"type"</c>, and a store decides what to read by looking
+/// there. The only thing the path carries is the name, which is why nothing has to be kept in sync between where a
+/// file sits and what it contains.
+///
+/// The document is the kernel's shape with the domain's payload under <c>config</c>: <c>{"id","type","config"}</c>.
+/// One file per node, readable by a person and by the loader that builds the node — a second file with a second
+/// shape would be a second answer to "what is this instance".
 /// </summary>
 internal static class SpecTree
 {
-    public const string FileName = "spec.json";
+    public const string FileName = "module.json";
+    public const string DirectoryName = "modules";
 
     /// <summary>One spec document plus where it was found, so the store can name the path in an error.</summary>
-    internal sealed record Entry<T>(string Path, T Document);
+    /// <param name="Id">The node's id, which is also the directory name.</param>
+    /// <param name="Type">The type the file declares — the store's filter, never derived from the id.</param>
+    /// <param name="Config">The domain's own payload, deserialized from <c>config</c>.</param>
+    internal sealed record Entry<T>(string Path, ModuleId Id, string Type, T Config);
 
-    internal static async ValueTask<Result> WriteAsync<T>(string root, ModuleId id, T document,
+    internal static async ValueTask<Result> WriteAsync<T>(string root, ModuleId id, string typeId, T config,
         JsonSerializerOptions options, CancellationToken cancellationToken)
     {
         if (!ModuleId.IsLegal(id.Value))
             return Result.Failure(new(ErrorCode.Invalid, $"Module id is not a file-safe name: {id.Value}"));
-        var directory = Path.Combine(root, id.Value);
+        if (string.IsNullOrWhiteSpace(typeId))
+            return Result.Failure(new(ErrorCode.Invalid, $"A module needs a type: {id.Value}"));
+        var directory = Path.Combine(Path.Combine(root, DirectoryName), id.Value);
         try
         {
             SafeFileSystem.EnsureDirectory(directory);
             var path = Path.Combine(directory, FileName);
             SafeFileSystem.VerifyNewOrRegularFile(path, directory);
             var temporary = path + ".partial";
-            await File.WriteAllBytesAsync(temporary, JsonSerializer.SerializeToUtf8Bytes(document, options), cancellationToken)
-                .ConfigureAwait(false);
+            await File.WriteAllBytesAsync(temporary, JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                id = id.Value,
+                type = typeId,
+                config
+            }, options), cancellationToken).ConfigureAwait(false);
             File.Move(temporary, path, overwrite: true);
             return Result.Success();
         }
@@ -48,7 +63,7 @@ internal static class SpecTree
     {
         if (!ModuleId.IsLegal(id.Value))
             return Result.Failure(new(ErrorCode.Invalid, $"Module id is not a file-safe name: {id.Value}"));
-        var directory = Path.Combine(root, id.Value);
+        var directory = Path.Combine(Path.Combine(root, DirectoryName), id.Value);
         try
         {
             var path = Path.Combine(directory, FileName);
@@ -70,40 +85,48 @@ internal static class SpecTree
     }
 
     /// <summary>
-    /// Every spec under the root whose <c>type</c> the caller claims. The type is read from the file, never from
-    /// the directory it sits in — which is what lets one directory hold adapters, channels and models together.
+    /// Every spec under <c>root/modules</c> whose <c>type</c> the caller claims. The type is read from the file,
+    /// never from the directory it sits in — which is what lets one tree hold adapters, channels, sessions and
+    /// providers together, each store picking its own kind.
     /// </summary>
     internal static async ValueTask<Result<IReadOnlyList<Entry<T>>>> LoadAllAsync<T>(string root,
         Func<string, bool> belongs, CancellationToken cancellationToken)
     {
-        if (!Directory.Exists(root)) return Result<IReadOnlyList<Entry<T>>>.Success([]);
+        var modules = Path.Combine(root, DirectoryName);
+        if (!Directory.Exists(modules)) return Result<IReadOnlyList<Entry<T>>>.Success([]);
         try
         {
-            // A file loose in the root cannot be found by name and would read as "nothing configured".
-            foreach (var stray in Directory.EnumerateFiles(root, "*.json", SearchOption.TopDirectoryOnly))
+            // A file loose in the tree cannot be found by name and would read as "nothing configured".
+            foreach (var stray in Directory.EnumerateFiles(modules, "*.json", SearchOption.TopDirectoryOnly))
                 return Result<IReadOnlyList<Entry<T>>>.Failure(new(ErrorCode.Invalid,
-                    $"Spec file is not in an instance directory: {stray}; specs live at {root}/<id>/{FileName}."));
+                    $"Module file is not in a module directory: {stray}; modules live at {modules}/<id>/{FileName}."));
 
             var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
             var entries = new List<Entry<T>>();
-            foreach (var directory in Directory.EnumerateDirectories(root).Order(StringComparer.Ordinal))
+            foreach (var directory in Directory.EnumerateDirectories(modules).Order(StringComparer.Ordinal))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var path = Path.Combine(directory, FileName);
                 if (!File.Exists(path)) continue;
-                SafeFileSystem.VerifyNewOrRegularFile(path, root);
+                SafeFileSystem.VerifyNewOrRegularFile(path, modules);
                 var bytes = await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
 
-                var type = ReadType(bytes);
+                using var document = JsonDocument.Parse(bytes);
+                var (id, type) = ReadIdentity(document.RootElement);
                 if (string.IsNullOrWhiteSpace(type))
-                    return Result<IReadOnlyList<Entry<T>>>.Failure(new(ErrorCode.Invalid,
-                        $"Spec has no type: {path}"));
+                    return Result<IReadOnlyList<Entry<T>>>.Failure(new(ErrorCode.Invalid, $"Module has no type: {path}"));
                 if (!belongs(type)) continue;
+                if (!ModuleId.TryParse(id, out var moduleId) ||
+                    !string.Equals(moduleId.Value, Path.GetFileName(directory), StringComparison.Ordinal))
+                    return Result<IReadOnlyList<Entry<T>>>.Failure(new(ErrorCode.Invalid,
+                        $"Module id \"{id}\" does not match its directory \"{Path.GetFileName(directory)}\" ({path})"));
+                if (!document.RootElement.TryGetProperty("config", out var config) || config.ValueKind != JsonValueKind.Object)
+                    return Result<IReadOnlyList<Entry<T>>>.Failure(new(ErrorCode.Invalid, $"Module has no config object: {path}"));
 
-                var document = JsonSerializer.Deserialize<T>(bytes, options);
-                if (document is null)
-                    return Result<IReadOnlyList<Entry<T>>>.Failure(new(ErrorCode.Invalid, $"Spec is empty: {path}"));
-                entries.Add(new Entry<T>(path, document));
+                var parsed = config.Deserialize<T>(options);
+                if (parsed is null)
+                    return Result<IReadOnlyList<Entry<T>>>.Failure(new(ErrorCode.Invalid, $"Module config is empty: {path}"));
+                entries.Add(new Entry<T>(path, moduleId, type, parsed));
             }
             return Result<IReadOnlyList<Entry<T>>>.Success(entries);
         }
@@ -114,15 +137,21 @@ internal static class SpecTree
         }
     }
 
-    private static string? ReadType(byte[] bytes)
+    /// <summary>
+    /// The id and type of a module file. Case-insensitive on the property names, because a person edits these by
+    /// hand and "Type" is the same word — but the values are read exactly as written.
+    /// </summary>
+    private static (string Id, string Type) ReadIdentity(JsonElement root)
     {
-        using var document = JsonDocument.Parse(bytes);
-        // Case-insensitive because a person edits this file by hand and "Type" is the same word.
-        foreach (var property in document.RootElement.EnumerateObject())
-            if (string.Equals(property.Name, "type", StringComparison.OrdinalIgnoreCase) &&
-                property.Value.ValueKind == JsonValueKind.String)
-                return property.Value.GetString();
-        return null;
+        string id = "";
+        string type = "";
+        foreach (var property in root.EnumerateObject())
+        {
+            if (property.Value.ValueKind != JsonValueKind.String) continue;
+            if (string.Equals(property.Name, "id", StringComparison.OrdinalIgnoreCase)) id = property.Value.GetString() ?? "";
+            else if (string.Equals(property.Name, "type", StringComparison.OrdinalIgnoreCase)) type = property.Value.GetString() ?? "";
+        }
+        return (id, type);
     }
 
     private static void RemoveIfEmpty(string directory)
