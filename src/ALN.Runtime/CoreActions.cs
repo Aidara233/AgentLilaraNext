@@ -118,7 +118,7 @@ public static class CoreActions
 
             (new(AdaptersStart, "Start one adapter.", Capabilities.AdaptersControl, true), StartAdapter),
             (new(AdaptersStop, "Stop one adapter.", Capabilities.AdaptersControl, true), StopAdapter),
-            (new(AdaptersCreate, "Create one adapter instance: {\"type\", \"instance\", \"platform\", \"account\", \"direction\", \"settings\"}.", Capabilities.AdaptersControl, true), CreateAdapter),
+            (new(AdaptersCreate, "Create one adapter instance (instance is named by the caller, or by the type plus a fresh suffix): {\"type\", \"instance\", \"platform\", \"account\", \"direction\", \"settings\"}.", Capabilities.AdaptersControl, true), CreateAdapter),
             (new(AdaptersDestroy, "Destroy one adapter instance and forget its spec.", Capabilities.AdaptersControl, true), DestroyAdapter),
 
             (new(ChannelsList, "List channels and their bindings.", Capabilities.ChannelsRead, false),
@@ -139,7 +139,7 @@ public static class CoreActions
             (new(ChannelsStart, "Start one channel.", Capabilities.ChannelsControl, true), StartChannel),
             (new(ChannelsStop, "Stop one channel.", Capabilities.ChannelsControl, true), StopChannel),
             (new(ChannelsSend, "Send one text message through a channel's binding.", Capabilities.MessagesWrite, true), SendChannel),
-            (new(ChannelsCreate, "Create one channel instance: {\"type\", \"instance\", \"name\", \"bindings\": [{\"adapter\", \"conversation\"}], \"maxMessages\"}.", Capabilities.ChannelsControl, true), CreateChannel),
+            (new(ChannelsCreate, "Create one channel instance (instance is named by the caller, or by the type plus a fresh suffix): {\"type\", \"instance\", \"name\", \"bindings\": [{\"adapter\", \"conversation\"}], \"maxMessages\"}.", Capabilities.ChannelsControl, true), CreateChannel),
             (new(ChannelsDestroy, "Destroy one channel instance and forget its spec.", Capabilities.ChannelsControl, true), DestroyChannel),
 
             (new(EdgesList, "List mounted scripts, durable mount rules, and which rules are still waiting.", Capabilities.ModulesRead, false), ListEdges),
@@ -483,9 +483,12 @@ public static class CoreActions
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Not an adapter type: {type}"));
             if (!adapterTypes.IsConcrete(type))
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Adapter type is not registered in this process: {type}"));
-            if (!TryReadText(arguments, "instance", out var instance) || instance.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "adapters.create requires 'instance'."));
-            var address = BuildAddress(type, instance.Trim());
+            // C-01: an instance is named when it is created and never renamed. A caller may name it; if it does not,
+            // the name is the type's own prefix plus a fresh suffix — readable to a person, never parsed by the code.
+            var instanceName = TryReadText(arguments, "instance", out var asked) && asked.Trim().Length > 0
+                ? asked.Trim()
+                : ModuleId.NewSuffix();
+            var address = BuildAddress(type, instanceName);
             if (!address.Ok) return Result<JsonElement>.Failure(address.Error!);
 
             var platform = TryReadText(arguments, "platform", out var platformText) && platformText.Trim().Length > 0
@@ -493,7 +496,7 @@ public static class CoreActions
                 : address.Value.Kind!;
             var account = TryReadText(arguments, "account", out var accountText) && accountText.Trim().Length > 0
                 ? accountText.Trim()
-                : instance.Trim();
+                : instanceName;
             // Direction decides which half of IChatAdapter anyone may call, so a typo must be refused rather than
             // defaulted: "inboud" quietly becoming Both turns an inbound-only account into a sender.
             var direction = AdapterDirection.Both;
@@ -541,11 +544,13 @@ public static class CoreActions
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Not a channel type: {type}"));
             if (!channelTypes.IsConcrete(type))
                 return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Channel type is not registered in this process: {type}"));
-            if (!TryReadText(arguments, "instance", out var instance) || instance.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.create requires 'instance'."));
-            var address = BuildAddress(type, instance.Trim());
+            // Same rule as adapters.create: named by the caller, or named by the type plus a fresh suffix.
+            var instanceName = TryReadText(arguments, "instance", out var asked) && asked.Trim().Length > 0
+                ? asked.Trim()
+                : ModuleId.NewSuffix();
+            var address = BuildAddress(type, instanceName);
             if (!address.Ok) return Result<JsonElement>.Failure(address.Error!);
-            var name = TryReadText(arguments, "name", out var nameText) && nameText.Trim().Length > 0 ? nameText.Trim() : instance.Trim();
+            var name = TryReadText(arguments, "name", out var nameText) && nameText.Trim().Length > 0 ? nameText.Trim() : instanceName;
 
             var bindings = new List<ChannelBinding>();
             if (arguments.ValueKind == JsonValueKind.Object && arguments.TryGetProperty("bindings", out var bindingItems))

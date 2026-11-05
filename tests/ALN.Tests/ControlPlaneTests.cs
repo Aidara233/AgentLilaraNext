@@ -338,6 +338,33 @@ public sealed class ControlPlaneTests : IDisposable
     }
 
     [Fact]
+    public async Task An_instance_the_caller_does_not_name_is_named_after_its_type()
+    {
+        // C-01: an instance is named when it is created. The caller may name it; otherwise the name is the type's
+        // own prefix plus a fresh suffix — two instances never collide, and nothing derives the name from a hash of
+        // what the instance happens to be.
+        var types = new AdapterTypeCatalog();
+        Assert.True(types.RegisterPackageTypes("test.pack", [new("adapter.file", "adapter")]).Ok);
+        var adapters = new FakeAdapters();
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, adapters, new FakeChannels(), new FakeModels(null),
+            _signals, new FakeGraph(), new FakeParameters(), moduleTypes: types).Ok);
+
+        var unnamed = JsonSerializer.SerializeToElement(new { type = "adapter.file", direction = "inbound" });
+        Assert.True((await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate, unnamed, default)).Ok);
+        Assert.True((await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate, unnamed, default)).Ok);
+
+        Assert.Equal(2, adapters.Created.Count);
+        Assert.All(adapters.Created, spec => Assert.StartsWith("adapter.file#", spec.Address.ToString(), StringComparison.Ordinal));
+        Assert.NotEqual(adapters.Created[0].Address, adapters.Created[1].Address);
+
+        // A name the caller gives is used as given: "instance" is a name, not a suggestion to be reformatted.
+        Assert.True((await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate,
+            JsonSerializer.SerializeToElement(new { type = "adapter.file", instance = "main" }), default)).Ok);
+        Assert.Equal("adapter.file#main", adapters.Created[2].Address.ToString());
+    }
+
+    [Fact]
     public async Task Creating_an_adapter_names_it_after_its_type_and_refuses_what_it_cannot_build()
     {
         var types = new AdapterTypeCatalog();
