@@ -99,6 +99,29 @@ public sealed record ModuleError(string Method, string Message, Exception? Excep
 /// referencing every module's contract to be able to judge. So the master judges, and a refusal is a bad edge
 /// with the master's own reason in it (docs/22 §5).
 /// </summary>
+/// <summary>
+/// How a platform names a person: a display name, and a remark that belongs to you rather than to them. The two are
+/// kept apart because they answer different questions — who this is, and what you call them — and a single field would
+/// have to throw one of them away.
+/// </summary>
+public sealed record TargetName(string Primary, string? Remark = null)
+{
+    /// <summary>The default shape: the name, then the remark in brackets. The remark never replaces the name.</summary>
+    public override string ToString() => Remark is null ? Primary : $"{Primary}({Remark})";
+}
+
+/// <summary>
+/// An adapter that can say how a platform names somebody. The default order is the platform's own display name first
+/// (a group card if there is one, then the account's nickname), the account id as the last resort, and the remark
+/// carried alongside — always shown when it exists, never instead of the name.
+/// </summary>
+public interface ITargetNaming
+{
+    /// <param name="targetId">The platform's identifier for the person.</param>
+    /// <param name="scope">Where they were seen, when names are per place — a group, for instance. Null when not.</param>
+    ValueTask<TargetName?> ResolveAsync(string targetId, string? scope, CancellationToken cancellationToken);
+}
+
 public interface IModuleWiring
 {
     Result WireSlave(ModuleId slaveId, IReadOnlyList<string> kinds, IKernelModule instance);
