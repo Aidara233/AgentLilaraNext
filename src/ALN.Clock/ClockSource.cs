@@ -1,116 +1,123 @@
-using System.Text.Json;
 using ALN.Contracts;
 
 namespace ALN.Clock;
 
+/// <summary>
+/// The clock, as a trigger source: every interval it triggers every sink that asked for a rhythm.
+///
+/// It used to be a subscription registry that adapters called into by address ("register me, I am a polling
+/// adapter"), which had two problems: the clock knew about adapter addresses, and the knowledge that a heartbeat was
+/// needed lived in two places at once (the adapter's own registration and the manager's). It is the other way round
+/// now — a sink declares its rhythm by reporting <see cref="ITriggerSink.PreferredInterval"/>, and whoever holds a
+/// clock attaches what wants a beat. The clock holds no addresses and knows no adapter; it would work just as well
+/// for a module that wants to flush every minute.
+/// </summary>
 [Module(ClockId, Category = "clock", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class ClockSource : IClockManager, IModule
+public sealed class ClockSource : IClockManager, ITriggerSource, IModule
 {
     public const string ClockId = ModuleNames.Clock;
+    public const string SourceName = "Clock";
+
     public ModuleId Id { get; } = new(ClockId);
 
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan SchedulerResolution = TimeSpan.FromMilliseconds(20);
-    private readonly IEventSink _events;
+    private static readonly TimeSpan LongestInterval = TimeSpan.FromDays(1);
     private readonly TimeProvider _timeProvider;
-    private readonly Dictionary<Guid, Subscription> _subscriptions = new();
+    private readonly Dictionary<ModuleId, Beat> _beats = new();
     private readonly object _gate = new();
 
     public ClockSource(IEventSink events, TimeProvider? timeProvider = null, Address? address = null)
     {
-        _events = events;
+        _ = events;
         _timeProvider = timeProvider ?? TimeProvider.System;
         Address = address ?? new Address("clock", "system", "1");
         // No check against the name: an id is a name, and a name that happens to start with something else is
         // still a legal clock address. What can be checked here is that it names something at all.
         if (!Address.IsInstance) throw new ArgumentException("Clock source requires a concrete clock address.", nameof(address));
     }
+
     public Address Address { get; }
 
-    public ValueTask<Result<Guid>> RegisterAsync(Address target, TimeSpan interval, CancellationToken cancellationToken)
+    public string Source => SourceName;
+
+    /// <summary>How many sinks are on a rhythm right now. Reported, never used to decide anything.</summary>
+    public int BeatCount
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (!target.IsInstance) return ValueTask.FromResult(Result<Guid>.Failure(new(ErrorCode.Invalid, "Clock target must be a concrete module instance.")));
-        if (interval < SchedulerResolution || interval > TimeSpan.FromDays(1))
-            return ValueTask.FromResult(Result<Guid>.Failure(new(ErrorCode.Invalid, "Clock interval must be between scheduler resolution and 1 day.")));
-        var id = Guid.NewGuid();
-        lock (_gate) _subscriptions.Add(id, new(id, target, interval, _timeProvider.GetUtcNow() + interval, null));
-        return ValueTask.FromResult(Result<Guid>.Success(id));
+        get { lock (_gate) return _beats.Count; }
     }
 
-    public ValueTask<Result> UnregisterAsync(Guid subscriptionId, Address target, CancellationToken cancellationToken)
+    public Result Attach(ModuleId sink, ITriggerSink trigger)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        lock (_gate)
+        if (trigger is null) return Result.Failure(new(ErrorCode.Invalid, "A trigger sink is required."));
+        if (sink.IsEmpty) return Result.Failure(new(ErrorCode.Invalid, "A trigger sink needs an id."));
+        if (trigger.PreferredInterval is not { } interval)
         {
-            if (!_subscriptions.TryGetValue(subscriptionId, out var subscription) || subscription.Target != target)
-                return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, "Clock subscription not found for target.")));
-            _subscriptions.Remove(subscriptionId);
-            return ValueTask.FromResult(Result.Success());
+            // No rhythm of its own: it wants to be pushed, not scheduled. That is an answer, not a refusal — and it
+            // is why this succeeds without holding on to anything.
+            return Result.Success();
         }
+        if (interval < SchedulerResolution || interval > LongestInterval)
+            return Result.Failure(new(ErrorCode.Invalid,
+                $"Sink {sink} asked for {interval}, outside {SchedulerResolution}..{LongestInterval}."));
+
+        lock (_gate) _beats[sink] = new(sink, trigger, interval, _timeProvider.GetUtcNow() + interval);
+        return Result.Success();
     }
 
-    public ValueTask<Result<int>> UnregisterTargetAsync(Address target, CancellationToken cancellationToken)
+    public Result Detach(ModuleId sink)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        lock (_gate)
-        {
-            var ids = _subscriptions.Values.Where(s => s.Target == target).Select(s => s.Id).ToArray();
-            foreach (var id in ids) _subscriptions.Remove(id);
-            return ValueTask.FromResult(Result<int>.Success(ids.Length));
-        }
+        lock (_gate) _beats.Remove(sink);
+        // Absent is what detaching wants: a sink that went away twice is not a problem to report.
+        return Result.Success();
     }
 
-    public ValueTask<Result> AcknowledgeAsync(Guid subscriptionId, Address target, Guid eventId, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        lock (_gate)
-        {
-            if (!_subscriptions.TryGetValue(subscriptionId, out var subscription) || subscription.Target != target || subscription.PendingEventId != eventId)
-                return ValueTask.FromResult(Result.Failure(new(ErrorCode.Invalid, "Clock pulse is stale or not registered for target.")));
-            _subscriptions[subscriptionId] = subscription with { NextDue = _timeProvider.GetUtcNow() + subscription.Interval, PendingEventId = null };
-            return ValueTask.FromResult(Result.Success());
-        }
-    }
+    public Task RunAsync(CancellationToken cancellationToken) => RunCoreAsync(cancellationToken);
 
-    public bool IsRegistered(Guid subscriptionId, Address target)
-    { lock (_gate) return _subscriptions.TryGetValue(subscriptionId, out var subscription) && subscription.Target == target; }
-
-    public async Task RunAsync(CancellationToken cancellationToken)
+    private async Task RunCoreAsync(CancellationToken cancellationToken)
     {
         using var timer = new PeriodicTimer(SchedulerResolution, _timeProvider);
         while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             await PulseDueAsync(_timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// One scheduler step: every sink whose beat is due gets one trigger, at most once per step.
+    ///
+    /// The next beat is scheduled from the clock's own time, not from the argument — a caller that passes a future
+    /// instant would otherwise push every later beat into that future, and "pulse one second from now" twice in a row
+    /// would find the second one not due. It is also scheduled <b>before</b> the call, so a slow sink cannot make the
+    /// clock drift and a sink that fails cannot stop the others: one failure is one failure.
+    /// </summary>
     public async ValueTask<Result<int>> PulseDueAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
-        Subscription[] due;
+        Beat[] due;
         lock (_gate)
         {
-            var dueNow = _subscriptions.Values.Where(s => s.PendingEventId is null && s.NextDue <= now).ToArray();
-            due = dueNow.Select(s => s with { PendingEventId = Guid.NewGuid() }).ToArray();
-            foreach (var subscription in due) _subscriptions[subscription.Id] = subscription;
+            due = _beats.Values.Where(beat => beat.NextDue <= now).ToArray();
+            var nowForSchedule = _timeProvider.GetUtcNow();
+            foreach (var beat in due) _beats[beat.Sink] = beat with { NextDue = nowForSchedule + beat.Interval };
         }
-        var emitted = 0;
-        foreach (var subscription in due)
+
+        var fired = 0;
+        foreach (var beat in due)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var eventId = subscription.PendingEventId!.Value;
-            var pulse = new ClockPulse(subscription.Id, now);
-            var routed = new RoutedEvent(EventNames.ClockPulse, Address, eventId, JsonSerializer.Serialize(pulse, JsonOptions), subscription.Target);
-            var result = await _events.PublishAsync(routed, cancellationToken).ConfigureAwait(false);
-            if (!result.Ok)
+            fired++;
+            try
             {
-                lock (_gate)
-                    if (_subscriptions.TryGetValue(subscription.Id, out var current) && current.PendingEventId == eventId)
-                        _subscriptions[subscription.Id] = current with { PendingEventId = null, NextDue = now + current.Interval };
-                return Result<int>.Failure(result.Error!);
+                await beat.Trigger
+                    .OnTriggerAsync(new TriggerSignal(TriggerReason.Schedule, SourceName, now), cancellationToken)
+                    .ConfigureAwait(false);
             }
-            emitted++;
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch
+            {
+                // A sink that fails one beat is not unregistered: the next beat may be the one that works, and a
+                // clock that silently dropped a module would be worse than one that keeps knocking.
+            }
         }
-        return Result<int>.Success(emitted);
+        return Result<int>.Success(fired);
     }
 
-    private sealed record Subscription(Guid Id, Address Target, TimeSpan Interval, DateTimeOffset NextDue, Guid? PendingEventId);
+    private sealed record Beat(ModuleId Sink, ITriggerSink Trigger, TimeSpan Interval, DateTimeOffset NextDue);
 }

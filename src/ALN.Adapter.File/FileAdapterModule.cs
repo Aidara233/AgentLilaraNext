@@ -18,7 +18,6 @@ public sealed class FileAdapterModule : IModulePlugin
 
     private IAdapterFactoryRegistry? _factories;
     private IAdapterManager? _adapters;
-    private IClockManager? _clock;
     private IModuleReloadStateStore? _reloadState;
     private FileAdapterFactory? _factory;
     private bool _started;
@@ -33,14 +32,10 @@ public sealed class FileAdapterModule : IModulePlugin
         var mailbox = GetHostService<IFileMailbox>(context);
         var events = GetHostService<IEventSink>(context);
         var acks = context.HostServices.GetService(typeof(ALN.Contracts.IInboundAcks)) as ALN.Contracts.IInboundAcks;
-        var clockResult = context.GetService<IClockManager>("clock.manager");
-        if (!clockResult.Ok || clockResult.Value is null)
-            return Result.Failure(clockResult.Error ?? new(ErrorCode.Unavailable, "Clock service is not available."));
-        _clock = clockResult.Value;
         _adapters = GetHostService<IAdapterManager>(context);
         _factories = GetHostService<IAdapterFactoryRegistry>(context);
         _reloadState = GetHostService<IModuleReloadStateStore>(context);
-        _factory = new FileAdapterFactory(mailbox, events, _clock, acks);
+        _factory = new FileAdapterFactory(mailbox, events, acks);
         var registered = _factories.Register(PackageId, _factory);
         if (!registered.Ok) return registered;
         _started = true;
@@ -56,8 +51,6 @@ public sealed class FileAdapterModule : IModulePlugin
                 // asking it would answer nothing, and reading the address would be guessing.
                 if (string.IsNullOrWhiteSpace(snapshot.TypeId))
                     return Result.Failure(new(ErrorCode.Invalid, $"Saved Adapter replacement state has no type for {snapshot.Address}."));
-                var unregistered = await _clock.UnregisterTargetAsync(snapshot.Address, cancellationToken).ConfigureAwait(false);
-                if (!unregistered.Ok) return Result.Failure(unregistered.Error!);
                 var created = await _adapters.CreateAsync(new(snapshot.Address, snapshot.Descriptor, snapshot.TypeId), cancellationToken).ConfigureAwait(false);
                 if (!created.Ok) return Result.Failure(created.Error!);
                 if (snapshot.State == AdapterState.Running)
@@ -117,11 +110,6 @@ public sealed class FileAdapterModule : IModulePlugin
             var snapshot = await _adapters!.SnapshotByTypeAsync("adapter.file", cancellationToken).ConfigureAwait(false);
             if (!snapshot.Ok || snapshot.Value is null)
                 return Result.Failure(snapshot.Error ?? new(ErrorCode.Internal, "Could not enumerate Adapters for forced disconnection."));
-            foreach (var adapter in snapshot.Value)
-            {
-                var unregistered = await _clock!.UnregisterTargetAsync(adapter.Address, cancellationToken).ConfigureAwait(false);
-                if (!unregistered.Ok) return Result.Failure(unregistered.Error!);
-            }
             destroyed = await _adapters.ForceDestroyByTypeAsync("adapter.file", cancellationToken).ConfigureAwait(false);
         }
         else
@@ -140,9 +128,9 @@ public sealed class FileAdapterModule : IModulePlugin
         return service as T ?? throw new InvalidOperationException($"Required host service is missing: {typeof(T).FullName}");
     }
 
-    private sealed class FileAdapterFactory(IFileMailbox mailbox, IEventSink events, IClockManager clock, IInboundAcks? acks) : IAdapterFactory
+    private sealed class FileAdapterFactory(IFileMailbox mailbox, IEventSink events, IInboundAcks? acks) : IAdapterFactory
     {
         public string TypeId => "adapter.file";
-        public IChatAdapter Create(AdapterSpec spec) => new FileAdapter(spec, mailbox, events, clock, acks);
+        public IChatAdapter Create(AdapterSpec spec) => new FileAdapter(spec, mailbox, events, acks);
     }
 }

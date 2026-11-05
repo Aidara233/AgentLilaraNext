@@ -592,6 +592,54 @@ public sealed class KernelTests : IDisposable
         Assert.Null(kernel.Find(instance));
     }
 
+    [Fact]
+    public async Task A_node_that_reports_a_rhythm_is_attached_to_the_schedule_in_the_graph()
+    {
+        // "Who is on a schedule" has to be a fact the graph knows, or nobody can answer it later.
+        var source = new CountingSource();
+        var ticker = new TickingModule(new("adapter.file#one"));
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(ticker).Ok);
+        Assert.True(kernel.Declare(new PassiveNode(new ModuleId("Clock"), source), typeId: "clock").Ok);
+
+        Assert.True((await kernel.StartAsync(default)).Ok);
+
+        Assert.Equal([new ModuleId("adapter.file#one")], source.Attached);
+        Assert.Empty(source.DetachedIds);
+        Assert.True((await kernel.RemoveAsync(new ModuleId("adapter.file#one"), default)).Ok);
+        Assert.Contains(new ModuleId("adapter.file#one"), source.DetachedIds);
+    }
+
+    private sealed class CountingSource : ITriggerSource
+    {
+        public string Source => "Clock";
+        public List<ModuleId> Attached { get; } = [];
+        public List<ModuleId> DetachedIds { get; } = [];
+        public Result Attach(ModuleId sink, ITriggerSink trigger)
+        {
+            Attached.Add(sink);
+            return Result.Success();
+        }
+        public Result Detach(ModuleId sink)
+        {
+            DetachedIds.Add(sink);
+            return Result.Success();
+        }
+    }
+
+    private sealed class TickingModule(ModuleId id) : IKernelModule, ITriggerSink
+    {
+        public ModuleId Id { get; } = id;
+        public TimeSpan? PreferredInterval => TimeSpan.FromMilliseconds(200);
+        public ValueTask<Result> OnTriggerAsync(TriggerSignal trigger, CancellationToken cancellationToken) =>
+            ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> InitializeAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> ReadyAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> StopAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> AbortAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> OnErrorAsync(ModuleError error, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+    }
+
     private sealed class RecordingSignals : ISignalLog
     {
         public List<SignalRecord> Records { get; } = [];

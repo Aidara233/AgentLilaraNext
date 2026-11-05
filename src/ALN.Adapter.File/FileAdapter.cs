@@ -3,25 +3,43 @@ using ALN.Contracts;
 
 namespace ALN.Adapter.File;
 
-public sealed class FileAdapter : AdapterBase, IPollingAdapter
+public sealed class FileAdapter : AdapterBase, IPollingAdapter, ITriggerSink
 {
     private readonly IFileMailbox _mailbox;
     private readonly IEventSink _sink;
-    private readonly IClockManager _clock;
     private readonly IInboundAcks? _acks;
     private readonly SemaphoreSlim _pollGate = new(1, 1);
-    private Guid? _clockSubscriptionId;
 
-    public FileAdapter(AdapterSpec spec, IFileMailbox mailbox, IEventSink sink, IClockManager clock, IInboundAcks? acks = null)
+    public FileAdapter(AdapterSpec spec, IFileMailbox mailbox, IEventSink sink, IInboundAcks? acks = null)
         : base(spec.Address, spec.Descriptor)
     {
         _mailbox = mailbox ?? throw new ArgumentNullException(nameof(mailbox));
         _sink = sink ?? throw new ArgumentNullException(nameof(sink));
-        _clock = clock ?? throw new ArgumentNullException(nameof(clock));
         _acks = acks;
     }
 
+    /// <summary>
+    /// A mailbox is a thing you look at, not a thing that tells you: the only way to learn about a new file is to
+    /// look. So this adapter asks for a rhythm, and says how fast.
+    /// </summary>
     public TimeSpan PollInterval { get; set; } = TimeSpan.FromMilliseconds(200);
+
+    /// <inheritdoc />
+    public TimeSpan? PreferredInterval => PollInterval;
+
+    /// <summary>
+    /// One trigger: look at the inbox once. From a schedule, from a script that decided it was time, or from somebody
+    /// calling directly — the adapter does not care which, and that is the point of the abstraction.
+    /// </summary>
+    public async ValueTask<Result> OnTriggerAsync(TriggerSignal trigger, CancellationToken cancellationToken)
+    {
+        _ = trigger;
+        // A trigger that arrives while the adapter is stopped is not an error: a schedule outlives a stop, and the
+        // next beat after a start will find the work.
+        if (!IsRunning) return Result.Success();
+        var polled = await PollOnceAsync(cancellationToken).ConfigureAwait(false);
+        return polled.Ok ? Result.Success() : Result.Failure(polled.Error!);
+    }
 
     public override async ValueTask<Result> StartAsync(CancellationToken cancellationToken)
     {
@@ -30,27 +48,11 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter
         // Whatever was claimed by a process that is no longer here is unfinished: put it back where it will
         // be found again. Doing this before the first poll is what makes a forced exit recoverable.
         await _mailbox.ReclaimAsync(cancellationToken).ConfigureAwait(false);
-        if (_clockSubscriptionId.HasValue) return Result.Success();
-        var registration = await _clock.RegisterAsync(Address, PollInterval, cancellationToken).ConfigureAwait(false);
-        if (!registration.Ok)
-        {
-            await base.StopAsync(CancellationToken.None).ConfigureAwait(false);
-            return Result.Failure(registration.Error ?? new(ErrorCode.Internal, "Clock registration failed."));
-        }
-        _clockSubscriptionId = registration.Value;
         return Result.Success();
     }
 
     public override async ValueTask<Result> StopAsync(CancellationToken cancellationToken)
     {
-        // A clock that no longer has this subscription is not a reason to stay Running: having no subscription is
-        // exactly what stopping is for. Treating its answer as a failure used to leave the Adapter Running while
-        // its owner believed it had stopped — and it skipped the base stop below, so the state never changed.
-        if (_clockSubscriptionId is { } subscriptionId)
-        {
-            var unregistered = await _clock.UnregisterAsync(subscriptionId, Address, cancellationToken).ConfigureAwait(false);
-            if (unregistered.Ok) _clockSubscriptionId = null;
-        }
         await _pollGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try { return await base.StopAsync(cancellationToken).ConfigureAwait(false); }
         finally { _pollGate.Release(); }

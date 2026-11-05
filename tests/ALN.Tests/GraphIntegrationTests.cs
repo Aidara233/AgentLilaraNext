@@ -54,7 +54,9 @@ public sealed class GraphIntegrationTests : IDisposable
         _bindings.Bind(_graph);
         _mailbox = new FileMailbox(Path.Combine(_root, "adapters", "test-1"));
         _adapter = new FileAdapter(new(_adapterAddress, new("file", "test-account", AdapterDirection.Both), "adapter.file"),
-            _mailbox, _events, _clock);
+            _mailbox, _events);
+        // What the kernel does in the real host: the Adapter declares a rhythm, the schedule attaches it.
+        Assert.True(_clock.Attach(new ModuleId(_adapterAddress.ToString()), _adapter).Ok);
     }
 
     public void Dispose()
@@ -290,7 +292,7 @@ public sealed class GraphIntegrationTests : IDisposable
         await WriteInputAsync("chat-1", "one");
         await WriteInputAsync("chat-2", "two");
         Assert.Equal(1, (await PulseAdapterAsync()).Value);
-        await DispatchOneAsync();
+        // One round fewer than before the trigger change: the pulse no longer queues an event of its own.
         await DispatchOneAsync();
         await DispatchOneAsync();
         await DispatchOneAsync();
@@ -301,7 +303,8 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.Equal("one", ReadOutbound(outOne).Text);
         Assert.Equal("two", ReadOutbound(outTwo).Text);
         Assert.Equal(2, _channels.List().Count);
-        Assert.Equal(5, _signals.Snapshot().Count(r => r.Group == "dispatch" && r.Outcome == "ok"));
+        // One dispatch fewer than before the trigger change: the pulse polls directly instead of being dispatched.
+        Assert.Equal(4, _signals.Snapshot().Count(r => r.Group == "dispatch" && r.Outcome == "ok"));
     }
 
     [Fact]
@@ -314,11 +317,11 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.False(duplicate.Ok);
         await _adapters.StartAsync(_adapterAddress, default);
         await WriteInputAsync("chat-3", "nobody owns this room");
+        // The trigger is not an event any more: the pulse polls directly, so the queue holds the envelope only.
         Assert.Equal(1, (await PulseAdapterAsync()).Value);
         await DispatchOneAsync();
-        await DispatchOneAsync();
         Assert.Empty(Directory.GetFiles(Path.Combine(_mailbox.Root, "outbox"), "*.json", SearchOption.AllDirectories));
-        Assert.Equal(2, _signals.Snapshot().Count(r => r.Group == "dispatch"));
+        Assert.Equal(1, _signals.Snapshot().Count(r => r.Group == "dispatch"));
     }
 
     [Fact]
@@ -332,7 +335,7 @@ public sealed class GraphIntegrationTests : IDisposable
         await _adapters.StartAsync(_adapterAddress, default);
         await WriteInputAsync("chat-1", "restricted");
         Assert.Equal(1, (await PulseAdapterAsync()).Value);
-        await DispatchOneAsync();
+        // The trigger polls directly now, so the queue is envelope → accepted → the refused reply.
         await DispatchOneAsync();
         var replyResult = await DispatchOneResultAsync();
         Assert.False(replyResult.Ok);
@@ -448,8 +451,7 @@ public sealed class GraphIntegrationTests : IDisposable
         await WriteInputAsync("chat-1", "one");
         Assert.Equal(1, (await PulseAdapterAsync()).Value);
 
-        // Drain both queued events: the clock pulse (poll) and the adapter envelope (accept).
-        await DispatchOneAsync();
+        // Only the envelope is queued now: the trigger polled directly instead of being an event of its own.
         await DispatchOneAsync();
 
         var intake = Assert.Single(SignalTree.Build(_signals.Snapshot()), n => n.Record.Mechanism == "event" &&

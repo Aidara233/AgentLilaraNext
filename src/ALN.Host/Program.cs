@@ -194,7 +194,7 @@ var deltaSource = sessionExtensions.Register(new ChannelDeltaSource(channelDelta
 if (!deltaSource.Ok) { Console.Error.WriteLine(deltaSource.Error?.Message); return 1; }
 // The manager owns adapter startup and the stop sweep; the clock interval belongs to the Adapter, which is the
 // only thing that knows how its transport wants to be polled.
-adapters.UseHeartbeat(new RecordingEventSink(queue, messageStore), clock);
+adapters.UseEvents(new RecordingEventSink(queue, messageStore));
 var adapterPackage = await modulePackages.LoadAsync(
     Path.Combine(AppContext.BaseDirectory, "modules", "adapter.file"), ModulePackageKind.Plugin, CancellationToken.None);
 if (!adapterPackage.Ok || adapterPackage.Value is null)
@@ -307,6 +307,20 @@ if (!memoryDeclared.Ok)
 // stored Channel happens *during* startup — wiring it afterwards would announce only the ones created later.
 if (channels is IInstanceNodeSink sink)
     sink.UseInstanceNodes(new InstanceNodeHost(kernel, new ModuleId(ModuleNames.ChannelManager)));
+// The same for Adapters - and it has to be here, not after startup: reviving the stored ones happens inside the
+// kernel's Ready phase, and an Adapter that is not a node never gets attached to the clock.
+if (adapters is IInstanceNodeSink adapterNodes)
+    adapterNodes.UseInstanceNodes(new InstanceNodeHost(kernel, new ModuleId(ModuleNames.AdapterManager)));
+// The clock is a node too, so the graph can answer "who is on a schedule". It has no phases of its own - the host
+// runs its loop - so it is a passive carrier rather than a participant.
+var clockDeclared = kernel.Declare(new PassiveNode(new ModuleId(ModuleNames.Clock), clock), typeId: ModuleNames.Clock);
+if (!clockDeclared.Ok)
+{
+    Console.Error.WriteLine(clockDeclared.Error?.Message ?? "Clock module declaration failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
 var started = await kernel.StartAsync(shutdown.Token);
 if (!started.Ok || started.Value is null)
 {

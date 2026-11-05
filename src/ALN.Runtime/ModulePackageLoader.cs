@@ -219,17 +219,6 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
                 var addresses = _adapters.List().Where(a => a.TypeId == provision.TypeId).Select(a => a.Address).ToArray();
                 foreach (var address in addresses)
                 {
-                    var clock = _services.GetService<IClockManager>("clock.manager");
-                    if (clock.Ok && clock.Value is not null)
-                    {
-                        try
-                        {
-                            var unregistered = await clock.Value.UnregisterTargetAsync(address, CancellationToken.None).AsTask()
-                                .WaitAsync(timeout).ConfigureAwait(false);
-                            if (!unregistered.Ok) errors.Add($"{address}: clock cleanup failed: {unregistered.Error?.Message}");
-                        }
-                        catch (Exception ex) { errors.Add($"{address}: clock cleanup failed: {ex.Message}"); }
-                    }
                     try
                     {
                         var detached = await _forceBindings.ForceDetachAsync(address, CancellationToken.None).AsTask()

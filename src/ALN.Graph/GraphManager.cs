@@ -579,12 +579,6 @@ public sealed class GraphManager : IGraphRuntime, IModule
     public async ValueTask<Result> DispatchAsync(RoutedEvent routedEvent, CancellationToken cancellationToken)
     {
         var target = routedEvent.Target ?? routedEvent.Source;
-        ClockPulse? clockPulse = null;
-        if (routedEvent.Name == EventNames.ClockPulse && routedEvent.Source == Clock.Address && routedEvent.Target is not null)
-        {
-            try { clockPulse = JsonSerializer.Deserialize<ClockPulse>(routedEvent.PayloadJson, JsonOptions); }
-            catch (JsonException) { }
-        }
         var dispatchEntered = false;
         // Fan-out needs one common parent, otherwise N handlers of the same event look like N
         // unrelated lines. Inside a pump the intake record already is that parent; a direct
@@ -694,8 +688,6 @@ public sealed class GraphManager : IGraphRuntime, IModule
         {
             eventScope?.Dispose();
             if (dispatchEntered) await EndDispatchAsync(target).ConfigureAwait(false);
-            if (clockPulse is not null && routedEvent.Target is { } clockTarget)
-                await Clock.AcknowledgeAsync(clockPulse.SubscriptionId, clockTarget, routedEvent.EventId, CancellationToken.None).ConfigureAwait(false);
         }
     }
 
@@ -1148,11 +1140,8 @@ public sealed class GraphManager : IGraphRuntime, IModule
         private async Task<string> PollSelfCoreAsync(CancellationToken cancellationToken)
         {
             await RequireCapabilityAsync(ScriptCapabilities.SelfAdapterPoll, cancellationToken).ConfigureAwait(false);
-            if (current.Name != EventNames.ClockPulse || current.Source != clock.Address || current.Target != mount.Target)
-                await DenyAsync(ScriptCapabilities.SelfAdapterPoll, "Clock pulse is not addressed to this Adapter.", cancellationToken).ConfigureAwait(false);
-            var pulse = Parse<ClockPulse>(current.PayloadJson);
-            if (!clock.IsRegistered(pulse.SubscriptionId, mount.Target))
-                return JsonSerializer.Serialize(new { polled = false, stale = true }, JsonOptions);
+            // Polling on demand, not "on a clock pulse": a script that wants its own rhythm decides when to look. That
+            // is what makes a relay a choice rather than a requirement — and asking here is a request, not a schedule.
             var found = adapters.Get(mount.Target);
             if (!found.Ok || found.Value is not IPollingAdapter poller)
                 throw new InvalidOperationException("Mounted Adapter does not expose a polling endpoint.");

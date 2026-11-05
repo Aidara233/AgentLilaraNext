@@ -238,7 +238,8 @@ public sealed class StateContinuityTests : IDisposable
             Assert.True((await first.Graph.AddRuleAsync(new("channel.responder", MountScope.ForType("channel.conversation")), default)).Ok);
 
             await first.SayAsync("chat-1", "你在吗");
-            Assert.True(await first.StepAsync());   // clock.pulse → the Adapter polls and publishes the envelope
+            // The poll already happened inside SayAsync: a trigger is not an event any more, so the queue now starts
+            // with the envelope. One step accepts, and that is as far as this test wants to go.
             Assert.True(await first.StepAsync());   // adapter.envelope → the Channel accepts, the answer is queued
             // Accepted, unanswered, and the process goes away before the round that would answer it.
             Assert.Empty(first.OutboxTexts("chat-1"));
@@ -338,9 +339,10 @@ public sealed class StateContinuityTests : IDisposable
             await first.AddChannelAsync("chat-1");
             Assert.True((await first.Graph.AddRuleAsync(new("channel.responder", MountScope.ForType("channel.conversation")), default)).Ok);
 
+            // The trigger fires inside SayAsync, so the file is claimed and the envelope published before this line:
+            // claimed, published, never dispatched — the mailbox must not believe this is done.
             await first.SayAsync("chat-1", "你好");
-            Assert.True(await first.StepAsync());   // the Adapter claims the file and publishes the envelope
-            // Claimed, published, never dispatched: the mailbox must not believe this is done.
+            Assert.True(first.Events.TryRead(out _));
             Assert.NotEmpty(Directory.GetFiles(Path.Combine(_root, "io", "file", "file-1", "inflight", "chat-1")));
             Assert.Empty(first.OutboxTexts("chat-1"));
         }
@@ -478,7 +480,9 @@ public sealed class StateContinuityTests : IDisposable
             _bindings.Bind(Graph);
             Settlers = new EventSettlers(new ChannelAcceptSettler(Channels), new InboundAckSettler(Acks));
             Mailbox = new FileMailbox(Path.Combine(root, "io", "file", "file-1"));
-            Adapter = new FileAdapter(new(_adapterAddress, new("file", "acc", AdapterDirection.Both), "adapter.file"), Mailbox, Events, Clock, Acks);
+            Adapter = new FileAdapter(new(_adapterAddress, new("file", "acc", AdapterDirection.Both), "adapter.file"), Mailbox, Events, Acks);
+            // What the kernel does in the real host: the Adapter declares a rhythm, the schedule attaches it.
+            Assert.True(Clock.Attach(new ModuleId(_adapterAddress.ToString()), Adapter).Ok);
         }
 
         public string Root { get; }

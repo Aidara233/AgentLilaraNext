@@ -15,14 +15,14 @@ public sealed class InstanceNodeHost(Kernel kernel, ModuleId master) : IInstance
     public string Category => master.Value;
 
     public async ValueTask<Result> AttachAsync(ModuleId masterId, ModuleId instance, string typeId,
-        IReadOnlyList<string>? kinds, CancellationToken cancellationToken)
+        IReadOnlyList<string>? kinds, CancellationToken cancellationToken, ITriggerSink? trigger = null)
     {
         // The manager names itself as the master; a caller that names another one would be claiming somebody
         // else's instance, which is the one thing this port must not allow.
         if (masterId != master)
             return Result.Failure(new(ErrorCode.Denied, $"This host announces instances for {master}, not {masterId}."));
 
-        var adopted = await kernel.AdoptAsync(master, new InstanceNode(instance), kinds, typeId, cancellationToken)
+        var adopted = await kernel.AdoptAsync(master, new InstanceNode(instance, trigger), kinds, typeId, cancellationToken)
             .ConfigureAwait(false);
         if (!adopted.Ok) return Result.Failure(adopted.Error!);
         // A refused edge means the master would not take it: the instance still exists, but the graph now says so

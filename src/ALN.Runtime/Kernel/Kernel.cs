@@ -204,6 +204,7 @@ public sealed class Kernel
             foreach (var node in component.Where(node => node.Phase != ModulePhase.Ready)) unfinishable.Add(node.Manifest.Id);
         }
 
+        await AttachTriggersAsync(cancellationToken).ConfigureAwait(false);
         lock (_gate) _issues = issues;
         return Result<ModuleReceipt>.Success(new(Snapshot().Select(node => node.Info()).ToArray(), wired + _runtimeEdges,
             badEdges, cycles, issues));
@@ -545,6 +546,7 @@ public sealed class Kernel
         }
 
         await ReadyAsync(node, cancellationToken).ConfigureAwait(false);
+        await AttachTriggersAsync(cancellationToken).ConfigureAwait(false);
         return Result<ModuleAddition>.Success(new(node.Info(), badEdges, wired));
     }
 
@@ -561,6 +563,7 @@ public sealed class Kernel
         if (node is null) return Result<IReadOnlyList<BadEdge>>.Failure(new(ErrorCode.Invalid, $"No module answers to \"{id}\"."));
 
         await StopOneAsync(node, cancellationToken).ConfigureAwait(false);
+        DetachTriggers(id);
 
         var dropped = new List<BadEdge>();
         lock (_gate)
@@ -626,6 +629,7 @@ public sealed class Kernel
         }
 
         await ReadyAsync(node, cancellationToken).ConfigureAwait(false);
+        await AttachTriggersAsync(cancellationToken).ConfigureAwait(false);
         return Result<ModuleAddition>.Success(new(node.Info(), [], 1));
     }
 
@@ -684,6 +688,65 @@ public sealed class Kernel
             ? removed
             : Result<IReadOnlyList<BadEdge>>.Failure(archived.Error ?? new(ErrorCode.Internal, $"Could not archive {id}."));
     }
+
+    /// <summary>
+    /// Hooks every node that wants a rhythm onto every node that can provide one.
+    ///
+    /// After Ready, because a schedule should start against modules that are working, and again whenever the graph
+    /// changes: a sink that arrives later still gets its beat. A source that refuses is recorded, not fatal — the same
+    /// rule as a bad edge, for the same reason: a missed beat does not stop the rest of the system.
+    /// </summary>
+    private async ValueTask AttachTriggersAsync(CancellationToken cancellationToken)
+    {
+        var nodes = Snapshot();
+        var sources = nodes.Where(node => SourceOf(node) is not null).ToArray();
+        if (sources.Length == 0) return;
+
+        foreach (var node in nodes)
+        {
+            var sink = node.Module as ITriggerSink ?? (node.Module as ITriggerBearer)?.Trigger;
+            if (sink is null || sink.PreferredInterval is null) continue;
+            foreach (var source in sources)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Result attached;
+                try { attached = SourceOf(source)!.Attach(node.Manifest.Id, sink); }
+                catch (Exception ex) { attached = Result.Failure(new(ErrorCode.Internal, "Attach threw.", ex.Message)); }
+                if (attached.Ok) continue;
+                _signals.Write(new()
+                {
+                    Id = Guid.NewGuid(),
+                    ParentId = SignalScope.CurrentId,
+                    Group = "kernel",
+                    Name = "trigger",
+                    From = node.Manifest.Id.Value,
+                    To = source.Manifest.Id.Value,
+                    Mechanism = "kernel.trigger.attach",
+                    Outcome = "failed",
+                    Level = SignalLevel.Warn,
+                    Detail = new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["error"] = attached.Error?.Message ?? "refused"
+                    }
+                });
+            }
+        }
+        await ValueTask.CompletedTask;
+    }
+
+    /// <summary>Takes a departing node off every schedule. The source keeps working for everybody else.</summary>
+    private void DetachTriggers(ModuleId id)
+    {
+        foreach (var node in Snapshot())
+        {
+            if (SourceOf(node) is not { } source) continue;
+            try { source.Detach(id); } catch { /* a source that cannot forget one sink must not block a removal */ }
+        }
+    }
+
+    /// <summary>The node's trigger source, whether the module is one itself or only carries one.</summary>
+    private static ITriggerSource? SourceOf(KernelNode node) =>
+        node.Module as ITriggerSource ?? (node.Module as ITriggerSourceBearer)?.TriggerSource;
 
     private KernelNode[] Snapshot()
     {

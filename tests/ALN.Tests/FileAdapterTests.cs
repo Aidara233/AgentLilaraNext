@@ -128,23 +128,17 @@ public sealed class FileAdapterTests : IDisposable
     }
 
     [Fact]
-    public async Task Stop_still_stops_when_the_clock_subscription_is_already_gone()
+    public async Task A_trigger_while_stopped_is_answered_and_a_trigger_while_running_polls()
     {
-        var mailbox = new FileMailbox(Path.Combine(_directory, "adapters", "instance-1"));
-        var sink = new RecordingSink(Result.Success());
-        var clock = new ALN.Clock.ClockSource(sink);
-        var adapter = new FileAdapter(
-            new AdapterSpec(new Address("adapter", "file", "test"), new("file", "account", AdapterDirection.Both), "adapter.file"),
-            mailbox, sink, clock);
+        // A schedule outlives a stop: the beat after a start will find the work, so a trigger against a stopped
+        // adapter is answered instead of refused.
+        var adapter = NewAdapter(new FileMailbox(Path.Combine(_directory, "adapters", "instance-1")), new RecordingSink(Result.Success()));
+        Assert.True((await adapter.OnTriggerAsync(new TriggerSignal(TriggerReason.Schedule, "Clock", DateTimeOffset.UtcNow), default)).Ok);
+
         Assert.True((await adapter.StartAsync(default)).Ok);
-        // What the owner used to do first: clear the target's subscriptions before telling it to stop.
-        Assert.True((await clock.UnregisterTargetAsync(adapter.Address, default)).Ok);
-
-        var stopped = await adapter.StopAsync(default);
-
-        Assert.True(stopped.Ok, stopped.Error?.Detail ?? stopped.Error?.Message);
+        Assert.True((await adapter.OnTriggerAsync(new TriggerSignal(TriggerReason.Demand, "test", DateTimeOffset.UtcNow), default)).Ok);
+        Assert.True((await adapter.StopAsync(default)).Ok);
         Assert.Equal(AdapterState.Stopped, adapter.State);
-        Assert.False((await adapter.PollOnceAsync()).Ok);
     }
 
     private static string Inbox(FileMailbox mailbox, string conversationId)
@@ -155,7 +149,7 @@ public sealed class FileAdapterTests : IDisposable
     }
 
     private static FileAdapter NewAdapter(IFileMailbox mailbox, IEventSink sink) =>
-        new(new AdapterSpec(new Address("adapter", "file", "test"), new("file", "account", AdapterDirection.Both), "adapter.file"), mailbox, sink, new ALN.Clock.ClockSource(sink));
+        new(new AdapterSpec(new Address("adapter", "file", "test"), new("file", "account", AdapterDirection.Both), "adapter.file"), mailbox, sink);
 
     private sealed class RecordingSink(Result result) : IEventSink
     {

@@ -16,7 +16,7 @@ public interface IInstanceNodeHost
 {
     /// <summary>Announces an instance the manager now holds. False when the graph cannot take it (reported by the caller).</summary>
     ValueTask<Result> AttachAsync(ModuleId master, ModuleId instance, string typeId,
-        IReadOnlyList<string>? kinds, CancellationToken cancellationToken);
+        IReadOnlyList<string>? kinds, CancellationToken cancellationToken, ITriggerSink? trigger = null);
 
     /// <summary>Announces that the manager no longer holds it. Absent is not an error: a manager may be tearing down.</summary>
     ValueTask<Result> DetachAsync(ModuleId master, ModuleId instance, CancellationToken cancellationToken);
@@ -28,9 +28,12 @@ public interface IInstanceNodeHost
 /// The no-ops are the point, not an omission. The manager owns this instance's lifecycle and calling back into it
 /// from here would give two owners to one thing. This node exists so that an edge can point at it.
 /// </summary>
-public sealed class InstanceNode(ModuleId id) : IKernelModule
+public sealed class InstanceNode(ModuleId id, ITriggerSink? trigger = null) : IKernelModule, ITriggerBearer
 {
     public ModuleId Id { get; } = id;
+
+    /// <inheritdoc />
+    public ITriggerSink? Trigger { get; } = trigger;
 
     public ValueTask<Result> InitializeAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
 
@@ -50,4 +53,52 @@ public sealed class InstanceNode(ModuleId id) : IKernelModule
 public interface IInstanceNodeSink
 {
     void UseInstanceNodes(IInstanceNodeHost nodes);
+}
+
+/// <summary>
+/// A node that is only a wrapper, and therefore has to say where the real capability is.
+///
+/// An instance node exists so an edge can point at it; the module behind it is the one that knows how to be triggered.
+/// Without this the graph would see a wrapper and conclude "this adapter has no rhythm", which is exactly the silent
+/// wrongness the trigger abstraction was introduced to remove.
+/// </summary>
+public interface ITriggerBearer
+{
+    ITriggerSink? Trigger { get; }
+}
+
+/// <summary>
+/// A node that is only a carrier for a module the host already built, and therefore has to say where the module's
+/// trigger capability is. The clock is the case this exists for: it is a module with no lifecycle work of its own,
+/// but a schedule nobody can find in the graph is a schedule nobody can reason about.
+/// </summary>
+public interface ITriggerSourceBearer
+{
+    ITriggerSource? TriggerSource { get; }
+}
+
+/// <summary>
+/// A node with no lifecycle of its own, wrapped around a module the host already holds.
+///
+/// Two no-op phases rather than a missing node: the graph should show that the module exists, and <c>Ready</c> is a
+/// truthful answer for something whose work is done elsewhere (the host runs the clock's loop itself).
+/// </summary>
+public sealed class PassiveNode(ModuleId id, object module) : IKernelModule, ITriggerSourceBearer
+{
+    public ModuleId Id { get; } = id;
+
+    /// <summary>The module behind this node. Read by whoever needs its capabilities, never cast by this class.</summary>
+    public object Module { get; } = module;
+
+    public ITriggerSource? TriggerSource => Module as ITriggerSource;
+
+    public ValueTask<Result> InitializeAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+
+    public ValueTask<Result> ReadyAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+
+    public ValueTask<Result> StopAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+
+    public ValueTask<Result> AbortAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+
+    public ValueTask<Result> OnErrorAsync(ModuleError error, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
 }

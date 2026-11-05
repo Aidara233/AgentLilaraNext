@@ -131,46 +131,20 @@ public sealed class LifecycleTests : IDisposable
         Assert.True(factories.Register("test.adapter", new StubFactory()).Ok);
         var specs = new FileAdapterSpecStore(Path.Combine(_root, "adapters"));
         var events = new EventQueue(16);
-        var clock = new StubClock();
         var address = new Address("adapter", "file", "file-1");
         Assert.True((await specs.SaveAsync(new AdapterSpec(address, new("file", "file-1", AdapterDirection.Both), "adapter.file"), default)).Ok);
 
-        var manager = new AdapterManager(types, bindings, factories, specs, events, clock);
+        var manager = new AdapterManager(types, bindings, factories, specs, events);
         var started = await manager.StartAsync(new LifecycleSignal(LifecyclePhase.Start, DateTimeOffset.UtcNow), default);
 
         Assert.True(started.Ok, started.Error?.Detail ?? started.Error?.Message);
         Assert.Equal(AdapterState.Running, Assert.Single(manager.List()).State);
-        // The manager does not decide that a polling adapter needs a heartbeat: it used to, on top of the one the
-        // Adapter already makes for itself, and the address then got two pulses per interval.
-        Assert.Empty(clock.Registered);
-        // And it forwards the same signal to the child.
+        // Nothing about pacing is the manager's business: an Adapter declares its own rhythm by implementing
+        // ITriggerSink, and the trigger source attaches it. A manager that guessed is how polled adapters got two
+        // pulses per interval.
         Assert.True(events.TryRead(out var lifecycleEvent));
         Assert.Equal(EventNames.LifecycleStart, lifecycleEvent.Name);
         Assert.Equal(address, lifecycleEvent.Target);
-    }
-
-    [Fact]
-    public async Task A_polling_adapter_is_subscribed_to_the_clock_once_and_unsubscribed_after_it_stops()
-    {
-        var types = new AdapterTypeCatalog();
-        Assert.True(types.RegisterPackageTypes("test.adapter", [new("adapter.file", "adapter")]).Ok);
-        var clock = new StubClock();
-        var factories = new AdapterFactoryRegistry();
-        Assert.True(factories.Register("test.adapter", new StubFactory(clock, clock.Order)).Ok);
-        var specs = new FileAdapterSpecStore(Path.Combine(_root, "adapters"));
-        var address = new Address("adapter", "file", "file-1");
-        Assert.True((await specs.SaveAsync(new AdapterSpec(address, new("file", "file-1", AdapterDirection.Both), "adapter.file"), default)).Ok);
-
-        var manager = new AdapterManager(types, new StubBindings(), factories, specs, new EventQueue(16), clock);
-        Assert.True((await manager.StartAsync(new LifecycleSignal(LifecyclePhase.Start, DateTimeOffset.UtcNow), default)).Ok);
-        Assert.Equal(address, Assert.Single(clock.Registered));
-
-        var stopped = await manager.StopAsync(new LifecycleSignal(LifecyclePhase.Stop, DateTimeOffset.UtcNow), default);
-        Assert.True(stopped.Ok, stopped.Error?.Detail ?? stopped.Error?.Message);
-        Assert.Equal(AdapterState.Stopped, Assert.Single(manager.List()).State);
-        // The Adapter stops itself before the manager sweeps the clock: sweeping first made the Adapter's own
-        // unregistration fail, and an Adapter that reports "could not unregister" never reaches its stopped state.
-        Assert.Equal(["clock.register", "adapter.stop", "clock.unregister"], clock.Order);
     }
 
     private sealed class Recorder(string name, List<string> order) : ILifecycleParticipant
@@ -209,29 +183,29 @@ public sealed class LifecycleTests : IDisposable
         }
     }
 
-    private sealed class StubFactory(IClockManager? clock = null, List<string>? order = null) : IAdapterFactory
+    private sealed class StubFactory : IAdapterFactory
     {
         public string TypeId => "adapter.file";
-        public IChatAdapter Create(AdapterSpec spec) => new StubAdapter(spec.Address, clock, order);
+        public IChatAdapter Create(AdapterSpec spec) => new StubAdapter(spec.Address);
     }
 
-    private sealed class StubAdapter(Address address, IClockManager? clock = null, List<string>? order = null) : IChatAdapter, IPollingAdapter
+    /// <summary>A polling adapter with no clock anywhere near it: rhythm is declared, not registered.</summary>
+    private sealed class StubAdapter(Address address) : IChatAdapter, IPollingAdapter, ITriggerSink
     {
         public Address Address { get; } = address;
         public ModuleId Id => new(Address.ToString());
         public AdapterDescriptor Descriptor { get; } = new("file", "file-1", AdapterDirection.Both);
         public AdapterState State { get; private set; } = AdapterState.Created;
-        public async ValueTask<Result> StartAsync(CancellationToken cancellationToken)
+        public TimeSpan? PreferredInterval => TimeSpan.FromMilliseconds(200);
+        public ValueTask<Result> OnTriggerAsync(TriggerSignal trigger, CancellationToken cancellationToken) =>
+            ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> StartAsync(CancellationToken cancellationToken)
         {
             State = AdapterState.Running;
-            // The Adapter owns its own heartbeat, the way a transport knows its own interval.
-            if (clock is not null)
-                await clock.RegisterAsync(Address, TimeSpan.FromMilliseconds(200), cancellationToken);
-            return Result.Success();
+            return ValueTask.FromResult(Result.Success());
         }
         public ValueTask<Result> StopAsync(CancellationToken cancellationToken)
         {
-            order?.Add("adapter.stop");
             State = AdapterState.Stopped;
             return ValueTask.FromResult(Result.Success());
         }
@@ -239,27 +213,6 @@ public sealed class LifecycleTests : IDisposable
             ValueTask.FromResult(Result<int>.Success(0));
         public ValueTask<Result<SendResult>> SendAsync(OutboundMessage message, CancellationToken cancellationToken) =>
             ValueTask.FromResult(Result<SendResult>.Success(new(true, "1")));
-    }
-
-    private sealed class StubClock : IClockManager
-    {
-        public List<Address> Registered { get; } = [];
-        public List<string> Order { get; } = [];
-        public Address Address { get; } = new("clock", "system", "1");
-        public ValueTask<Result<Guid>> RegisterAsync(Address target, TimeSpan interval, CancellationToken cancellationToken)
-        {
-            Registered.Add(target);
-            Order.Add("clock.register");
-            return ValueTask.FromResult(Result<Guid>.Success(Guid.NewGuid()));
-        }
-        public ValueTask<Result> UnregisterAsync(Guid subscriptionId, Address target, CancellationToken cancellationToken)
-        { Order.Add("clock.unregister.subscription"); return ValueTask.FromResult(Result.Success()); }
-        public ValueTask<Result<int>> UnregisterTargetAsync(Address target, CancellationToken cancellationToken)
-        { Order.Add("clock.unregister"); return ValueTask.FromResult(Result<int>.Success(1)); }
-        public ValueTask<Result> AcknowledgeAsync(Guid subscriptionId, Address target, Guid eventId, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
-        public bool IsRegistered(Guid subscriptionId, Address target) => false;
-        public Task RunAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public ValueTask<Result<int>> PulseDueAsync(DateTimeOffset now, CancellationToken cancellationToken) => ValueTask.FromResult(Result<int>.Success(0));
     }
 
     private sealed class StubBindings : IInstanceBindings

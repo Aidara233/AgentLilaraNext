@@ -106,7 +106,7 @@ public sealed class AdapterTypeCatalog : IModuleTypeRegistry
 }
 
 [Module(AdapterManagerId, Category = "adapter", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecycleParticipant, IModule
+public sealed class AdapterManager : IAdapterManager, IModuleIndex, IModuleWiring, IInstanceNodeSink, ILifecycleParticipant, IModule
 {
     public const string AdapterManagerId = ModuleNames.AdapterManager;
     public ModuleId Id { get; } = new(AdapterManagerId);
@@ -125,33 +125,42 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecyclePa
     private readonly IAdapterFactoryRegistry? _factories;
     private readonly IAdapterSpecStore? _specs;
     private IEventSink? _events;
-    private IClockManager? _clock;
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _gate = new();
     // Adapters that declare tunables register themselves here, the same way Channels do.
     private readonly IParameterRegistry? _parameters;
+    private IInstanceNodeHost? _nodes;
 
     public AdapterManager(IModuleTypeCatalog types, IInstanceBindings bindings, IAdapterFactoryRegistry? factories = null,
-        IAdapterSpecStore? specs = null, IEventSink? events = null, IClockManager? clock = null,
-        IParameterRegistry? parameters = null)
+        IAdapterSpecStore? specs = null, IEventSink? events = null, IParameterRegistry? parameters = null)
     {
         _types = types;
         _bindings = bindings;
         _factories = factories;
         _specs = specs;
         _events = events;
-        _clock = clock;
         _parameters = parameters;
     }
 
     /// <summary>
-    /// Wires the two things a manager needs but cannot be given at construction time (they live in
-    /// module packages resolved later). Must be called before the lifecycle signal arrives.
+    /// Wires the event sink the manager forwards lifecycle signals through. It cannot be given at construction
+    /// time because it lives in a module package resolved later. Must be called before the lifecycle signal arrives.
     /// </summary>
-    public void UseHeartbeat(IEventSink events, IClockManager clock)
+    public void UseEvents(IEventSink events) => _events = events ?? throw new ArgumentNullException(nameof(events));
+
+    /// <inheritdoc />
+    public void UseInstanceNodes(IInstanceNodeHost nodes) => _nodes = nodes ?? throw new ArgumentNullException(nameof(nodes));
+
+    /// <summary>
+    /// The master side of the edge: the graph offers an instance and this manager says whether it holds it. It only
+    /// accepts what it already has, because an Adapter is created here and announced afterwards.
+    /// </summary>
+    public Result WireSlave(ModuleId slaveId, IReadOnlyList<string> kinds, IKernelModule instance)
     {
-        _events = events ?? throw new ArgumentNullException(nameof(events));
-        _clock = clock ?? throw new ArgumentNullException(nameof(clock));
+        lock (_gate)
+            return _adapters.Values.Any(live => string.Equals(live.Adapter.Address.ToString(), slaveId.Value, StringComparison.Ordinal))
+                ? Result.Success()
+                : Result.Failure(new(ErrorCode.Invalid, $"{slaveId} is not one of this manager's Adapters."));
     }
 
     /// <inheritdoc />
@@ -241,6 +250,21 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecyclePa
                     return Result<IChatAdapter>.Failure(persisted.Error!);
                 }
             }
+            // Announced to the graph, so "what is connected to this manager" stops being a fact only the dictionary
+            // knows. The node carries the Adapter's own trigger capability: an Adapter that wants a rhythm says so by
+            // implementing ITriggerSink, and a wrapper must not hide that.
+            if (_nodes is not null)
+            {
+                var announced = await _nodes.AttachAsync(new ModuleId(ModuleNames.AdapterManager),
+                    new ModuleId(spec.Address.ToString()), spec.TypeId, [EventNames.AdapterEnvelope], cancellationToken,
+                    adapter as ITriggerSink).ConfigureAwait(false);
+                if (!announced.Ok)
+                {
+                    lock (_gate) _adapters.Remove(IdOf(spec.Address));
+                    await _bindings.DetachAsync(spec.Address, CancellationToken.None).ConfigureAwait(false);
+                    return Result<IChatAdapter>.Failure(announced.Error!);
+                }
+            }
             return Result<IChatAdapter>.Success(adapter);
         }
         catch (OperationCanceledException) { throw; }
@@ -301,11 +325,9 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecyclePa
     }
 
     /// <summary>
-    /// Hands the same start signal one level down. The heartbeat is deliberately not here: an Adapter
-    /// subscribes to the clock itself, because the interval is a property of the transport (a file mailbox
-    /// polls at 200ms, a socket listens), and a manager that guessed would either pick the wrong interval or
-    /// add a second subscription on top of the Adapter's own — which is exactly what used to happen, and is
-    /// why every polled Adapter used to be polled twice per interval.
+    /// Hands the same start signal one level down. Nothing about pacing is here: an Adapter that wants a rhythm says
+    /// so by implementing ITriggerSink and reporting its interval, and the trigger source attaches it. A manager that
+    /// guessed at heartbeats is exactly how every polled Adapter used to be polled twice per interval.
     /// </summary>
     private async ValueTask<Result> StartChildrenAsync(Address address, LifecycleSignal signal, CancellationToken cancellationToken)
     {
@@ -321,14 +343,8 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecyclePa
         Result firstFailure = Result.Success();
         foreach (var address in List().Select(a => a.Address))
         {
-            // Child first, then the heartbeat: an Adapter's own Stop unregisters the subscription it made, and
-            // clearing the clock for it beforehand made that unregistration fail — which the Adapter read as
-            // "not stopped", leaving it Running while the manager believed it was down. The sweep afterwards is
-            // only for Adapters that forgot to clean up after themselves, and its answer is not a verdict.
             var stopped = await StopAsync(address, cancellationToken).ConfigureAwait(false);
             if (!stopped.Ok && firstFailure.Ok) firstFailure = stopped;
-            if (_clock is not null)
-                await _clock.UnregisterTargetAsync(address, CancellationToken.None).ConfigureAwait(false);
             if (_events is not null)
                 await _events.PublishAsync(new(EventNames.LifecycleStop, address, Guid.NewGuid(),
                     JsonSerializer.Serialize(signal.For(address), new JsonSerializerOptions(JsonSerializerDefaults.Web)), address),
@@ -393,6 +409,10 @@ public sealed class AdapterManager : IAdapterManager, IModuleIndex, ILifecyclePa
                 if (!detached.Ok) return detached;
                 lock (_gate) _adapters.Remove(IdOf(address));
                 _parameters?.Unregister(address.ToString());
+                // Out of the graph too: a removed Adapter that is still on a schedule is a module that exists on paper.
+                if (_nodes is not null)
+                    await _nodes.DetachAsync(new ModuleId(ModuleNames.AdapterManager), new ModuleId(address.ToString()),
+                        CancellationToken.None).ConfigureAwait(false);
             }
             return Result.Success();
         }
