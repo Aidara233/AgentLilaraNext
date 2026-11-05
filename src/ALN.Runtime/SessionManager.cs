@@ -98,6 +98,40 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
             : Result<ISession>.Failure(loaded.Error!);
     }
 
+    /// <summary>
+    /// The Session that serves this Channel: the one whose own record says so, or a new one named after its type.
+    ///
+    /// Two rules meet here. Which Channel a Session answers for is <b>data on the Session</b> (C-20), so it can only
+    /// be found by reading the Session — never by recomputing a hash of the Channel's address (C-01). And the name
+    /// of a new Session is its type plus a fresh suffix, exactly as any other instance is named.
+    /// </summary>
+    public async ValueTask<Result<ISession>> OpenForChannelAsync(string channelKey, SessionSpec spec,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(channelKey))
+            return Result<ISession>.Failure(new(ErrorCode.Invalid, "A Channel key is required to find or open a Session."));
+
+        foreach (var (id, directory) in EnumerateSessions())
+        {
+            if (string.Equals(TryReadState(directory)?.Channel, channelKey, StringComparison.Ordinal))
+                return await OpenAsync(id, spec, cancellationToken).ConfigureAwait(false);
+        }
+
+        var fresh = ModuleId.NewFor("session.chat").Value;
+        var created = await OpenAsync(fresh, spec, cancellationToken).ConfigureAwait(false);
+        if (!created.Ok) return created;
+
+        // Written before the caller gets the handle: the next message on this Channel must find this Session, and a
+        // turn that dies halfway must not leave a Session no Channel can reach.
+        if (_loaded.TryGetValue(fresh, out var record))
+        {
+            record.State = record.State with { Channel = channelKey };
+            await WriteAtomicJsonAsync(Path.Combine(ResolveSessionDirectory(fresh), "state.json"), record.State,
+                cancellationToken).ConfigureAwait(false);
+        }
+        return created;
+    }
+
     /// <summary>An existing Session, or a failure. Never creates one: a name that was never opened is not a Session.</summary>
     public async ValueTask<Result<ISession>> GetAsync(string sessionId, CancellationToken cancellationToken)
     {
@@ -1943,8 +1977,12 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
 
     private string ResolveSessionDirectory(string sessionId) => Path.Combine(ModulesRoot, sessionId);
 
-    private static bool IsValidSessionId(string value) => value is { Length: > 0 and <= 128 } && value.All(c =>
-        c is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9' or '-' or '_');
+    /// <summary>
+    /// A Session's name is validated as a module id and nothing else: letters, digits, '.', '#', '-' and '_'. The
+    /// old rule was narrower because a name used to be a hash; adding '.' and '#' is what lets a Session be named
+    /// after its type like every other instance (C-01, C-02).
+    /// </summary>
+    private static bool IsValidSessionId(string value) => ModuleId.IsLegal(value);
 
     private sealed record LoadedSession(SessionSpec Spec, SessionState State);
     private sealed record LoadedRecovery(SessionState State, IReadOnlyList<SessionHistoryEntry> History);

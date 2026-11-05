@@ -186,6 +186,13 @@ public interface ISessionManager
     /// </summary>
     ValueTask<Result<ISession>> OpenAsync(string sessionId, SessionSpec spec, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// The Session that serves this Channel: the one whose own record says so, or a new one named by its type and a
+    /// fresh suffix. Which Channel a Session answers for is data on the Session (C-20), never hashed into its id
+    /// (C-01) — otherwise changing what the Session serves silently moves its identity.
+    /// </summary>
+    ValueTask<Result<ISession>> OpenForChannelAsync(string channelKey, SessionSpec spec, CancellationToken cancellationToken);
+
     /// <summary>An existing Session, or a failure when there is none. Never creates one.</summary>
     ValueTask<Result<ISession>> GetAsync(string sessionId, CancellationToken cancellationToken);
 

@@ -36,6 +36,31 @@ public sealed class SessionLifecycleTests : IDisposable
     /// operator action all start from a name.
     /// </summary>
     [Fact]
+    public async Task The_session_that_serves_a_channel_is_found_by_its_record_not_by_a_hash()
+    {
+        // C-01/C-20: the Channel a Session serves is data on the Session. So: the same Channel gets the same
+        // Session back, a different Channel gets a different one, and a new Session is named after its type.
+        var sessions = Sessions();
+        var channel = Chat.ToString();
+
+        var first = await sessions.OpenForChannelAsync(channel, Spec, default);
+        var again = await sessions.OpenForChannelAsync(channel, Spec, default);
+        var other = await sessions.OpenForChannelAsync(Ghost.ToString(), Spec, default);
+
+        Assert.True(first.Ok, first.Error?.Message);
+        Assert.True(again.Ok, again.Error?.Message);
+        Assert.True(other.Ok, other.Error?.Message);
+        var session = first.Value!;
+        Assert.Equal(session.Id, again.Value!.Id);
+        Assert.NotEqual(session.Id, other.Value!.Id);
+        // Named after its type, with a fresh suffix — not a hash of the Channel's address.
+        Assert.StartsWith("session.chat#", session.Id.Value, StringComparison.Ordinal);
+        // The record is on disk: a restart finds the same Session for the same Channel without recomputing anything.
+        Assert.Equal(channel, JsonSerializer.Deserialize<SessionState>(
+            File.ReadAllText(Path.Combine(SessionPath(session.Id.Value), "state.json")), Json)!.Channel);
+    }
+
+    [Fact]
     public async Task A_session_is_found_by_name_and_stops_being_found_once_it_is_gone()
     {
         var sessions = Sessions();

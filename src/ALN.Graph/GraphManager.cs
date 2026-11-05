@@ -801,16 +801,18 @@ public sealed class GraphManager : IGraphRuntime, IModule
                 channels.Get(channelMessage.Channel).Value is { ModelProfile: { Length: > 0 } channelProfile })
                 spec = spec with { ModelProfileId = channelProfile };
 
-            var identity = $"{current.Source}\n{channelMessage.Channel}";
-            var sessionId = "s-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
+            // C-01/C-20: the Channel a Session serves is data on the Session, so it is asked for, not hashed into a
+            // name. A Channel that no Session serves yet gets a Session named after its type.
+            var opened = await sessions.OpenForChannelAsync(channelMessage.Channel.ToString(), spec, cancellationToken).ConfigureAwait(false);
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
-                mount.Target, ScriptCapabilities.SessionActivate, "allowed", sessionId), cancellationToken).ConfigureAwait(false);
+                mount.Target, ScriptCapabilities.SessionActivate, opened.Ok ? "allowed" : "failed",
+                opened.Ok && opened.Value is not null ? opened.Value.Id.Value : channelMessage.Channel.ToString()),
+                cancellationToken).ConfigureAwait(false);
 
             // The trigger message is not handed over here on purpose: it is already in the Channel's history,
             // and the delta pull will include it. Passing it twice is how a conversation gets answered twice.
             var input = new SessionTurnInput([], channelMessage.Channel, channelMessage.Binding);
             // The spec is what an absent Session becomes: one that already exists keeps the one it was created with.
-            var opened = await sessions.OpenAsync(sessionId, spec, cancellationToken).ConfigureAwait(false);
             var result = opened.Ok && opened.Value is not null
                 ? await opened.Value.RunTurnAsync(current.EventId, input,
                     new TurnToolbox(new SpeakTool(this, current, mount, channels, audit)), cancellationToken).ConfigureAwait(false)
@@ -822,7 +824,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
                 return JsonSerializer.Serialize(new { ok = false, error = result.Error }, JsonOptions);
             }
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
-                mount.Target, ScriptCapabilities.SessionActivate, "completed", sessionId), cancellationToken).ConfigureAwait(false);
+                mount.Target, ScriptCapabilities.SessionActivate, "completed", result.Value.SessionId), cancellationToken).ConfigureAwait(false);
             return JsonSerializer.Serialize(new { ok = true, result = result.Value }, JsonOptions);
         }
 
@@ -841,13 +843,14 @@ public sealed class GraphManager : IGraphRuntime, IModule
             if (string.IsNullOrWhiteSpace(spec.ModelProfileId) &&
                 channels.Get(channelMessage.Channel).Value is { ModelProfile: { Length: > 0 } channelProfile })
                 spec = spec with { ModelProfileId = channelProfile };
-            var identity = $"{current.Source}\n{channelMessage.Channel}";
-            var sessionId = "s-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
+            // Same rule as session.activate: the Session that serves this Channel is asked for, not derived.
+            var opened = await sessions.OpenForChannelAsync(channelMessage.Channel.ToString(), spec, cancellationToken).ConfigureAwait(false);
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
-                mount.Target, ScriptCapabilities.SessionRun, "allowed", sessionId), cancellationToken).ConfigureAwait(false);
+                mount.Target, ScriptCapabilities.SessionRun, opened.Ok ? "allowed" : "failed",
+                opened.Ok && opened.Value is not null ? opened.Value.Id.Value : channelMessage.Channel.ToString()),
+                cancellationToken).ConfigureAwait(false);
             var input = new SessionTurnInput([new SessionChannelMessage(channelMessage.MessageId.ToString("N"), "user",
                 channelMessage.Sender, channelMessage.Text, channelMessage.At)], channelMessage.Channel, channelMessage.Binding);
-            var opened = await sessions.OpenAsync(sessionId, spec, cancellationToken).ConfigureAwait(false);
             var result = opened.Ok && opened.Value is not null
                 ? await opened.Value.RunTurnAsync(current.EventId, input,
                     new TurnToolbox(new SpeakTool(this, current, mount, channels, audit)), cancellationToken).ConfigureAwait(false)
@@ -859,7 +862,7 @@ public sealed class GraphManager : IGraphRuntime, IModule
                 return JsonSerializer.Serialize(new { ok = false, error = result.Error }, JsonOptions);
             }
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
-                mount.Target, ScriptCapabilities.SessionRun, "completed", sessionId), cancellationToken).ConfigureAwait(false);
+                mount.Target, ScriptCapabilities.SessionRun, "completed", result.Value.SessionId), cancellationToken).ConfigureAwait(false);
             return JsonSerializer.Serialize(new { ok = true, result = result.Value }, JsonOptions);
         }
 
