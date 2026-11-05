@@ -172,17 +172,26 @@ public sealed class Kernel
         lock (_gate) { _instances.Clear(); _issues = []; _runtimeEdges = 0; _rhythms.Clear(); _badEdges = []; _state = KernelRunState.Starting; }
         foreach (var declared in Declared()) lock (_gate) _instances[declared.Manifest.Id] = declared;
 
+        // C-03: a module declared in code is still a module, so it gets its directory and its file. Written once —
+        // from the next start on, the file is the record of what exists and the declaration only says "this one is
+        // the host's". Without this, the graph had instances the disk knew nothing about (22 §7 I2).
+        foreach (var declared in Declared())
+            await _store.WriteIfMissingAsync(declared.Manifest, cancellationToken).ConfigureAwait(false);
+
         // 0 — Scan: everything the disk says, plus one line per directory that is not a module.
-        var scan = await _store.ScanAsync(_types, _hostOwnsTypes, cancellationToken).ConfigureAwait(false);
+        var scan = await _store.ScanAsync(_types, _hostOwnsTypes, cancellationToken, id => _instances.ContainsKey(id)).ConfigureAwait(false);
         var issues = new List<ModuleIssue>(scan.Issues);
 
         foreach (var manifest in scan.Manifests)
         {
-            if (_instances.ContainsKey(manifest.Id))
+            if (_instances.TryGetValue(manifest.Id, out var already))
             {
-                // Declared in code and on disk: the code wins, and the collision is reported. Two instances with one
-                // name is the shape that makes "which one did I just stop" unanswerable.
-                issues.Add(new ModuleIssue(manifest.Id.Value, $"Declared by the host and also present on disk: {manifest.Id}."));
+                // Declared in code and recorded on disk is not a collision: it is one module with two marks. The file
+                // says what it is (C-03), the declaration says the host builds it. Only a *different* type under one
+                // id is a real conflict, and that is what gets reported.
+                if (string.Equals(already.Manifest.Type, manifest.Type, StringComparison.Ordinal)) continue;
+                issues.Add(new ModuleIssue(manifest.Id.Value,
+                    $"Declared by the host as \"{already.Manifest.Type}\" but the file says \"{manifest.Type}\": {manifest.Id}."));
                 continue;
             }
             var created = _types.Create(manifest);
@@ -797,7 +806,7 @@ public sealed class Kernel
     /// </summary>
     public async ValueTask<Result<ModuleAddition>> LoadAsync(ModuleId id, CancellationToken cancellationToken)
     {
-        var scan = await _store.ScanAsync(_types, _hostOwnsTypes, cancellationToken).ConfigureAwait(false);
+        var scan = await _store.ScanAsync(_types, _hostOwnsTypes, cancellationToken, id => _instances.ContainsKey(id)).ConfigureAwait(false);
         var manifest = scan.Manifests.FirstOrDefault(candidate => candidate.Id == id);
         if (manifest is null)
         {

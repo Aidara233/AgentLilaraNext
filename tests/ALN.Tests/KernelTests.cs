@@ -95,6 +95,32 @@ public sealed class KernelTests : IDisposable
     }
 
     [Fact]
+    public async Task A_module_declared_in_code_still_gets_its_directory_and_its_file()
+    {
+        // C-03: "declared in code" is not an exemption — the module gets a directory and a module.json like any
+        // other, so the disk and the graph describe the same set (22 §7 I2).
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(new TestModule(new("core-1")), typeId: "test.plain").Ok);
+        var receipt = await kernel.StartAsync(default);
+        Assert.True(receipt.Ok, receipt.Error?.Message);
+
+        var path = Path.Combine(_root, "modules", "core-1", "module.json");
+        Assert.True(File.Exists(path));
+        using var written = JsonDocument.Parse(File.ReadAllText(path));
+        Assert.Equal("core-1", written.RootElement.GetProperty("id").GetString());
+        Assert.Equal("test.plain", written.RootElement.GetProperty("type").GetString());
+
+        // A second start over the same disk: one module with two marks is not a collision. Only a different type
+        // under one id would be.
+        var again = new Kernel(_root, _types);
+        Assert.True(again.Declare(new TestModule(new("core-1")), typeId: "test.plain").Ok);
+        var second = await again.StartAsync(default);
+        Assert.True(second.Ok, second.Error?.Message);
+        Assert.DoesNotContain(second.Value!.Issues, issue => issue.Path.Contains("core-1", StringComparison.Ordinal));
+        Assert.Equal(ModulePhase.Ready, second.Value.Instances.Single(i => i.Id.Value == "core-1").Phase);
+    }
+
+    [Fact]
     public async Task A_startup_with_broken_edges_completes_and_reports_each_one()
     {
         var missing = new TestMaster(new("missing"));

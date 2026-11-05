@@ -33,6 +33,33 @@ public sealed class ModuleManifestStore(string root)
     public string Root { get; } = root;
     public string ModulesRoot => Path.Combine(Root, DirectoryName);
 
+    /// <summary>
+    /// Writes a module's file once, if it is not there yet (C-03). Never rewrites: the file belongs to whoever edits
+    /// it, and a module declared again in a later build must not overwrite what somebody configured (there is no
+    /// migrator — C-24). The directory name and the <c>id</c> come from the same value, so they cannot disagree.
+    /// </summary>
+    public async ValueTask<Result> WriteIfMissingAsync(ModuleManifest manifest, CancellationToken cancellationToken)
+    {
+        var directory = Path.Combine(ModulesRoot, manifest.Id.Value);
+        var path = Path.Combine(directory, FileName);
+        if (File.Exists(path)) return Result.Success();
+        try
+        {
+            Directory.CreateDirectory(directory);
+            var json = JsonSerializer.Serialize(manifest, new JsonSerializerOptions(JsonSerializerDefaults.Web)
+            {
+                WriteIndented = true,
+                Converters = { new ModuleIdJsonConverter() }
+            });
+            await File.WriteAllTextAsync(path, json, cancellationToken).ConfigureAwait(false);
+            return Result.Success();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return Result.Failure(new(ErrorCode.Internal, $"Could not write {path}: {ex.Message}"));
+        }
+    }
+
     public async ValueTask<ManifestScan> ScanAsync(IModuleFactoryRegistry? types, CancellationToken cancellationToken) =>
         await ScanAsync(types, hostOwns: null, cancellationToken).ConfigureAwait(false);
 
@@ -45,7 +72,7 @@ public sealed class ModuleManifestStore(string root)
     /// The type's own implementation decides who owns it, so the question is asked of the host, not parsed from the id.
     /// </summary>
     public async ValueTask<ManifestScan> ScanAsync(IModuleFactoryRegistry? types, Func<string, bool>? hostOwns,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, Func<ModuleId, bool>? declaredByHost = null)
     {
         var manifests = new List<ModuleManifest>();
         var issues = new List<ModuleIssue>();
@@ -109,6 +136,15 @@ public sealed class ModuleManifestStore(string root)
                 // Two directories, one name: the first wins and the second is reported. Startup does not fail over
                 // it — refusing to boot would cost every other module too.
                 issues.Add(new(path, $"Duplicate id \"{id.Value}\"; already loaded from {first}."));
+                continue;
+            }
+
+            if (declaredByHost is not null && declaredByHost(id))
+            {
+                // Declared in code by the host: the file is the record of that declaration (C-03), not a second
+                // source, and its type is not this store's to judge — the host builds it. Skipped silently; it is
+                // already in the graph.
+                seen[id.Value] = path;
                 continue;
             }
 

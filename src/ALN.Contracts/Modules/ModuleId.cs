@@ -88,3 +88,19 @@ public readonly struct ModuleId : IEquatable<ModuleId>, IComparable<ModuleId>
 
     public override string ToString() => Value ?? string.Empty;
 }
+
+/// <summary>
+/// A module id is a name on the wire too: one string, never an object with a <c>value</c> inside it. Whoever edits a
+/// <c>module.json</c> by hand writes <c>"id": "adapters"</c>, so that is what gets written.
+/// </summary>
+public sealed class ModuleIdJsonConverter : System.Text.Json.Serialization.JsonConverter<ModuleId>
+{
+    public override ModuleId Read(ref System.Text.Json.Utf8JsonReader reader, Type typeToConvert,
+        System.Text.Json.JsonSerializerOptions options) =>
+        reader.TokenType == System.Text.Json.JsonTokenType.String && ModuleId.TryParse(reader.GetString(), out var id)
+            ? id
+            : throw new System.Text.Json.JsonException("A module id must be a legal string.");
+
+    public override void Write(System.Text.Json.Utf8JsonWriter writer, ModuleId value,
+        System.Text.Json.JsonSerializerOptions options) => writer.WriteStringValue(value.Value);
+}
