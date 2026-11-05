@@ -674,6 +674,48 @@ public sealed class KernelTests : IDisposable
         Assert.Equal(BadEdgeReason.MissingModule, edge.Reason);
     }
 
+    [Fact]
+    public async Task An_instance_announced_before_startup_is_initialized_wired_and_counted_like_any_other_node()
+    {
+        // Providers are built from their files before the graph exists. If adoption only worked after startup, those
+        // would be the one kind of instance the receipt never mentions — and "which nodes are there" would be
+        // answered differently by the receipt and by the running graph.
+        var manager = new TestMaster(new("ModelManager"));
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(new PassiveNode(manager.Id, manager), typeId: "manager").Ok);
+        var host = new InstanceNodeHost(kernel, manager.Id);
+
+        var announced = await host.AttachAsync(manager.Id, new ModuleId("model.chat#one"), "model.openai-chat", null, default);
+
+        Assert.True(announced.Ok, announced.Error?.Message);
+        var receipt = await Start(kernel);
+        Assert.Equal(ModulePhase.Ready, receipt.Nodes.Single(node => node.Id.Value == "model.chat#one").Phase);
+        Assert.Equal(1, receipt.WiredEdges);
+        // The master judges even here: the instance is wired through it, not just written down next to it.
+        Assert.Equal([new ModuleId("model.chat#one")], manager.Wired);
+    }
+
+    [Fact]
+    public async Task An_instance_announced_while_the_graph_is_starting_gets_its_phases_and_is_in_the_receipt()
+    {
+        // A manager revives its instances in Ready — inside startup, not after it. Treating that announcement as a
+        // declaration is not a small mix-up: the node lands in no phase at all, the receipt comes up short by exactly
+        // the instances that were revived, and nothing says so. (That is what the real host did when this was wrong.)
+        var manager = new TestMaster(new("ChannelManager"));
+        var kernel = new Kernel(_root, _types);
+        Assert.True(kernel.Declare(manager, typeId: "manager").Ok);
+        var host = new InstanceNodeHost(kernel, manager.Id);
+        manager.Ready = () => host.AttachAsync(manager.Id, new ModuleId("channel.conversation#chat"),
+            "channel.conversation", ["message.accepted"], default);
+
+        var receipt = await Start(kernel);
+
+        var instance = receipt.Nodes.Single(node => node.Id.Value == "channel.conversation#chat");
+        Assert.Equal(ModulePhase.Ready, instance.Phase);
+        Assert.Equal(1, receipt.WiredEdges);
+        Assert.Equal([new ModuleId("channel.conversation#chat")], manager.Wired);
+    }
+
     private sealed class CountingSource : ITriggerSource
     {
         public string Source => "Clock";

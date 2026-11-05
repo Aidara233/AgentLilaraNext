@@ -36,6 +36,10 @@ public sealed class Kernel
     // Edges that never became calls, kept after the receipt was handed out. A bad edge that only exists in one
     // return value is invisible to anybody asking the process how it is doing ten minutes later (docs/22 §5.2).
     private IReadOnlyList<BadEdge> _badEdges = [];
+    // Where the phases are. "Before startup" and "inside startup" are different answers for an announcement: before it
+    // the graph does not exist and the instance is a declaration; inside it the graph exists and the instance has to
+    // walk its own phases now — filing it as a declaration there is how a node ends up in no phase at all.
+    private KernelRunState _state;
 
     public Kernel(string dataRoot, IModuleFactoryRegistry types, ISignalLog? signals = null, TimeSpan? stopTimeout = null)
         : this(new ModuleManifestStore(dataRoot), types, signals, stopTimeout)
@@ -161,7 +165,7 @@ public sealed class Kernel
 
     public async ValueTask<Result<ModuleReceipt>> StartAsync(CancellationToken cancellationToken)
     {
-        lock (_gate) { _nodes.Clear(); _issues = []; _runtimeEdges = 0; _rhythms.Clear(); _badEdges = []; }
+        lock (_gate) { _nodes.Clear(); _issues = []; _runtimeEdges = 0; _rhythms.Clear(); _badEdges = []; _state = KernelRunState.Starting; }
         foreach (var declared in Declared()) lock (_gate) _nodes[declared.Manifest.Id] = declared;
 
         // 0 — Scan: everything the disk says, plus one line per directory that is not a module.
@@ -207,7 +211,7 @@ public sealed class Kernel
         var wired = 0;
         foreach (var node in initialized.Where(node => node.Manifest.Slaves is { Count: > 0 }))
         {
-            if (node.Module is not IModuleWiring master)
+            if (WiringOf(node) is not { } master)
             {
                 foreach (var slave in node.Manifest.Slaves!)
                     badEdges.Add(new(node.Manifest.Id, slave.Id, BadEdgeReason.MasterDoesNotWire,
@@ -260,7 +264,7 @@ public sealed class Kernel
         }
 
         await AttachTriggersAsync(cancellationToken).ConfigureAwait(false);
-        lock (_gate) { _issues = issues; _badEdges = badEdges.ToArray(); }
+        lock (_gate) { _issues = issues; _badEdges = badEdges.ToArray(); _state = KernelRunState.Running; }
         return Result<ModuleReceipt>.Success(new(Snapshot().Select(node => node.Info()).ToArray(), wired + _runtimeEdges,
             badEdges, cycles, issues, Rhythms));
     }
@@ -560,7 +564,7 @@ public sealed class Kernel
         var wired = 0;
         if (node.Manifest.Slaves is { Count: > 0 })
         {
-            if (module is IModuleWiring master)
+            if (WiringOf(node) is { } master)
             {
                 foreach (var slave in node.Manifest.Slaves!)
                 {
@@ -655,21 +659,37 @@ public sealed class Kernel
         IReadOnlyList<string>? kinds = null, string? typeId = null, CancellationToken cancellationToken = default)
     {
         if (instance is null) return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, "An instance cannot be null."));
+        var edge = new ModuleSlave(instance.Id, kinds ?? [], RequireAll: false);
         KernelNode master;
+        KernelNode node;
         lock (_gate)
         {
-            if (!_nodes.TryGetValue(masterId, out master!))
+            // Before startup the master may only be *declared*: the graph does not exist yet, and refusing here
+            // would be answering a question startup has not asked. A provider built from its file belongs to this
+            // case — it is held before anything runs.
+            if (!_nodes.TryGetValue(masterId, out master!) && !_declared.TryGetValue(masterId, out master!))
                 return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, $"No module answers to \"{masterId}\"."));
-            if (_nodes.ContainsKey(instance.Id))
+            if (_nodes.ContainsKey(instance.Id) || _declared.ContainsKey(instance.Id))
                 return Result<ModuleAddition>.Failure(new(ErrorCode.Conflict, $"A module already answers to \"{instance.Id}\"."));
-        }
-        if (master.Module is not IModuleWiring wiring)
-            return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, $"{masterId} does not hold instances."));
 
-        var manifest = new ModuleManifest(instance.Id, typeId ?? instance.Id.Value, true, null,
-            [new ModuleSlave(masterId, kinds ?? [], RequireAll: false)], []);
-        var node = new KernelNode(manifest, instance);
-        lock (_gate) _nodes[instance.Id] = node;
+            // The edge lives on the master, and only there: the master is what holds the instance and what has to
+            // accept it during Wire. Writing the master into the instance's own slave list would make the instance a
+            // master too — the kernel would then ask it to wire its "slave", and report the refusal as a bad edge.
+            node = new KernelNode(new ModuleManifest(instance.Id, typeId ?? instance.Id.Value), instance);
+            if (_state == KernelRunState.BeforeStart)
+            {
+                // Nothing to phase through yet: this is a declaration that happens to come from a manager. Startup
+                // will initialize, wire and start it like any other, so the receipt counts the edge and the master
+                // still has to accept it.
+                _declared[instance.Id] = node;
+                master.AdoptSlave(edge);
+                return Result<ModuleAddition>.Success(new(node.Info(), []));
+            }
+            _nodes[instance.Id] = node;
+        }
+
+        if (WiringOf(master) is not { } wiring)
+            return Result<ModuleAddition>.Failure(new(ErrorCode.Invalid, $"{masterId} does not hold instances."));
 
         await InitializeAsync(node, cancellationToken).ConfigureAwait(false);
         if (node.Phase != ModulePhase.Initialized)
@@ -680,17 +700,17 @@ public sealed class Kernel
         catch (Exception ex) { accepted = Result.Failure(new(ErrorCode.Internal, "Wire threw.", ex.Message)); }
         if (!accepted.Ok)
         {
-            var edge = new BadEdge(masterId, instance.Id, BadEdgeReason.RejectedByMaster, accepted.Error?.Message ?? "Rejected.");
-            KeepBadEdges([edge]);
+            var bad = new BadEdge(masterId, instance.Id, BadEdgeReason.RejectedByMaster, accepted.Error?.Message ?? "Rejected.");
+            KeepBadEdges([bad]);
             lock (_gate) _nodes.Remove(instance.Id);
-            return Result<ModuleAddition>.Success(new(node.Info(), [edge]));
+            return Result<ModuleAddition>.Success(new(node.Info(), [bad]));
         }
 
         // The edge is recorded on the master too, so the next receipt shows it as a declared slave rather than as
         // something that only exists in this method's local variable.
         lock (_gate)
         {
-            master.AdoptSlave(new ModuleSlave(instance.Id, kinds ?? [], RequireAll: false));
+            master.AdoptSlave(edge);
             _runtimeEdges++;
         }
 
@@ -839,6 +859,14 @@ public sealed class Kernel
     private static ITriggerSource? SourceOf(KernelNode node) =>
         node.Module as ITriggerSource ?? (node.Module as IModuleCarrier)?.Target as ITriggerSource;
 
+    /// <summary>
+    /// The same door for the master side: a node that holds slaves may be the manager itself or a carrier around it
+    /// (a manager the host runs outside the phase machine is a <see cref="PassiveNode"/>). One lookup, so a new kind
+    /// of wrapper never means a new place for the kernel to forget.
+    /// </summary>
+    private static IModuleWiring? WiringOf(KernelNode node) =>
+        node.Module as IModuleWiring ?? (node.Module as IModuleCarrier)?.Target as IModuleWiring;
+
     private KernelNode[] Snapshot()
     {
         lock (_gate) return _nodes.Values.ToArray();
@@ -851,6 +879,17 @@ public sealed class Kernel
 
     private static string? Describe(Result result) =>
         result.Ok ? null : result.Error?.Detail is { } detail ? $"{result.Error.Message} {detail}" : result.Error?.Message;
+
+    /// <summary>Where the phase machine is, which is what decides how an announcement is handled.</summary>
+    private enum KernelRunState
+    {
+        /// <summary>Declarations only: nothing has a phase yet.</summary>
+        BeforeStart,
+        /// <summary>Inside <see cref="StartAsync"/>: the nodes exist, so an instance walks its own phases now.</summary>
+        Starting,
+        /// <summary>Startup finished; additions and removals are the only way in.</summary>
+        Running
+    }
 
     private sealed class KernelNode(ModuleManifest manifest, IKernelModule module)
     {

@@ -302,6 +302,17 @@ if (!memoryDeclared.Ok)
     queue.Complete();
     return 1;
 }
+// The model manager holds provider instances, so it is a master and has to be a node. It has no phases of its own —
+// the host builds providers from their files — so it is a carrier, and the kernel finds its wiring through the
+// carrier door like it finds everything else.
+var modelManagerDeclared = kernel.Declare(new PassiveNode(new ModuleId(ModuleNames.ModelManager), modelManager), typeId: ModuleNames.ModelManager);
+if (!modelManagerDeclared.Ok)
+{
+    Console.Error.WriteLine(modelManagerDeclared.Error?.Message ?? "Model manager declaration failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
 // Instances are announced to the graph by the manager that holds them, so "what is mounted on this Channel" stops
 // being a question only the manager can answer (docs/23 §4 step 1). Installed before startup, because reviving a
 // stored Channel happens *during* startup — wiring it afterwards would announce only the ones created later.
@@ -311,6 +322,22 @@ if (channels is IInstanceNodeSink sink)
 // kernel's Ready phase, and an Adapter that is not a node never gets attached to the clock.
 if (adapters is IInstanceNodeSink adapterNodes)
     adapterNodes.UseInstanceNodes(new InstanceNodeHost(kernel, new ModuleId(ModuleNames.AdapterManager)));
+// Model providers were built from their files long before the graph existed, so nothing announced them at the time.
+// Announcing them now — before startup — makes them ordinary declarations: startup initializes, wires and starts
+// them, and the receipt counts their edges like everybody else's.
+var modelNodeHost = new InstanceNodeHost(kernel, new ModuleId(ModuleNames.ModelManager));
+if (modelManager is IInstanceNodeSink modelNodes)
+    modelNodes.UseInstanceNodes(modelNodeHost);
+foreach (var provider in modelManager.Entries())
+{
+    var announced = await modelNodeHost.AttachAsync(new ModuleId(ModuleNames.ModelManager), provider.Id,
+        provider.TypeId, null, CancellationToken.None);
+    if (announced.Ok) continue;
+    Console.Error.WriteLine(announced.Error?.Message ?? $"Model provider {provider.Id} could not be announced.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
 // The clock is a node too, so the graph can answer "who is on a schedule". It has no phases of its own - the host
 // runs its loop - so it is a passive carrier rather than a participant.
 var clockDeclared = kernel.Declare(new PassiveNode(new ModuleId(ModuleNames.Clock), clock), typeId: ModuleNames.Clock);

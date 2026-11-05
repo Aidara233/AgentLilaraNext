@@ -122,4 +122,51 @@ public sealed class ModelConfigurationTests : IDisposable
         var entry = Assert.Single((await store.LoadAllAsync(default)).Value!);
         Assert.False(entry.Spec.Enabled);
     }
+
+    [Fact]
+    public async Task A_provider_is_a_node_while_it_is_held_and_stops_being_one_when_it_is_destroyed()
+    {
+        // A mount that names a provider points at a node; a provider that only exists in the manager's dictionary is
+        // a target the graph cannot draw an edge to (docs/23 §4 step 1).
+        var models = new ModelManager();
+        Assert.True(models.RegisterFactory("test.models", new NodeStubFactory()).Ok);
+        var kernel = new Kernel(_root, new ModuleFactoryRegistry());
+        Assert.True(kernel.Declare(new PassiveNode(models.Id, models), typeId: ModuleNames.ModelManager).Ok);
+        models.UseInstanceNodes(new InstanceNodeHost(kernel, models.Id));
+        Assert.True((await kernel.StartAsync(default)).Ok);
+
+        var address = new Address("model", "stub", "one");
+        var created = await models.CreateAsync(new(address, "{}", "model.stub"), default);
+        Assert.True(created.Ok, created.Error?.Message);
+
+        var node = kernel.Nodes.Single(candidate => candidate.Id.Value == "model.stub#one");
+        Assert.Equal(ModulePhase.Ready, node.Phase);
+        Assert.Equal("model.stub", node.Type);
+        // Accepted, so nothing about this edge is in the "never became a call" list.
+        Assert.Empty(kernel.Status.BadEdges);
+
+        var destroyed = await models.DestroyAsync(address, default);
+        Assert.True(destroyed.Ok, destroyed.Error?.Message);
+        Assert.Null(kernel.Find(new ModuleId("model.stub#one")));
+    }
+
+    private sealed class NodeStubFactory : IModelProviderFactory
+    {
+        public string TypeId => "model.stub";
+        public ModelProviderDescriptor Describe { get; } = new("model.stub", "chat", "Stub", ModelCapabilities.Streaming);
+        public ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken) =>
+            ValueTask.FromResult(Result<IModelProvider>.Success(new NodeStubProvider(spec.Address)));
+    }
+
+    private sealed class NodeStubProvider(Address address) : IModelProvider
+    {
+        public Address Address { get; } = address;
+        public ModuleId Id => new(Address.ToString());
+        public ModelProviderDescriptor Describe { get; } = new("model.stub", "chat", "Stub", ModelCapabilities.Streaming);
+        public IAsyncEnumerable<ModelEvent> CompleteAsync(ModelRequest request, CancellationToken cancellationToken = default) =>
+            Empty();
+
+        private static async IAsyncEnumerable<ModelEvent> Empty() { await Task.Yield(); yield break; }
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
 }
