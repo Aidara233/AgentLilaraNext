@@ -40,9 +40,11 @@ var moduleLoggers = new SignalModuleLoggerFactory(signalLog);
 var queue = new EventQueue(capacity: 256);
 // The address book. Not a module itself: if it were, finding a module would require a module.
 var modules = new ModuleCatalog();
-var adapterSpecs = new FileAdapterSpecStore(data.Root);
-var channelSpecs = new FileChannelSpecStore(data.Root);
 var adapterTypes = new AdapterTypeCatalog();
+// The spec stores are given the type tree: "is this record mine" is a question about types, not about how a type id
+// happens to be spelled (C-04/C-06).
+var adapterSpecs = new FileAdapterSpecStore(data.Root, adapterTypes);
+var channelSpecs = new FileChannelSpecStore(data.Root, adapterTypes);
 var bindings = new InstanceBindingsProxy();
 var adapterFactories = new AdapterFactoryRegistry();
 // One registry for every tunable: components register themselves, the registry validates, applies, persists.

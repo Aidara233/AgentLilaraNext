@@ -11,7 +11,7 @@ namespace ALN.Runtime;
 /// The address is the id, so it is not repeated inside the payload: a file that names itself twice is a file that
 /// can disagree with its own directory.
 /// </summary>
-public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
+public sealed class FileAdapterSpecStore(string root, IModuleTypeCatalog? types = null) : IAdapterSpecStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -19,7 +19,13 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    private const string TypePrefix = "adapter.";
+    /// <summary>
+    /// Whether a stored record is this store's: asked of the type tree ("is this type an adapter"), never of the
+    /// spelling of the type id (C-04/C-06). With no type tree nothing can be classified, so every record is read and
+    /// the parse decides — guessing by prefix is what this replaced.
+    /// </summary>
+    private bool Belongs(string? type, string category) =>
+        types is null || (type is not null && types.IsAssignableTo(type, category));
 
     public ValueTask<Result> SaveAsync(AdapterSpec spec, CancellationToken cancellationToken) =>
         SpecTree.WriteAsync(root, new ModuleId(spec.Address.ToString()), spec.TypeId,
@@ -32,7 +38,7 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
     public async ValueTask<Result<IReadOnlyList<AdapterSpec>>> LoadAllAsync(CancellationToken cancellationToken)
     {
         var entries = await SpecTree
-            .LoadAllAsync<AdapterSpecDocument>(root, type => type.StartsWith(TypePrefix, StringComparison.Ordinal), cancellationToken)
+            .LoadAllAsync<AdapterSpecDocument>(root, type => Belongs(type, "adapter"), cancellationToken)
             .ConfigureAwait(false);
         if (!entries.Ok) return Result<IReadOnlyList<AdapterSpec>>.Failure(entries.Error!);
 
@@ -60,11 +66,13 @@ public sealed class FileAdapterSpecStore(string root) : IAdapterSpecStore
 }
 
 /// <summary>Channel specs: one module directory per channel, named after its id, holding <c>module.json</c>.</summary>
-public sealed class FileChannelSpecStore(string root) : IChannelSpecStore
+public sealed class FileChannelSpecStore(string root, IModuleTypeCatalog? types = null) : IChannelSpecStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
 
-    private const string TypePrefix = "channel.";
+    /// <summary>Same rule as the adapter store: the type tree says what a record is, its spelling does not.</summary>
+    private bool Belongs(string? type, string category) =>
+        types is null || (type is not null && types.IsAssignableTo(type, category));
 
     public ValueTask<Result> SaveAsync(ChannelSpec spec, CancellationToken cancellationToken) =>
         SpecTree.WriteAsync(root, new ModuleId(spec.Address.ToString()), spec.TypeId, new ChannelSpecDocument(
@@ -78,7 +86,7 @@ public sealed class FileChannelSpecStore(string root) : IChannelSpecStore
     public async ValueTask<Result<IReadOnlyList<ChannelSpec>>> LoadAllAsync(CancellationToken cancellationToken)
     {
         var entries = await SpecTree
-            .LoadAllAsync<ChannelSpecDocument>(root, type => type.StartsWith(TypePrefix, StringComparison.Ordinal), cancellationToken)
+            .LoadAllAsync<ChannelSpecDocument>(root, type => Belongs(type, "channel"), cancellationToken)
             .ConfigureAwait(false);
         if (!entries.Ok) return Result<IReadOnlyList<ChannelSpec>>.Failure(entries.Error!);
 
