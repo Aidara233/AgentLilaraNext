@@ -57,12 +57,14 @@ var timeSource = sessionExtensions.Register(new TimeContextSource());
 if (!timeSource.Ok) { Console.Error.WriteLine(timeSource.Error?.Message); return 1; }
 var channelInfoSource = sessionExtensions.Register(new ChannelInfoSource());
 if (!channelInfoSource.Ok) { Console.Error.WriteLine(channelInfoSource.Error?.Message); return 1; }
-// Memory is a module of its own: it registers its own line and its own tools, and nothing else knows it exists.
-var memoryModule = new MemoryModule(storage, sessionExtensions);
 // Everything a model may reach on disk goes through this one port, and the scopes it knows are registered here and
 // nowhere else. The memory library is the first; another is added by registering it here and naming it in that
 // module's own module.json — never by a module inventing a path.
 var fileAccess = new LocalFileSystemAccess(data.Root, [FileScopes.Memory]);
+// Memory is a module of its own: it registers its own line and its own tools, and nothing else knows it exists. It
+// reads and writes through the port above, so "the model may tidy memory with file tools" needs no special case:
+// they reach the same files by the same rules.
+var memoryModule = new MemoryModule(new FileMemoryLibrary(fileAccess), sessionExtensions);
 // The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.

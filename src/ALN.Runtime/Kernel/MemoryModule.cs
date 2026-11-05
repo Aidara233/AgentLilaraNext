@@ -15,13 +15,13 @@ namespace ALN.Runtime;
 /// Registering in Initialize (not in a constructor) is what makes the graph honest: before Initialize nothing is
 /// allowed to be visible to anything else.
 /// </summary>
-public sealed class MemoryModule(IMemoryStore store, ISessionExtensionRegistry extensions, TimeProvider? timeProvider = null)
+public sealed class MemoryModule(IMemoryLibrary library, ISessionExtensionRegistry extensions, TimeProvider? timeProvider = null)
     : IKernelModule
 {
     public const string TypeId = "memory.store";
 
-    private readonly MemoryContextSource _floating = new(store);
-    private readonly MemoryToolSource _tools = new(store, timeProvider);
+    private readonly MemoryGroupsSource _floating = new(library);
+    private readonly MemoryTools _tools = new(library, timeProvider);
     private bool _registered;
 
     public ModuleId Id { get; } = new(ModuleNames.Memory);
