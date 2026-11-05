@@ -144,6 +144,39 @@ public sealed class KernelTests : IDisposable
     }
 
     [Fact]
+    public async Task A_module_that_needs_a_name_nobody_answers_fails_at_startup()
+    {
+        // C-19: modules are equal and find each other by name. A name nobody answers is a startup failure of that
+        // module, not a surprise on the first message — and it does not take the others down with it.
+        var needy = new Needy(new("needy"), ["somebody"]);
+        var fine = new TestModule(new("fine"));
+        Add(needy, "test.needy");
+        Add(fine, "test.plain");
+
+        var receipt = await Start();
+
+        var failed = receipt.Instances.Single(instance => instance.Id.Value == "needy");
+        Assert.Equal(ModulePhase.Failed, failed.Phase);
+        Assert.Contains("somebody", failed.Failure ?? "", StringComparison.Ordinal);
+        Assert.Contains(needy.Errors, error => error.Message.Contains("somebody", StringComparison.Ordinal));
+        Assert.Equal(ModulePhase.Ready, receipt.Instances.Single(instance => instance.Id.Value == "fine").Phase);
+    }
+
+    [Fact]
+    public async Task A_name_the_module_needs_only_has_to_be_answered_by_someone()
+    {
+        var needy = new Needy(new("needy"), ["fine"]);
+        var fine = new TestModule(new("fine"));
+        Add(needy, "test.needy");
+        Add(fine, "test.plain");
+
+        var receipt = await Start();
+
+        Assert.Equal(ModulePhase.Ready, receipt.Instances.Single(instance => instance.Id.Value == "needy").Phase);
+        Assert.Empty(needy.Errors);
+    }
+
+    [Fact]
     public async Task A_startup_with_broken_edges_completes_and_reports_each_one()
     {
         var missing = new TestMaster(new("missing"));
@@ -606,6 +639,11 @@ public sealed class KernelTests : IDisposable
             Errors.Add(error);
             return OnError?.Invoke(error) ?? ValueTask.FromResult(Result.Success());
         }
+    }
+
+    private sealed class Needy(ModuleId id, IReadOnlyList<string> requires) : TestModule(id), IRequireModules
+    {
+        public IReadOnlyList<string> Requires { get; } = requires;
     }
 
     private sealed class TestMaster(ModuleId id) : TestModule(id), IModuleWiring

@@ -259,6 +259,27 @@ public sealed class Kernel
                     $"{badEdges[i].Slave}: {badEdges[i].Detail}", cancellationToken).ConfigureAwait(false);
         }
 
+        // 2.5 — Requirements: a module that finds its peers by name says which names it will ask for. Checked once,
+        // here, so a missing peer fails the module at startup instead of failing the first message that needed it.
+        // Nothing is ordered by this: the question is only "does somebody answer to that name", never "who first".
+        foreach (var instance in initialized.Where(instance => instance.Module is IRequireModules))
+        {
+            var requires = ((IRequireModules)instance.Module).Requires;
+            foreach (var name in requires)
+            {
+                var id = new ModuleId(name);
+                KernelInstance? peer;
+                lock (_gate) _instances.TryGetValue(id, out peer);
+                if (peer is not null && peer.Manifest.Enabled && peer.Phase is ModulePhase.Initialized or ModulePhase.Ready)
+                    continue;
+                var message = peer is null
+                    ? $"Requires \"{name}\", and nothing answers to it."
+                    : $"Requires \"{name}\", which is {peer.Phase.ToString().ToLowerInvariant()} rather than up.";
+                await MissedRequirementAsync(instance, message, cancellationToken).ConfigureAwait(false);
+                break;
+            }
+        }
+
         // 3 — Ready: dependencies first, and modules that depend on each other at the same time.
         var components = Components(initialized);
         var cycles = components.Where(component => component.Count > 1)
@@ -282,7 +303,10 @@ public sealed class Kernel
             }
 
             var ready = new List<Task>();
-            foreach (var instance in component) ready.Add(ReadyAsync(instance, cancellationToken));
+            // A module that already failed is not asked to become ready: its requirement was not answered, and asking
+            // it to prepare would only overwrite that failure with a later one.
+            foreach (var instance in component.Where(instance => instance.Phase == ModulePhase.Initialized))
+                ready.Add(ReadyAsync(instance, cancellationToken));
             await Task.WhenAll(ready).ConfigureAwait(false);
             foreach (var instance in component.Where(instance => instance.Phase != ModulePhase.Ready)) unfinishable.Add(instance.Manifest.Id);
         }
@@ -475,6 +499,17 @@ public sealed class Kernel
             // Same rule as everywhere else: one attempt at telling, then nothing.
             Record(instance, nameof(IKernelModule.OnErrorAsync), ex.Message, ex);
         }
+    }
+
+    /// <summary>
+    /// A name the module said it needs is not answered. The module itself fails — it told the kernel it could not
+    /// work without that name — and its own error hook hears why, so the reason is in the module's log and not only in
+    /// a receipt. Everything else keeps going: only the module that cannot work is out.
+    /// </summary>
+    private async ValueTask MissedRequirementAsync(KernelInstance instance, string message, CancellationToken cancellationToken)
+    {
+        await ReportErrorAsync(instance, new(nameof(IRequireModules.Requires), message), cancellationToken).ConfigureAwait(false);
+        instance.Phase = ModulePhase.Failed;
     }
 
     private KernelInstance? Resolve(ModuleId id, List<BadEdge> badEdges, ModuleId master)

@@ -104,6 +104,17 @@ public interface IModuleWiring
     Result WireSlave(ModuleId slaveId, IReadOnlyList<string> kinds, IKernelModule instance);
 }
 
+/// <summary>
+/// The names a module will look up while it works. Nothing is ordered by this list — it is an existence claim, checked
+/// once before the graph is declared ready, so a missing peer is a startup failure instead of a failure on the first
+/// message that happens to need it. A module that finds its peers by name (rather than by being handed them) has to
+/// say which names it will ask for.
+/// </summary>
+public interface IRequireModules
+{
+    IReadOnlyList<string> Requires { get; }
+}
+
 /// <summary>Maps a manifest's <c>type</c> to the code that implements it. Types are declared, never derived.</summary>
 public interface IModuleFactoryRegistry
 {
