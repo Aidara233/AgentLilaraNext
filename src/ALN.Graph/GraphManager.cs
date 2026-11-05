@@ -306,16 +306,27 @@ public sealed class GraphManager : IGraphRuntime, IModule
     private static string LibraryOf(ScriptPackage package) =>
         string.IsNullOrWhiteSpace(package.Origin) ? "user" : package.Origin;
 
-    /// <summary>One namespace for both switches: <c>library:&lt;id&gt;</c> and <c>script:&lt;id&gt;</c>.</summary>
-    private static string SwitchKey(string target) =>
-        target.StartsWith("library:", StringComparison.Ordinal) || target.StartsWith("script:", StringComparison.Ordinal)
-            ? target
-            : target.Contains(':') || target is "user" or "bundled"
-                ? "library:" + target
-                : "script:" + target;
+    /// <summary>
+    /// The key a switch is stored under. <c>library:</c> and <c>script:</c> are this store's own encoding of two
+    /// kinds, not a rule about what a name means: when the caller gives a bare name, the catalog says which kind it
+    /// is — a name that a script answers to is a script, otherwise it is a library. Nothing is inferred from how the
+    /// name is spelled.
+    /// </summary>
+    private string SwitchKey(string target)
+    {
+        if (target.StartsWith(LibraryPrefix, StringComparison.Ordinal) || target.StartsWith(ScriptPrefix, StringComparison.Ordinal))
+            return target;
+        if (_packages.ContainsKey(target)) return ScriptPrefix + target;
+        if (_packages.Values.Select(LibraryOf).Contains(target, StringComparer.Ordinal)) return LibraryPrefix + target;
+        // Unknown: report it as a script so the caller gets "nothing matches" rather than a guess that stuck.
+        return ScriptPrefix + target;
+    }
+
+    private const string LibraryPrefix = "library:";
+    private const string ScriptPrefix = "script:";
 
     private bool IsEnabled(ScriptPackage package) =>
-        !_disabled.Contains("script:" + package.Manifest.Id) && !_disabled.Contains("library:" + LibraryOf(package));
+        !_disabled.Contains(ScriptPrefix + package.Manifest.Id) && !_disabled.Contains(LibraryPrefix + LibraryOf(package));
 
     public async ValueTask<Result> SetScriptEnabledAsync(string target, bool enabled, CancellationToken cancellationToken)
     {
@@ -324,9 +335,9 @@ public sealed class GraphManager : IGraphRuntime, IModule
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var known = key.StartsWith("library:", StringComparison.Ordinal)
-                ? _packages.Values.Select(LibraryOf).Distinct(StringComparer.Ordinal).Contains(key["library:".Length..])
-                : _packages.ContainsKey(key["script:".Length..]);
+            var known = key.StartsWith(LibraryPrefix, StringComparison.Ordinal)
+                ? _packages.Values.Select(LibraryOf).Distinct(StringComparer.Ordinal).Contains(key[LibraryPrefix.Length..])
+                : _packages.ContainsKey(key[ScriptPrefix.Length..]);
             if (!known) return Result.Failure(new(ErrorCode.Invalid, $"Nothing in the catalog matches '{target}'."));
 
             var changed = enabled ? _disabled.Remove(key) : _disabled.Add(key);
