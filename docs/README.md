@@ -21,7 +21,7 @@
 | **能力 + 审计** | **界**（唯一碰 OS 的地方） | host（极小） | 改版本 |
 
 ```
-ClockSource ──clock.pulse──▶ RoutedEvent 队列 ──target=Adapter──▶ Graph poll script ──▶ FileAdapter.PollOnce
+ClockSource ──OnTriggerAsync(Schedule)──▶ FileAdapter.PollOnce（触发是关系，不是事件；`22` §1.4）
                                                                          │ adapter.envelope
                                                                          ▼
 平台/文件夹 ⇄ Adapter ──adapter.envelope──▶ Graph intake 脚本
