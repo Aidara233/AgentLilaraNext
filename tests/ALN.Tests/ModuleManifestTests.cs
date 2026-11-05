@@ -20,6 +20,27 @@ public sealed class ModuleManifestTests : IDisposable
     }
 
     [Fact]
+    public async Task A_directory_whose_type_the_host_builds_is_skipped_instead_of_reported()
+    {
+        // Every instance has its own module.json too (docs/22 §2), and its type belongs to a manager. Reporting those
+        // as "unknown module type" would put one false line per adapter, per channel and per provider into the
+        // receipt — a receipt nobody can read is the same as no receipt.
+        Write("channel.conversation#chat", """{ "id": "channel.conversation#chat", "type": "channel.conversation" }""");
+        Write("mystery", """{ "id": "mystery", "type": "not.a.type" }""");
+
+        var scan = await new ModuleManifestStore(_root).ScanAsync(_types,
+            typeId => typeId == "channel.conversation", default);
+
+        Assert.Empty(scan.Manifests);
+        var issue = Assert.Single(scan.Issues);
+        Assert.Contains("not.a.type", issue.Message, StringComparison.Ordinal);
+
+        // Without the answer, both are unknown — the distinction is the host's, and the scan does not invent it.
+        var blind = await new ModuleManifestStore(_root).ScanAsync(_types, default);
+        Assert.Equal(2, blind.Issues.Count);
+    }
+
+    [Fact]
     public async Task A_module_is_read_from_its_own_directory_and_its_config_is_not_parsed()
     {
         Write("thing#one", """

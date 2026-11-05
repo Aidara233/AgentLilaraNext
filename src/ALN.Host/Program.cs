@@ -278,7 +278,12 @@ var deadlineSweepTask = sessions.RunDeadlineSweepAsync(deadlines, TimeProvider.S
 
 // The host's only startup act: build the graph and hand it to the kernel, which decides the phases, the order
 // and what to do about a module that fails. The host does not know what a wave is.
-var kernel = new Kernel(data.Root, new ModuleFactoryRegistry(), signalLog);
+// The kernel is told which types this process builds itself: every instance has a module.json too (docs/22 §2), and
+// its type belongs to a manager, so the loader must not treat the directory as a module it failed to understand.
+var kernel = new Kernel(data.Root, new ModuleFactoryRegistry(), signalLog, hostOwnsTypes: typeId =>
+    adapterTypes.IsConcrete(typeId) ||
+    string.Equals(typeId, SessionManager.SessionTypeId, StringComparison.Ordinal) ||
+    modelManager.ListTypes().Any(type => string.Equals(type.TypeId, typeId, StringComparison.Ordinal)));
 foreach (var declared in new (ILifecycleParticipant Participant, string TypeId)[]
          {
              (adapters, ModuleNames.AdapterManager),

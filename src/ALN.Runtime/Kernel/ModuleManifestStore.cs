@@ -33,7 +33,19 @@ public sealed class ModuleManifestStore(string root)
     public string Root { get; } = root;
     public string ModulesRoot => Path.Combine(Root, DirectoryName);
 
-    public async ValueTask<ManifestScan> ScanAsync(IModuleFactoryRegistry? types, CancellationToken cancellationToken)
+    public async ValueTask<ManifestScan> ScanAsync(IModuleFactoryRegistry? types, CancellationToken cancellationToken) =>
+        await ScanAsync(types, hostOwns: null, cancellationToken).ConfigureAwait(false);
+
+    /// <summary>
+    /// The same scan, told which types the host instantiates itself.
+    ///
+    /// Every instance lives in its own module directory too (docs/22 §2), and its <c>module.json</c> names a type the
+    /// kernel must not build: the manager does. Without this, every instance would come back as "unknown module type"
+    /// — one false issue per adapter, per channel, per provider — and the receipt would be noise nobody could read.
+    /// The type's own implementation decides who owns it, so the question is asked of the host, not parsed from the id.
+    /// </summary>
+    public async ValueTask<ManifestScan> ScanAsync(IModuleFactoryRegistry? types, Func<string, bool>? hostOwns,
+        CancellationToken cancellationToken)
     {
         var manifests = new List<ModuleManifest>();
         var issues = new List<ModuleIssue>();
@@ -102,6 +114,10 @@ public sealed class ModuleManifestStore(string root)
 
             if (types is not null && !types.IsRegistered(raw.Type))
             {
+                // Not the loader's to build: the host owns this type, so the file is that instance's configuration
+                // and the manager will announce the node when it holds it. Skipped silently — an issue here would be
+                // one line per instance, which is the same as no receipt at all.
+                if (hostOwns is not null && hostOwns(raw.Type)) continue;
                 issues.Add(new(path, $"Unknown module type: {raw.Type}"));
                 continue;
             }

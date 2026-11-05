@@ -23,6 +23,7 @@ public sealed class Kernel
     private readonly ISignalLog _signals;
     private readonly TimeSpan _stopTimeout;
     private readonly ModuleDataRoot _data;
+    private readonly Func<string, bool>? _hostOwnsTypes;
     private readonly Dictionary<ModuleId, KernelNode> _nodes = new();
     private readonly Dictionary<ModuleId, KernelNode> _declared = new();
     private readonly object _gate = new();
@@ -41,17 +42,20 @@ public sealed class Kernel
     // walk its own phases now — filing it as a declaration there is how a node ends up in no phase at all.
     private KernelRunState _state;
 
-    public Kernel(string dataRoot, IModuleFactoryRegistry types, ISignalLog? signals = null, TimeSpan? stopTimeout = null)
-        : this(new ModuleManifestStore(dataRoot), types, signals, stopTimeout)
+    public Kernel(string dataRoot, IModuleFactoryRegistry types, ISignalLog? signals = null, TimeSpan? stopTimeout = null,
+        Func<string, bool>? hostOwnsTypes = null)
+        : this(new ModuleManifestStore(dataRoot), types, signals, stopTimeout, hostOwnsTypes)
     {
     }
 
-    public Kernel(ModuleManifestStore store, IModuleFactoryRegistry types, ISignalLog? signals = null, TimeSpan? stopTimeout = null)
+    public Kernel(ModuleManifestStore store, IModuleFactoryRegistry types, ISignalLog? signals = null, TimeSpan? stopTimeout = null,
+        Func<string, bool>? hostOwnsTypes = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _types = types ?? throw new ArgumentNullException(nameof(types));
         _signals = signals ?? NullSignalLog.Instance;
         _stopTimeout = stopTimeout ?? TimeSpan.FromSeconds(5);
+        _hostOwnsTypes = hostOwnsTypes;
         _data = new ModuleDataRoot(store.Root);
     }
 
@@ -169,7 +173,7 @@ public sealed class Kernel
         foreach (var declared in Declared()) lock (_gate) _nodes[declared.Manifest.Id] = declared;
 
         // 0 — Scan: everything the disk says, plus one line per directory that is not a module.
-        var scan = await _store.ScanAsync(_types, cancellationToken).ConfigureAwait(false);
+        var scan = await _store.ScanAsync(_types, _hostOwnsTypes, cancellationToken).ConfigureAwait(false);
         var issues = new List<ModuleIssue>(scan.Issues);
 
         foreach (var manifest in scan.Manifests)
@@ -742,7 +746,7 @@ public sealed class Kernel
     /// </summary>
     public async ValueTask<Result<ModuleAddition>> LoadAsync(ModuleId id, CancellationToken cancellationToken)
     {
-        var scan = await _store.ScanAsync(_types, cancellationToken).ConfigureAwait(false);
+        var scan = await _store.ScanAsync(_types, _hostOwnsTypes, cancellationToken).ConfigureAwait(false);
         var manifest = scan.Manifests.FirstOrDefault(candidate => candidate.Id == id);
         if (manifest is null)
         {
