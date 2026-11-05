@@ -45,8 +45,8 @@ public readonly record struct ModuleId(string Value) : IComparable<ModuleId>
         !Reserved.Contains(value, StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Validation only: "is this a usable name", never "what does this name mean". Parsing is deliberately
-    /// absent — the old three-part address type is gone precisely so that nobody can write it again.
+    /// Validation only: "is this a usable name", never "what does this name mean". There is deliberately
+    /// nothing here that reads a type, a parent or an instance back out of the value.
     /// </summary>
     public static bool TryParse(string? text, out ModuleId id)
     {

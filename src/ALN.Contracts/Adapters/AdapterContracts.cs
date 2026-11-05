@@ -2,6 +2,8 @@ namespace ALN.Contracts;
 
 public readonly record struct Address(string Module, string? Kind = null, string? Instance = null)
 {
+    /// <summary>Two-part spelling kept for <see cref="ToString"/> and for the spec files. Reading a type or a
+    /// category out of it is what the constitution forbids (C-04/C-06): ask the module, not its name.</summary>
     public string TypeId => Kind is null ? Module : $"{Module}.{Kind}";
     public override string ToString() => Instance is null ? TypeId : $"{TypeId}#{Instance}";
     public bool IsInstance => !string.IsNullOrWhiteSpace(Module) && !string.IsNullOrWhiteSpace(Kind) && !string.IsNullOrWhiteSpace(Instance);
@@ -56,7 +58,7 @@ public sealed record SendResult(bool Sent, string AttemptId, string? Detail = nu
     string? PlatformMessageId = null);
 public sealed record AdapterInfo(Address Address, AdapterDescriptor Descriptor, AdapterState State,
     /// <summary>The type this instance implements, as declared in its spec — the only row of truth for "what is it".
-    /// Callers that filter by type read this, never the spelling of the address.</summary>
+    /// Callers that filter by type must read this, not the spelling of the address.</summary>
     string TypeId);
 
 /// <summary>
