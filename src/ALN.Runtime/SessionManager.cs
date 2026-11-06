@@ -793,12 +793,16 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             history = record.History;
 
             var channelTimeline = CollectChannelTimeline(history);
-            // How much room is left is a fact about this request, so it goes in the round block like the time does —
-            // never into history, and last, because it is the note rather than the subject.
-            var roundContext = collected.Value.RoundContext
+            // How much room is left, and how long it has been quiet, are facts about this request — they go in the
+            // round block like the time does, never into history, and last, because they are the note rather than the
+            // subject.
+            var notes = collected.Value.RoundContext
+                .Append(IdleNote(state.LastActiveAt, DateTimeOffset.UtcNow))
                 .Append(BudgetNote(TokenEstimator.Estimate(messages) + TokenEstimator.Estimate(visible), window))
+                .Where(note => note is not null)
+                .Select(note => note!)
                 .ToArray();
-            var channelContext = RenderChannelContext(channelTimeline, roundContext);
+            var channelContext = RenderChannelContext(channelTimeline, notes);
             if (channelContext.Length > 0) messages.Add(new ModelMessage("user", channelContext));
             var turnUsage = new ModelUsage(0, 0);
             var executedCalls = new List<ModelToolCall>();
@@ -1871,6 +1875,33 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             .FirstOrDefault(candidate => string.Equals(candidate.Id, spec.ModelProfileId, StringComparison.Ordinal));
         return profile?.EffectiveContextWindow ?? ModelProfile.AssumedContextWindow;
     }
+
+    /// <summary>
+    /// How long the conversation has been quiet, when it has been long enough to matter.
+    ///
+    /// A model can read the clock but not the gap: it sees "16:20" and has no way to know whether the last thing said was
+    /// ten minutes or three weeks ago. That gap is the one moment when compacting is free — the provider's prefix cache
+    /// has already expired, so the jump costs nothing that was not already being paid — and it is also the moment when a
+    /// model is most likely to answer a stale question. One line says both.
+    /// </summary>
+    private static CollectedRoundContext? IdleNote(DateTimeOffset? lastActiveAt, DateTimeOffset now)
+    {
+        if (lastActiveAt is not { } last) return null;
+        var quiet = now - last;
+        if (quiet < TimeSpan.FromHours(IdleNoticeHours)) return null;
+        var days = (int)quiet.TotalDays;
+        var span = days >= 1 ? $"{days} 天" : $"{(int)quiet.TotalHours} 小时";
+        return new CollectedRoundContext("session.idle", "idle", "idle",
+            $"距上一次有动静（说话或有工具执行）已经 {span}。上一次请求的缓存多半已经过期，所以现在压一次不额外花钱：" +
+            "如果之前那件事已经办完、细节用不上了，先调 compact 再开始新的；如果它还没完，就接着做完。",
+            IdleNoteOrder);
+    }
+
+    /// <summary>Where the idle note sits: right before the budget line, since the two are read together.</summary>
+    private const int IdleNoteOrder = 190;
+
+    /// <summary>Quiet for longer than this is worth mentioning. A day, because anything shorter is a normal pause.</summary>
+    public const int IdleNoticeHours = 24;
 
     /// <summary>
     /// What the model is told about its own room, as a floating field. A model that cannot see the ceiling either

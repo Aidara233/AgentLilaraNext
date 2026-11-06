@@ -179,6 +179,33 @@ public sealed class SessionReplayWiringTests : IDisposable
         Assert.Single(history, line => line.Contains("\"role\":\"system\"", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task A_conversation_that_has_been_quiet_for_days_is_told_how_long()
+    {
+        // The model can read the clock but not the gap. "Quiet for three days" is the one moment compacting is free —
+        // the prefix cache has expired anyway — and also the moment it is most likely to answer a stale question.
+        var model = new ReplayModel(Turn(), contextWindow: 12_000);
+        var spec = new SessionSpec("default", "Keep reading.", "1", Tools: [ReadShape]);
+        var toolbox = new ReplayToolbox(new ReadingTool("短文"));
+        Assert.True((await new SessionManager(_root, model).TurnAsync("s-1", spec, Guid.NewGuid(),
+            new SessionTurnInput([], null, null), toolbox, default)).Ok);
+
+        // Three days of silence, as a restart would find it.
+        var options = new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web);
+        var statePath = Path.Combine(_root, "modules", "s-1", "state.json");
+        var state = System.Text.Json.JsonSerializer.Deserialize<SessionState>(await File.ReadAllTextAsync(statePath), options)!;
+        await File.WriteAllTextAsync(statePath,
+            System.Text.Json.JsonSerializer.Serialize(state with { LastActiveAt = DateTimeOffset.UtcNow.AddDays(-3) }, options));
+
+        Assert.True((await new SessionManager(_root, model).TurnAsync("s-1", spec, Guid.NewGuid(),
+            new SessionTurnInput([], null, null), toolbox, default)).Ok);
+
+        var messages = model.Requests.Last().Messages;
+        Assert.Contains(messages, message =>
+            message.Content?.Contains("<section name=\"idle\"", StringComparison.Ordinal) == true);
+        Assert.Contains(messages, message => message.Content?.Contains("3 天", StringComparison.Ordinal) == true);
+    }
+
     /// <summary>Turns of history as the loop would have written them, so a segment exists to summarize.</summary>
     private async Task SeedAsync(int activations)
     {
