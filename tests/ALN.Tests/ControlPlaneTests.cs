@@ -77,6 +77,36 @@ public sealed class ControlPlaneTests : IDisposable
     }
 
     [Fact]
+    public async Task The_subject_is_recorded_and_the_arguments_are_not()
+    {
+        // "Who changed what" has to survive the call, and an argument object is where a credential lives. So the
+        // descriptor names one argument and only that one is written down.
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(plane.Register(new("demo.patch", "Patch a thing.", "demo.write", true,
+            ParamsJson: """{"type":"object","properties":{"id":{"type":"string"},"key":{"type":"string"}},"required":["id"]}""",
+            Subject: "id"),
+            (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(JsonSerializer.SerializeToElement(new { ok = 1 })))).Ok);
+
+        var ok = await plane.InvokeAsync(User("demo.write"), "demo.patch",
+            JsonSerializer.SerializeToElement(new { id = "thing-1", key = "sk-must-not-be-logged" }), default);
+
+        Assert.True(ok.Ok, ok.Error?.Message);
+        var signal = Assert.Single(_signals.Snapshot(), r => r.Name == "demo.patch" && r.Outcome == "ok");
+        Assert.Equal("thing-1", signal.Detail!["subject"]);
+        Assert.DoesNotContain("sk-must-not-be-logged", JsonSerializer.Serialize(signal.Detail));
+        Assert.Contains("subject=thing-1", Assert.Single(_audit).Detail);
+
+        // An action that does not say which argument is the subject gets no subject, rather than a guess from the
+        // first field that happens to be a string.
+        _audit.Clear();
+        Assert.True(plane.Register(new("demo.opaque", "No subject.", "demo.write", true),
+            (_, _) => ValueTask.FromResult(Result<JsonElement>.Failure(new(ErrorCode.Invalid, "nope")))).Ok);
+        Assert.False((await plane.InvokeAsync(User("demo.write"), "demo.opaque",
+            JsonSerializer.SerializeToElement(new { id = "thing-2" }), default)).Ok);
+        Assert.DoesNotContain("thing-2", JsonSerializer.Serialize(_audit));
+    }
+
+    [Fact]
     public void Wildcards_grant_a_group_but_not_everything()
     {
         Assert.True(new Actor("ops", ActorKind.User, ["demo.*"]).Allows("demo.read"));

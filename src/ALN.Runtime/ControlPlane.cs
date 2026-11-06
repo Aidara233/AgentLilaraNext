@@ -41,15 +41,19 @@ public sealed class ControlPlane(IAuditSink audit, ISignalLog signalLog) : ICont
         if (entry is null)
         {
             // Unknown actions are not an authorization problem: they simply do not exist.
-            await RecordAsync(actor, actionId, "unknown", null, cancellationToken).ConfigureAwait(false);
+            await RecordAsync(actor, actionId, "unknown", SubjectOf(null, arguments), null, cancellationToken).ConfigureAwait(false);
             return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Unknown action: {actionId}"));
         }
+        // Read before the call: a handler that fails may still have changed something, and the thing it was asked to
+        // change is the half of the story that survives.
+        var subject = SubjectOf(entry.Descriptor, arguments);
         if (!actor.Allows(entry.Descriptor.Capability))
         {
             var reason = $"Actor {actor.Id} lacks capability {entry.Descriptor.Capability}.";
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, Guid.Empty, actor.Id,
-                new Address("control", "action", actionId), actionId, "denied", reason), cancellationToken).ConfigureAwait(false);
-            await RecordAsync(actor, actionId, "denied", reason, cancellationToken).ConfigureAwait(false);
+                new Address("control", "action", actionId), actionId, "denied", Describe(subject, reason)),
+                cancellationToken).ConfigureAwait(false);
+            await RecordAsync(actor, actionId, "denied", subject, reason, cancellationToken).ConfigureAwait(false);
             return Result<JsonElement>.Failure(new(ErrorCode.Denied, reason));
         }
 
@@ -58,8 +62,8 @@ public sealed class ControlPlane(IAuditSink audit, ISignalLog signalLog) : ICont
             var result = await entry.Handler(arguments, cancellationToken).ConfigureAwait(false);
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, Guid.Empty, actor.Id,
                 new Address("control", "action", actionId), actionId, result.Ok ? "allowed" : "failed",
-                result.Ok ? null : result.Error?.Message), cancellationToken).ConfigureAwait(false);
-            await RecordAsync(actor, actionId, result.Ok ? "ok" : "failed", result.Error?.Message, cancellationToken)
+                Describe(subject, result.Ok ? null : result.Error?.Message)), cancellationToken).ConfigureAwait(false);
+            await RecordAsync(actor, actionId, result.Ok ? "ok" : "failed", subject, result.Error?.Message, cancellationToken)
                 .ConfigureAwait(false);
             return result;
         }
@@ -67,15 +71,52 @@ public sealed class ControlPlane(IAuditSink audit, ISignalLog signalLog) : ICont
         catch (Exception ex)
         {
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, Guid.Empty, actor.Id,
-                new Address("control", "action", actionId), actionId, "failed", ex.Message), cancellationToken).ConfigureAwait(false);
-            await RecordAsync(actor, actionId, "failed", ex.Message, cancellationToken).ConfigureAwait(false);
+                new Address("control", "action", actionId), actionId, "failed", Describe(subject, ex.Message)),
+                cancellationToken).ConfigureAwait(false);
+            await RecordAsync(actor, actionId, "failed", subject, ex.Message, cancellationToken).ConfigureAwait(false);
             return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, $"Action failed: {actionId}", ex.Message));
         }
     }
 
-    private ValueTask RecordAsync(Actor actor, string action, string outcome, string? message,
+    /// <summary>
+    /// The argument the action says names the thing it acts on, as text. An action that does not say which argument
+    /// that is gets no subject rather than a guess: recording the wrong field is worse than recording none, because
+    /// the record then reads like an answer.
+    /// </summary>
+    private static string? SubjectOf(ActionDescriptor? descriptor, JsonElement arguments)
+    {
+        if (descriptor?.Subject is not { Length: > 0 } name) return null;
+        if (arguments.ValueKind != JsonValueKind.Object) return null;
+        if (!arguments.TryGetProperty(name, out var value)) return null;
+        return value.ValueKind switch
+        {
+            JsonValueKind.String => value.GetString(),
+            JsonValueKind.Object when value.TryGetProperty("address", out var address) && address.ValueKind == JsonValueKind.String
+                => address.GetString(),
+            _ => null
+        };
+    }
+
+    private static string? Describe(string? subject, string? message) => (subject, message) switch
+    {
+        (null, null) => null,
+        (null, { } only) => only,
+        ({ } who, null) => $"subject={who}",
+        ({ } who, { } why) => $"subject={who}; {why}"
+    };
+
+    private ValueTask RecordAsync(Actor actor, string action, string outcome, string? subject, string? message,
         CancellationToken cancellationToken)
     {
+        Dictionary<string, string>? detail = null;
+        if (subject is not null || message is not null)
+        {
+            detail = new Dictionary<string, string>(StringComparer.Ordinal);
+            // The subject is what makes "who changed what" a question with an answer. The arguments themselves are
+            // deliberately not recorded: one of them may be a credential, and a log is the last place that belongs.
+            if (subject is not null) detail["subject"] = subject;
+            if (message is not null) detail["message"] = message;
+        }
         signalLog.Write(new()
         {
             Group = "control",
@@ -84,7 +125,7 @@ public sealed class ControlPlane(IAuditSink audit, ISignalLog signalLog) : ICont
             Mechanism = "invoke",
             Outcome = outcome,
             Level = outcome == "ok" ? SignalLevel.Info : SignalLevel.Warn,
-            Detail = message is null ? null : new Dictionary<string, string> { ["message"] = message }
+            Detail = detail
         });
         return ValueTask.CompletedTask;
     }

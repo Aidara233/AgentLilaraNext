@@ -2,7 +2,7 @@ using System.Text.Json;
 
 namespace ALN.Contracts;
 
-public enum ActorKind { User = 0, Script = 1, System = 2 }
+public enum ActorKind { User = 0, Script = 1, System = 2, Model = 3 }
 
 /// <summary>
 /// Who is invoking an action. A script carries its mount identity; a user carries an account id.
@@ -55,7 +55,19 @@ public sealed record Actor(string Id, ActorKind Kind, IReadOnlyList<string> Capa
 /// One externally reachable action. This is the only thing that crosses the boundary: internal
 /// managers stay free to change, the catalog is the contract.
 /// </summary>
-public sealed record ActionDescriptor(string Id, string Summary, string Capability, bool Mutating);
+/// <param name="ParamsJson">
+/// The arguments this action takes, as a JSON Schema object — the same shape a model tool carries. It used to be
+/// missing, and the only description of an action's arguments was prose inside <paramref name="Summary"/>; a caller
+/// that cannot see the fields guesses them, and guessing a field name is the most common way a call fails for a
+/// reason that has nothing to do with the call.
+/// </param>
+/// <param name="Subject">
+/// Which argument names the thing being acted on (<c>id</c>, <c>address</c>, <c>script</c>…). Recorded instead of the
+/// whole argument object: "who changed what" has to be answerable afterwards, and an argument object is the one
+/// place a credential would end up in a log (<c>models.provider.save</c> carries a key).
+/// </param>
+public sealed record ActionDescriptor(string Id, string Summary, string Capability, bool Mutating,
+    string? ParamsJson = null, string? Subject = null);
 
 /// <summary>
 /// Single execution point for every front-end (scripts today, the HTTP API next). Authorization,
