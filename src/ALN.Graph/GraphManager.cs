@@ -1367,7 +1367,7 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
     public async ValueTask<Result<IReadOnlyList<ScriptPackage>>> LoadAsync(CancellationToken cancellationToken)
     {
         var packages = new List<ScriptPackage>();
-        var seen = new Dictionary<string, string>(StringComparer.Ordinal);
+        var seen = new Dictionary<string, (string Path, TrustDomain Domain)>(StringComparer.Ordinal);
         try
         {
             var roots = new[]
@@ -1405,7 +1405,7 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
 
     /// <summary>One source of script packages. Returns a failure to stop the whole catalog, null when fine.</summary>
     private static async ValueTask<Error?> LoadRootAsync(string root, TrustDomain expectedDomain, string? origin,
-        List<ScriptPackage> packages, Dictionary<string, string> seen, CancellationToken cancellationToken)
+        List<ScriptPackage> packages, Dictionary<string, (string Path, TrustDomain Domain)> seen, CancellationToken cancellationToken)
     {
         if (!Directory.Exists(root)) return null;
         foreach (var manifestPath in Directory.EnumerateFiles(root, "manifest.json", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
@@ -1417,13 +1417,23 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
             if (manifest is null || manifest.TrustDomain != expectedDomain)
                 return new(ErrorCode.Denied, $"Invalid manifest or trust domain mismatch: {manifestPath}");
             // Two scripts with one id would make graph.mount ambiguous; say which two, do not pick one.
+            //
+            // One exception, and it is the whole reason seeding exists: the operator's copy in scripts/trusted
+            // replaces the shipped one. Without it, the first start after seeding would find every shipped script
+            // twice and refuse the catalogue — "copy it out so it can be edited" would break the host it serves.
+            // Only an operator copy may win. Two operator copies, or a plugin claiming a name already taken, is
+            // still an ambiguity and still refused.
             if (seen.TryGetValue(manifest.Id, out var first))
-                return new(ErrorCode.Conflict, $"Duplicate script id {manifest.Id}: {first} and {manifestPath}");
+            {
+                if (first.Domain != TrustDomain.Builtin || origin != "user")
+                    return new(ErrorCode.Conflict, $"Duplicate script id {manifest.Id}: {first.Path} and {manifestPath}");
+                packages.RemoveAll(package => string.Equals(package.Manifest.Id, manifest.Id, StringComparison.Ordinal));
+            }
             var scriptPath = Path.Combine(Path.GetDirectoryName(manifestPath)!, "main.js");
             var source = await File.ReadAllTextAsync(scriptPath, cancellationToken).ConfigureAwait(false);
             if (source.Length > 256_000) return new(ErrorCode.Invalid, $"Script source exceeds 256 KB: {manifest.Id}");
             var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source)));
-            seen[manifest.Id] = manifestPath;
+            seen[manifest.Id] = (manifestPath, expectedDomain);
             packages.Add(new(new(manifest.Id, manifest.Version, manifest.TargetType, manifest.Mount, manifest.Events,
                 manifest.EntryPoint, manifest.Capabilities, manifest.TrustDomain, manifest.MaxStatements,
                 manifest.TimeoutMilliseconds, manifest.MemoryLimitBytes), source, fingerprint,

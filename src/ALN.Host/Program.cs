@@ -224,6 +224,15 @@ foreach (var dropped in await DroppedModules.LoadAsync(modulePackages, Path.Comb
     else Console.Error.WriteLine($"plugin skipped: {Path.GetFileName(dropped.Directory)} — {dropped.Failure?.Message} {dropped.Failure?.Detail}".TrimEnd());
 }
 
+// Before the catalogue is read, and only once per script: the shipped scripts get a copy in the operator's tree,
+// where they can be edited and reloaded. Never rewritten afterwards (C-03) — see ScriptSeed for why the copy is
+// not byte-identical.
+var seededScripts = await new ScriptSeed(AppContext.BaseDirectory, data.Root).CopyMissingAsync(CancellationToken.None);
+if (seededScripts.AddedAnything)
+    restore.Note("scripts", $"copied to scripts/trusted: {string.Join(", ", seededScripts.Copied)}");
+foreach (var (seedId, seedReason) in seededScripts.Failed)
+    restore.Note("scripts", $"could not copy {seedId}: {seedReason}");
+
 var scriptCatalog = moduleServices.GetService<IGraphScriptCatalog>("graph.script-catalog");
 if (!scriptCatalog.Ok || scriptCatalog.Value is null)
 {
