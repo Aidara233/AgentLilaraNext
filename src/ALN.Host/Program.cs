@@ -59,6 +59,12 @@ var adapterFactories = new AdapterFactoryRegistry();
 var parameters = new ParameterRegistry(stateStore);
 var adapters = new AdapterManager(adapterTypes, bindings, adapterFactories, adapterSpecs, parameters: parameters);
 var artifacts = new FileArtifactStore(Path.Combine(data.Root, "artifacts"));
+// Model calls are stored whole — request and answer — because a refused request is only diagnosable with the body that
+// caused it. They are also the biggest thing on disk by far (42 MB in one day of light use), and they are a copy: what
+// they describe is in the session timeline. A week is long enough to answer "what did it actually send yesterday".
+const string ArtifactRetentionCategory = "model-calls";
+const int ArtifactRetentionDays = 7;
+const int ArtifactRetentionCheckHours = 6;
 var modelManager = new ModelManager(artifacts, signalLog);
 var sessionExtensions = new SessionExtensionRegistry();
 var timeSource = sessionExtensions.Register(new TimeContextSource());
@@ -311,6 +317,10 @@ var clockTask = clock.RunAsync(shutdown.Token);
 // the host stops it too — a sweep that outlived the host would act on state nothing else is maintaining.
 var deadlineSweepTask = sessions.RunDeadlineSweepAsync(deadlines, TimeProvider.System,
     SessionDeadlineHandler.Interval, shutdown.Token);
+// Stored model calls are derived data — a copy of a request that has already been answered — and they were the largest
+// thing on disk by far: 42 MB in one day of light use. Deleted on a timer rather than at exit, because the host this is
+// for is the one that does not exit.
+var retentionTask = RunRetentionAsync(shutdown.Token);
 
 // The host's only startup act: build the graph and hand it to the kernel, which decides the phases, the order
 // and what to do about a module that fails. The host does not know what a wave is.
@@ -536,6 +546,7 @@ if (receipt.Ready == 0)
     try { await pumpTask; } catch (OperationCanceledException) { }
     try { await clockTask; } catch (OperationCanceledException) { }
     try { await deadlineSweepTask; } catch (OperationCanceledException) { }
+    try { await retentionTask; } catch (OperationCanceledException) { }
     return 1;
 }
 
@@ -603,6 +614,7 @@ finally
     shutdown.Cancel();
     try { await clockTask; } catch (OperationCanceledException) { }
     try { await deadlineSweepTask; } catch (OperationCanceledException) { }
+    try { await retentionTask; } catch (OperationCanceledException) { }
     queue.Complete();
     try { await pumpTask.WaitAsync(TimeSpan.FromSeconds(10)); }
     catch (TimeoutException) { pumpStop.Cancel(); try { await pumpTask; } catch (OperationCanceledException) { } }
@@ -614,8 +626,29 @@ finally
 }
 return 0;
 
-async Task<Result> LoadModelConfigurationAsync(IModelInstanceStore store)
+/// <summary>
+/// Deletes derived artifacts older than the retention window, now and every few hours.
+///
+/// A pass that fails is reported and then waited out: cleanup is maintenance, and a host that stopped because it could
+/// not delete a file would be a worse outcome than the file staying.
+/// </summary>
+async Task RunRetentionAsync(CancellationToken cancellationToken)
 {
+    using var timer = new PeriodicTimer(TimeSpan.FromHours(ArtifactRetentionCheckHours));
+    while (true)
+    {
+        var pruned = await artifacts.PruneAsync(ArtifactRetentionCategory, ArtifactRetentionDays,
+            DateOnly.FromDateTime(DateTime.UtcNow), cancellationToken).ConfigureAwait(false);
+        if (pruned.Error is { } failure) restore.Note("artifacts", $"cleanup failed: {failure.Message}");
+        else if (pruned.Value is { Removed: > 0 } report)
+            restore.Note("artifacts", $"removed {report.Removed} day folder(s) of {ArtifactRetentionCategory}, " +
+                $"{report.Bytes / (1024 * 1024)} MB freed, {report.Kept} kept");
+        try { if (!await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false)) return; }
+        catch (OperationCanceledException) { return; }
+    }
+}
+
+async Task<Result> LoadModelConfigurationAsync(IModelInstanceStore store){
     var loaded = await store.LoadAllAsync(CancellationToken.None);
     if (!loaded.Ok || loaded.Value is null) return Result.Failure(loaded.Error!);
     foreach (var entry in loaded.Value)
