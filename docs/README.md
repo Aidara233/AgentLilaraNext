@@ -196,7 +196,7 @@ Runtime 核心 ──持有──▶ AdapterManager、事件队列、包注册�
 | 12 | **全局重载验收**：指纹相同 no-op；重载后所有会话下一次请求用新系统块；历史不变；不调用全局 Stepper 失效 | `08` §10.3 |
 | 13 | **冷却期 / 心跳间隔 / 超期阈值 / 连败阈值**的数值 | `09` §8 |
 | 14 | **信号日志**的保留期与采样策略（与审计分开算量） | `H1` / `09` §6.5 |
-| 15 | **其余动作的分批搬迁**：`adapters.*` / `models.*` / `scripts.*` / `modules.edge.*` / `sessions.list` / `archive.*` / `prompts.*` 还在宿主的 `CoreActions` 里，`channels.*` 已搬走；`system.info` / `packages.list` / `system.types` 属于宿主自我描述，留在原处 | `15` / 本轮记录 |
+| 15 | ~~其余动作的分批搬迁~~ **已做完**：`adapters.*` / `models.*` / `scripts.*` / `modules.edge.*` / `sessions.list` / `archive.*` / `prompts.*` 都已搬到实现它的模块/包/库里登记。`CoreActions` 只剩 `system.info` / `system.types` / `packages.list` / `modules.list`/`load`/`unload` —— 内核自己的表，不该由别人来汇报 | `15` / 本轮记录 |
 
 ---
 
