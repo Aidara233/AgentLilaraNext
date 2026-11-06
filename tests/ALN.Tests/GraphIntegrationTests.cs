@@ -656,6 +656,56 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.True((await _channels.StartAsync(address, default)).Ok);
     }
 
+    /// <summary>
+    /// Nothing in the host answers a message. The only callers of <c>RunTurnAsync</c> are scripts, and so are the
+    /// only callers of <c>ChannelManager.AcceptAsync</c>: C# supplies the parts and the bus, never the wiring.
+    /// With no catalogue the host still starts, still claims its mail, and still settles the round — which is the
+    /// part worth knowing: the input is acknowledged and then dropped, not held for a script that is not there.
+    /// </summary>
+    [Fact]
+    public async Task With_no_scripts_a_message_is_claimed_settled_and_answered_by_nobody()
+    {
+        Assert.True((await _graph.LoadAsync([], default)).Ok);
+        Assert.Empty(_graph.Mounted);
+
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+
+        await WriteInputAsync("chat-1", "nobody-is-listening");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+
+        // Claimed out of the inbox, so nothing is stuck; acknowledged into processed, so nothing will retry it.
+        Assert.Empty(Directory.GetFiles(Path.Combine(_mailbox.Root, "inbox", "chat-1")));
+        Assert.Single(Directory.GetFiles(Path.Combine(_mailbox.Root, "processed", "chat-1")));
+
+        // Nothing was said, no Channel message was accepted, no Session was opened: all three are script work.
+        Assert.False(Directory.Exists(Path.Combine(_mailbox.Root, "outbox", "chat-1")));
+        Assert.DoesNotContain(_signals.Snapshot(), record => record.Group == "script");
+    }
+
+    /// <summary>
+    /// Half the catalogue is still nothing: without the script that turns Adapter envelopes into Channel
+    /// messages, a responder has nothing to respond to. The two scripts are two halves of one conversation.
+    /// </summary>
+    [Fact]
+    public async Task Removing_only_the_intake_script_is_enough_to_silence_the_responder()
+    {
+        Assert.True((await _graph.LoadAsync([ChannelReply()], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+
+        await WriteInputAsync("chat-1", "in");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+
+        Assert.False(Directory.Exists(Path.Combine(_mailbox.Root, "outbox", "chat-1")));
+        // The responder is mounted and healthy — it simply never hears an event.
+        Assert.Contains(_graph.Mounted, m => m.Package.Manifest.Id == "channel.bound-reply");
+    }
+
     private async Task WriteInputAsync(string conversation, string text)
     {
         var directory = Path.Combine(_mailbox.Root, "inbox", conversation);
