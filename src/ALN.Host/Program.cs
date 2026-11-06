@@ -414,6 +414,27 @@ if (!scriptToolsFile.Ok)
     queue.Complete();
     return 1;
 }
+// What the file system module will actually offer, said out loud. The scopes this host registers and the scopes that
+// module's own file declares are two different lists, and only their intersection is reachable — and the file is never
+// rewritten (C-03), so a module.json written before a scope existed keeps the old list forever. Without this line,
+// "the tools do not offer it" is indistinguishable from "the code forgot it", which is exactly the confusion this
+// project already paid for once.
+var declaredScopes = ReadDeclaredScopes(Path.Combine(data.Root, ModuleManifestStore.DirectoryName,
+    FileSystemModule.TypeId, ModuleManifestStore.FileName));
+var offeredScopes = declaredScopes.Length == 0
+    ? fileAccess.Scopes
+    : fileAccess.Scopes.Where(scope => declaredScopes.Contains(scope, StringComparer.Ordinal)).ToArray();
+restore.Note("filesystem", $"offers {string.Join(", ", offeredScopes)}");
+var undeclaredScopes = declaredScopes.Length == 0
+    ? []
+    : fileAccess.Scopes.Where(scope => !declaredScopes.Contains(scope, StringComparer.Ordinal)).ToArray();
+if (undeclaredScopes.Length > 0)
+{
+    Console.Error.WriteLine(
+        $"filesystem.local's {ModuleManifestStore.FileName} does not declare {string.Join(", ", undeclaredScopes)}: the file "
+        + "tools will not offer it. Add it to that file's config.scopes to grant it — the host will not rewrite the file.");
+}
+
 var started = await kernel.StartAsync(shutdown.Token);
 if (!started.Ok || started.Value is null)
 {
@@ -557,6 +578,39 @@ async Task<Result> LoadModelConfigurationAsync(IModelInstanceStore store)
 // Channels are created by scripts and persisted; startup only revives what already exists.
 // A conversation folder with no channel is not a channel — the next message routes into a new one.
 // Channels are revived by their manager when the lifecycle signal arrives; the host keeps no list.
+
+/// <summary>
+/// The scopes a module's own file declares, in either shape that file has ever had: the object written now, or the
+/// escaped string an older version wrote. Read-only and best-effort — this answers "what will be offered", so a file
+/// that cannot be read is reported by the caller as "nothing declared" rather than taken as an empty whitelist.
+/// </summary>
+static string[] ReadDeclaredScopes(string manifestPath)
+{
+    if (!File.Exists(manifestPath)) return [];
+    try
+    {
+        using var document = JsonDocument.Parse(File.ReadAllText(manifestPath));
+        var root = document.RootElement;
+        if (root.TryGetProperty("config", out var config) && config.ValueKind == JsonValueKind.Object)
+            return ScopesOf(config);
+        if (root.TryGetProperty("configJson", out var legacy) && legacy.ValueKind == JsonValueKind.String)
+        {
+            using var inner = JsonDocument.Parse(legacy.GetString()!);
+            return inner.RootElement.ValueKind == JsonValueKind.Object ? ScopesOf(inner.RootElement) : [];
+        }
+        return [];
+    }
+    catch (Exception ex) when (ex is IOException or JsonException)
+    {
+        return [];
+    }
+}
+
+static string[] ScopesOf(JsonElement config) =>
+    config.TryGetProperty("scopes", out var scopes) && scopes.ValueKind == JsonValueKind.Array
+        ? scopes.EnumerateArray().Where(scope => scope.ValueKind == JsonValueKind.String)
+            .Select(scope => scope.GetString()!).ToArray()
+        : [];
 
 sealed class HostServiceProvider(params (Type Type, object Service)[] services) : IServiceProvider
 {
