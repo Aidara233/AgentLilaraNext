@@ -189,6 +189,34 @@ public sealed class FileAdapterTests : IDisposable
     }
 
     [Fact]
+    public async Task Start_then_stop_at_once_does_not_leave_a_dead_beat_behind()
+    {
+        // The beat is a task started by Start and awaited by Stop. Reading the field instead of the local it had just
+        // written meant a stop that landed first cleared that field, and the beat then died of a null reference inside
+        // Stop's own await — a crash on the way out, reported as the caller's failure.
+        var mailbox = new FileMailbox(Path.Combine(_directory, "beat-race"));
+        var sink = new RecordingSink(Result.Success());
+        var adapter = NewAdapter(mailbox, sink);
+        adapter.PollInterval = TimeSpan.FromMilliseconds(1);
+        for (var i = 0; i < 100; i++)
+        {
+            Assert.True((await adapter.StartAsync(default)).Ok);
+            Assert.True((await adapter.StopAsync(default)).Ok);
+        }
+
+        // And after all that, the mailbox is still read exactly once per start rather than by a loop nobody stopped.
+        await File.WriteAllTextAsync(Path.Combine(Inbox(mailbox, "room"), "after.txt"), "one");
+        Assert.True((await adapter.StartAsync(default)).Ok);
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (sink.Events.Count == 0 && DateTimeOffset.UtcNow < deadline) await Task.Delay(10);
+        Assert.True((await adapter.StopAsync(default)).Ok);
+        var count = sink.Events.Count;
+        await Task.Delay(50);
+        Assert.Equal(count, sink.Events.Count);
+        Assert.Single(sink.Events);
+    }
+
+    [Fact]
     public void Data_directory_resolves_relative_path_from_current_directory()
     {
         var current = Environment.CurrentDirectory;

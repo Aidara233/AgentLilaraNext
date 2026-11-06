@@ -73,8 +73,16 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter, ITriggerSink
         lock (_beatGate)
         {
             _beat?.Cancel();
-            _beat = new CancellationTokenSource();
-            _beatLoop = Task.Run(() => BeatAsync(_beat.Token), CancellationToken.None);
+            // The source is captured, not read off the field: a stop that lands between the start of the task and its
+            // first instruction would otherwise clear the field before the token was taken, and the beat would die
+            // of a null reference instead of being cancelled.
+            // And a beat that is already running is left alone: Start is idempotent (the base answers success when
+            // already running), so restarting here would abandon a live loop with nothing awaiting it.
+            if (_beatLoop is { IsCompleted: false }) return;
+            _beat?.Dispose();
+            var source = new CancellationTokenSource();
+            _beat = source;
+            _beatLoop = Task.Run(() => BeatAsync(source.Token), CancellationToken.None);
         }
     }
 
