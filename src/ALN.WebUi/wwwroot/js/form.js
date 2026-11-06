@@ -51,17 +51,23 @@ function control(field, value, onChange) {
 
 function rowEditor(field, values, redraw) {
   const list = h('div', { class: 'rows' });
+  // A field can say "at most one row" — the channel binding is one, because a Channel serves one conversation and a
+  // form that lets a person build something the action will refuse is a form that teaches the wrong model.
+  const full = field.maxRows !== undefined && values.length >= field.maxRows;
   const add = h('button', { class: 'act', type: 'button', text: field.addLabel ?? '添加一行' });
+  add.hidden = full;
   add.addEventListener('click', () => { values.push(field.blank()); redraw(); });
 
+  const removable = field.maxRows === undefined || field.maxRows > 1;
   values.forEach((row, index) => {
     const cells = field.columns.map((column) => {
       const cell = control(column, row[column.name], (next) => { row[column.name] = next; });
       return h('label', { class: 'field' }, h('span', { class: 'field-label', text: column.label ?? column.name }), cell);
     });
     const remove = h('button', { class: 'act danger', type: 'button', text: '删除' });
+    remove.hidden = !removable && values.length === 1;
     remove.addEventListener('click', () => { values.splice(index, 1); redraw(); });
-    list.append(h('div', { class: 'row' }, cells, remove));
+    list.append(h('div', { class: 'row' }, cells, removable || values.length > 1 ? remove : null));
   });
 
   return h('div', {}, list, add);

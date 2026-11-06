@@ -115,7 +115,9 @@ async function openCreate(ctx) {
         name: 'bindings',
         label: '绑定',
         type: 'rows',
-        addLabel: '添加一个绑定',
+        // One Channel serves one conversation (one conversation belongs to one Channel). The form stops at one instead of
+        // building something channels.create refuses; moving a Channel later is channels.connect, not a second row.
+        maxRows: 1,
         blank: () => ({ adapter: adapterOptions[0]?.value ?? '', conversation: '' }),
         columns: [
           adapterOptions.length
@@ -123,8 +125,8 @@ async function openCreate(ctx) {
             : { name: 'adapter', label: '适配器', type: 'text', placeholder: 'adapter.qq#qq-1' },
           { name: 'conversation', label: '平台会话', type: 'text', placeholder: 'group-123456' },
         ],
-        hint: '一个绑定 = 一个适配器上的一个会话。没有绑定的频道能建，但谁也投不进来。',
-        required: false,
+        hint: '一个绑定 = 一个适配器上的一个会话，恰好一条：一个频道只服务一个会话。要换会话用 channels.connect（搬），不用重建。',
+        required: true,
       },
     ],
     submit: '创建',
