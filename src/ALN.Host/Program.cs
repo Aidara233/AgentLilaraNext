@@ -101,7 +101,13 @@ if (catalog.Groups.Count > 0 || catalog.Warnings.Count > 0)
         (catalog.Warnings.Count == 0 ? "" : $"; skipped {catalog.Warnings.Count}: {string.Join("; ", catalog.Warnings)}"));
 var sessions = new SessionManager(data.Root, extensions: sessionExtensions, signalLog: signalLog, prompts: prompts, catalog: modules);
 var reloadState = new ModuleReloadStateStore();
+// The action table exists before anything runs, because the modules that implement actions are the ones that
+// register them: a manager is created (and readied) inside a package load, long before startup finishes, and it
+// used to find no control plane to register with. Whoever implements a verb announces it; the host only hands out
+// the table. This is also why it is in host services: a module reaches it the same way it reaches the signal log.
+var controlPlane = new ControlPlane(auditSink, signalLog);
 var hostServices = new HostServiceProvider(
+    (typeof(IControlPlane), controlPlane),
     (typeof(IAdapterManager), adapters),
     (typeof(IAdapterFactoryRegistry), adapterFactories),
     (typeof(IModelManager), modelManager),
@@ -511,8 +517,8 @@ if (receipt.Ready == 0)
 }
 
 // The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
-// WebUI itself — it exposes actions, and a separate project consumes them.
-var controlPlane = new ControlPlane(auditSink, signalLog);
+// WebUI itself — it exposes actions, and a separate project consumes them. The table itself came up long before
+// startup (see host services); this is where the host adds the verbs it owns itself.
 var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes, modelInstances, graphStatus: () => kernel.Status, kernel: kernel, scriptCatalog: scriptCatalog.Value);
 if (!actionsRegistered.Ok)
 {
