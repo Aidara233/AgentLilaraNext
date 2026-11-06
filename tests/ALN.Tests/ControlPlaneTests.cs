@@ -638,37 +638,36 @@ public sealed class ControlPlaneTests : IDisposable
         var prompts = new PromptLibrary([shipped, data]);
 
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
-        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null),
-            _signals, new FakeGraph(), new FakeParameters(), prompts: prompts).Ok);
+        Assert.True(PromptActions.Register(plane, prompts).Ok);
 
-        var read = await plane.InvokeAsync(User(Capabilities.PromptsRead), CoreActions.PromptsGet,
+        var read = await plane.InvokeAsync(User(Capabilities.PromptsRead), PromptActions.Get,
             JsonSerializer.SerializeToElement(new { group = "1身份", name = "标准" }), default);
         Assert.True(read.Ok, read.Error?.Message);
         Assert.Equal("运送来的原文", read.Value.GetProperty("text").GetString());
         // The path shown is the winning file, which is the shipped one until somebody edits it.
         Assert.StartsWith(shipped, read.Value.GetProperty("path").GetString(), StringComparison.OrdinalIgnoreCase);
 
-        var written = await plane.InvokeAsync(User(Capabilities.PromptsWrite), CoreActions.PromptsSet,
+        var written = await plane.InvokeAsync(User(Capabilities.PromptsWrite), PromptActions.Set,
             JsonSerializer.SerializeToElement(new { group = "1身份", name = "标准", text = "改过之后的话" }), default);
         Assert.True(written.Ok, written.Error?.Message);
         // An edit lands in the data root, because that is the root that wins. Writing to the shipped one would
         // produce an edit the loader never reads.
         Assert.StartsWith(data, written.Value.GetProperty("path").GetString(), StringComparison.OrdinalIgnoreCase);
 
-        var edited = await plane.InvokeAsync(User(Capabilities.PromptsRead), CoreActions.PromptsGet,
+        var edited = await plane.InvokeAsync(User(Capabilities.PromptsRead), PromptActions.Get,
             JsonSerializer.SerializeToElement(new { group = "1身份", name = "标准" }), default);
         Assert.Equal("改过之后的话", edited.Value.GetProperty("text").GetString());
 
         // Editing is not a read.
-        Assert.Equal(Capabilities.PromptsWrite, Assert.Single(plane.Catalog, a => a.Id == CoreActions.PromptsSet).Capability);
-        Assert.Equal(ErrorCode.Denied, (await plane.InvokeAsync(User(Capabilities.PromptsRead), CoreActions.PromptsSet,
+        Assert.Equal(Capabilities.PromptsWrite, Assert.Single(plane.Catalog, a => a.Id == PromptActions.Set).Capability);
+        Assert.Equal(ErrorCode.Denied, (await plane.InvokeAsync(User(Capabilities.PromptsRead), PromptActions.Set,
             JsonSerializer.SerializeToElement(new { group = "1身份", name = "标准", text = "x" }), default)).Error!.Code);
         // An empty prompt is refused: it is almost always a half-finished edit, and the next turn would answer
         // with no instructions at all.
-        Assert.Equal(ErrorCode.Invalid, (await plane.InvokeAsync(User(Capabilities.PromptsWrite), CoreActions.PromptsSet,
+        Assert.Equal(ErrorCode.Invalid, (await plane.InvokeAsync(User(Capabilities.PromptsWrite), PromptActions.Set,
             JsonSerializer.SerializeToElement(new { group = "1身份", name = "标准", text = "  " }), default)).Error!.Code);
         // A name that is a path is refused rather than written through.
-        Assert.Equal(ErrorCode.Invalid, (await plane.InvokeAsync(User(Capabilities.PromptsWrite), CoreActions.PromptsSet,
+        Assert.Equal(ErrorCode.Invalid, (await plane.InvokeAsync(User(Capabilities.PromptsWrite), PromptActions.Set,
             JsonSerializer.SerializeToElement(new { group = "..", name = "x", text = "y" }), default)).Error!.Code);
     }
 

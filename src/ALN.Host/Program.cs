@@ -560,6 +560,12 @@ if (!scriptActions.Ok)
     Console.Error.WriteLine(scriptActions.Error?.Message ?? "Script action registration failed.");
     return 1;
 }
+var promptActions = PromptActions.Register(controlPlane, prompts);
+if (!promptActions.Ok)
+{
+    Console.Error.WriteLine(promptActions.Error?.Message ?? "Prompt action registration failed.");
+    return 1;
+}
 var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes, graphStatus: () => kernel.Status, kernel: kernel, scriptCatalog: scriptCatalog.Value);
 if (!actionsRegistered.Ok)
 {

@@ -37,10 +37,6 @@ public static class CoreActions
     public const string ArchiveList = "archive.list";
     public const string ArchiveMove = "archive.move";
     public const string ArchiveRestore = "archive.restore";
-    public const string PromptsList = "prompts.list";
-    public const string PromptsGet = "prompts.get";
-    public const string PromptsSet = "prompts.set";
-    public const string ScriptsGet = "scripts.get";
     /// <summary>Reads the script folders again and replaces what the graph is running (docs/25 §7).</summary>
     public const string ScriptsReload = "scripts.reload";
 
@@ -225,36 +221,6 @@ public static class CoreActions
                 MoveToArchive),
             (new(ArchiveRestore, "Take items back out of the bin, by id. dryRun defaults to true.", Capabilities.ArchiveControl, true),
                 RestoreFromArchive),
-
-            // Prompts are files; this is the "what do I have and where do I edit it" action. There is no write
-            // side on purpose: editing a prompt is editing a file, not calling an API.
-            (new(PromptsGet, "Read one prompt file's text so it can be edited.", Capabilities.PromptsRead, false), ReadPrompt),
-            (new(PromptsSet, "Write one prompt file into the data root (the copy that wins).", Capabilities.PromptsWrite, true), WritePrompt),
-            (new(PromptsList, "Prompt groups and the files in them, with their origin and fingerprint.", Capabilities.PromptsRead, false),
-                (_, _) =>
-                {
-                    if (prompts is null) return ValueTask.FromResult(Result<JsonElement>.Failure(
-                        new(ErrorCode.Unavailable, "The prompt library is unavailable.")));
-                    var catalog = prompts.List();
-                    return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
-                    {
-                        roots = prompts.Roots,
-                        groups = catalog.Groups.Select(group => new
-                        {
-                            group = group.Group,
-                            prompts = group.Entries.Select(entry => new
-                            {
-                                name = entry.Name,
-                                bytes = entry.Bytes,
-                                fingerprint = entry.Fingerprint,
-                                path = entry.Path
-                            })
-                        }),
-                        // Reported rather than swallowed: a prompt that cannot be read is a Session that would
-                        // answer as somebody else if nothing said so.
-                        warnings = catalog.Warnings
-                    })));
-                })
         };
 
         foreach (var (descriptor, handler) in registrations)
@@ -272,62 +238,6 @@ public static class CoreActions
             reason = JsonNamingPolicy.CamelCase.ConvertName(edge.Reason.ToString()),
             detail = edge.Detail
         };
-        async ValueTask<Result<JsonElement>> ReadPrompt(JsonElement arguments, CancellationToken ct)
-        {
-            if (prompts is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "The prompt library is unavailable."));
-            if (!TryReadText(arguments, "group", out var group) || group.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "prompts.get requires 'group'."));
-            if (!TryReadText(arguments, "name", out var name) || name.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "prompts.get requires 'name'."));
-            group = group.Trim();
-            name = name.Trim();
-
-            // The catalog is what knows where the winning copy lives; resolving alone would answer with the text
-            // but not with the path the editor needs to show.
-            var catalog = prompts.List();
-            var known = catalog.Groups.FirstOrDefault(candidate => string.Equals(candidate.Group, group, StringComparison.Ordinal));
-            var entry = known?.Entries.FirstOrDefault(candidate => string.Equals(candidate.Name, name, StringComparison.Ordinal));
-            if (entry is null)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
-                    $"No prompt '{name}' in group '{group}'. Available: {(known is null ? catalog.Groups.Count == 0 ? "(no groups)" : string.Join(", ", catalog.Groups.Select(g => g.Group)) : string.Join(", ", known.Entries.Select(e => e.Name)))}."));
-
-            var selection = new PromptSelection(new Dictionary<string, string>(StringComparer.Ordinal) { [group] = name });
-            var resolved = await prompts.ResolveAsync(selection, ct).ConfigureAwait(false);
-            if (!resolved.Ok || resolved.Value is null) return Result<JsonElement>.Failure(resolved.Error!);
-            return Result<JsonElement>.Success(ToJson(new
-            {
-                group,
-                name,
-                path = entry.Path,
-                bytes = entry.Bytes,
-                fingerprint = entry.Fingerprint,
-                text = resolved.Value.Text
-            }));
-        }
-
-        async ValueTask<Result<JsonElement>> WritePrompt(JsonElement arguments, CancellationToken ct)
-        {
-            if (prompts is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "The prompt library is unavailable."));
-            if (!TryReadText(arguments, "group", out var group) || group.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "prompts.set requires 'group'."));
-            if (!TryReadText(arguments, "name", out var name) || name.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "prompts.set requires 'name'."));
-            // Required even when empty-looking, so that clearing a prompt is a decision somebody made rather than a
-            // field the client forgot to send.
-            if (!arguments.TryGetProperty("text", out var textItem) || textItem.ValueKind != JsonValueKind.String)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "prompts.set requires 'text' as a string."));
-
-            var saved = await prompts.SaveAsync(group.Trim(), name.Trim(), textItem.GetString() ?? "", ct).ConfigureAwait(false);
-            if (!saved.Ok || saved.Value is null) return Result<JsonElement>.Failure(saved.Error!);
-            return Result<JsonElement>.Success(ToJson(new
-            {
-                group = group.Trim(),
-                name = name.Trim(),
-                path = saved.Value,
-                bytes = System.Text.Encoding.UTF8.GetByteCount(textItem.GetString() ?? "")
-            }));
-        }
-
         static Result<JsonElement> Unavailable(string message) => Result<JsonElement>.Failure(new(ErrorCode.Unavailable, message));
 
         async ValueTask<Result<JsonElement>> ListArchive(JsonElement arguments, CancellationToken ct)
