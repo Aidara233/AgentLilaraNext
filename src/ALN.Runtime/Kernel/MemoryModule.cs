@@ -15,6 +15,7 @@ namespace ALN.Runtime;
 /// Registering in Initialize (not in a constructor) is what makes the graph honest: before Initialize nothing is
 /// allowed to be visible to anything else.
 /// </summary>
+[Module(TypeId, Category = "memory")]
 public sealed class MemoryModule(IMemoryLibrary library, ISessionExtensionRegistry extensions, TimeProvider? timeProvider = null)
     : IKernelModule
 {
