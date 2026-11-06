@@ -32,6 +32,9 @@ public static class CoreActions
     /// <summary>The module <b>packages</b> loaded into this process. Formerly modules.list, which now means the graph.</summary>
     public const string PackagesList = "packages.list";
     public const string ModuleTypes = "system.types";
+    /// <summary>Recent signal records, newest last. The WebUI's Signals view reads nothing else (it was dropped
+    /// while the other verbs moved out of the host, and a page that asks for an id nobody registered just breaks).</summary>
+    public const string SignalsRecent = "signals.recent";
     public const string ScriptsList = "scripts.list";
     public const string ScriptsSet = "scripts.set";
     /// <summary>Reads the script folders again and replaces what the graph is running (docs/25 §7).</summary>
@@ -73,6 +76,8 @@ public static class CoreActions
                         badEdges = (status?.BadEdges ?? []).Select(EdgeOf).ToArray()
                     })));
                 }),
+
+            (new(SignalsRecent, "Recent signal records, newest last.", Capabilities.SignalsRead, false), RecentSignals),
 
             (new(ParamsList, "List every tunable the running components expose, with its current value.", Capabilities.ParamsRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
