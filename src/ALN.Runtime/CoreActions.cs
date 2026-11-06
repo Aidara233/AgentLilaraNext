@@ -34,9 +34,6 @@ public static class CoreActions
     public const string ModuleTypes = "system.types";
     public const string ScriptsList = "scripts.list";
     public const string ScriptsSet = "scripts.set";
-    public const string ArchiveList = "archive.list";
-    public const string ArchiveMove = "archive.move";
-    public const string ArchiveRestore = "archive.restore";
     /// <summary>Reads the script folders again and replaces what the graph is running (docs/25 §7).</summary>
     public const string ScriptsReload = "scripts.reload";
 
@@ -212,15 +209,6 @@ public static class CoreActions
                         droppedEdges = unloaded.Value!.Select(EdgeOf)
                     }));
                 }),
-            // The bin: what could go in, what is in it, and putting things back. Same two verbs for every kind,
-            // so a script or an operator learns it once — an action that only ever did Sessions would have to be
-            // relearned for model-call artifacts next.
-            (new(ArchiveList, "What could be put away, and what is already in the bin. Read-only.", Capabilities.ArchiveRead, false),
-                ListArchive),
-            (new(ArchiveMove, "Put candidates in the bin: one kind, all of it or the named ids. dryRun defaults to true.", Capabilities.ArchiveControl, true),
-                MoveToArchive),
-            (new(ArchiveRestore, "Take items back out of the bin, by id. dryRun defaults to true.", Capabilities.ArchiveControl, true),
-                RestoreFromArchive),
         };
 
         foreach (var (descriptor, handler) in registrations)
@@ -239,109 +227,6 @@ public static class CoreActions
             detail = edge.Detail
         };
         static Result<JsonElement> Unavailable(string message) => Result<JsonElement>.Failure(new(ErrorCode.Unavailable, message));
-
-        async ValueTask<Result<JsonElement>> ListArchive(JsonElement arguments, CancellationToken ct)
-        {
-            if (archive is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "The archive module is not loaded."));
-            var kind = TryReadText(arguments, "kind", out var requestedKind) ? requestedKind.Trim() : null;
-            var candidates = await archive.CandidatesAsync(kind, ct).ConfigureAwait(false);
-            if (!candidates.Ok || candidates.Value is null) return Result<JsonElement>.Failure(candidates.Error!);
-            var archived = await archive.ArchivedAsync(kind, ct).ConfigureAwait(false);
-            if (!archived.Ok || archived.Value is null) return Result<JsonElement>.Failure(archived.Error!);
-            return Result<JsonElement>.Success(ToJson(new
-            {
-                kinds = archive.Kinds,
-                candidates = ToJson(CandidatesOf(candidates.Value)),
-                archived = ToJson(archived.Value.Select(ItemOf).ToArray()),
-                bin = new { items = archived.Value.Count, bytes = archived.Value.Sum(item => item.Bytes) }
-            }));
-        }
-
-        async ValueTask<Result<JsonElement>> MoveToArchive(JsonElement arguments, CancellationToken ct)
-        {
-            if (archive is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "The archive module is not loaded."));
-            if (!TryReadText(arguments, "kind", out var kind) || kind.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
-                    $"archive.move requires 'kind' ({string.Join(", ", archive.Kinds)})."));
-            var ids = ReadIds(arguments);
-            // Dry run unless the caller says otherwise: a missing flag must never be what took a conversation out
-            // of service.
-            var moved = await archive.ArchiveAsync(kind.Trim(), ids, IsDryRun(arguments), ct).ConfigureAwait(false);
-            return moved.Ok && moved.Value is not null
-                ? Result<JsonElement>.Success(ToJson(ReportOf(moved.Value)))
-                : Result<JsonElement>.Failure(moved.Error!);
-        }
-
-        async ValueTask<Result<JsonElement>> RestoreFromArchive(JsonElement arguments, CancellationToken ct)
-        {
-            if (archive is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "The archive module is not loaded."));
-            if (!TryReadText(arguments, "kind", out var kind) || kind.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
-                    $"archive.restore requires 'kind' ({string.Join(", ", archive.Kinds)})."));
-            var ids = ReadIds(arguments);
-            if (ids is null)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
-                    "archive.restore requires 'ids': putting everything back at once is a decision, not a default."));
-            var restored = await archive.RestoreAsync(kind.Trim(), ids, IsDryRun(arguments), ct).ConfigureAwait(false);
-            return restored.Ok && restored.Value is not null
-                ? Result<JsonElement>.Success(ToJson(ReportOf(restored.Value)))
-                : Result<JsonElement>.Failure(restored.Error!);
-        }
-
-        static object[] CandidatesOf(IReadOnlyList<ArchiveCandidate> candidates) => candidates.Select(candidate => (object)new
-        {
-            kind = candidate.Kind,
-            id = candidate.Id,
-            bytes = candidate.Bytes,
-            lastActiveAt = candidate.LastUsedAt,
-            owner = candidate.Owner,
-            reason = candidate.Reason
-        }).ToArray();
-
-        static object ItemOf(ArchivedItem item) => new
-        {
-            kind = item.Kind,
-            id = item.Id,
-            bytes = item.Bytes,
-            archivedAt = item.ArchivedAt,
-            owner = item.Owner,
-            reason = item.Reason,
-            note = item.Note,
-            path = item.Path
-        };
-
-        static object ReportOf(ArchiveReport report) => new
-        {
-            dryRun = report.DryRun,
-            count = report.Count,
-            done = report.Done,
-            bytes = report.Bytes,
-            items = report.Items.Select(item => new
-            {
-                kind = item.Kind,
-                id = item.Id,
-                action = item.Action,
-                done = item.Done,
-                bytes = item.Bytes,
-                message = item.Message
-            })
-        };
-
-        static bool IsDryRun(JsonElement arguments) =>
-            !(arguments.ValueKind == JsonValueKind.Object && arguments.TryGetProperty("dryRun", out var flag) &&
-              flag.ValueKind == JsonValueKind.False);
-
-        static IReadOnlyList<string>? ReadIds(JsonElement arguments)
-        {
-            if (arguments.ValueKind != JsonValueKind.Object || !arguments.TryGetProperty("ids", out var ids) ||
-                ids.ValueKind != JsonValueKind.Array) return null;
-            var values = ids.EnumerateArray()
-                .Where(id => id.ValueKind == JsonValueKind.String)
-                .Select(id => id.GetString() ?? "")
-                .Where(id => id.Length > 0)
-                .ToArray();
-            return values.Length == 0 ? null : values;
-        }
 
         ValueTask<Result<JsonElement>> RecentSignals(JsonElement arguments, CancellationToken ct)
         {

@@ -36,6 +36,12 @@ public sealed class ArchiveModule : IModulePlugin
         var archive = new ArchiveManager(paths.DataRoot);
         var registered = context.RegisterService(ArchiveManager.ServiceId, archive);
         if (!registered.Ok) return registered;
+        // The bin0027s verbs are the package0027s: it owns the bin, and it is the only thing that knows what kinds exist.
+        if (context.HostServices.GetService(typeof(IControlPlane)) is IControlPlane plane)
+        {
+            var actions = ArchiveActions.Register(plane, archive);
+            if (!actions.Ok) return actions;
+        }
 
         // Say what is in the bin, the way every other component says what it recovered: a bin nobody can see
         // is indistinguishable from data that vanished.

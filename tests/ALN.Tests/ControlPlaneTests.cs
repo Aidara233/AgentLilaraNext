@@ -318,28 +318,25 @@ public sealed class ControlPlaneTests : IDisposable
     }
 
     [Fact]
-    public async Task Archive_actions_are_in_the_catalogue_and_need_more_than_read()
+    public void Archive_actions_are_in_the_catalogue_and_need_more_than_read()
     {
+        // The bin registers its own verbs: same two for every kind, and both writes are dry-run by default.
+        var archive = new ALN.Archive.ArchiveManager(_root);
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
-        var provider = new ModelProviderInfo(new Address("model", "openai-chat", "one"),
-            new ModelProviderDescriptor("chat", "openai-chat", "OpenAI", ModelCapabilities.Streaming), 0);
-        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(provider),
-            _signals, new FakeGraph(), new FakeParameters()).Ok);
+        Assert.True(ALN.Archive.ArchiveActions.Register(plane, archive).Ok);
 
-        foreach (var id in new[] { CoreActions.ArchiveMove, CoreActions.ArchiveRestore })
+        foreach (var id in new[] { ALN.Archive.ArchiveActions.Move, ALN.Archive.ArchiveActions.Restore })
         {
             var action = Assert.Single(plane.Catalog, candidate => candidate.Id == id);
             // Taking a conversation out of service must not be a read: a "*.read" viewer may look, not sweep.
             Assert.Equal(Capabilities.ArchiveControl, action.Capability);
             Assert.True(action.Mutating);
             Assert.False(User("*.read").Allows(action.Capability));
+            Assert.False(string.IsNullOrWhiteSpace(action.ParamsJson));
         }
-        Assert.Equal(Capabilities.ArchiveRead, Assert.Single(plane.Catalog, action => action.Id == CoreActions.ArchiveList).Capability);
+        Assert.Equal(Capabilities.ArchiveRead,
+            Assert.Single(plane.Catalog, action => action.Id == ALN.Archive.ArchiveActions.List).Capability);
         Assert.DoesNotContain(plane.Catalog, action => action.Id == "sessions.gc");
-
-        // Without an archive module the actions are registered but honest about being unavailable.
-        var refused = await plane.InvokeAsync(Actor.System, CoreActions.ArchiveList, default, default);
-        Assert.Equal(ErrorCode.Unavailable, refused.Error?.Code);
     }
 
     [Fact]
