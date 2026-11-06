@@ -125,32 +125,6 @@ public static class CoreActions
                     }));
                 }),
 
-            (new(ScriptsList, "Scripts in the catalog, with their library and whether they are switched on.", Capabilities.GraphRead, false),
-                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
-                {
-                    libraries = graph.Scripts.GroupBy(entry => string.IsNullOrWhiteSpace(entry.Package.Origin) ? "user" : entry.Package.Origin)
-                        .Select(group => new { library = group.Key, scripts = group.Count(), enabled = group.Count(entry => entry.Enabled) }),
-                    scripts = graph.Scripts.Select(entry => new
-                    {
-                        id = entry.Package.Manifest.Id,
-                        library = string.IsNullOrWhiteSpace(entry.Package.Origin) ? "user" : entry.Package.Origin,
-                        mount = JsonNamingPolicy.CamelCase.ConvertName(entry.Package.Manifest.Mount.ToString()),
-                        trust = JsonNamingPolicy.CamelCase.ConvertName(entry.Package.Manifest.TrustDomain.ToString()),
-                        enabled = entry.Enabled,
-                        mounted = graph.Mounted.Count(mounted => mounted.Package.Manifest.Id == entry.Package.Manifest.Id)
-                    })
-                })))),
-            (new(ScriptsSet, "Switch one script or a whole library on or off. target: a script id, or bundled / user / plugin:<id>.", Capabilities.GraphControl, false),
-                async (arguments, ct) =>
-                {
-                    if (!TryReadText(arguments, "target", out var target) || target.Trim().Length == 0)
-                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "scripts.set requires 'target'."));
-                    var enabled = !arguments.TryGetProperty("enabled", out var flag) || flag.ValueKind != JsonValueKind.False;
-                    var switched = await graph.SetScriptEnabledAsync(target.Trim(), enabled, ct).ConfigureAwait(false);
-                    return switched.Ok
-                        ? Result<JsonElement>.Success(ToJson(new { target = target.Trim(), enabled, mounted = graph.Mounted.Count }))
-                        : Result<JsonElement>.Failure(switched.Error!);
-                }),
             (new(ModuleTypes, "Every module type the process knows: what a spec may name, and its abstract family.", Capabilities.SystemRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
                 {
@@ -256,9 +230,6 @@ public static class CoreActions
             // side on purpose: editing a prompt is editing a file, not calling an API.
             (new(PromptsGet, "Read one prompt file's text so it can be edited.", Capabilities.PromptsRead, false), ReadPrompt),
             (new(PromptsSet, "Write one prompt file into the data root (the copy that wins).", Capabilities.PromptsWrite, true), WritePrompt),
-            (new(ScriptsGet, "One script package as loaded: manifest and source.", Capabilities.GraphRead, false), ReadScript),
-            (new(ScriptsReload, "Read the script folders again and switch to what they now say. Failing scripts keep the body that already works.", Capabilities.GraphControl, false),
-                (_, ct) => ReloadScripts(ct)),
             (new(PromptsList, "Prompt groups and the files in them, with their origin and fingerprint.", Capabilities.PromptsRead, false),
                 (_, _) =>
                 {
@@ -357,66 +328,7 @@ public static class CoreActions
             }));
         }
 
-        /// <summary>
-        /// Re-reads every script folder and hands the result to the graph. The reading and the rules live in
-        /// <see cref="ScriptReload"/> because the same question has two doors — this action and the model's tool — and an
-        /// answer that depends on the door is a second implementation waiting to disagree.
-        /// </summary>
-        ValueTask<Result<JsonElement>> ReloadScripts(CancellationToken ct)
-        {
-            if (scriptCatalog is null)
-                return ValueTask.FromResult(Result<JsonElement>.Failure(
-                    new(ErrorCode.Unavailable, "No script catalogue is wired to this process.")));
-            return ReloadScriptsCore();
-
-            async ValueTask<Result<JsonElement>> ReloadScriptsCore()
-            {
-                var reloaded = await ScriptReload.RunAsync(graph, scriptCatalog, ct).ConfigureAwait(false);
-                if (!reloaded.Ok || reloaded.Value is null)
-                    return Result<JsonElement>.Failure(reloaded.Error ?? new(ErrorCode.Internal, "Reload failed."));
-                return Result<JsonElement>.Success(ToJson(new
-                {
-                    loaded = true,
-                    scripts = reloaded.Value.Scripts.Select(status => new
-                    {
-                        id = status.Id,
-                        library = status.Library,
-                        enabled = status.Enabled
-                    }).ToArray(),
-                    rejected = reloaded.Value.Rejected.Select(issue => new { path = issue.Path, reason = issue.Reason }).ToArray()
-                }));
-            }
-        }
-
-        ValueTask<Result<JsonElement>> ReadScript(JsonElement arguments, CancellationToken ct)
-        {
-            if (!TryReadText(arguments, "id", out var id) || id.Trim().Length == 0)
-                return ValueTask.FromResult(Result<JsonElement>.Failure(new(ErrorCode.Invalid, "scripts.get requires 'id'.")));
-            var found = graph.Scripts.FirstOrDefault(entry => string.Equals(entry.Package.Manifest.Id, id.Trim(), StringComparison.Ordinal));
-            if (found.Package is null)
-                return ValueTask.FromResult(Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"No script named '{id.Trim()}'.")));
-            var manifest = found.Package.Manifest;
-            return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
-            {
-                id = manifest.Id,
-                version = manifest.Version,
-                library = string.IsNullOrWhiteSpace(found.Package.Origin) ? "user" : found.Package.Origin,
-                targetType = manifest.TargetType,
-                mount = JsonNamingPolicy.CamelCase.ConvertName(manifest.Mount.ToString()),
-                trust = JsonNamingPolicy.CamelCase.ConvertName(manifest.TrustDomain.ToString()),
-                entryPoint = manifest.EntryPoint,
-                events = manifest.Events,
-                capabilities = manifest.Capabilities,
-                fingerprint = found.Package.Fingerprint,
-                enabled = found.Enabled,
-                source = found.Package.Source
-            })));
-        }
-
-        /// <summary>"This process has no graph to talk about" — a different answer from "the graph says zero".</summary>
         static Result<JsonElement> Unavailable(string message) => Result<JsonElement>.Failure(new(ErrorCode.Unavailable, message));
-
-
 
         async ValueTask<Result<JsonElement>> ListArchive(JsonElement arguments, CancellationToken ct)
         {

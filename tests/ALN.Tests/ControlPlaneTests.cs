@@ -678,11 +678,13 @@ public sealed class ControlPlaneTests : IDisposable
         var manifest = new ScriptManifest("channel.echo", 2, "channel", MountMode.Manual, ["channel.message.accepted"],
             "onEvent", ["session.activate"], TrustDomain.Trusted);
         var script = new ScriptPackage(manifest, "async function onEvent(event, ctx) { return; }", "abc123");
+        // The script verbs live with the script library now: same table, same execution point, registered by the
+        // code that owns the catalogue.
+        var graph = new FakeGraph(script);
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
-        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null),
-            _signals, new FakeGraph(script), new FakeParameters()).Ok);
+        Assert.True(ScriptActions.Register(plane, graph, catalog: null).Ok);
 
-        var read = await plane.InvokeAsync(User(Capabilities.GraphRead), CoreActions.ScriptsGet,
+        var read = await plane.InvokeAsync(User(Capabilities.GraphRead), ScriptActions.Get,
             JsonSerializer.SerializeToElement(new { id = "channel.echo" }), default);
         Assert.True(read.Ok, read.Error?.Message);
         Assert.Equal("async function onEvent(event, ctx) { return; }", read.Value.GetProperty("source").GetString());
@@ -691,7 +693,7 @@ public sealed class ControlPlaneTests : IDisposable
         Assert.True(read.Value.GetProperty("enabled").GetBoolean());
         // Reading a script is not controlling the graph.
         Assert.False(User("*.read").Allows(Capabilities.GraphControl));
-        Assert.Equal(ErrorCode.Invalid, (await plane.InvokeAsync(User(Capabilities.GraphRead), CoreActions.ScriptsGet,
+        Assert.Equal(ErrorCode.Invalid, (await plane.InvokeAsync(User(Capabilities.GraphRead), ScriptActions.Get,
             JsonSerializer.SerializeToElement(new { id = "nope" }), default)).Error!.Code);
     }
 
