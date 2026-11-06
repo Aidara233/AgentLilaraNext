@@ -745,6 +745,84 @@ public sealed class GraphIntegrationTests : IDisposable
         offers.Value!.Single(offer => offer.Definition.Name == name).Tool;
 
     /// <summary>
+    /// The loop the model gets: mount, and the folder follows the mount. A draft that is mounted is in effect, so it is
+    /// in scripts/live; unmount it and it goes back to scripts/draft. The folder is worth trusting only if it cannot
+    /// disagree with the graph.
+    /// </summary>
+    [Fact]
+    public async Task Mounting_a_draft_moves_it_to_live_and_unmounting_moves_it_back()
+    {
+        var channel = new Address("channel", "conversation", "chat-1");
+        var draft = Path.Combine(_root, "scripts", "draft", "say-hello");
+        var live = Path.Combine(_root, "scripts", "live", "say-hello");
+        Directory.CreateDirectory(draft);
+        await File.WriteAllTextAsync(Path.Combine(draft, "manifest.json"), ScriptSeed.ExampleManifest);
+        await File.WriteAllTextAsync(Path.Combine(draft, "main.js"), ScriptSeed.ExampleSource);
+
+        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root),
+            new ScriptLibrary(_root));
+        var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
+        await ToolOf(offers, ScriptTools.ReloadToolName).ExecuteAsync(new("c1", ScriptTools.ReloadToolName, "{}"), default);
+        await AddChannelAsync(channel, "chat-1");
+
+        var mounted = await ToolOf(offers, ScriptTools.MountToolName).ExecuteAsync(
+            new("c2", ScriptTools.MountToolName, $$"""{"script":"channel.say-hello","target":"{{channel}}"}"""), default);
+        Assert.True(mounted.Ok, mounted.Error?.Message);
+
+        // The mount happened, and the folder followed it.
+        Assert.Contains(_graph.Rules, rule => rule.ScriptId == "channel.say-hello");
+        Assert.True(Directory.Exists(live));
+        Assert.False(Directory.Exists(draft));
+        Assert.Contains(_graph.Scripts, entry => entry.Package.Manifest.Id == "channel.say-hello"
+                                                 && ScriptReload.LibraryOf(entry.Package) == "live");
+
+        var unmounted = await ToolOf(offers, ScriptTools.UnmountToolName).ExecuteAsync(
+            new("c3", ScriptTools.UnmountToolName, $$"""{"script":"channel.say-hello","target":"{{channel}}"}"""), default);
+        Assert.True(unmounted.Ok, unmounted.Error?.Message);
+
+        // No mount names it any more, so it is a draft again.
+        Assert.DoesNotContain(_graph.Rules, rule => rule.ScriptId == "channel.say-hello");
+        Assert.True(Directory.Exists(draft));
+        Assert.False(Directory.Exists(live));
+        Assert.Contains(_graph.Scripts, entry => entry.Package.Manifest.Id == "channel.say-hello"
+                                                 && ScriptReload.LibraryOf(entry.Package) == "draft");
+    }
+
+    /// <summary>One script can answer more than one instance: only the last unmount sends it back to the draft folder.</summary>
+    [Fact]
+    public async Task A_script_mounted_twice_stays_live_until_the_last_mount_goes()
+    {
+        var first = new Address("channel", "conversation", "chat-1");
+        var second = new Address("channel", "conversation", "chat-2");
+        var draft = Path.Combine(_root, "scripts", "draft", "say-hello");
+        Directory.CreateDirectory(draft);
+        await File.WriteAllTextAsync(Path.Combine(draft, "manifest.json"), ScriptSeed.ExampleManifest);
+        await File.WriteAllTextAsync(Path.Combine(draft, "main.js"), ScriptSeed.ExampleSource);
+
+        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root),
+            new ScriptLibrary(_root));
+        var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
+        await ToolOf(offers, ScriptTools.ReloadToolName).ExecuteAsync(new("c1", ScriptTools.ReloadToolName, "{}"), default);
+        await AddChannelAsync(first, "chat-1");
+        await AddChannelAsync(second, "chat-2");
+
+        foreach (var (target, index) in new[] { (first, 2), (second, 3) })
+        {
+            var mounted = await ToolOf(offers, ScriptTools.MountToolName).ExecuteAsync(
+                new("c" + index, ScriptTools.MountToolName, $$"""{"script":"channel.say-hello","target":"{{target}}"}"""),
+                default);
+            Assert.True(mounted.Ok, mounted.Error?.Message);
+        }
+
+        var oneLeft = await ToolOf(offers, ScriptTools.UnmountToolName).ExecuteAsync(
+            new("c4", ScriptTools.UnmountToolName, $$"""{"script":"channel.say-hello","target":"{{first}}"}"""), default);
+        Assert.True(oneLeft.Ok, oneLeft.Error?.Message);
+        // Still answers chat-2, so it is still live.
+        Assert.True(Directory.Exists(Path.Combine(_root, "scripts", "live", "say-hello")));
+        Assert.False(Directory.Exists(draft));
+    }
+
+    /// <summary>
     /// The model's side of the draft folder: it can ask what is loaded and ask for a re-read, and neither of those starts
     /// anything. A draft becomes visible after a reload and still runs for nobody until a person mounts it.
     /// </summary>

@@ -128,8 +128,11 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     public static readonly string DraftGuide = $$"""
     # 在这里写脚本
 
-    你现在在 `scripts/draft/`。这个目录你可以写，但写在这里的脚本**不会自动运行**：要有人执行 `scripts.reload`
-    （或重启宿主）才被看见，而且要有人手工挂载才开始工作。这是刻意的：你能写的地方，不应该就是能生效的地方。
+    你现在在 `scripts/draft/`。这个目录你可以写，但写在这里的脚本**不会自己运行**：要 `scripts_reload` 让它被加载，
+    再要一次显式的 `scripts_mount` 让它生效。
+
+    **挂载之后它会从这个目录移到 `scripts/live/`**——目录本身就记录了它是否在生效。卸载掉最后一个挂载点，
+    它会移回 `scripts/draft/`。`scripts/trusted/` 是系统/用户放的脚本，不在这条移动线上。
 
     ## 一个脚本是一个目录
 
@@ -213,12 +216,15 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
 
     ## 写完以后
 
-    1. 用 `scripts_reload` 让宿主重读所有文件夹。这时你的脚本出现在 `scripts_list` 里，**但仍未运行**；
+    1. `scripts_reload` 让宿主重读所有文件夹。这时你的脚本出现在 `scripts_list` 里，**但仍未生效**；
        如果它没出现，`scripts_list` 会告诉你为什么。
-    2. 让人把它挂到目标实例上：`modules.edge.mount { "script": "<id>", "target": "<实例地址>" }`。
+    2. `scripts_mount { "script": "<id>", "target": "<实例地址>" }` 把它挂到某个实例上。挂载成功后它会从
+       `scripts/draft/` 移到 `scripts/live/`，并应答那个实例的下一个事件；地址可以在 `graph` 的实例列表里找。
+    3. `scripts_unmount { "script": "<id>", "target": "<实例地址>" }` 停掉它；如果那是它最后一个挂载点，
+       它会移回 `scripts/draft/`。
 
-    草稿永远不会自己接管任何东西——这是这条路的全部意义。`scripts_list` 与 `scripts_reload` 能看见和重读，
-    挂载是唯一不能由脚本这一侧完成的事。
+    这三步里，只有 `scripts_mount` 会让它生效。写在草稿里、被加载、出现在列表里，都不等于在生效——
+    目录不同就是状态不同。
     """;
 
     /// <summary>

@@ -306,7 +306,8 @@ factories.Register(FileSystemModule.TypeId,
 // The script control tools are a module too: "who may reload scripts" is answerable by looking at the graph instead of
 // at the host's source, and the two tools it offers read whatever the graph holds at the moment they are called.
 factories.Register(ScriptToolsModule.TypeId,
-    manifest => ScriptToolsModule.FromManifest(manifest, graph, scriptCatalog.Value!, sessionExtensions));
+    manifest => ScriptToolsModule.FromManifest(manifest, graph, scriptCatalog.Value!, sessionExtensions,
+        new ScriptLibrary(data.Root)));
 foreach (var type in adapterTypes.ListTypes().Where(type => adapterTypes.IsConcrete(type.TypeId)))
     factories.RegisterOwned(type.TypeId);
 foreach (var type in modelManager.ListTypes())

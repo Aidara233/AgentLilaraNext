@@ -57,14 +57,18 @@ public static class ScriptReload
 ///
 /// Neither tool speaks to anyone: they change what runs, not what the conversation hears.
 /// </summary>
-public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog) : ISessionToolSource
+public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog, ScriptLibrary? library = null)
+    : ISessionToolSource
 {
     public const string SourceId = "system.script-tools";
     public const string ListToolName = "scripts_list";
     public const string ReloadToolName = "scripts_reload";
+    public const string MountToolName = "scripts_mount";
+    public const string UnmountToolName = "scripts_unmount";
 
     private readonly IGraphRuntime _graph = graph;
     private readonly IGraphScriptCatalog _catalog = catalog;
+    private readonly ScriptLibrary? _library = library;
 
     public string Id => SourceId;
 
@@ -81,6 +85,28 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
         + "mounted by hand before it runs.",
         """{"type":"object","properties":{},"additionalProperties":false}""");
 
+    public static readonly ModelToolDefinition MountDefinition = new(MountToolName,
+        "Mount one script on one instance, so it starts answering that instance's events. Take the id from scripts_list "
+        + "and the address from the graph. A script kept in scripts/draft moves to scripts/live when the mount works, and "
+        + "moves back when the last mount goes away — the folder is the record of whether it is in effect. This changes "
+        + "what that instance does from now on; it puts nothing into the conversation.",
+        """
+        {"type":"object","properties":{
+          "script":{"type":"string","description":"The script id, exactly as scripts_list shows it."},
+          "target":{"type":"string","description":"The instance address to mount it on, e.g. channel.conversation#chat-auto."}},
+         "required":["script","target"]}
+        """);
+
+    public static readonly ModelToolDefinition UnmountDefinition = new(UnmountToolName,
+        "Stop one script on one instance. If that was its last mount and it lives in scripts/live, it moves back to "
+        + "scripts/draft: the folder keeps saying whether it is in effect.",
+        """
+        {"type":"object","properties":{
+          "script":{"type":"string","description":"The script id."},
+          "target":{"type":"string","description":"The instance it was mounted on."}},
+         "required":["script","target"]}
+        """);
+
     public ValueTask<Result<IReadOnlyList<SessionToolOffer>>> ToolsAsync(RoundContextRequest request,
         CancellationToken cancellationToken)
     {
@@ -88,7 +114,12 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
         IReadOnlyList<SessionToolOffer> offers =
         [
             new(new ListTool(this), ListDefinition, ActsExternally: false),
-            new(new ReloadTool(this), ReloadDefinition, ActsExternally: false)
+            new(new ReloadTool(this), ReloadDefinition, ActsExternally: false),
+            // Mounting does change what a channel answers to from now on, but it says nothing to the conversation: the
+            // next message does. Keeping it non-external is what lets a turn mount and then speak in the same step
+            // without the reply being taken for the effect.
+            new(new MountTool(this), MountDefinition, ActsExternally: false),
+            new(new UnmountTool(this), UnmountDefinition, ActsExternally: false)
         ];
         return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(offers));
     }
@@ -165,6 +196,95 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
             return Result<SessionToolResult>.Success(new(text.ToString()));
         }
     }
+
+    /// <summary>
+    /// Mounting, with the folder following the fact rather than standing in for it.
+    ///
+    /// The mount happens first, so a refusal never leaves a script looking live. Only after it works does the folder
+    /// move — and if the body then fails to load from its new place, the move is undone rather than leaving a rule
+    /// pointing at something the catalogue no longer holds.
+    /// </summary>
+    private sealed class MountTool(ScriptTools owner) : ISessionTool
+    {
+        public string Name => MountToolName;
+        public bool EndsTurn => false;
+
+        public async ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken)
+        {
+            if (ToolArguments.Parse(call.ArgumentsJson) is not { } arguments) return ToolArguments.BadJson(MountToolName);
+            var script = ToolArguments.Text(arguments, "script")?.Trim();
+            if (string.IsNullOrEmpty(script))
+                return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid, "scripts_mount needs a 'script' id."));
+            var targetText = ToolArguments.Text(arguments, "target")?.Trim();
+            if (string.IsNullOrEmpty(targetText) || !Address.TryParse(targetText, out var target))
+                return Result<SessionToolResult>.Failure(
+                    new(ErrorCode.Invalid, "scripts_mount needs a 'target' instance address, e.g. channel.conversation#chat-auto."));
+
+            var mounted = await owner._graph.MountAsync(script, target, cancellationToken).ConfigureAwait(false);
+            if (!mounted.Ok) return Result<SessionToolResult>.Failure(mounted.Error!);
+
+            var text = new StringBuilder($"Mounted {script} on {target}.");
+            if (owner._library?.Promote(script) is { } promoted)
+            {
+                if (!promoted.Ok)
+                {
+                    text.Append($" It stays in scripts/draft: {promoted.Error!.Message}");
+                }
+                else
+                {
+                    var reloaded = await ScriptReload.RunAsync(owner._graph, owner._catalog, cancellationToken).ConfigureAwait(false);
+                    if (!reloaded.Ok || reloaded.Value is null || !reloaded.Value.Scripts.Any(status => status.Id == script))
+                    {
+                        // It loaded from the draft folder and not from the live one. Put it back where it worked: a
+                        // folder that lies about being in effect is worse than a mount that points at a draft.
+                        owner._library.Demote(script);
+                        await ScriptReload.RunAsync(owner._graph, owner._catalog, cancellationToken).ConfigureAwait(false);
+                        return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid,
+                            $"{script} could not be loaded from scripts/live, so it was moved back to scripts/draft. "
+                            + "The mount is in place and takes effect once the script loads again."));
+                    }
+                    text.Append(" It moved from scripts/draft to scripts/live: the folder now says it is in effect.");
+                }
+            }
+
+            text.Append(" It answers the next event on that instance.");
+            return Result<SessionToolResult>.Success(new(text.ToString()));
+        }
+    }
+
+    /// <summary>
+    /// Unmounting, and the folder following it back. Only when nothing else mounts the script: one that still answers
+    /// somewhere else is still in effect, and moving it to the draft folder would then be a lie in the other direction.
+    /// </summary>
+    private sealed class UnmountTool(ScriptTools owner) : ISessionTool
+    {
+        public string Name => UnmountToolName;
+        public bool EndsTurn => false;
+
+        public async ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken)
+        {
+            if (ToolArguments.Parse(call.ArgumentsJson) is not { } arguments) return ToolArguments.BadJson(UnmountToolName);
+            var script = ToolArguments.Text(arguments, "script")?.Trim();
+            if (string.IsNullOrEmpty(script))
+                return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid, "scripts_unmount needs a 'script' id."));
+            var targetText = ToolArguments.Text(arguments, "target")?.Trim();
+            if (string.IsNullOrEmpty(targetText) || !Address.TryParse(targetText, out var target))
+                return Result<SessionToolResult>.Failure(
+                    new(ErrorCode.Invalid, "scripts_unmount needs the 'target' it was mounted on."));
+
+            var unmounted = await owner._graph.UnmountAsync(script, target, cancellationToken).ConfigureAwait(false);
+            if (!unmounted.Ok) return Result<SessionToolResult>.Failure(unmounted.Error!);
+
+            var text = new StringBuilder($"Unmounted {script} from {target}.");
+            var stillMounted = owner._graph.Rules.Any(rule => string.Equals(rule.ScriptId, script, StringComparison.Ordinal));
+            if (!stillMounted && owner._library?.Demote(script) is { Ok: true })
+            {
+                await ScriptReload.RunAsync(owner._graph, owner._catalog, cancellationToken).ConfigureAwait(false);
+                text.Append(" It moved back to scripts/draft: no mount names it any more.");
+            }
+            return Result<SessionToolResult>.Success(new(text.ToString()));
+        }
+    }
 }
 
 /// <summary>
@@ -183,12 +303,13 @@ public sealed class ScriptToolsModule(ModuleId id, ScriptTools tools, ISessionEx
     public ModuleId Id { get; } = id;
 
     public static Result<IKernelModule> FromManifest(ModuleManifest manifest, IGraphRuntime graph, IGraphScriptCatalog catalog,
-        ISessionExtensionRegistry extensions)
+        ISessionExtensionRegistry extensions, ScriptLibrary? scripts = null)
     {
         ArgumentNullException.ThrowIfNull(manifest);
         if (!string.Equals(manifest.Type, TypeId, StringComparison.Ordinal))
             return Result<IKernelModule>.Failure(new(ErrorCode.Invalid, $"This factory builds {TypeId}, not {manifest.Type}."));
-        return Result<IKernelModule>.Success(new ScriptToolsModule(manifest.Id, new ScriptTools(graph, catalog), extensions));
+        return Result<IKernelModule>.Success(
+            new ScriptToolsModule(manifest.Id, new ScriptTools(graph, catalog, scripts), extensions));
     }
 
     public ValueTask<Result> InitializeAsync(CancellationToken cancellationToken)

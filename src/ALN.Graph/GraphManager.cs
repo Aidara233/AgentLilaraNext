@@ -335,9 +335,12 @@ public sealed class GraphManager : IGraphRuntime, IModule
         if (m.Mount is not (MountMode.Default or MountMode.Manual)) return $"Unknown mount mode: {m.Mount}.";
         if (string.IsNullOrWhiteSpace(package.Source) || package.Source.Length > 256_000) return "Empty or oversized source.";
         // A draft is written by whoever may write the draft folder, so it may not take a type over by itself: what a
-        // model can write must be something a person still has to mount (docs/25 §5).
+        // model can write must be something a mount names (docs/25 §5). A live script is in effect because a mount says
+        // so, not because it sits in a folder — so it is manual for the same reason.
         if (string.Equals(package.Origin, "draft", StringComparison.Ordinal) && m.Mount == MountMode.Default)
             return "A draft must be mounted by hand: it cannot attach itself to a type.";
+        if (string.Equals(package.Origin, "live", StringComparison.Ordinal) && m.Mount == MountMode.Default)
+            return "A live script must stay manual: it is in effect because a mount says so, not because of its folder.";
         return null;
     }
 
@@ -1447,6 +1450,9 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
             {
                 (Path.Combine(programRoot, "resources", "scripts", "builtin"), TrustDomain.Builtin, (string?)"bundled"),
                 (Path.Combine(dataRoot, "scripts", "trusted"), TrustDomain.Trusted, (string?)"user"),
+                // Written by the model and in effect: the mount moved it here, which is why being in this folder and
+                // being mounted are the same fact.
+                (Path.Combine(dataRoot, "scripts", "live"), TrustDomain.Trusted, (string?)"live"),
                 (Path.Combine(dataRoot, "scripts", "draft"), TrustDomain.Trusted, (string?)"draft"),
                 (Path.Combine(dataRoot, "scripts", "restricted"), TrustDomain.Restricted, (string?)"user")
             };

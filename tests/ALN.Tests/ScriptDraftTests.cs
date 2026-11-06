@@ -78,9 +78,27 @@ public sealed class ScriptDraftTests : IDisposable
         Assert.True(guide.Ok, guide.Error?.Message);
         Assert.NotNull(guide.Value);
         Assert.Contains("manifest.json", guide.Value!.Text, StringComparison.Ordinal);
-        // It is a guide a model can act on, not a stub: the capability table is the part that keeps it from guessing.
+        // It is a guide a model can act on, not a stub: the capability table and the tool names are what keep it from
+        // guessing, and the tools are the names it can actually call.
         Assert.Contains("channel.accept", guide.Value.Text, StringComparison.Ordinal);
-        Assert.Contains("scripts.reload", guide.Value.Text, StringComparison.Ordinal);
+        Assert.Contains("scripts_reload", guide.Value.Text, StringComparison.Ordinal);
+        Assert.Contains("scripts_mount", guide.Value.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_script_in_the_live_folder_is_loaded_as_live()
+    {
+        var folder = Path.Combine(DataRoot, "scripts", "live", "say-hello");
+        Directory.CreateDirectory(folder);
+        await File.WriteAllTextAsync(Path.Combine(folder, "manifest.json"), ScriptSeed.ExampleManifest);
+        await File.WriteAllTextAsync(Path.Combine(folder, "main.js"), ScriptSeed.ExampleSource);
+
+        var loaded = await new JsonScriptCatalog(ProgramRoot, DataRoot).LoadAsync(default);
+
+        Assert.True(loaded.Ok, loaded.Error?.Message);
+        var script = Assert.Single(loaded.Value!, package => package.Manifest.Id == "channel.say-hello");
+        // The folder is the answer to "is it in effect", so loading has to keep saying which one it was.
+        Assert.Equal("live", script.Origin);
     }
 
     [Fact]
