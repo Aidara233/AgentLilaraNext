@@ -124,6 +124,37 @@ public sealed class ModulePluginTests : IDisposable
     }
 
     [Fact]
+    public async Task A_script_tree_is_read_from_disk_every_time_so_an_edit_needs_no_restart_to_be_seen()
+    {
+        var folder = Path.Combine(_root, "scripts", "trusted", "chat");
+        Directory.CreateDirectory(folder);
+        await File.WriteAllTextAsync(Path.Combine(folder, "manifest.json"), """
+        {
+          "id": "chat", "version": 1, "targetType": "channel", "mount": "manual",
+          "events": ["channel.message.accepted"], "entryPoint": "onEvent",
+          "capabilities": ["channel.bound-send"], "trustDomain": "trusted"
+        }
+        """);
+        await File.WriteAllTextAsync(Path.Combine(folder, "main.js"), "async function onEvent() { }");
+        var catalog = new JsonScriptCatalog(Path.Combine(_root, "program"), _root);
+
+        var first = await catalog.LoadAsync(default);
+        Assert.True(first.Ok, first.Error?.Message);
+        var before = Assert.Single(first.Value!, package => package.Manifest.Id == "chat");
+
+        // The operator edits the file, not a database: the next read is the new body.
+        await File.WriteAllTextAsync(Path.Combine(folder, "main.js"),
+            "async function onEvent(event, ctx) { ctx.log.info('edited'); }");
+        var second = await catalog.LoadAsync(default);
+        Assert.True(second.Ok, second.Error?.Message);
+        var after = Assert.Single(second.Value!, package => package.Manifest.Id == "chat");
+
+        Assert.Contains("edited", after.Source, StringComparison.Ordinal);
+        // The fingerprint is what makes "did this change" answerable without diffing bodies.
+        Assert.NotEqual(before.Fingerprint, after.Fingerprint);
+    }
+
+    [Fact]
     public async Task A_shipped_script_cannot_claim_to_be_builtin()
     {
         var folder = WriteSamplePluginFolder();

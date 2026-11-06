@@ -111,6 +111,101 @@ public sealed class GraphIntegrationTests : IDisposable
     }
 
     /// <summary>
+    /// A script tree is a file tree, so "reload" is: read it again, hand the whole catalogue back. What makes
+    /// that safe is that loading is a replacement, not an addition — the same script id with a new body needs no
+    /// unmount, no remount and no restart, and the next event runs the new body.
+    /// </summary>
+    [Fact]
+    public async Task Loading_the_catalogue_again_replaces_what_runs_without_remounting_anything()
+    {
+        static ScriptPackage Replying(string version) => new(
+            new("channel.bound-reply", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",
+                [ScriptCapabilities.ChannelReply], TrustDomain.Builtin),
+            $"async function onEvent(event, ctx) {{ await ctx.channel.reply({{ platformConversationId: event.binding.platformConversationId, text: '{version}:' + event.text }}); }}");
+
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), Replying("v1")], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+
+        await WriteInputAsync("chat-1", "one");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+        Assert.Equal(["v1:one"], OutboxTexts("chat-1"));
+
+        // The body changed, the id did not. Nothing was unmounted; the default mount was simply rebuilt from the
+        // catalogue that arrived, which is why a reload does not have to remember what was mounted before.
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), Replying("v2")], default)).Ok);
+        await WriteInputAsync("chat-1", "two");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+        Assert.Equal(["v1:one", "v2:two"], OutboxTexts("chat-1"));
+    }
+
+    /// <summary>
+    /// A reload that fails must leave the running one alone. That is the whole reason the catalogue is validated
+    /// before the current set is cleared: an edited script with a typo is a reason to keep working, not a reason
+    /// to stop answering.
+    /// </summary>
+    [Fact]
+    public async Task A_reload_that_is_refused_leaves_the_previous_scripts_in_place()
+    {
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), ChannelReply()], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+
+        await WriteInputAsync("chat-1", "one");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+        Assert.Equal(["one"], OutboxTexts("chat-1"));
+
+        // Same id, a capability this host does not have: refused at the door.
+        var refused = new ScriptPackage(
+            new("channel.bound-reply", 2, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted],
+                "onEvent", ["channel.teleport"], TrustDomain.Builtin),
+            "async function onEvent(event, ctx) { }");
+        var reload = await _graph.LoadAsync([AdapterIntake(), refused], default);
+        Assert.False(reload.Ok);
+        Assert.Equal(ErrorCode.Denied, reload.Error!.Code);
+
+        await WriteInputAsync("chat-1", "two");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+        Assert.Equal(["one", "two"], OutboxTexts("chat-1"));
+    }
+
+    /// <summary>
+    /// A manual mount is a durable rule naming a script id — not a reference to a package object — so replacing
+    /// that script's body keeps the rule, and the instance keeps answering with the new body.
+    /// </summary>
+    [Fact]
+    public async Task A_manual_mount_survives_a_reload_because_a_rule_names_a_script_not_a_package()
+    {
+        var channel = new Address("channel", "conversation", "chat-1");
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), ManualTagger("channel.tagger", "tagged")], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        await AddChannelAsync(channel, "chat-1");
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+        Assert.True((await _graph.MountAsync("channel.tagger", channel, default)).Ok);
+
+        await WriteInputAsync("chat-1", "one");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+        Assert.Equal(["tagged"], OutboxTexts("chat-1"));
+
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), ManualTagger("channel.tagger", "tagged-2")], default)).Ok);
+        // Still mounted, and still the same rule: a reload does not unmount what a person mounted by hand.
+        Assert.Contains(_graph.Mounted, m => m.Package.Manifest.Id == "channel.tagger");
+        Assert.Single(_graph.Rules, rule => rule.ScriptId == "channel.tagger");
+
+        await WriteInputAsync("chat-1", "two");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+        Assert.Equal(["tagged", "tagged-2"], OutboxTexts("chat-1"));
+    }
+
+    /// <summary>
     /// The reply mode decides how many messages one answer becomes; the Adapter still sends one message per
     /// call. Segments is the default because a chat window is not a page.
     /// </summary>
@@ -602,6 +697,12 @@ public sealed class GraphIntegrationTests : IDisposable
         "async function onEvent(event, ctx) { await ctx.channel.reply({ platformConversationId: event.binding.platformConversationId, text: event.text, replyTo: event.platformMessageId }); }");
 
     private static OutboundMessage ReadOutbound(string path) => JsonSerializer.Deserialize<OutboundMessage>(File.ReadAllText(path))!;
+
+    /// <summary>Everything one conversation has been sent, sorted: the order files land in is not a promise.</summary>
+    private string[] OutboxTexts(string conversation) => Directory
+        .GetFiles(Path.Combine(_mailbox.Root, "outbox", conversation), "*.json")
+        .Select(ReadOutbound).Select(message => message.Text)
+        .Order(StringComparer.Ordinal).ToArray();
 
     private sealed class GraphBindingProxy : IInstanceBindings
     {
