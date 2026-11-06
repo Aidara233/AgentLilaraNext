@@ -1,5 +1,6 @@
 using System.Text.Json;
 using ALN.Api;
+using ALN.Channel;
 using ALN.Contracts;
 using ALN.Contracts.Models;
 using ALN.Graph.Contracts;
@@ -460,28 +461,31 @@ public sealed class ControlPlaneTests : IDisposable
     {
         var types = new AdapterTypeCatalog();
         Assert.True(types.RegisterPackageTypes("test.pack", [new("channel.conversation", "channel")]).Ok);
-        var channels = new FakeChannels();
+        // The verb belongs to the Channel module now, so this asks the real manager for it: parsing the arguments is
+        // the module's job, and a fake would be a second implementation of the thing being tested.
+        var channels = new ChannelManager(new EventQueue(8), new QuietBindings(), new ModuleCatalog(), types: types);
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(channels.RegisterActions(plane).Ok);
         Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), channels, new FakeModels(null),
-            _signals, new FakeGraph(), new FakeParameters(), moduleTypes: types).Ok);
+            _signals, new FakeGraph(), new FakeParameters()).Ok);
 
-        var created = await plane.InvokeAsync(User(Capabilities.ChannelsControl), CoreActions.ChannelsCreate,
+        var created = await plane.InvokeAsync(User(Capabilities.ChannelsControl), ChannelActions.Create,
             JsonSerializer.SerializeToElement(new
             {
                 type = "channel.conversation", instance = "group-1", maxMessages = 25,
                 bindings = new[] { new { adapter = "adapter.qq#qq-1", conversation = "group-123" } }
             }), default);
         Assert.True(created.Ok, created.Error?.Message);
-        var spec = Assert.Single(channels.Created);
-        Assert.Equal("channel.conversation#group-1", spec.Address.ToString());
-        Assert.Equal("group-1", spec.Name);          // default: the instance name
-        Assert.Equal(25, spec.MaxMessages);
-        var binding = Assert.Single(spec.Bindings);
+        var channel = channels.Get(new Address("channel", "conversation", "group-1"));
+        Assert.True(channel.Ok, channel.Error?.Message);
+        Assert.Equal("group-1", channel.Value!.Name);          // default: the instance name
+        Assert.Equal(25, channel.Value.MaxMessages);
+        var binding = Assert.Single(channel.Value.Bindings);
         Assert.Equal("adapter.qq#qq-1", binding.Adapter.ToString());
         Assert.Equal("group-123", binding.PlatformConversationId);
 
         // Half a binding is not a binding: an adapter without a conversation would bind to nothing.
-        var half = await plane.InvokeAsync(User(Capabilities.ChannelsControl), CoreActions.ChannelsCreate,
+        var half = await plane.InvokeAsync(User(Capabilities.ChannelsControl), ChannelActions.Create,
             JsonSerializer.SerializeToElement(new
             {
                 type = "channel.conversation", instance = "group-2",
@@ -489,16 +493,43 @@ public sealed class ControlPlaneTests : IDisposable
             }), default);
         Assert.Equal(ErrorCode.Invalid, half.Error!.Code);
         // Zero is refused rather than read as "unlimited".
-        var zero = await plane.InvokeAsync(User(Capabilities.ChannelsControl), CoreActions.ChannelsCreate,
+        var zero = await plane.InvokeAsync(User(Capabilities.ChannelsControl), ChannelActions.Create,
             JsonSerializer.SerializeToElement(new { type = "channel.conversation", instance = "group-3", maxMessages = 0 }), default);
         Assert.Equal(ErrorCode.Invalid, zero.Error!.Code);
-        Assert.Single(channels.Created);
+        Assert.False(channels.Get(new Address("channel", "conversation", "group-2")).Ok);
 
-        var destroyed = await plane.InvokeAsync(User(Capabilities.ChannelsControl), CoreActions.ChannelsDestroy,
+        var destroyed = await plane.InvokeAsync(User(Capabilities.ChannelsControl), ChannelActions.Destroy,
             JsonSerializer.SerializeToElement(new { address = "channel.conversation#group-1" }), default);
         Assert.True(destroyed.Ok, destroyed.Error?.Message);
-        Assert.Equal("channel.conversation#group-1", Assert.Single(channels.Destroyed).ToString());
+        Assert.False(channels.Get(new Address("channel", "conversation", "group-1")).Ok);
     }
+
+    [Fact]
+    public async Task A_channel_serves_one_conversation_and_a_second_binding_is_refused_up_front()
+    {
+        var types = new AdapterTypeCatalog();
+        Assert.True(types.RegisterPackageTypes("test.pack", [new("channel.conversation", "channel")]).Ok);
+        var channels = new ChannelManager(new EventQueue(8), new QuietBindings(), new ModuleCatalog(), types: types);
+
+        var two = await channels.CreateAsync(new ChannelSpec(new Address("channel", "conversation", "two"), "two",
+            [new ChannelBinding(new Address("adapter", "qq", "one"), "a"), new ChannelBinding(new Address("adapter", "qq", "one"), "b")],
+            "channel.conversation"), default);
+
+        // Refused here rather than accepted and then unusable: accepting a message had to pick a binding, and sending
+        // refused anything but exactly one, so a two-binding channel was a channel that half worked.
+        Assert.Equal(ErrorCode.Invalid, two.Error!.Code);
+        Assert.Contains("one conversation", two.Error!.Message, StringComparison.OrdinalIgnoreCase);
+
+        // And the ids are the module's own: registered with it, not by the host.
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(channels.RegisterActions(plane).Ok);
+        Assert.Equal(
+            [ChannelActions.Create, ChannelActions.Destroy, ChannelActions.List, ChannelActions.Send,
+                ChannelActions.Start, ChannelActions.Stop],
+            plane.Catalog.Select(action => action.Id).ToArray());
+        Assert.All(plane.Catalog, action => Assert.False(string.IsNullOrWhiteSpace(action.ParamsJson)));
+    }
+
 
     [Fact]
     public async Task A_saved_provider_is_written_to_disk_masked_on_the_way_back_and_enough_to_run()
@@ -782,8 +813,16 @@ public sealed class ControlPlaneTests : IDisposable
         public IReadOnlyList<ModelProfile> ListProfiles() => Profiles;
     }
 
-    private sealed class StubProvider(Address address, ModelProviderDescriptor describe) : IModelProvider
+    /// <summary>
+    /// The graph port, doing nothing: these tests are about what a manager does before an instance reaches the graph.
+    /// </summary>
+    private sealed class QuietBindings : IInstanceBindings
     {
+        public ValueTask<Result> AttachAsync(Address target, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> DetachAsync(Address target, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+    }
+
+    private sealed class StubProvider(Address address, ModelProviderDescriptor describe) : IModelProvider    {
         public Address Address => address;
         public ModelProviderDescriptor Describe => describe;
         public ModuleId Id => new(address.ToString());

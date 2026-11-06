@@ -21,12 +21,8 @@ public static class CoreActions
     public const string AdaptersStop = "adapters.stop";
     public const string AdaptersCreate = "adapters.create";
     public const string AdaptersDestroy = "adapters.destroy";
-    public const string ChannelsList = "channels.list";
-    public const string ChannelsStart = "channels.start";
-    public const string ChannelsStop = "channels.stop";
-    public const string ChannelsCreate = "channels.create";
-    public const string ChannelsDestroy = "channels.destroy";
-    public const string ChannelsSend = "channels.send";
+    // The channel verbs live with the Channel module now (ALN.Channel/ChannelManager.Actions.cs): the ids are in
+    // ALN.Contracts.ChannelActions, and the manager registers them itself.
     // The three edge actions were graph.* until the graph grew modules (docs/15). They live under modules.edge now, and
     // the old names stay registered for one release, pointing at the same handlers: a client that says graph.mount
     // should get a mount, not a lesson in naming.
@@ -122,27 +118,6 @@ public static class CoreActions
             (new(AdaptersStop, "Stop one adapter.", Capabilities.AdaptersControl, true), StopAdapter),
             (new(AdaptersCreate, "Create one adapter instance (instance is named by the caller, or by the type plus a fresh suffix): {\"type\", \"instance\", \"platform\", \"account\", \"direction\", \"settings\"}.", Capabilities.AdaptersControl, true), CreateAdapter),
             (new(AdaptersDestroy, "Destroy one adapter instance and forget its spec.", Capabilities.AdaptersControl, true), DestroyAdapter),
-
-            (new(ChannelsList, "List channels and their bindings.", Capabilities.ChannelsRead, false),
-                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(
-                    channels.List().Select(c => new
-                    {
-                        address = c.Address.ToString(),
-                        name = c.Name,
-                        running = c.Running,
-                        maxMessages = c.MaxMessages,
-                        bindings = c.Bindings.Select(b => new
-                        {
-                            adapter = b.Adapter.ToString(),
-                            conversation = b.PlatformConversationId
-                        })
-                    }))))),
-
-            (new(ChannelsStart, "Start one channel.", Capabilities.ChannelsControl, true), StartChannel),
-            (new(ChannelsStop, "Stop one channel.", Capabilities.ChannelsControl, true), StopChannel),
-            (new(ChannelsSend, "Send one text message through a channel's binding.", Capabilities.MessagesWrite, true), SendChannel),
-            (new(ChannelsCreate, "Create one channel instance (instance is named by the caller, or by the type plus a fresh suffix): {\"type\", \"instance\", \"name\", \"bindings\": [{\"adapter\", \"conversation\"}], \"maxMessages\"}.", Capabilities.ChannelsControl, true), CreateChannel),
-            (new(ChannelsDestroy, "Destroy one channel instance and forget its spec.", Capabilities.ChannelsControl, true), DestroyChannel),
 
             (new(EdgesList, "List mounted scripts, durable mount rules, and which rules are still waiting.", Capabilities.ModulesRead, false), ListEdges),
             // One release of forwarding: same handler, same capability, so an old client keeps working and gets the
@@ -527,75 +502,6 @@ public static class CoreActions
             }));
         }
 
-        async ValueTask<Result<JsonElement>> DestroyChannel(JsonElement arguments, CancellationToken ct)
-        {
-            var target = ReadAddress(arguments, "address");
-            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
-            var destroyed = await channels.DestroyAsync(target.Value, ct).ConfigureAwait(false);
-            return destroyed.Ok
-                ? Result<JsonElement>.Success(ToJson(new { address = target.Value.ToString(), destroyed = true }))
-                : Result<JsonElement>.Failure(destroyed.Error!);
-        }
-
-        async ValueTask<Result<JsonElement>> CreateChannel(JsonElement arguments, CancellationToken ct)
-        {
-            if (!TryReadText(arguments, "type", out var typeId) || typeId.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.create requires 'type'."));
-            var type = typeId.Trim();
-            if (moduleTypes is not { } channelTypes)
-                return Unavailable("No type tree in this process; channel types cannot be checked.");
-            if (!channelTypes.IsAssignableTo(type, "channel"))
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Not a channel type: {type}"));
-            if (!channelTypes.IsConcrete(type))
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Channel type is not registered in this process: {type}"));
-            // Same rule as adapters.create: named by the caller, or named by the type plus a fresh suffix.
-            var instanceName = TryReadText(arguments, "instance", out var asked) && asked.Trim().Length > 0
-                ? asked.Trim()
-                : ModuleId.NewSuffix();
-            var address = BuildAddress(type, instanceName);
-            if (!address.Ok) return Result<JsonElement>.Failure(address.Error!);
-            var name = TryReadText(arguments, "name", out var nameText) && nameText.Trim().Length > 0 ? nameText.Trim() : instanceName;
-
-            var bindings = new List<ChannelBinding>();
-            if (arguments.ValueKind == JsonValueKind.Object && arguments.TryGetProperty("bindings", out var bindingItems))
-            {
-                if (bindingItems.ValueKind != JsonValueKind.Array)
-                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.create 'bindings' must be an array."));
-                foreach (var item in bindingItems.EnumerateArray())
-                {
-                    if (item.ValueKind != JsonValueKind.Object ||
-                        !item.TryGetProperty("adapter", out var adapterText) || adapterText.ValueKind != JsonValueKind.String ||
-                        !Address.TryParse(adapterText.GetString(), out var adapterAddress) || !adapterAddress.IsInstance)
-                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "Each binding needs 'adapter' as an instance address."));
-                    if (!item.TryGetProperty("conversation", out var conversationText) || conversationText.ValueKind != JsonValueKind.String ||
-                        string.IsNullOrWhiteSpace(conversationText.GetString()))
-                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "Each binding needs a non-empty 'conversation'."));
-                    bindings.Add(new ChannelBinding(adapterAddress, conversationText.GetString()!.Trim()));
-                }
-            }
-
-            int? maxMessages = null;
-            if (arguments.ValueKind == JsonValueKind.Object && arguments.TryGetProperty("maxMessages", out var window) &&
-                window.ValueKind != JsonValueKind.Null)
-            {
-                if (window.ValueKind != JsonValueKind.Number || !window.TryGetInt32(out var parsed) || parsed <= 0)
-                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.create 'maxMessages' must be a positive integer."));
-                maxMessages = parsed;
-            }
-
-            var spec = new ChannelSpec(address.Value, name, bindings, type, maxMessages);
-            var created = await channels.CreateAsync(spec, ct).ConfigureAwait(false);
-            if (!created.Ok || created.Value is null) return Result<JsonElement>.Failure(created.Error ?? new(ErrorCode.Unavailable, "Channel could not be created."));
-            return Result<JsonElement>.Success(ToJson(new
-            {
-                address = address.Value.ToString(),
-                type,
-                name,
-                bindings = bindings.Select(binding => new { adapter = binding.Adapter.ToString(), conversation = binding.PlatformConversationId }),
-                maxMessages
-            }));
-        }
-
         // ---- model configuration: the files a person edits, behind the same single execution point ----------
 
         /// <summary>"openai-chat" → "chat": the file's category comes from the type, not from the kind in the address.</summary>
@@ -949,27 +855,6 @@ public static class CoreActions
                 ? Result<JsonElement>.Success(ToJson(new { address = target.Value.ToString(), state = "stopped" }))
                 : Result<JsonElement>.Failure(stopped.Error!);
         }
-
-        async ValueTask<Result<JsonElement>> StartChannel(JsonElement arguments, CancellationToken ct)
-        {
-            var target = ReadAddress(arguments, "address");
-            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
-            var started = await channels.StartAsync(target.Value, ct).ConfigureAwait(false);
-            return started.Ok
-                ? Result<JsonElement>.Success(ToJson(new { address = target.Value.ToString(), state = "running" }))
-                : Result<JsonElement>.Failure(started.Error!);
-        }
-
-        async ValueTask<Result<JsonElement>> StopChannel(JsonElement arguments, CancellationToken ct)
-        {
-            var target = ReadAddress(arguments, "address");
-            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
-            var stopped = await channels.StopAsync(target.Value, ct).ConfigureAwait(false);
-            return stopped.Ok
-                ? Result<JsonElement>.Success(ToJson(new { address = target.Value.ToString(), state = "stopped" }))
-                : Result<JsonElement>.Failure(stopped.Error!);
-        }
-
         // Optional per-adapter health: the state says whether somebody asked it to run, this says
         // whether it is actually connected right now.
         IAdapterHealth? Health(Address address)
@@ -1167,49 +1052,6 @@ public static class CoreActions
         {
             var found = adapters.Get(address);
             return found.Ok ? found.Value as IAdapterIdentity : null;
-        }
-
-        /// <summary>
-        /// One text, one binding, no policy: this is the action a human or a test uses to prove that the
-        /// Channel → Adapter → platform path works without waiting for somebody to talk to the bot.
-        ///
-        /// It refuses a channel with zero or several bindings rather than picking one: guessing which
-        /// conversation a message was meant for is exactly the kind of guess that ends up in the wrong
-        /// group.
-        /// </summary>
-        async ValueTask<Result<JsonElement>> SendChannel(JsonElement arguments, CancellationToken ct)
-        {
-            var target = ReadAddress(arguments, "address");
-            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
-            if (!TryReadText(arguments, "text", out var text) || text.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.send requires a non-empty 'text'."));
-            var replyTo = TryReadText(arguments, "replyTo", out var reply) ? reply : null;
-
-            var channel = channels.Get(target.Value);
-            if (!channel.Ok || channel.Value is null) return Result<JsonElement>.Failure(channel.Error!);
-            if (!channel.Value.Running)
-                return Result<JsonElement>.Failure(new(ErrorCode.Conflict, $"Channel is not running: {target.Value}"));
-            if (channel.Value.Bindings.Count != 1)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
-                    $"Channel has {channel.Value.Bindings.Count} bindings; channels.send needs exactly one. " +
-                    "Sending to a chosen binding among several is not implemented."));
-
-            var binding = channel.Value.Bindings[0];
-            var adapter = adapters.Get(binding.Adapter);
-            if (!adapter.Ok || adapter.Value is null) return Result<JsonElement>.Failure(adapter.Error!);
-
-            var sent = await adapter.Value.SendAsync(new OutboundMessage(binding.PlatformConversationId, text, replyTo), ct)
-                .ConfigureAwait(false);
-            if (!sent.Ok || sent.Value is null) return Result<JsonElement>.Failure(sent.Error!);
-            return Result<JsonElement>.Success(ToJson(new
-            {
-                channel = target.Value.ToString(),
-                adapter = binding.Adapter.ToString(),
-                conversation = binding.PlatformConversationId,
-                sent = sent.Value.Sent,
-                messageId = sent.Value.AttemptId,
-                detail = sent.Value.Detail
-            }));
         }
 
         ValueTask<Result<JsonElement>> RecentSignals(JsonElement arguments, CancellationToken ct)

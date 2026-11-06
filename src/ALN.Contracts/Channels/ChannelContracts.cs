@@ -5,6 +5,26 @@ namespace ALN.Contracts;
 public sealed record ChannelBinding(Address Adapter, string PlatformConversationId);
 
 /// <summary>
+/// The action ids the Channel module answers to. They live in contracts for the same reason
+/// <see cref="Capabilities"/> does: an id is part of the interface, and the module that implements the verb and the
+/// caller that reads the answer must not each spell it out.
+///
+/// They are here rather than next to the handler because a handler is one implementation of an action: the host used
+/// to own all of them, and an id that moves with the implementation would eventually move twice.
+/// </summary>
+public static class ChannelActions
+{
+    public const string List = "channels.list";
+    public const string Start = "channels.start";
+    public const string Stop = "channels.stop";
+    public const string Send = "channels.send";
+    public const string Create = "channels.create";
+    public const string Destroy = "channels.destroy";
+    public const string Connect = "channels.connect";
+    public const string Disconnect = "channels.disconnect";
+}
+
+/// <summary>
 /// One tunable, as a component describes it. The description is the contract: a parameter that cannot say
 /// what it accepts and when it takes effect is a parameter the UI has to guess about.
 /// </summary>

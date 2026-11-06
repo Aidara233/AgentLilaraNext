@@ -56,7 +56,12 @@ public sealed class DefaultModulesPlugin : IModulePlugin
                 context.HostServices.GetService(typeof(IChannelSpecStore)) as IChannelSpecStore,
                 context.HostServices.GetService(typeof(IMessageStore)) as IMessageStore,
                 context.HostServices.GetService(typeof(IParameterRegistry)) as IParameterRegistry,
-                state, report, atomic, queue, registry);
+                state, report, atomic, queue, registry, types: types);
+            // The channel verbs are the Channel module's, so it registers them: the table is handed out, not filled in
+            // from outside. Failing here is a startup failure — a verb that silently did not exist would only be
+            // discovered by whoever tried to use it.
+            var channelActions = channels.RegisterActions(HostService<IControlPlane>(context));
+            if (!channelActions.Ok) return ValueTask.FromResult(channelActions);
             var executor = new JintScriptExecutor();
             var graph = new GraphManager(catalog, types, executor, audit, journal, state, report);
             if (bindings is IInstanceBindingsProxy proxy) proxy.Bind(graph);

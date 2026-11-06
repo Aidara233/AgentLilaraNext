@@ -6,10 +6,10 @@ using ALN.Contracts.Sessions;
 namespace ALN.Channel;
 
 [Module(ChannelManagerId, Category = "channel", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class ChannelManager(IEventSink events, IInstanceBindings bindings, ICatalog catalog,
+public sealed partial class ChannelManager(IEventSink events, IInstanceBindings bindings, ICatalog catalog,
     IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
     IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IQueuedMessageStore? queue = null,
-    IArchiveRegistry? archive = null, IInstanceHost? instances = null)
+    IArchiveRegistry? archive = null, IInstanceHost? instances = null, IModuleTypeCatalog? types = null)
     : IChannelManager, IModuleIndex, IModuleWiring, IInstanceSink, ILifecycleParticipant, IModule, IRequireModules
 {
     /// <inheritdoc />
@@ -58,6 +58,7 @@ public sealed class ChannelManager(IEventSink events, IInstanceBindings bindings
     // Accepted-but-unfinished markers are their own rows: one per message, not a list rewritten per message.
     private readonly IQueuedMessageStore? _queue = queue;
     private readonly IArchiveRegistry? _archive = archive;
+    private readonly IModuleTypeCatalog? _types = types;
     private IInstanceHost? _instances = instances;
     /// <summary>Instances by name. The address lives on the instance; the name is the key, so nothing has to take one
     /// apart to look something up.</summary>
@@ -115,8 +116,18 @@ public sealed class ChannelManager(IEventSink events, IInstanceBindings bindings
     {
         if (spec.Address.Instance is null || string.IsNullOrWhiteSpace(spec.TypeId))
             return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "A Channel instance needs an instance id and the type it implements."));
+        // The type tree says what a record is (C-04/C-06). Checked here rather than only in the action that happens to
+        // call this, so a create from anywhere — action, startup revive, a script tomorrow — is judged the same way.
+        if (_types is { } types && !types.IsConcrete(spec.TypeId))
+            return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, $"Not a registered concrete Channel type: {spec.TypeId}"));
         if (string.IsNullOrWhiteSpace(spec.Name) || spec.Bindings is null || spec.Bindings.Count == 0)
             return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "Channel requires a name and at least one Adapter binding."));
+        // One channel serves one conversation. A second binding used to be accepted and then silently unusable:
+        // accepting a message had to pick a binding, and sending refused anything but exactly one. Saying no here is
+        // cheaper than explaining later which of the two actually answers.
+        if (spec.Bindings.Count > 1)
+            return Result<ChannelInfo>.Failure(new(ErrorCode.Invalid,
+                $"A Channel serves one conversation; this spec has {spec.Bindings.Count} bindings."));
         // A window bounds what one turn may carry; zero and negatives are not "no window", they are a bug in
         // the config, and silently treating them as unlimited is how a typo becomes a huge prompt.
         if (spec.MaxMessages is <= 0)

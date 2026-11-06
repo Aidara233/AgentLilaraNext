@@ -76,6 +76,14 @@ public sealed record ActionDescriptor(string Id, string Summary, string Capabili
 public interface IControlPlane
 {
     IReadOnlyList<ActionDescriptor> Catalog { get; }
+
+    /// <summary>
+    /// Adds one action to the table. A module registers the verbs it implements, so "who owns this verb" is a fact
+    /// about the module rather than a list in the host; the host still owns the execution point, and nothing can
+    /// register an action without going through it.
+    /// </summary>
+    Result Register(ActionDescriptor descriptor, ActionHandler handler);
+
     ValueTask<Result<JsonElement>> InvokeAsync(Actor actor, string action, JsonElement arguments,
         CancellationToken cancellationToken);
 }
