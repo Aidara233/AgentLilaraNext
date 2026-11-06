@@ -30,6 +30,17 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     /// </summary>
     public const int RecentChannelMessages = 40;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    /// <summary>
+    /// The same, but with text left as text.
+    ///
+    /// This is for anything the <b>model</b> reads: the default encoder turns every Chinese character into six ASCII
+    /// characters ("上限" becomes "\u4E0A\u9650"), which costs five times the tokens and hands the model escaped
+    /// gibberish for the one message that most needs to be plain — why its call was refused. The records on disk keep
+    /// using the escaping options, where stable bytes matter more than readability.
+    /// </summary>
+    private static readonly JsonSerializerOptions ToolJson = new(JsonSerializerDefaults.Web)
+    { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
     private readonly string _root;
     /// <summary>
     /// A Session's directory is <c>modules/&lt;id&gt;/</c>, like every other instance's (docs/22 §2). The id stays the
@@ -737,10 +748,12 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             messages.Add(new ModelMessage("user", record.Spec.Objective));
             // What goes in is a view of the timeline, not a copy of it. Old work traces are folded to their outline so
             // that the request stays inside the model's window; the records themselves are untouched (SessionReplay).
-            var replayBudget = ReplayBudget(record.Spec);
+            var window = ContextWindow(record.Spec);
+            var replayBudget = (int)(window * (long)ReplayBudgetPercent / 100);
             var replay = SessionReplay.Build(history, actingTools > 0, replayBudget);
             messages.AddRange(replay.Messages);
             RecordReplay(sessionId, replay, replayBudget);
+            var turnCeiling = (int)(window * (long)TurnCeilingPercent / 100);
             var collected = await CollectRoundContextAsync(request, cancellationToken).ConfigureAwait(false);
             if (!collected.Ok || collected.Value is null) return Result<SessionTurnResult>.Failure(collected.Error!);
 
@@ -905,32 +918,52 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                 var anyEffect = false;
                 // One per turn: it is where this turn's wait declaration lives until the round is committed.
                 var stop = new WaitTool();
+                // A turn may run as long as it needs — nothing here counts steps — but not past the end of the window.
+                // One round of reads can be a whole budget on its own, and a request the provider refuses teaches
+                // nobody anything. Checked here because a round of tool calls is where a request grows.
+                var used = TokenEstimator.Estimate(messages) + TokenEstimator.Estimate(visible);
+                var outOfRoom = used >= turnCeiling;
+                if (outOfRoom)
+                    WriteSignal(activationId, "ceiling", SignalLevel.Warn,
+                        ("estimated", used.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+                        ("ceiling", turnCeiling.ToString(System.Globalization.CultureInfo.InvariantCulture)));
                 foreach (var call in completedCalls)
                 {
                     // "wait" belongs to the loop and resolves even when nothing else does: it is how a turn ends
                     // without saying anything. Everything else comes from a module that offered it this round.
-                    ISessionTool? tool = string.Equals(call.Name, WaitTool.ToolName, StringComparison.Ordinal)
+                    var isWait = string.Equals(call.Name, WaitTool.ToolName, StringComparison.Ordinal);
+                    ISessionTool? tool = isWait
                         ? stop
                         : resolved.Value.ByName.TryGetValue(call.Name, out var offeredTool)
                             ? offeredTool
                             : ResolveHosted(tools, call.Name);
                     var found = tools?.Find(call.Name);
                     Result<SessionToolResult> execution;
-                    try
+                    if (outOfRoom && !isWait)
                     {
-                        execution = tool is not null
-                            ? await tool.ExecuteAsync(call, cancellationToken).ConfigureAwait(false)
-                            : Result<SessionToolResult>.Failure(new(ErrorCode.Denied,
-                                found?.Error?.Message ?? $"Tool is not available: {call.Name}"));
+                        // Refused for room, in the same shape as any other refusal — the round still commits, the call
+                        // still gets an answer, and nothing had an effect. Ending a turn stays possible, because wait
+                        // is never refused: the model must always be able to stop.
+                        execution = Result<SessionToolResult>.Failure(new(ErrorCode.Unavailable, TurnCeilingNote));
                     }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-                    catch (Exception ex)
-                    { execution = Result<SessionToolResult>.Failure(new(ErrorCode.Internal, "Session tool execution failed.", ex.Message)); }
+                    else
+                    {
+                        try
+                        {
+                            execution = tool is not null
+                                ? await tool.ExecuteAsync(call, cancellationToken).ConfigureAwait(false)
+                                : Result<SessionToolResult>.Failure(new(ErrorCode.Denied,
+                                    found?.Error?.Message ?? $"Tool is not available: {call.Name}"));
+                        }
+                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                        catch (Exception ex)
+                        { execution = Result<SessionToolResult>.Failure(new(ErrorCode.Internal, "Session tool execution failed.", ex.Message)); }
+                    }
 
                     var outcome = execution.Ok && execution.Value is not null
                         ? execution.Value
                         : new SessionToolResult(JsonSerializer.Serialize(
-                            new { error = execution.Error?.Message ?? "Tool returned no result." }, JsonOptions));
+                            new { error = execution.Error?.Message ?? "Tool returned no result." }, ToolJson));
                     if (!string.IsNullOrWhiteSpace(outcome.SpokenText)) spokenTexts.Add(outcome.SpokenText!);
                     if (execution.Ok) anyEffect = true;
                     // A refused call has no effect, so it must not produce the effect of ending the turn either —
@@ -1783,13 +1816,27 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     public const int ReplayBudgetPercent = 55;
 
     /// <summary>The window this Session's model declared, or the floor when it declared nothing.</summary>
-    private int ReplayBudget(SessionSpec spec)
+    private int ContextWindow(SessionSpec spec)
     {
         var profile = Models.ListProfiles()
             .FirstOrDefault(candidate => string.Equals(candidate.Id, spec.ModelProfileId, StringComparison.Ordinal));
-        var window = profile?.EffectiveContextWindow ?? ModelProfile.AssumedContextWindow;
-        return (int)(window * (long)ReplayBudgetPercent / 100);
+        return profile?.EffectiveContextWindow ?? ModelProfile.AssumedContextWindow;
     }
+
+    /// <summary>
+    /// Where a turn must stop growing: past this, the model is being asked to answer inside what is left of its own
+    /// input. Refusing is better than sending a request the provider will reject — and unlike a rejected request, a
+    /// refusal can be explained to the model, which is the only party that can end the turn.
+    /// </summary>
+    public const int TurnCeilingPercent = 85;
+
+    /// <summary>
+    /// What the model is told when a call is refused for room. It has to say three things: the call did not run, why,
+    /// and what to do next — a silent truncation would leave the model believing it had read what it asked for.
+    /// </summary>
+    private const string TurnCeilingNote =
+        "（系统）这一轮的上下文已经到上限，这个调用没有执行。要么把已经查到的说完，要么用 wait 结束这一轮；" +
+        "还需要看别的东西，就在下一轮开始后再说。不要把这次调用当成已经做过。";
 
     /// <summary>
     /// One line per turn about how big the request got and how much of it was an outline. Written whenever anything was

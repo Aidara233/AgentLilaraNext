@@ -67,6 +67,36 @@ public sealed class SessionReplayWiringTests : IDisposable
         Assert.DoesNotContain(history, line => line.Contains("已折叠", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task A_call_that_would_overflow_the_window_is_refused_and_the_model_is_told_why()
+    {
+        // A turn is allowed to run as long as it needs; it is not allowed to run past the end of its own window. The
+        // ceiling here is 85% of a declared 4k window (~14k characters), and one read of 30,000 characters crosses it.
+        var call = 0;
+        ModelEvent[][] script =
+        [
+            [new ToolCallDelta(0, $"call_a{call++}", "read", """{"path":"a.md"}"""), new ModelCompleted(StopReason.ToolUse, new ModelUsage(10, 10))],
+            [new ToolCallDelta(0, $"call_b{call++}", "read", """{"path":"b.md"}"""), new ModelCompleted(StopReason.ToolUse, new ModelUsage(10, 10))],
+            [new ToolCallDelta(0, $"call_w{call++}", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(10, 10))]
+        ];
+        var model = new ReplayModel(script, contextWindow: 4_000);
+        var read = new ReadingTool(new string('q', 30_000));
+        var sessions = new SessionManager(_root, model);
+        var spec = new SessionSpec("default", "Read a lot.", "1", Tools: [ReadShape]);
+
+        var ran = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(),
+            new SessionTurnInput([], null, null), new ReplayToolbox(read), default);
+
+        Assert.True(ran.Ok, ran.Error?.Detail ?? ran.Error?.Message);
+        // The first read happened, the second one did not: it would have arrived at the provider with no room to answer.
+        Assert.Single(read.Calls);
+        var refusal = Assert.Single(model.Requests.Last().Messages,
+            message => message.Role == "tool" && message.Content?.Contains("上限", StringComparison.Ordinal) == true);
+        // It says what happened and what to do, and it does not pretend the read happened.
+        Assert.Contains("没有执行", refusal.Content, StringComparison.Ordinal);
+        Assert.Contains("wait", refusal.Content, StringComparison.Ordinal);
+    }
+
     /// <summary>One turn's script: read a file, then stop.</summary>
     private static ModelEvent[][] Turn()
     {
@@ -82,11 +112,15 @@ public sealed class SessionReplayWiringTests : IDisposable
 
     private sealed class ReadingTool(string result) : ISessionTool
     {
+        public List<ModelToolCall> Calls { get; } = [];
         public string Name => "read";
         public bool EndsTurn => false;
 
-        public ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken) =>
-            ValueTask.FromResult(Result<SessionToolResult>.Success(new SessionToolResult(result, null)));
+        public ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken)
+        {
+            Calls.Add(call);
+            return ValueTask.FromResult(Result<SessionToolResult>.Success(new SessionToolResult(result, null)));
+        }
     }
 
     private sealed class ReplayToolbox(params ISessionTool[] tools) : ISessionToolbox
@@ -98,8 +132,8 @@ public sealed class SessionReplayWiringTests : IDisposable
             : Result<ISessionTool>.Failure(new(ErrorCode.Invalid, $"No tool named {name}."));
     }
 
-    /// <summary>A model that answers with the same two steps forever and keeps every request it was given.</summary>
-    private sealed class ReplayModel(ModelEvent[][] script) : IModelManager
+    /// <summary>A model that answers with the same steps forever and keeps every request it was given.</summary>
+    private sealed class ReplayModel(ModelEvent[][] script, int? contextWindow = null) : IModelManager
     {
         public List<ModelRequest> Requests { get; } = [];
 
@@ -107,7 +141,7 @@ public sealed class SessionReplayWiringTests : IDisposable
             CancellationToken cancellationToken)
         {
             Requests.Add(request);
-            var step = script[Requests.Count % 2 == 1 ? 0 : 1];
+            var step = script[(Requests.Count - 1) % script.Length];
             return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Success(Stream(step)));
         }
 
@@ -128,8 +162,13 @@ public sealed class SessionReplayWiringTests : IDisposable
         public ValueTask<Result> DestroyAsync(Address provider, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
         public Result<IModelProvider> Get(Address provider) => Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "No providers."));
         public IReadOnlyList<ModelProviderInfo> List() => [];
+
+        /// <summary>The window a Session plans against. Nothing declared means the floor, which is what most tests want.</summary>
+        public IReadOnlyList<ModelProfile> ListProfiles() => contextWindow is { } declared
+            ? [new ModelProfile("default", new Address("model", "stub", "one"), "stub", ContextWindow: declared)]
+            : [];
+
         public Result RegisterProfile(ModelProfile profile) => Result.Success();
         public Result RemoveProfile(string profileId) => Result.Success();
-        public IReadOnlyList<ModelProfile> ListProfiles() => [];
     }
 }
