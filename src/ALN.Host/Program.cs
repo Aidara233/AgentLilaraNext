@@ -35,6 +35,14 @@ IAuditSink auditSink = storage;
 foreach (var legacy in new[] { "state", "messages", "audit" })
     if (Directory.Exists(Path.Combine(data.Root, legacy)))
         Console.Error.WriteLine($"note: {legacy}/ is left over from file storage and is ignored; aln.db is the source of truth now.");
+// The spec trees moved too: an Adapter, Channel or Session spec is a module file under modules/<id>/, and nothing
+// reads <DataRoot>/adapters, /channels or /sessions. A spec written there is a no-op, and a no-op looks exactly like
+// a spec that was read and rejected on purpose — which is how a person ends up checking the code for a mistake the
+// disk made. So the directory gets a line, the same way the old file layout does.
+foreach (var stale in new[] { "adapters", "channels", "sessions" })
+    if (Directory.Exists(Path.Combine(data.Root, stale)))
+        Console.Error.WriteLine($"note: {stale}/ is not read; instance specs live in " +
+            $"{ModuleManifestStore.DirectoryName}/<id>/{ModuleManifestStore.FileName}.");
 await using var signalLog = SignalLog.Open(Path.Combine(data.Root, "logs"));
 var moduleLoggers = new SignalModuleLoggerFactory(signalLog);
 var queue = new EventQueue(capacity: 256);
