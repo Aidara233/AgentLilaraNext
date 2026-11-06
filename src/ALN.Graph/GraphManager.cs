@@ -344,6 +344,17 @@ public sealed class GraphManager : IGraphRuntime, IModule
         return null;
     }
 
+    /// <summary>Every instance the graph knows, mounted or not: exactly what a rule may name as its target.</summary>
+    public IReadOnlyList<Address> Instances
+    {
+        get
+        {
+            _gate.Wait();
+            try { return Targets().Select(target => target.Address).ToArray(); }
+            finally { _gate.Release(); }
+        }
+    }
+
     /// <summary>Every catalogued script, with the library it came from and whether it is currently allowed to run.</summary>
     public IReadOnlyList<(ScriptPackage Package, bool Enabled)> Scripts
     {

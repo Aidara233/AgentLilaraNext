@@ -823,6 +823,73 @@ public sealed class GraphIntegrationTests : IDisposable
     }
 
     /// <summary>
+    /// The addresses a mount takes are not guessable, so the model gets a way to look. Filtering is part of it: a host
+    /// with a hundred channels and no search is a list nobody reads.
+    /// </summary>
+    [Fact]
+    public async Task The_model_can_find_an_instance_address_and_narrow_the_list()
+    {
+        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
+        var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
+        // The graph has to have been loaded before instances can be attached to it.
+        Assert.True((await _graph.LoadAsync([AdapterIntake()], default)).Ok);
+        await AddChannelAsync(new Address("channel", "conversation", "chat-1"), "chat-1");
+        await AddChannelAsync(new Address("channel", "conversation", "chat-2"), "chat-2");
+
+        var all = await ToolOf(offers, ScriptTools.InstancesToolName)
+            .ExecuteAsync(new("c1", ScriptTools.InstancesToolName, "{}"), default);
+        Assert.True(all.Ok, all.Error?.Message);
+        Assert.Contains("channel.conversation#chat-1", all.Value!.Content, StringComparison.Ordinal);
+        Assert.Contains("channel.conversation#chat-2", all.Value.Content, StringComparison.Ordinal);
+
+        // By any part of the address.
+        var byQuery = await ToolOf(offers, ScriptTools.InstancesToolName)
+            .ExecuteAsync(new("c2", ScriptTools.InstancesToolName, """{"query":"chat-2"}"""), default);
+        Assert.True(byQuery.Ok);
+        Assert.Contains("chat-2", byQuery.Value!.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("chat-1", byQuery.Value.Content, StringComparison.Ordinal);
+
+        // By type, and the type filter is a prefix so "channel" keeps "channel.conversation".
+        var byType = await ToolOf(offers, ScriptTools.InstancesToolName)
+            .ExecuteAsync(new("c3", ScriptTools.InstancesToolName, """{"type":"channel"}"""), default);
+        Assert.True(byType.Ok);
+        Assert.Contains("chat-1", byType.Value!.Content, StringComparison.Ordinal);
+        Assert.Contains("chat-2", byType.Value.Content, StringComparison.Ordinal);
+
+        var nothing = await ToolOf(offers, ScriptTools.InstancesToolName)
+            .ExecuteAsync(new("c4", ScriptTools.InstancesToolName, """{"type":"adapter"}"""), default);
+        Assert.True(nothing.Ok);
+        Assert.Contains("No instance matches", nothing.Value!.Content, StringComparison.Ordinal);
+    }
+
+    /// <summary>One line answers both questions: where it is, and what already answers there.</summary>
+    [Fact]
+    public async Task An_instance_line_says_which_scripts_are_mounted_on_it()
+    {
+        var channel = new Address("channel", "conversation", "chat-1");
+        var draft = Path.Combine(_root, "scripts", "draft", "say-hello");
+        Directory.CreateDirectory(draft);
+        await File.WriteAllTextAsync(Path.Combine(draft, "manifest.json"), ScriptSeed.ExampleManifest);
+        await File.WriteAllTextAsync(Path.Combine(draft, "main.js"), ScriptSeed.ExampleSource);
+
+        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root),
+            new ScriptLibrary(_root));
+        var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
+        await ToolOf(offers, ScriptTools.ReloadToolName).ExecuteAsync(new("c1", ScriptTools.ReloadToolName, "{}"), default);
+        await AddChannelAsync(channel, "chat-1");
+        var mounted = await ToolOf(offers, ScriptTools.MountToolName).ExecuteAsync(
+            new("c2", ScriptTools.MountToolName, $$"""{"script":"channel.say-hello","target":"{{channel}}"}"""), default);
+        Assert.True(mounted.Ok, mounted.Error?.Message);
+
+        var listed = await ToolOf(offers, ScriptTools.InstancesToolName)
+            .ExecuteAsync(new("c3", ScriptTools.InstancesToolName, """{"query":"chat-1"}"""), default);
+
+        Assert.True(listed.Ok);
+        Assert.Contains("channel.conversation#chat-1", listed.Value!.Content, StringComparison.Ordinal);
+        Assert.Contains("← channel.say-hello", listed.Value.Content, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// The model's side of the draft folder: it can ask what is loaded and ask for a re-read, and neither of those starts
     /// anything. A draft becomes visible after a reload and still runs for nobody until a person mounts it.
     /// </summary>

@@ -65,6 +65,7 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
     public const string ReloadToolName = "scripts_reload";
     public const string MountToolName = "scripts_mount";
     public const string UnmountToolName = "scripts_unmount";
+    public const string InstancesToolName = "instances_list";
 
     private readonly IGraphRuntime _graph = graph;
     private readonly IGraphScriptCatalog _catalog = catalog;
@@ -107,6 +108,19 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
          "required":["script","target"]}
         """);
 
+    public static readonly ModelToolDefinition InstancesDefinition = new(InstancesToolName,
+        "Every instance the graph knows, with its address — the value scripts_mount takes as 'target'. Addresses are not "
+        + "guessable, so look them up instead of inventing them. Each line says which scripts are already mounted on it. "
+        + "Filter with 'query' (any part of an address or a type) or 'type' (one type, e.g. 'channel', which also keeps "
+        + "'channel.conversation').",
+        """
+        {"type":"object","properties":{
+          "query":{"type":"string","description":"Case-insensitive substring of the address or the type. Optional."},
+          "type":{"type":"string","description":"One type, e.g. 'channel' or 'channel.conversation'. Optional."},
+          "limit":{"type":"integer","minimum":1,"maximum":200,"description":"How many to show at most. Default 50."}},
+         "additionalProperties":false}
+        """);
+
     public ValueTask<Result<IReadOnlyList<SessionToolOffer>>> ToolsAsync(RoundContextRequest request,
         CancellationToken cancellationToken)
     {
@@ -119,7 +133,10 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
             // next message does. Keeping it non-external is what lets a turn mount and then speak in the same step
             // without the reply being taken for the effect.
             new(new MountTool(this), MountDefinition, ActsExternally: false),
-            new(new UnmountTool(this), UnmountDefinition, ActsExternally: false)
+            new(new UnmountTool(this), UnmountDefinition, ActsExternally: false),
+            // Reading addresses, for the same reason the mount tool exists: an address cannot be guessed, and the
+            // moment a model can mount it needs to see what there is to mount onto.
+            new(new InstancesTool(this), InstancesDefinition, ActsExternally: false)
         ];
         return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(offers));
     }
@@ -283,6 +300,69 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
                 text.Append(" It moved back to scripts/draft: no mount names it any more.");
             }
             return Result<SessionToolResult>.Success(new(text.ToString()));
+        }
+    }
+
+    /// <summary>
+    /// Listing addresses. This exists because a mount names an address and an address cannot be derived: the model has to
+    /// be able to look at what there is. It reports what is already mounted on each one, so "what answers here" is one
+    /// question with one answer rather than two lists the caller has to join.
+    /// </summary>
+    private sealed class InstancesTool(ScriptTools owner) : ISessionTool
+    {
+        public string Name => InstancesToolName;
+        public bool EndsTurn => false;
+
+        private const int DefaultLimit = 50;
+
+        public ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var arguments = ToolArguments.Parse(call.ArgumentsJson);
+            var query = arguments is { } root ? ToolArguments.Text(root, "query")?.Trim() : null;
+            var type = arguments is { } typed ? ToolArguments.Text(typed, "type")?.Trim() : null;
+            var limit = arguments is { } limited
+                ? Math.Clamp(ToolArguments.Number(limited, "limit") ?? DefaultLimit, 1, 200)
+                : DefaultLimit;
+
+            var mounted = owner._graph.Mounted
+                .GroupBy(entry => entry.Target.ToString(), StringComparer.Ordinal)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.Select(entry => entry.Package.Manifest.Id).Order(StringComparer.Ordinal).ToArray(),
+                    StringComparer.Ordinal);
+
+            var matching = owner._graph.Instances
+                .Where(address => address.IsInstance)
+                .Where(address => string.IsNullOrWhiteSpace(type)
+                                  || address.TypeId == type
+                                  || address.TypeId.StartsWith(type + ".", StringComparison.Ordinal))
+                .Where(address => string.IsNullOrWhiteSpace(query)
+                                  || address.ToString().Contains(query, StringComparison.OrdinalIgnoreCase)
+                                  || address.TypeId.Contains(query, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(address => address.ToString(), StringComparer.Ordinal)
+                .ToArray();
+
+            var text = new StringBuilder();
+            if (matching.Length == 0)
+            {
+                text.Append(string.IsNullOrWhiteSpace(query) && string.IsNullOrWhiteSpace(type)
+                    ? "No instance exists yet: there is nothing to mount a script on."
+                    : $"No instance matches{(string.IsNullOrWhiteSpace(type) ? "" : $" type {type}")}"
+                      + $"{(string.IsNullOrWhiteSpace(query) ? "" : $" query \"{query}\"")}.");
+                return ValueTask.FromResult(Result<SessionToolResult>.Success(new(text.ToString())));
+            }
+
+            text.Append(matching.Length <= limit
+                ? $"{matching.Length} instance(s):"
+                : $"{matching.Length} instance(s), showing the first {limit} — narrow it with query or type:");
+            foreach (var address in matching.Take(limit))
+            {
+                text.Append("\n- ").Append(address).Append(" [").Append(address.TypeId).Append(']');
+                if (mounted.TryGetValue(address.ToString(), out var scripts))
+                    text.Append(" ← ").Append(string.Join(", ", scripts));
+            }
+            return ValueTask.FromResult(Result<SessionToolResult>.Success(new(text.ToString())));
         }
     }
 }

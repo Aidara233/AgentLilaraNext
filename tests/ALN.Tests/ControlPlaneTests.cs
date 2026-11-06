@@ -636,6 +636,7 @@ public sealed class ControlPlaneTests : IDisposable
         public IReadOnlyList<MountRule> Rules => [];
         public IReadOnlyList<MountRule> PendingRules => [];
         public IReadOnlyList<(ScriptPackage Package, bool Enabled)> Scripts => script is null ? [] : [(script, true)];
+        public IReadOnlyList<Address> Instances => [];
         public IReadOnlyList<ScriptIssue> RejectedScripts => [];
         public ValueTask<Result> SetScriptEnabledAsync(string target, bool enabled, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result<MountRule>> AddRuleAsync(MountRequest request, CancellationToken ct) =>

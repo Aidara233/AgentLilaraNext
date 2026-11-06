@@ -218,12 +218,14 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
 
     1. `scripts_reload` 让宿主重读所有文件夹。这时你的脚本出现在 `scripts_list` 里，**但仍未生效**；
        如果它没出现，`scripts_list` 会告诉你为什么。
-    2. `scripts_mount { "script": "<id>", "target": "<实例地址>" }` 把它挂到某个实例上。挂载成功后它会从
-       `scripts/draft/` 移到 `scripts/live/`，并应答那个实例的下一个事件；地址可以在 `graph` 的实例列表里找。
-    3. `scripts_unmount { "script": "<id>", "target": "<实例地址>" }` 停掉它；如果那是它最后一个挂载点，
+    2. `instances_list` 查实例地址（可以带 `query` 或 `type` 过滤；返回里还会说每个实例上已经挂了哪些脚本）。
+       地址是猜不出来的，别自己编。
+    3. `scripts_mount { "script": "<id>", "target": "<实例地址>" }` 把它挂到那个实例上。挂载成功后它会从
+       `scripts/draft/` 移到 `scripts/live/`，并应答那个实例的下一个事件。
+    4. `scripts_unmount { "script": "<id>", "target": "<实例地址>" }` 停掉它；如果那是它最后一个挂载点，
        它会移回 `scripts/draft/`。
 
-    这三步里，只有 `scripts_mount` 会让它生效。写在草稿里、被加载、出现在列表里，都不等于在生效——
+    这几步里，只有 `scripts_mount` 会让它生效。写在草稿里、被加载、出现在列表里，都不等于在生效——
     目录不同就是状态不同。
     """;
 

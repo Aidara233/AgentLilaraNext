@@ -41,6 +41,12 @@ public interface IGraphRuntime : IInstanceBindings
 
     IReadOnlyList<MountedScript> Mounted { get; }
 
+    /// <summary>
+    /// Every instance the graph can mount onto: the addresses a rule may name. It includes instances nothing is mounted
+    /// on, which is the whole point — a mount needs an address before anything has been mounted anywhere.
+    /// </summary>
+    IReadOnlyList<Address> Instances { get; }
+
     /// <summary>Every durable rule, including those whose scope currently matches nothing.</summary>
     IReadOnlyList<MountRule> Rules { get; }
 
