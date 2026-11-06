@@ -36,8 +36,9 @@ public sealed record SessionState(
     SessionUsage Usage,
     int SchemaVersion,
     /// <summary>
-    /// The Channel address this Session answers for, as text. The Session id is a hash, so this is the only
-    /// way anybody — an operator, a maintenance action — can tell which Channel a directory belongs to.
+    /// The Channel address this Session answers for, as text. A Session's id is its type plus a fresh suffix —
+    /// the name is just a name (C-01) — so this field is the only way anybody, an operator or a maintenance
+    /// action, can tell which Channel a directory belongs to.
     /// </summary>
     string? Channel = null,
     /// <summary>
@@ -115,13 +116,7 @@ public sealed record RoundContextRequest(
     Guid ActivationId,
     int StepNumber,
     Address? Channel = null,
-    ChannelBinding? Binding = null,
-    /// <summary>
-    /// Whose memory this turn may read, when the host has memory at all. A string rather than the Channel,
-    /// because memory outlives Channels and Sessions both: it is keyed by the conversation, and a Session that
-    /// woke itself up still has one even when there is no Channel message behind the turn.
-    /// </summary>
-    string? MemoryScope = null);
+    ChannelBinding? Binding = null);
 
 /// <summary>Ephemeral context to render into this model request; it is never persisted in Session history.</summary>
 public sealed record RoundContextContribution(string Id, string Section, string Content, int Order = 0);
