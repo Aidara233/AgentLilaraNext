@@ -322,6 +322,10 @@ factories.Register(FileSystemModule.TypeId,
 factories.Register(ScriptToolsModule.TypeId,
     manifest => ScriptToolsModule.FromManifest(manifest, graph, scriptCatalog.Value!, sessionExtensions,
         new ScriptLibrary(data.Root)));
+// The action table reaches the model through a module too, and the plane it registers into came up long before this:
+// a module that offers tools is a module like any other, and the tools read the table as it is when they are called.
+factories.Register(ActionToolsModule.TypeId,
+    manifest => ActionToolsModule.FromManifest(manifest, controlPlane, sessionExtensions));
 foreach (var type in adapterTypes.ListTypes().Where(type => adapterTypes.IsConcrete(type.TypeId)))
     factories.RegisterOwned(type.TypeId);
 foreach (var type in modelManager.ListTypes())
@@ -425,6 +429,18 @@ var scriptToolsFile = await new ModuleManifestStore(data.Root).WriteIfMissingAsy
 if (!scriptToolsFile.Ok)
 {
     Console.Error.WriteLine(scriptToolsFile.Error?.Message ?? "Script control module declaration failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
+// The action table, offered to the model the same way: a module with a file, so "may the model reach the actions"
+// is a question with an answer on disk rather than a switch in the source.
+var actionToolsFile = await new ModuleManifestStore(data.Root).WriteIfMissingAsync(
+    new ModuleManifest(new ModuleId(ActionToolsModule.TypeId), ActionToolsModule.TypeId, Enabled: true),
+    CancellationToken.None);
+if (!actionToolsFile.Ok)
+{
+    Console.Error.WriteLine(actionToolsFile.Error?.Message ?? "Action tool module declaration failed.");
     shutdown.Cancel();
     queue.Complete();
     return 1;
