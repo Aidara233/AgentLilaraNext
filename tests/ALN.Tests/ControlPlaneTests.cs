@@ -524,8 +524,8 @@ public sealed class ControlPlaneTests : IDisposable
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
         Assert.True(channels.RegisterActions(plane).Ok);
         Assert.Equal(
-            [ChannelActions.Create, ChannelActions.Destroy, ChannelActions.List, ChannelActions.Send,
-                ChannelActions.Start, ChannelActions.Stop],
+            [ChannelActions.Connect, ChannelActions.Create, ChannelActions.Destroy, ChannelActions.Disconnect,
+                ChannelActions.List, ChannelActions.Send, ChannelActions.Start, ChannelActions.Stop],
             plane.Catalog.Select(action => action.Id).ToArray());
         Assert.All(plane.Catalog, action => Assert.False(string.IsNullOrWhiteSpace(action.ParamsJson)));
     }

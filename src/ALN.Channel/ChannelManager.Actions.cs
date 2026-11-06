@@ -76,7 +76,24 @@ public sealed partial class ChannelManager
 
             (new(ChannelActions.Destroy, "Destroy one channel instance. Its directory goes to the bin and the Sessions "
                     + "that serve it are archived with it.", Capabilities.ChannelsControl, true,
-                ParamsJson: AddressArgs("The channel to destroy."), Subject: "address"), DestroyChannelAsync)
+                ParamsJson: AddressArgs("The channel to destroy."), Subject: "address"), DestroyChannelAsync),
+
+            (new(ChannelActions.Connect, "Point one channel at one adapter conversation. This MOVES the conversation: it "
+                    + "leaves whatever channel had it (that channel then hears nothing), and the channel's own previous "
+                    + "binding is dropped. The answer names both. A conversation belongs to one channel, and a channel "
+                    + "serves one conversation.", Capabilities.ChannelsControl, true,
+                ParamsJson: """
+                {"type":"object","properties":{
+                  "address":{"type":"string","description":"The channel to aim."},
+                  "adapter":{"type":"string","description":"An adapter instance, e.g. adapter.file#file-1."},
+                  "conversation":{"type":"string","description":"The platform conversation id inside that adapter."}},
+                 "required":["address","adapter","conversation"],"additionalProperties":false}
+                """, Subject: "address"), ConnectChannelAsync),
+
+            (new(ChannelActions.Disconnect, "Let go of the conversation. The channel keeps existing and keeps its "
+                    + "history, and from now on it receives nothing — say so when you report this, because 'it worked' and "
+                    + "'it can no longer hear anything' look the same from the outside.", Capabilities.ChannelsControl, true,
+                ParamsJson: AddressArgs("The channel to disconnect."), Subject: "address"), DisconnectChannelAsync)
         };
 
         foreach (var (descriptor, handler) in registrations)
@@ -218,6 +235,59 @@ public sealed partial class ChannelManager
         return destroyed.Ok
             ? Result<JsonElement>.Success(Json(new { address = target.Value.ToString(), destroyed = true }))
             : Result<JsonElement>.Failure(destroyed.Error!);
+    }
+
+    private async ValueTask<Result<JsonElement>> ConnectChannelAsync(JsonElement arguments, CancellationToken ct)
+    {
+        var target = ReadAddress(arguments, "address");
+        if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
+        if (!TryReadText(arguments, "adapter", out var adapterText) || !Address.TryParse(adapterText, out var adapter) || !adapter.IsInstance)
+            return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.connect requires 'adapter' as an instance address."));
+        if (!TryReadText(arguments, "conversation", out var conversation) || conversation.Trim().Length == 0)
+            return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "channels.connect requires a non-empty 'conversation'."));
+
+        var connected = await ConnectAsync(target.Value, new ChannelBinding(adapter, conversation.Trim()), ct).ConfigureAwait(false);
+        if (!connected.Ok || connected.Value is null) return Result<JsonElement>.Failure(connected.Error!);
+
+        // The whole point of the answer is the part a caller would otherwise have to go and look for: what it took the
+        // conversation away from, and which binding the channel itself dropped to take it.
+        var change = connected.Value;
+        return Result<JsonElement>.Success(Json(new
+        {
+            address = change.Channel.ToString(),
+            binding = new { adapter = change.Binding!.Adapter.ToString(), conversation = change.Binding.PlatformConversationId },
+            dropped = change.Dropped is null ? null : new
+            {
+                adapter = change.Dropped.Adapter.ToString(),
+                conversation = change.Dropped.PlatformConversationId
+            },
+            takenFrom = change.TakenFrom?.ToString(),
+            note = change.TakenFrom is null
+                ? "the conversation is now this channel's"
+                : $"{change.TakenFrom} no longer receives that conversation and now has no binding at all"
+        }));
+    }
+
+    private async ValueTask<Result<JsonElement>> DisconnectChannelAsync(JsonElement arguments, CancellationToken ct)
+    {
+        var target = ReadAddress(arguments, "address");
+        if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
+        var disconnected = await DisconnectAsync(target.Value, ct).ConfigureAwait(false);
+        if (!disconnected.Ok || disconnected.Value is null) return Result<JsonElement>.Failure(disconnected.Error!);
+
+        var change = disconnected.Value;
+        return Result<JsonElement>.Success(Json(new
+        {
+            address = change.Channel.ToString(),
+            dropped = change.Dropped is null ? null : new
+            {
+                adapter = change.Dropped.Adapter.ToString(),
+                conversation = change.Dropped.PlatformConversationId
+            },
+            note = change.Dropped is null
+                ? "this channel had no binding to begin with; it still receives nothing"
+                : "this channel now receives nothing from that conversation; it still exists and keeps its history"
+        }));
     }
 
     private static Result<Address> BuildAddress(string typeId, string instance)

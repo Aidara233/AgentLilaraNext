@@ -97,15 +97,16 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
     {
         lock (_gate)
             return _channels.TryGetValue(IdOf(channelAddress), out var channel) && channel.Running &&
-                   channel.Bindings.Any(b => b.Adapter == adapter && b.PlatformConversationId == platformConversationId);
+                   channel.Binding is { } aimed && aimed.Adapter == adapter && aimed.PlatformConversationId == platformConversationId;
     }
 
     public Result<ChannelInfo> FindBound(Address adapter, string platformConversationId)
     {
         lock (_gate)
         {
-            var channel = _channels.Values.FirstOrDefault(c => c.Running && !c.Draining && c.Bindings.Any(b =>
-                b.Adapter == adapter && b.PlatformConversationId == platformConversationId));
+            var channel = _channels.Values.FirstOrDefault(c => c.Running && !c.Draining &&
+                c.Binding is { } aimed && aimed.Adapter == adapter &&
+                aimed.PlatformConversationId == platformConversationId);
             return channel is null
                 ? Result<ChannelInfo>.Failure(new(ErrorCode.Invalid, "No running Channel is bound to this Adapter conversation."))
                 : Result<ChannelInfo>.Success(channel.ToInfo());
@@ -146,9 +147,10 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
             {
                 if (_channels.ContainsKey(IdOf(spec.Address)))
                     return Result<ChannelInfo>.Failure(new(ErrorCode.Conflict, $"Channel already exists: {spec.Address}"));
-                foreach (var binding in spec.Bindings)
-                    if (_channels.Values.Any(c => c.Bindings.Contains(binding)))
-                        return Result<ChannelInfo>.Failure(new(ErrorCode.Conflict, "An Adapter/conversation binding can belong to only one Channel."));
+                // One channel serves one conversation, and a conversation belongs to one channel: the same rule read
+                // from the other end.
+                if (_channels.Values.Any(c => c.Binding == spec.Bindings[0]))
+                    return Result<ChannelInfo>.Failure(new(ErrorCode.Conflict, "An Adapter/conversation binding can belong to only one Channel."));
                 var instance = new ChannelInstance(spec);
                 _channels.Add(instance.Id, instance);
                 // A scope that is already taken means a Channel nobody removed still answers to this address; that
@@ -190,6 +192,18 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
                     await _bindings.DetachAsync(spec.Address, CancellationToken.None).ConfigureAwait(false);
                     return Result<ChannelInfo>.Failure(persisted.Error!);
                 }
+            }
+            // The spec file records what this Channel was made as; the table records what it is aimed at now. Both are
+            // written here so a Channel that exists is a Channel the next boot can aim — a file without a row would
+            // come back with an empty binding and look like somebody had disconnected it.
+            var table = await ReadBindingsAsync(cancellationToken).ConfigureAwait(false);
+            table[spec.Address.ToString()] = spec.Bindings[0];
+            var aimed = await WriteBindingsAsync(table, cancellationToken).ConfigureAwait(false);
+            if (!aimed.Ok)
+            {
+                lock (_gate) _channels.Remove(IdOf(spec.Address));
+                await _bindings.DetachAsync(spec.Address, CancellationToken.None).ConfigureAwait(false);
+                return Result<ChannelInfo>.Failure(aimed.Error!);
             }
             return Get(spec.Address);
         }
@@ -318,7 +332,14 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
             // A destroyed Channel takes its wish and its unfinished markers with it; otherwise a new Channel
             // with the same address would inherit them from one that no longer exists.
             if (_state is not null)
+            {
                 await _state.DeleteAsync(DesiredScope, StateName.Encode(address.ToString()), cancellationToken).ConfigureAwait(false);
+                // The wiring row goes too: an aim left behind would be inherited by the next Channel at this address,
+                // and a Channel inheriting a stranger's conversation is worse than one with none.
+                var table = await ReadBindingsAsync(cancellationToken).ConfigureAwait(false);
+                if (table.Remove(address.ToString()))
+                    await WriteBindingsAsync(table, cancellationToken).ConfigureAwait(false);
+            }
             if (_queue is not null) await _queue.ClearAsync(PendingScope, address, cancellationToken).ConfigureAwait(false);
             // The Channel's Sessions go with it: they answer for an address that no longer exists, and their spec
             // is immutable, so a Channel re-created at the same address would inherit one it can never use.
@@ -348,13 +369,16 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
     {
         ChannelInstance[] matched;
         lock (_gate)
-            matched = _channels.Values.Where(c => c.Running && !c.Draining && c.Bindings.Any(b =>
-                b.Adapter == envelope.Adapter && b.PlatformConversationId == envelope.PlatformConversationId)).ToArray();
+            // One comparison, because a Channel has one binding: there is nothing to pick and nothing to disambiguate.
+            matched = _channels.Values.Where(c => c.Running && !c.Draining &&
+                c.Binding is { } aimed &&
+                aimed.Adapter == envelope.Adapter &&
+                aimed.PlatformConversationId == envelope.PlatformConversationId).ToArray();
         var accepted = 0;
         foreach (var channel in matched)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var binding = channel.Bindings.Single(b => b.Adapter == envelope.Adapter && b.PlatformConversationId == envelope.PlatformConversationId);
+            var binding = channel.Binding!;
             // Delivery is where availability actually matters: the Channel may have been created
             // before its Adapter, so this is the first moment we can honestly check it. The Adapter manager is asked
             // for by name — modules do not hold each other (C-19).
@@ -462,9 +486,10 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
                     await CompleteAcceptAsync(channel.Address, Guid.Empty, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
-                var binding = channel.Bindings.FirstOrDefault(candidate =>
-                    candidate.Adapter.ToString() == entry.Adapter && candidate.PlatformConversationId == entry.Conversation);
-                if (binding is null) continue;   // the binding changed under it; leave the marker alone
+                // The binding changed under it: leave the marker alone rather than replay it into another conversation.
+                // A disconnected channel has none at all, which is the same answer for a different reason.
+                var binding = channel.Bindings.Count == 1 ? channel.Bindings[0] : null;
+                if (binding is null || binding.Adapter.ToString() != entry.Adapter || binding.PlatformConversationId != entry.Conversation) continue;
                 // Answered already? Then only the marker survived the crash, and clearing it is the whole job.
                 // This is the last window closed: a reply that went out can no longer be sent twice.
                 if (_messages is not null)
@@ -550,11 +575,47 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
         if (!stored.Ok) return Result.Failure(stored.Error!);
         var revived = 0;
         var keptStopped = 0;
+        var bindings = await ReadBindingsAsync(cancellationToken).ConfigureAwait(false);
+        var seeded = 0;
         foreach (var spec in stored.Value!)
         {
             if (Get(spec.Address).Ok) continue;
-            var created = await CreateAsync(spec, cancellationToken).ConfigureAwait(false);
+            // What a Channel is aimed at is state now; the spec file is where it starts, read once and never written
+            // again (C-03's documented exception). A row that disagrees with the file wins, and says so — a silent
+            // disagreement between two records of the same thing is exactly what this split is supposed to prevent.
+            var key = spec.Address.ToString();
+            ChannelBinding? aimedAt = null;
+            var known = bindings.TryGetValue(key, out aimedAt);
+            ChannelBinding seed;
+            if (known)
+            {
+                // The table has an opinion, and it wins — including when the opinion is "nothing".
+                seed = aimedAt ?? spec.Bindings[0];
+                if (aimedAt is { } stated && spec.Bindings[0] != stated)
+                    _report.Note("channels", $"{spec.Address} is aimed at {stated.Adapter} / {stated.PlatformConversationId}, "
+                        + $"not at what its file says ({spec.Bindings[0].Adapter} / {spec.Bindings[0].PlatformConversationId}): "
+                        + "the wiring table wins, the file is left as it was.");
+            }
+            else
+            {
+                seed = spec.Bindings[0];
+                seeded++;
+                if (spec.Bindings.Count > 1)
+                    _report.Note("channels", $"{spec.Address} was stored with {spec.Bindings.Count} bindings and kept the "
+                        + $"first ({seed.Adapter} / {seed.PlatformConversationId}): a Channel serves one conversation.");
+            }
+            var normalized = spec with { Bindings = [seed] };
+            var created = await CreateAsync(normalized, cancellationToken).ConfigureAwait(false);
             if (!created.Ok) return Result.Failure(created.Error!);
+            // A Channel created from a file its wiring says is disconnected: it comes back with no aim, and the table is
+            // written again so the next boot does not have to re-run this dance.
+            if (known && aimedAt is null)
+            {
+                lock (_gate) if (_channels.TryGetValue(IdOf(spec.Address), out var revivedChannel)) revivedChannel.Aim(null);
+                var table = await ReadBindingsAsync(cancellationToken).ConfigureAwait(false);
+                table[key] = null;
+                await WriteBindingsAsync(table, cancellationToken).ConfigureAwait(false);
+            }
             // A Channel comes back in the state somebody left it in, not in a default one.
             var desired = await ReadDesiredAsync(spec.Address, cancellationToken).ConfigureAwait(false);
             if (desired.Error is { } readError) return Result.Failure(readError);
@@ -570,6 +631,9 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
         }
         if (revived + keptStopped > 0)
             _report.Note("channels", $"{revived} revived running, {keptStopped} kept stopped as they were left");
+        // Wiring that came from a file this boot is now state, so the next change is a change of state and not a
+        // second guess about which record is the real one.
+        if (seeded > 0) _report.Note("channels", $"{seeded} binding(s) taken from their spec files into the wiring table");
         return Result.Success();
     }
 
@@ -591,7 +655,22 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
         /// <summary>The address is the name; the catalog and the graph reach the instance by this.</summary>
         public ModuleId Id => new(Address.ToString());
         public string Name { get; } = spec.Name;
-        public IReadOnlyList<ChannelBinding> Bindings { get; } = Array.AsReadOnly(spec.Bindings.ToArray());
+
+        /// <summary>
+        /// The one conversation this Channel serves.
+        ///
+        /// Singular because that is the rule: a Channel is one conversation, on one platform. It used to be a list,
+        /// which let a Channel exist that could never accept cleanly — matching had to pick one, and sending refused
+        /// anything but exactly one. The addresses outside are still a list of one, so what a client sees does not move.
+        /// </summary>
+        public ChannelBinding? Binding { get; private set; } = spec.Bindings[0];
+
+        /// <summary>Re-aims the Channel; null means "nothing, for now". Called with the manager's gate held, so a move is never half seen.</summary>
+        public void Aim(ChannelBinding? binding) => Binding = binding;
+
+        /// <summary>What a person reads: the one binding, shaped the way the interface has always spelled it (empty when disconnected).</summary>
+        public IReadOnlyList<ChannelBinding> Bindings => Binding is null ? [] : [Binding];
+
         /// <summary>Spec value unless overridden at runtime; the window is read on every activation.</summary>
         public int? MaxMessages { get; set; } = spec.MaxMessages;
         public string? ModelProfile { get; set; }
