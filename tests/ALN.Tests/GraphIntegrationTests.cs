@@ -56,8 +56,13 @@ public sealed class GraphIntegrationTests : IDisposable
         _bindings.Bind(_graph);
         _mailbox = new FileMailbox(Path.Combine(_root, "adapters", "test-1"));
         _adapter = new FileAdapter(new(_adapterAddress, new("file", "test-account", AdapterDirection.Both), "adapter.file"),
-            _mailbox, _events);
-        // What the kernel does in the real host: the Adapter declares a rhythm, the schedule attaches it.
+            _mailbox, _events)
+        {
+            // The adapter keeps its own beat in the host. Here a test polls by hand, so the beat is parked out of the
+            // way instead of racing it for the same files.
+            PollInterval = TimeSpan.FromHours(1)
+        };
+        // Nothing to schedule: the adapter asks the clock for no rhythm, and the attach is accepted without holding one.
         Assert.True(_clock.Attach(new ModuleId(_adapterAddress.ToString()), _adapter).Ok);
     }
 
@@ -88,7 +93,7 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
         await WriteInputAsync("chat-1", "hello-1");
         await WriteInputAsync("chat-2", "hello-2");
-        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        Assert.Equal(2, (await PulseAdapterAsync()).Value);
         await DrainAsync();
 
         // chat-1 has two responders (the default one plus the mounted one); chat-2 has one.
@@ -389,7 +394,7 @@ public sealed class GraphIntegrationTests : IDisposable
 
         await WriteInputAsync("chat-1", "one");
         await WriteInputAsync("chat-2", "two");
-        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        Assert.Equal(2, (await PulseAdapterAsync()).Value);
         // One round fewer than before the trigger change: the pulse no longer queues an event of its own.
         await DispatchOneAsync();
         await DispatchOneAsync();
@@ -981,16 +986,22 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.DoesNotContain(extensions.Tools, source => source.Id == ScriptTools.SourceId);
     }
 
+    /// <summary>The file is the message: its text, nothing else. The id and the sender are the mailbox's business.</summary>
     private async Task WriteInputAsync(string conversation, string text)
     {
         var directory = Path.Combine(_mailbox.Root, "inbox", conversation);
         Directory.CreateDirectory(directory);
-        await File.WriteAllTextAsync(Path.Combine(directory, $"{Guid.NewGuid():N}.ready.json"),
-            JsonSerializer.Serialize(new { text, messageId = Guid.NewGuid().ToString("N") }));
+        await File.WriteAllTextAsync(Path.Combine(directory, $"{Guid.NewGuid():N}.txt"), text);
     }
 
-    private async Task<Result<int>> PulseAdapterAsync() =>
-        await _clock.PulseDueAsync(DateTimeOffset.UtcNow.AddSeconds(1), default);
+    private async Task<Result<int>> PulseAdapterAsync()
+    {
+        // Ask the adapter to look now, which is what the clock used to do for it. A test that leaned on a schedule
+        // would be testing the scheduler instead of the mailbox.
+        var polled = await _adapter.PollOnceAsync(default);
+        Assert.True(polled.Ok, polled.Error?.Message);
+        return polled;
+    }
 
     private async Task DispatchOneAsync()
     {

@@ -270,27 +270,27 @@ public sealed class StateContinuityTests : IDisposable
     }
 
     [Fact]
-    public async Task The_same_platform_message_delivered_twice_is_answered_once()
+    public async Task Two_files_are_two_messages_even_when_they_say_the_same_thing()
     {
         using var node = new Node(_root);
         await node.StartAsync([Intake(), Echo("channel.responder", "once")]);
         await node.AddChannelAsync("chat-1");
         Assert.True((await node.Graph.AddRuleAsync(new("channel.responder", MountScope.ForType("channel.conversation")), default)).Ok);
 
-        await node.SayAsync("chat-1", "hi", messageId: "platform-1");
+        await node.SayAsync("chat-1", "hi");
         await node.DrainAsync();
-        // The transport hands the very same message over again — a redelivery, not a new message.
-        await node.SayAsync("chat-1", "hi", messageId: "platform-1");
+        await node.SayAsync("chat-1", "hi");
         await node.DrainAsync();
 
-        Assert.Single(node.OutboxTexts("chat-1"));
+        // A file is a message. Nothing in a mailbox says two files were meant as one delivery, and the id is assigned
+        // per delivery — so a transport that really does redeliver has to mark it, which is what channel.pending is for
+        // and what the next test exercises.
+        Assert.Equal(2, node.OutboxTexts("chat-1").Length);
         var history = (await node.Messages.ReadAsync(ChatOne, default)).Value!;
-        var inbound = Assert.Single(history, message => message.Direction == MessageDirection.Inbound);
-        Assert.Equal("platform-1", inbound.PlatformMessageId);
-        // ... and exactly one reply, pointing at what it answers. That row is what makes "already answered"
-        // a question with an answer.
-        var outbound = Assert.Single(history, message => message.Direction == MessageDirection.Outbound);
-        Assert.Equal(inbound.Id, outbound.ReplyTo);
+        var inbound = history.Where(message => message.Direction == MessageDirection.Inbound).ToArray();
+        Assert.Equal(2, inbound.Length);
+        Assert.All(inbound, message => Assert.Equal(32, message.PlatformMessageId!.Length));
+        Assert.Equal(2, inbound.Select(message => message.PlatformMessageId).Distinct().Count());
     }
 
     [Fact]
@@ -303,18 +303,18 @@ public sealed class StateContinuityTests : IDisposable
             await first.AddChannelAsync("chat-1");
             Assert.True((await first.Graph.AddRuleAsync(new("channel.responder", MountScope.ForType("channel.conversation")), default)).Ok);
 
-            await first.SayAsync("chat-1", "你在吗", messageId: "platform-2");
+            await first.SayAsync("chat-1", "你在吗");
             await first.DrainAsync();
             Assert.Equal(["only once"], first.OutboxTexts("chat-1"));
 
             var history = (await first.Messages.ReadAsync(ChatOne, default)).Value!;
+            var inbound = Assert.Single(history, message => message.Direction == MessageDirection.Inbound);
             answeredMessageId = Assert.Single(history, message => message.Direction == MessageDirection.Outbound).ReplyTo!;
-            // The reply went out, then the process died before the marker was cleared: exactly the window this
-            // whole mechanism exists for.
+            // The marker names the id the mailbox assigned: a redelivery is recognised by that id, not by the text.
             var marker = new
             {
                 messageId = answeredMessageId,
-                platformMessageId = "platform-2",
+                platformMessageId = inbound.PlatformMessageId,
                 adapter = "adapter.file#file-1",
                 conversation = "chat-1",
                 text = "你在吗",
@@ -361,7 +361,7 @@ public sealed class StateContinuityTests : IDisposable
         await second.ReviveAsync();
         Assert.Single(Directory.GetFiles(Path.Combine(_root, "io", "file", "file-1", "inbox", "chat-1")));
 
-        Assert.True((await second.Clock.PulseDueAsync(DateTimeOffset.UtcNow.AddSeconds(2), default)).Ok);
+        Assert.True((await second.Adapter.PollOnceAsync(default)).Ok);
         await second.DrainAsync();
         Assert.Equal(["recovered"], second.OutboxTexts("chat-1"));
         Assert.Single(Directory.GetFiles(Path.Combine(_root, "io", "file", "file-1", "processed", "chat-1")));
@@ -488,8 +488,12 @@ public sealed class StateContinuityTests : IDisposable
             _bindings.Bind(Graph);
             Settlers = new EventSettlers(new ChannelAcceptSettler(Channels), new InboundAckSettler(Acks));
             Mailbox = new FileMailbox(Path.Combine(root, "io", "file", "file-1"));
-            Adapter = new FileAdapter(new(_adapterAddress, new("file", "acc", AdapterDirection.Both), "adapter.file"), Mailbox, Events, Acks);
-            // What the kernel does in the real host: the Adapter declares a rhythm, the schedule attaches it.
+            Adapter = new FileAdapter(new(_adapterAddress, new("file", "acc", AdapterDirection.Both), "adapter.file"), Mailbox, Events, Acks)
+            {
+                // The tests poll by hand; the adapter's own beat is parked so the two do not race.
+                PollInterval = TimeSpan.FromHours(1)
+            };
+            // Nothing to schedule: the adapter asks the clock for no rhythm, and the attach is accepted without one.
             Assert.True(Clock.Attach(new ModuleId(_adapterAddress.ToString()), Adapter).Ok);
         }
 
@@ -549,14 +553,19 @@ public sealed class StateContinuityTests : IDisposable
                 Assert.True((await Channels.StartAsync(address, default)).Ok);
         }
 
-        public async Task SayAsync(string conversation, string text, string? messageId = null)
+        /// <summary>
+        /// Drop one message in as a file and let the adapter look. The file's text is the message; the mailbox assigns the
+        /// id and the sender, so there is nothing for a test to say about them here.
+        /// </summary>
+        public async Task SayAsync(string conversation, string text)
         {
             var directory = Path.Combine(Mailbox.Root, "inbox", conversation);
             Directory.CreateDirectory(directory);
-            await File.WriteAllTextAsync(Path.Combine(directory, $"{Guid.NewGuid():N}.ready.json"),
-                JsonSerializer.Serialize(new { text, messageId = messageId ?? Guid.NewGuid().ToString("N") }));
-            var pulsed = await Clock.PulseDueAsync(DateTimeOffset.UtcNow.AddSeconds(1), default);
-            Assert.True(pulsed.Ok, pulsed.Error?.Message);
+            await File.WriteAllTextAsync(Path.Combine(directory, $"{Guid.NewGuid():N}.txt"), text);
+            // Look at the mailbox directly: the adapter keeps its own beat now, so a test that pulsed the clock would be
+            // testing a schedule that no longer holds adapters.
+            var polled = await Adapter.PollOnceAsync(default);
+            Assert.True(polled.Ok, polled.Error?.Message);
         }
 
         /// <summary>Dispatches exactly one queued event and settles it, the way the pump does one at a time.</summary>

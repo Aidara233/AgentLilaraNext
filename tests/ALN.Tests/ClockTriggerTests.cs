@@ -71,29 +71,37 @@ public sealed class ClockTriggerTests : IDisposable
     }
 
     [Fact]
-    public async Task A_file_adapter_is_a_trigger_sink_and_needs_nobody_to_register_it()
+    public async Task A_file_adapter_keeps_its_own_beat_and_asks_the_clock_for_nothing()
     {
         var time = new MutableTimeProvider(DateTimeOffset.UtcNow);
         var clock = new ClockSource(new EventQueue(8), time);
         var mailbox = new FileMailbox(Path.Combine(_root, "adapter"));
         var adapter = new FileAdapter(
             new(new Address("adapter", "file", "clocked"), new("file", "clocked", AdapterDirection.Both), "adapter.file"),
-            mailbox, new EventQueue(8));
+            mailbox, new EventQueue(8))
+        {
+            PollInterval = TimeSpan.FromMilliseconds(10)
+        };
 
-        // The adapter declares its own rhythm; the clock is told nothing about adapters in general.
-        Assert.Equal(TimeSpan.FromMilliseconds(200), adapter.PreferredInterval);
+        // The adapter asks for no rhythm at all: a mailbox is something you look at, so the beat is its own. The clock
+        // accepts the attach and holds nothing, which is the correct answer to "do not schedule me".
+        Assert.Null(adapter.PreferredInterval);
         Assert.True(clock.Attach(new ModuleId(adapter.Address.ToString()), adapter).Ok);
+        Assert.Equal(0, clock.BeatCount);
+
         var inbox = Path.Combine(mailbox.Root, "inbox", "chat-1");
         Directory.CreateDirectory(inbox);
-        await File.WriteAllTextAsync(Path.Combine(inbox, "one.ready.json"), """{"text":"hi"}""");
+        await File.WriteAllTextAsync(Path.Combine(inbox, "one.ready.json"), "hi");
         Assert.True((await adapter.StartAsync(default)).Ok);
-
-        time.Advance(TimeSpan.FromSeconds(1));
-        await clock.PulseDueAsync(time.GetUtcNow(), default);
-
-        // The trigger turned into a poll without anybody wiring a script: that is the whole point of the abstraction.
-        Assert.False(File.Exists(Path.Combine(inbox, "one.ready.json")));
-        await adapter.StopAsync(default);
+        try
+        {
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            while (File.Exists(Path.Combine(inbox, "one.ready.json")) && DateTimeOffset.UtcNow < deadline)
+                await Task.Delay(20);
+            // Picked up with nobody triggering it: that is the adapter's own beat doing its job.
+            Assert.False(File.Exists(Path.Combine(inbox, "one.ready.json")));
+        }
+        finally { await adapter.StopAsync(default); }
     }
 
     [Fact]

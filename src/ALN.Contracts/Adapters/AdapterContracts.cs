@@ -215,7 +215,14 @@ public interface IInstanceBindingsProxy : IForceInstanceBindings
 }
 
 // File IO is supplied by the host. Adapters cannot choose arbitrary OS paths.
-public sealed record MailboxInput(string ConversationId, string Token, string Json);
+/// <summary>
+/// One input the mailbox has claimed and handed over.
+///
+/// <paramref name="Token"/> is the message id the mailbox assigned, not part of the file name: a file name is a way to
+/// drop something in, not an identity, and taking it as one made two folders with the same file name a collision.
+/// <paramref name="Content"/> is the file's text as it was written — no envelope, no JSON to parse.
+/// </summary>
+public sealed record MailboxInput(string ConversationId, string Token, string Content);
 public interface IFileMailbox
 {
     ValueTask<IReadOnlyList<string>> GetConversationIdsAsync(CancellationToken cancellationToken);

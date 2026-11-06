@@ -9,6 +9,9 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter, ITriggerSink
     private readonly IEventSink _sink;
     private readonly IInboundAcks? _acks;
     private readonly SemaphoreSlim _pollGate = new(1, 1);
+    private readonly object _beatGate = new();
+    private CancellationTokenSource? _beat;
+    private Task? _beatLoop;
 
     public FileAdapter(AdapterSpec spec, IFileMailbox mailbox, IEventSink sink, IInboundAcks? acks = null)
         : base(spec.Address, spec.Descriptor)
@@ -24,8 +27,12 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter, ITriggerSink
     /// </summary>
     public TimeSpan PollInterval { get; set; } = TimeSpan.FromMilliseconds(200);
 
-    /// <inheritdoc />
-    public TimeSpan? PreferredInterval => PollInterval;
+    /// <summary>
+    /// No rhythm asked of anyone else, because this adapter keeps its own (see <see cref="BeatAsync"/>). Returning null
+    /// says "do not schedule me" — which is true, and which is also the only claim that was ever honest: a beat list
+    /// that never held an adapter instance was never going to start this one.
+    /// </summary>
+    public TimeSpan? PreferredInterval => null;
 
     /// <summary>
     /// One trigger: look at the inbox once. From a schedule, from a script that decided it was time, or from somebody
@@ -48,14 +55,75 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter, ITriggerSink
         // Whatever was claimed by a process that is no longer here is unfinished: put it back where it will
         // be found again. Doing this before the first poll is what makes a forced exit recoverable.
         await _mailbox.ReclaimAsync(cancellationToken).ConfigureAwait(false);
+        RestartBeat();
         return Result.Success();
     }
 
     public override async ValueTask<Result> StopAsync(CancellationToken cancellationToken)
     {
+        // The beat first: once it is gone nothing is inside the poll gate, so taking it cannot wait on a tick.
+        await StopBeatAsync().ConfigureAwait(false);
         await _pollGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try { return await base.StopAsync(cancellationToken).ConfigureAwait(false); }
         finally { _pollGate.Release(); }
+    }
+
+    private void RestartBeat()
+    {
+        lock (_beatGate)
+        {
+            _beat?.Cancel();
+            _beat = new CancellationTokenSource();
+            _beatLoop = Task.Run(() => BeatAsync(_beat.Token), CancellationToken.None);
+        }
+    }
+
+    private async Task StopBeatAsync()
+    {
+        CancellationTokenSource? beat;
+        Task? loop;
+        lock (_beatGate)
+        {
+            beat = _beat;
+            loop = _beatLoop;
+            _beat = null;
+            _beatLoop = null;
+        }
+        if (beat is null) return;
+        beat.Cancel();
+        if (loop is not null)
+        {
+            try { await loop.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
+        beat.Dispose();
+    }
+
+    /// <summary>
+    /// The adapter's own beat, because nobody else was giving it one.
+    ///
+    /// A mailbox is something you look at, and waiting to be told to look is waiting forever. The kernel's beat list holds
+    /// kernel modules, and an Adapter instance is not one, so no schedule was ever attached here — which is how this
+    /// adapter could sit started for hours while its inbox filled up. A failed poll is not fatal: the next tick retries,
+    /// and <see cref="PollOnceAsync"/> reports its own result.
+    /// </summary>
+    private async Task BeatAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timer = new PeriodicTimer(PollInterval);
+            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (!IsRunning) continue;
+                try { await PollOnceAsync(cancellationToken).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                catch (Exception) { /* tried, and will try again */ }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on stop.
+        }
     }
 
     public async ValueTask<Result<int>> PollOnceAsync(CancellationToken cancellationToken = default)
@@ -82,43 +150,25 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter, ITriggerSink
         foreach (var input in inputs)
         {
             if (!IsRunning) return Result<int>.Failure(new(ErrorCode.Unavailable, "FileAdapter is not running."));
-            AdapterEnvelope? envelope = null;
-            string? validationError = null;
-            try
-            {
-                using var document = JsonDocument.Parse(input.Json);
-                var root = document.RootElement;
-                if (root.ValueKind != JsonValueKind.Object)
-                {
-                    validationError = "Input must be a JSON object.";
-                }
-                else
-                {
-                    var declaredConversation = root.TryGetProperty("platformConversationId", out var c) && c.ValueKind == JsonValueKind.String ? c.GetString() : null;
-                    var conversation = input.ConversationId;
-                    var text = root.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String ? t.GetString() : null;
-                    var messageId = root.TryGetProperty("messageId", out var m) && m.ValueKind == JsonValueKind.String ? m.GetString() : null;
-                    var sender = root.TryGetProperty("sender", out var s) && s.ValueKind == JsonValueKind.String ? s.GetString() : null;
-                    if (!string.IsNullOrWhiteSpace(declaredConversation) && !StringComparer.Ordinal.Equals(declaredConversation, conversation))
-                        validationError = "JSON conversation id must match its inbox directory.";
-                    if (validationError is null && string.IsNullOrWhiteSpace(text)) validationError = "text must be non-empty and a string.";
-                    if (validationError is null)
-                        envelope = new(Address, Descriptor.PlatformId, conversation, messageId, text!, DateTimeOffset.UtcNow, sender);
-                }
-            }
-            catch (JsonException ex) { validationError = $"Invalid JSON: {ex.Message}"; }
-
-            if (validationError is not null)
+            // The file's text is the message: nothing to parse, nothing to validate. The sender is the conversation,
+            // because one folder is one person here — a private mailbox has no roster — and the message id was assigned
+            // when the input was claimed, so the file name is not an identity and does not have to be well-formed.
+            var text = input.Content.Trim();
+            if (text.Length == 0)
             {
                 try
                 {
                     if (!IsRunning) return Result<int>.Failure(new(ErrorCode.Unavailable, "FileAdapter is not running."));
-                    await _mailbox.CompleteAsync(input.ConversationId, input.Token, false, validationError, cancellationToken).ConfigureAwait(false);
+                    await _mailbox.CompleteAsync(input.ConversationId, input.Token, false, "Input is empty.", cancellationToken)
+                        .ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
                 catch (Exception ex) { return Result<int>.Failure(new(ErrorCode.Internal, "Unable to record rejected input.", ex.Message, true)); }
                 continue;
             }
+
+            var envelope = new AdapterEnvelope(Address, Descriptor.PlatformId, input.ConversationId, input.Token, text,
+                DateTimeOffset.UtcNow, input.ConversationId);
 
             Result published;
             try
@@ -126,7 +176,7 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter, ITriggerSink
                 var payload = JsonSerializer.Serialize(envelope, new JsonSerializerOptions(JsonSerializerDefaults.Web));
                 // Registered before publication: the pump may settle the event the instant it can read it,
                 // and an acknowledgement that arrives after the settle would be lost.
-                var eventId = envelope!.EventId;
+                var eventId = envelope.EventId;
                 _acks?.Expect(eventId, settleToken =>
                     _mailbox.CompleteAsync(input.ConversationId, input.Token, true, null, settleToken));
                 try

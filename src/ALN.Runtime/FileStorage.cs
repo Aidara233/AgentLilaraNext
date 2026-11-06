@@ -77,6 +77,14 @@ public sealed class FileMailbox : IFileMailbox
         finally { _ioLock.Release(); }
     }
 
+    /// <summary>
+    /// Claims every readable file in the inbox and hands back its text.
+    ///
+    /// The file is the message: its content is what was said, and the name is only the way it was dropped in. So the id
+    /// is assigned here rather than parsed out of the name, and two folders may hold a file of the same name without
+    /// one shadowing the other. Empty files are left where they are — a file that is still being saved looks empty, and
+    /// taking it now would send half a message and delete the rest of what is coming.
+    /// </summary>
     public async ValueTask<IReadOnlyList<MailboxInput>> ReadPendingAsync(CancellationToken cancellationToken)
     {
         await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -84,46 +92,93 @@ public sealed class FileMailbox : IFileMailbox
         {
             SafeFileSystem.VerifyDirectory(_root);
             SafeFileSystem.VerifyDirectory(_inbox);
-            var paths = new List<(string ConversationId, string Directory, string Path)>();
-            foreach (var conversationDirectory in Directory.EnumerateDirectories(_inbox, "*", SearchOption.TopDirectoryOnly).Order(StringComparer.Ordinal))
+            var candidates = new List<(string ConversationId, string Directory, string Path)>();
+            foreach (var conversationDirectory in Directory.EnumerateDirectories(_inbox, "*", SearchOption.TopDirectoryOnly)
+                         .Order(StringComparer.Ordinal))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var conversationId = Path.GetFileName(conversationDirectory);
-                ValidateConversationId(conversationId);
+                // A folder whose name cannot be a conversation is not input. Skipped, not thrown: one stray folder used
+                // to make every poll fail for as long as it stayed there, which is a mailbox that silently stops.
+                if (!IsValidToken(conversationId)) continue;
                 SafeFileSystem.VerifyDirectory(conversationDirectory);
-                foreach (var path in Directory.EnumerateFiles(conversationDirectory, "*" + ReadySuffix, SearchOption.TopDirectoryOnly))
-                    paths.Add((conversationId, conversationDirectory, path));
+                foreach (var path in Directory.EnumerateFiles(conversationDirectory, "*", SearchOption.TopDirectoryOnly)
+                             .Order(StringComparer.Ordinal))
+                {
+                    if (IsTransient(Path.GetFileName(path))) continue;
+                    candidates.Add((conversationId, conversationDirectory, path));
+                }
             }
-            var batch = paths.OrderBy(p => p.ConversationId, StringComparer.Ordinal)
-                .ThenBy(p => Path.GetFileName(p.Path), StringComparer.Ordinal).Take(BatchSize).ToArray();
-            var inputs = new List<MailboxInput>(batch.Length);
-            foreach (var item in batch)
+
+            var inputs = new List<MailboxInput>(Math.Min(candidates.Count, BatchSize));
+            foreach (var item in candidates.Take(BatchSize))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var fileName = Path.GetFileName(item.Path);
-                var token = fileName[..^ReadySuffix.Length];
-                ValidateToken(token);
                 SafeFileSystem.VerifyFile(item.Path, item.Directory);
-                // Claim it: the rename is what stops a second reader from publishing the same input twice,
-                // and what leaves it recoverable if this process dies mid-round.
+                byte[] bytes;
+                try { bytes = await ReadAtMostAsync(item.Path, MaxInputBytes + 1, cancellationToken).ConfigureAwait(false); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
+
+                if (bytes.Length > MaxInputBytes)
+                {
+                    Reject(item.ConversationId, item.Path, $"Input exceeds {MaxInputBytes} bytes.");
+                    continue;
+                }
+                string text;
+                try { text = StrictUtf8.GetString(bytes); }
+                catch (DecoderFallbackException)
+                {
+                    Reject(item.ConversationId, item.Path, "Input is not valid UTF-8.");
+                    continue;
+                }
+                // Still being written, or deliberately empty: either way it is not a message yet.
+                if (string.IsNullOrWhiteSpace(text)) continue;
+
+                var messageId = Guid.NewGuid().ToString("N");
                 var claimedDirectory = Path.Combine(_inflight, item.ConversationId);
                 SafeFileSystem.EnsureDirectory(claimedDirectory);
-                var claimed = Path.Combine(claimedDirectory, token + ".json");
+                var claimed = Path.Combine(claimedDirectory, messageId + ".json");
                 SafeFileSystem.VerifyNewFilePath(claimed, claimedDirectory);
-                System.IO.File.Move(item.Path, claimed);
-                var bytes = await ReadAtMostAsync(claimed, MaxInputBytes + 1, cancellationToken).ConfigureAwait(false);
-                string json;
-                if (bytes.Length > MaxInputBytes) json = "null";
-                else
-                {
-                    try { json = StrictUtf8.GetString(bytes); }
-                    catch (DecoderFallbackException) { json = "null"; }
-                }
-                inputs.Add(new(item.ConversationId, token, json));
+                // Claim it: the move is what stops a second reader from publishing the same input twice, and what
+                // leaves it recoverable if this process dies mid-round (ReclaimAsync puts it back).
+                try { System.IO.File.Move(item.Path, claimed); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
+                inputs.Add(new(item.ConversationId, messageId, text));
             }
             return inputs;
         }
         finally { _ioLock.Release(); }
+    }
+
+    /// <summary>
+    /// A file that is not finished: an editor's swap file, a dotfile, a half-written .tmp. Never input, never reported.
+    /// </summary>
+    private static bool IsTransient(string fileName) =>
+        fileName.StartsWith('.') || fileName.EndsWith('~')
+        || fileName.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)
+        || fileName.EndsWith(".partial", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Refuses one file in place, keeping the original name and writing the reason next to it. The reason is the point:
+    /// a rejected file with no explanation is a file somebody will put back unchanged.
+    /// </summary>
+    private void Reject(string conversationId, string path, string reason)
+    {
+        try
+        {
+            var directory = Path.Combine(_rejected, conversationId);
+            SafeFileSystem.EnsureDirectory(directory);
+            var id = Guid.NewGuid().ToString("N")[..8];
+            var name = Path.GetFileNameWithoutExtension(path) + "-" + id + ".txt";
+            var destination = Path.Combine(directory, name);
+            SafeFileSystem.VerifyNewFilePath(destination, directory);
+            System.IO.File.Move(path, destination);
+            System.IO.File.WriteAllText(Path.Combine(directory, Path.GetFileNameWithoutExtension(name) + ".error.txt"), reason);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Refusing to move it is not a reason to fail the poll: it stays in the inbox and is looked at again.
+        }
     }
 
     public async ValueTask CompleteAsync(string conversationId, string token, bool accepted, string? error, CancellationToken cancellationToken)
@@ -160,6 +215,14 @@ public sealed class FileMailbox : IFileMailbox
             SafeFileSystem.VerifyNewFilePath(destination, destinationDirectory);
             cancellationToken.ThrowIfCancellationRequested();
             System.IO.File.Move(source, destination);
+            // The reason travels with the file. A rejected input with no explanation is one somebody puts back
+            // unchanged, and then again.
+            if (!accepted && !string.IsNullOrWhiteSpace(error))
+            {
+                var reasonPath = Path.Combine(destinationDirectory, token + ".error.txt");
+                try { await System.IO.File.WriteAllTextAsync(reasonPath, error, cancellationToken).ConfigureAwait(false); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            }
         }
         finally { _ioLock.Release(); }
     }

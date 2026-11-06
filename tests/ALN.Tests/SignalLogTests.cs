@@ -83,7 +83,10 @@ public sealed class SignalLogTests : IDisposable
 
         var adapterAddress = new Address("adapter", "file", "denied-1");
         var mailbox = new FileMailbox(Path.Combine(_root, "adapters", "denied-1"));
-        var adapter = new FileAdapter(new(adapterAddress, new("file", "denied-account", AdapterDirection.Both), "adapter.file"), mailbox, events);
+        var adapter = new FileAdapter(new(adapterAddress, new("file", "denied-account", AdapterDirection.Both), "adapter.file"), mailbox, events)
+        {
+            PollInterval = TimeSpan.FromHours(1)
+        };
         Assert.True((await adapters.CreateAsync(new(adapterAddress, adapter.Descriptor, "adapter.file"), _ => adapter, default)).Ok);
 
         var envelope = new AdapterEnvelope(adapterAddress, "file", "chat-1", "m-1", "hello", DateTimeOffset.UtcNow);
