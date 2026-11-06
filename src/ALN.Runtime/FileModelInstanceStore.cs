@@ -180,8 +180,11 @@ public sealed class FileModelInstanceStore(string root, IModuleTypeCatalog? type
                 return Result<ModelInstanceEntry?>.Failure(new(ErrorCode.Invalid, $"Model configuration has no \"config\" object: {path}"));
             if (!config.TryGetProperty("configuration", out var provider) || provider.ValueKind != JsonValueKind.Object)
                 return Result<ModelInstanceEntry?>.Failure(new(ErrorCode.Invalid, $"Model provider configuration must be a JSON object: {path}"));
+            var profiles = ReadProfiles(config, out var profileError);
+            if (profileError is not null)
+                return Result<ModelInstanceEntry?>.Failure(new(ErrorCode.Invalid, profileError, path));
             var spec = new ModelInstanceSpec(provider.Clone(),
-                ReadProfiles(config),
+                profiles,
                 !(config.TryGetProperty("enabled", out var enabled) && enabled.ValueKind == JsonValueKind.False));
             return Result<ModelInstanceEntry?>.Success(new ModelInstanceEntry(type, address, spec));
         }
@@ -189,8 +192,9 @@ public sealed class FileModelInstanceStore(string root, IModuleTypeCatalog? type
         { return Result<ModelInstanceEntry?>.Failure(new(ErrorCode.Invalid, $"Model configuration is not valid JSON: {path}", ex.Message)); }
     }
 
-    private static IReadOnlyList<ModelProfile>? ReadProfiles(JsonElement config)
+    private static IReadOnlyList<ModelProfile>? ReadProfiles(JsonElement config, out string? error)
     {
+        error = null;
         if (!config.TryGetProperty("profiles", out var profiles) || profiles.ValueKind != JsonValueKind.Array) return null;
         var parsed = new List<ModelProfile>();
         foreach (var profile in profiles.EnumerateArray())
@@ -199,9 +203,22 @@ public sealed class FileModelInstanceStore(string root, IModuleTypeCatalog? type
             SamplingSettings? sampling = null;
             if (profile.TryGetProperty("defaultSampling", out var value) && value.ValueKind == JsonValueKind.Object)
                 sampling = value.Deserialize<SamplingSettings>(JsonOptions);
+            // A window that is not a positive number is refused rather than rounded or ignored: "128k" written as a
+            // string, or a zero someone meant as "unlimited", would otherwise look exactly like "nobody said" and
+            // the Session would quietly plan against the default instead of the number the operator believes it set.
+            int? contextWindow = null;
+            if (profile.TryGetProperty("contextWindow", out var window) && window.ValueKind != JsonValueKind.Null)
+            {
+                if (window.ValueKind != JsonValueKind.Number || !window.TryGetInt32(out var declared) || declared <= 0)
+                {
+                    error = $"Profile \"{id}\" declares a contextWindow that is not a positive whole number of tokens.";
+                    return null;
+                }
+                contextWindow = declared;
+            }
             // The provider is implied by the file the profile lives in, so it stays empty here and the loader fills it
             // from the address: a file that repeats its own address is a file that can disagree with its directory.
-            parsed.Add(new ModelProfile(id, default, model, sampling));
+            parsed.Add(new ModelProfile(id, default, model, sampling, contextWindow));
         }
         return parsed;
     }

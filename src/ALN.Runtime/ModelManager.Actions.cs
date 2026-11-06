@@ -31,7 +31,11 @@ public sealed partial class ModelManager
                     // Only addresses and type ids: ModelProviderInfo carries configuration, which can hold an api key,
                     // so it is never serialized here.
                     providers = List().Select(p => new { address = p.Address.ToString(), typeId = p.Descriptor.TypeId, inFlight = p.InFlight }),
-                    profiles = ListProfiles().Select(p => new { id = p.Id, provider = p.Provider.ToString(), model = p.ModelId }),
+                    profiles = ListProfiles().Select(p => new
+                    {
+                        id = p.Id, provider = p.Provider.ToString(), model = p.ModelId,
+                        contextWindow = p.EffectiveContextWindow, contextWindowAssumed = p.ContextWindowAssumed
+                    }),
                     types = ListTypes().Select(type => new
                     {
                         typeId = type.TypeId,
@@ -53,7 +57,8 @@ public sealed partial class ModelManager
                   "instance":{"type":"string","description":"Alternative to address: the instance name."},
                   "configuration":{"type":"object","description":"Provider configuration; *** keeps the stored value."},
                   "profiles":{"type":"array","items":{"type":"object","properties":{
-                    "id":{"type":"string"},"model":{"type":"string"},"defaultSampling":{"type":"object"}},
+                    "id":{"type":"string"},"model":{"type":"string"},"defaultSampling":{"type":"object"},
+                    "contextWindow":{"type":"integer","minimum":1,"description":"Tokens one request may carry for this profile. Omit and a Session plans against 128k."}},
                     "required":["id","model"]}},
                   "enabled":{"type":"boolean","description":"Default true."}},
                  "required":["configuration"],"additionalProperties":false}
@@ -71,7 +76,8 @@ public sealed partial class ModelManager
                   "id":{"type":"string"},
                   "model":{"type":"string","description":"The provider's own model id."},
                   "provider":{"type":"string","description":"The provider instance address."},
-                  "defaultSampling":{"type":"object","description":"Optional sampling settings."}},
+                  "defaultSampling":{"type":"object","description":"Optional sampling settings."},
+                  "contextWindow":{"type":"integer","minimum":1,"description":"Tokens one request may carry. Omit and a Session plans against 128k."}},
                  "required":["id","model","provider"],"additionalProperties":false}
                 """, Subject: "id"), (arguments, ct) => CreateProfileAsync(arguments, store, ct)),
 
@@ -97,6 +103,23 @@ public sealed partial class ModelManager
           "instance":{"type":"string","description":"Alternative: the instance name."}},
          "additionalProperties":false}
         """;
+
+    /// <summary>
+    /// A profile's declared window, or null when nobody declared one. A value that is present but unusable is refused
+    /// rather than read as "absent": a window typed as "128k" would otherwise become the default, and the Session would
+    /// plan against a number the caller never chose while every answer still looked right.
+    /// </summary>
+    private static int? ReadContextWindow(JsonElement arguments, out Error? error)
+    {
+        error = null;
+        if (!arguments.TryGetProperty("contextWindow", out var window) || window.ValueKind == JsonValueKind.Null) return null;
+        if (window.ValueKind != JsonValueKind.Number || !window.TryGetInt32(out var declared) || declared <= 0)
+        {
+            error = new(ErrorCode.Invalid, "contextWindow must be a positive whole number of tokens.");
+            return null;
+        }
+        return declared;
+    }
 
     /// <summary>The category a kind belongs to: read from the type tree, not taken from the address.</summary>
     private string CategoryOfKind(string kind)
@@ -179,7 +202,10 @@ public sealed partial class ModelManager
             {
                 id = profile.Id,
                 model = profile.ModelId,
-                defaultSampling = profile.DefaultSampling
+                defaultSampling = profile.DefaultSampling,
+                // Read back as written: a save that drops a field nobody touched is how a settings page quietly
+                // changes what the Session plans against.
+                contextWindow = profile.ContextWindow
             })
         }));
     }
@@ -218,7 +244,9 @@ public sealed partial class ModelManager
                     try { sampling = samplingItem.Deserialize<SamplingSettings>(ActionJson); }
                     catch (JsonException ex) { return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "Profile sampling is malformed.", ex.Message)); }
                 }
-                parsed.Add(new ModelProfile(idText.GetString()!.Trim(), default, modelText.GetString()!.Trim(), sampling));
+                var window = ReadContextWindow(item, out var windowFailure);
+                if (windowFailure is { } failure) return Result<JsonElement>.Failure(failure);
+                parsed.Add(new ModelProfile(idText.GetString()!.Trim(), default, modelText.GetString()!.Trim(), sampling, window));
             }
             profiles = parsed;
         }
@@ -289,7 +317,9 @@ public sealed partial class ModelManager
             try { sampling = samplingItem.Deserialize<SamplingSettings>(ActionJson); }
             catch (JsonException ex) { return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "defaultSampling is malformed.", ex.Message)); }
         }
-        var registered = RegisterProfile(new ModelProfile(id.Trim(), provider.Value, model.Trim(), sampling));
+        var window = ReadContextWindow(arguments, out var windowError);
+        if (windowError is { } error) return Result<JsonElement>.Failure(error);
+        var registered = RegisterProfile(new ModelProfile(id.Trim(), provider.Value, model.Trim(), sampling, window));
         if (!registered.Ok) return Result<JsonElement>.Failure(registered.Error!);
 
         // The live registry is not the file: a profile that is not written down dies at the next restart, and "it worked
@@ -302,7 +332,7 @@ public sealed partial class ModelManager
                 // The provider is implied by the file it lives in, so the stored profile leaves it empty: a file that
                 // repeats its own address is a file that can disagree with its own directory.
                 var profiles = (instanceSpec.Profiles ?? []).Where(profile => profile.Id != id.Trim())
-                    .Append(new ModelProfile(id.Trim(), default, model.Trim(), sampling)).ToArray();
+                    .Append(new ModelProfile(id.Trim(), default, model.Trim(), sampling, window)).ToArray();
                 var saved = await store.SaveAsync(provider.Value.ToString(), instanceSpec with { Profiles = profiles }, ct)
                     .ConfigureAwait(false);
                 if (!saved.Ok) return Result<JsonElement>.Failure(saved.Error!);

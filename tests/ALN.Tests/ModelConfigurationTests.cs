@@ -185,6 +185,66 @@ public sealed class ModelConfigurationTests : IDisposable
         Assert.Null(kernel.Find(new ModuleId("model.stub#one")));
     }
 
+    [Fact]
+    public async Task A_declared_context_window_survives_the_file_both_ways()
+    {
+        // The window decides how much history a Session carries. If a read-modify-write through the settings page could
+        // drop it, the Session would silently start planning against the default — and every answer would still look
+        // right, which is how a wrong number stays wrong for months.
+        var store = new FileModelInstanceStore(_root, Types());
+        var spec = new ModelInstanceSpec(Json("""{"endpoint":"https://api.example.com"}"""),
+            [
+                new ModelProfile("declared", new Address("model", "openai-chat", "one"), "deepseek-flash", ContextWindow: 200_000),
+                new ModelProfile("unsaid", new Address("model", "openai-chat", "one"), "deepseek-flash")
+            ]);
+
+        Assert.True((await store.SaveAsync("model.openai-chat#one", spec, default)).Ok);
+        var read = await store.ReadAsync("model.openai-chat#one", default);
+        var profiles = read.Value!.Profiles!;
+        Assert.Equal(200_000, profiles.Single(profile => profile.Id == "declared").ContextWindow);
+        Assert.Null(profiles.Single(profile => profile.Id == "unsaid").ContextWindow);
+
+        // Saving what was read must not lose it either: the file is written from the same record.
+        Assert.True((await store.SaveAsync("model.openai-chat#one", read.Value, default)).Ok);
+        var again = (await store.ReadAsync("model.openai-chat#one", default)).Value!;
+        Assert.Equal(200_000, again.Profiles!.Single(profile => profile.Id == "declared").ContextWindow);
+    }
+
+    [Fact]
+    public async Task A_window_that_is_not_a_positive_number_is_refused_instead_of_read_as_unsaid()
+    {
+        // "128k" and 0 both mean something to whoever wrote them. Treating either as "nobody said" would replace a
+        // stated wish with a default and leave no trace of the difference.
+        var other = Path.Combine(_root, "modules", "model.openai-chat#one");
+        Directory.CreateDirectory(other);
+        await File.WriteAllTextAsync(Path.Combine(other, "module.json"), """
+            {"id":"model.openai-chat#one","type":"model.openai-chat",
+             "config":{"configuration":{"endpoint":"https://api.example.com"},
+                       "profiles":[{"id":"default","modelId":"deepseek-flash","contextWindow":"128k"}]}}
+            """);
+
+        var loaded = await new FileModelInstanceStore(_root, Types()).LoadAllAsync(default);
+
+        Assert.Equal(ErrorCode.Invalid, loaded.Error!.Code);
+        Assert.Contains("contextWindow", loaded.Error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_profile_that_declares_nothing_plans_against_the_floor_and_says_so()
+    {
+        var unsaid = new ModelProfile("default", new Address("model", "openai-chat", "one"), "deepseek-flash");
+        Assert.True(unsaid.ContextWindowAssumed);
+        Assert.Equal(ModelProfile.AssumedContextWindow, unsaid.EffectiveContextWindow);
+
+        // Zero is a declaration that carries no room, so it is not a window either — the floor is still the answer.
+        var zero = unsaid with { ContextWindow = 0 };
+        Assert.True(zero.ContextWindowAssumed);
+        Assert.Equal(ModelProfile.AssumedContextWindow, zero.EffectiveContextWindow);
+        var declared = unsaid with { ContextWindow = 64_000 };
+        Assert.False(declared.ContextWindowAssumed);
+        Assert.Equal(64_000, declared.EffectiveContextWindow);
+    }
+
     private sealed class InstanceStubFactory : IModelProviderFactory
     {
         public string TypeId => "model.stub";

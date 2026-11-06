@@ -24,11 +24,35 @@ public sealed record ModelProviderSpec(Address Address, string ConfigurationJson
 
 public sealed record ModelProviderInfo(Address Address, ModelProviderDescriptor Descriptor, int InFlight);
 
+/// <summary>
+/// One model as a Session calls it: which provider, which model id, and how much room one request has.
+/// </summary>
+/// <param name="ContextWindow">
+/// How many tokens one request may carry, as this model really accepts them. Declared rather than derived: the number
+/// belongs to the model and to the operator's arrangement with it, and no provider answer reports it. Null means
+/// nobody said — which a Session must read as "assume a small window", never as "no limit": a guessed limit costs
+/// some forgotten history, an unbounded request costs every turn after it.
+/// </param>
 public sealed record ModelProfile(
     string Id,
     Address Provider,
     string ModelId,
-    SamplingSettings? DefaultSampling = null);
+    SamplingSettings? DefaultSampling = null,
+    int? ContextWindow = null)
+{
+    /// <summary>
+    /// What a Session assumes when the profile declares no <see cref="ContextWindow"/>. 128k is the smallest window
+    /// among the models this system is run against, and guessing low keeps a Session working on a smaller model too —
+    /// guessing high turns the first symptom into a provider error nobody can act on.
+    /// </summary>
+    public const int AssumedContextWindow = 128 * 1024;
+
+    /// <summary>The window to plan against: what was declared, or the floor a Session can still be useful in.</summary>
+    public int EffectiveContextWindow => ContextWindow is > 0 and var declared ? declared : AssumedContextWindow;
+
+    /// <summary>Whether the window above is a guess, so that a receipt can say so instead of implying a fact.</summary>
+    public bool ContextWindowAssumed => ContextWindow is not > 0;
+}
 
 /// <summary>
 /// One model provider instance as it is written on disk: <c>modules/&lt;type&gt;#&lt;instance&gt;/module.json</c>, with

@@ -630,10 +630,18 @@ async Task<Result> LoadModelConfigurationAsync(IModelInstanceStore store)
         var providerAddress = createdProvider.Value.Address;
         foreach (var profile in entry.Spec.Profiles ?? [])
         {
-            var registered = modelManager.RegisterProfile(new(profile.Id, providerAddress, profile.ModelId, profile.DefaultSampling));
+            var registered = modelManager.RegisterProfile(new(profile.Id, providerAddress, profile.ModelId,
+                profile.DefaultSampling, profile.ContextWindow));
             if (!registered.Ok) return registered;
         }
     }
+    // A window nobody declared is planned against the floor, and the receipt says which profiles are in that state:
+    // "it silently assumed a number" and "somebody chose that number" look identical from outside otherwise.
+    var profiles = modelManager.ListProfiles();
+    var assumed = profiles.Where(profile => profile.ContextWindowAssumed).Select(profile => profile.Id).ToArray();
+    restore.Note("models", $"{profiles.Count} profile(s)" + (assumed.Length == 0
+        ? ", all declare their context window"
+        : $"; context window unsaid for {string.Join(", ", assumed)} — those plan against {ModelProfile.AssumedContextWindow / 1024}k"));
     return Result.Success();
 }
 
