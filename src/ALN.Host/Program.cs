@@ -21,10 +21,10 @@ if (dataArg + 1 >= args.Length || string.IsNullOrWhiteSpace(args[dataArg + 1]))
     return 2;
 }
 var data = DataDirectory.Open(args[dataArg + 1]);
-// Transport state, not configuration: the mailbox is IO and lives under io/, one directory per
-// type and instance, mirroring the spec tree under adapters/.
-var mailboxRoot = Path.Combine(data.Root, "io", "file", "file-1");
-var mailbox = new FileMailbox(mailboxRoot);
+// Transport state, not configuration: a file Adapter's mailbox is IO and lives under io/file/<account>/, which the
+// adapter package derives from the spec it is handed. The host no longer hands out one mailbox for everybody — that
+// made the second file Adapter read the first one's inbox.
+var defaultInbox = Path.Combine(data.Root, "io", "file", "file-1", "inbox");
 // One file for everything a program writes down: component state, message history, audit records. The
 // spec tree stays files — those a person writes and reads.
 using var storage = new SqliteStore(Path.Combine(data.Root, "aln.db"));
@@ -114,7 +114,6 @@ var hostServices = new HostServiceProvider(
     (typeof(ISessionManager), sessions),
     (typeof(IPromptLibrary), prompts),
     (typeof(ISessionExtensionRegistry), sessionExtensions),
-    (typeof(IFileMailbox), mailbox),
     (typeof(IEventSink), new RecordingEventSink(queue, messageStore)),
     (typeof(IMessageStore), messageStore),
     (typeof(IStateStore), stateStore),
@@ -123,6 +122,7 @@ var hostServices = new HostServiceProvider(
     (typeof(IRestoreReporter), restore),
     (typeof(IInboundAcks), acks),
     (typeof(IParameterRegistry), parameters),
+    (typeof(IFileMailboxFactory), new FileMailboxFactory(data.Root)),
     (typeof(IChannelSpecStore), channelSpecs),
     (typeof(IAdapterSpecStore), adapterSpecs),
     (typeof(IModuleTypeCatalog), adapterTypes),
@@ -288,8 +288,6 @@ if (storedAdapters.Value!.Count == 0)
         return 1;
     }
 }
-if (storedAdapters.Value!.Count > 1)
-    Console.Error.WriteLine("Warning: only the first adapter.file spec is started; additional Adapter instances need their own mailbox.");
 
 using var shutdown = new CancellationTokenSource();
 using var pumpStop = new CancellationTokenSource();
@@ -559,7 +557,7 @@ else
     Console.WriteLine("API disabled: no api/server.json.");
 }
 
-Console.WriteLine($"ALN is running. Data: {data.Root}; inbox: {Path.Combine(mailboxRoot, "inbox")}; create conversation subdirectories before starting. Ctrl+C to stop.");
+Console.WriteLine($"ALN is running. Data: {data.Root}; inbox: {defaultInbox}; create conversation subdirectories before starting. Ctrl+C to stop.");
 try
 {
     await Task.Delay(Timeout.InfiniteTimeSpan, shutdown.Token);

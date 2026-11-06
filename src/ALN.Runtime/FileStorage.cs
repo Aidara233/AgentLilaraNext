@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Security;
 using System.Text;
 using System.Text.Json;
@@ -23,8 +24,7 @@ public sealed class DataDirectory
 
 /// <summary>Host-owned file mailbox rooted at one adapter instance directory.</summary>
 public sealed class FileMailbox : IFileMailbox
-{
-    private const int MaxInputBytes = 64 * 1024;
+{    private const int MaxInputBytes = 64 * 1024;
     private const int BatchSize = 64;
     private const string ReadySuffix = ".ready.json";
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
@@ -450,5 +450,28 @@ internal static class SafeFileSystem
         info.Refresh();
         if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
             throw new SecurityException($"Reparse points are not allowed in scoped storage: {info.FullName}");
+    }
+}
+
+/// <summary>
+/// The host's mailboxes, one per account, under <c>&lt;dataRoot&gt;/io/file/&lt;account&gt;</c>.
+///
+/// The account id becomes a path segment, so it is validated as one here rather than trusted: it comes from a spec a
+/// person or a model wrote, and a name with a directory separator in it would put one account's mail inside another's.
+/// Two Adapters with the same account share a mailbox on purpose — that is what "same account" means — and asking twice
+/// returns the same object rather than two readers of one directory.
+/// </summary>
+public sealed class FileMailboxFactory(string dataRoot) : IFileMailboxFactory
+{
+    private readonly ConcurrentDictionary<string, FileMailbox> _mailboxes = new(StringComparer.Ordinal);
+
+    public string Root { get; } = dataRoot;
+
+    public IFileMailbox For(string accountId)
+    {
+        if (string.IsNullOrWhiteSpace(accountId) || accountId.Length > 128 ||
+            accountId.Any(c => !char.IsAsciiLetterOrDigit(c) && c is not ('-' or '_')))
+            throw new ArgumentException($"Not a usable account id for a mailbox: {accountId}", nameof(accountId));
+        return _mailboxes.GetOrAdd(accountId, name => new FileMailbox(Path.Combine(Root, "io", "file", name)));
     }
 }

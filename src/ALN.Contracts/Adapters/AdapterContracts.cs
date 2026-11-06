@@ -223,9 +223,23 @@ public interface IInstanceBindingsProxy : IForceInstanceBindings
 /// <paramref name="Content"/> is the file's text as it was written — no envelope, no JSON to parse.
 /// </summary>
 public sealed record MailboxInput(string ConversationId, string Token, string Content);
-public interface IFileMailbox
+
+/// <summary>
+/// Hands out the mailbox for one account. The host owns where mailboxes live; the adapter package only asks for one
+/// by account id, which it already has in its spec.
+///
+/// It exists because one mailbox for every file Adapter meant the second instance read the first one's inbox. The
+/// path was always derivable from the account; what was missing was a way to ask for it without the adapter package
+/// taking a dependency on the host's storage implementation.
+/// </summary>
+public interface IFileMailboxFactory
 {
-    ValueTask<IReadOnlyList<string>> GetConversationIdsAsync(CancellationToken cancellationToken);
+    /// <summary>The mailbox for that account, created (or remembered) — one per account, never one for everybody.</summary>
+    IFileMailbox For(string accountId);
+}
+
+public interface IFileMailbox
+{    ValueTask<IReadOnlyList<string>> GetConversationIdsAsync(CancellationToken cancellationToken);
 
     /// <summary>
     /// Claims the pending inputs and hands them over. Claiming is a rename (inbox → inflight), so a second

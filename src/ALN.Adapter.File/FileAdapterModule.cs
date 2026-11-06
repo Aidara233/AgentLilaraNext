@@ -29,13 +29,15 @@ public sealed class FileAdapterModule : IModulePlugin
     public async ValueTask<Result> StartAsync(IModulePluginContext context, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var mailbox = GetHostService<IFileMailbox>(context);
+        var mailboxes = GetHostService<IFileMailboxFactory>(context);
         var events = GetHostService<IEventSink>(context);
         var acks = context.HostServices.GetService(typeof(ALN.Contracts.IInboundAcks)) as ALN.Contracts.IInboundAcks;
         _adapters = GetHostService<IAdapterManager>(context);
         _factories = GetHostService<IAdapterFactoryRegistry>(context);
         _reloadState = GetHostService<IModuleReloadStateStore>(context);
-        _factory = new FileAdapterFactory(mailbox, events, acks);
+        // The mailbox is derived from the account, not from the host: two file Adapters are two mailboxes, and one
+        // Adapter reading another's inbox is the sort of quiet mixing that looks exactly like a duplicate message.
+        _factory = new FileAdapterFactory(mailboxes, events, acks);
         var registered = _factories.Register(PackageId, _factory);
         if (!registered.Ok) return registered;
         _started = true;
@@ -128,9 +130,20 @@ public sealed class FileAdapterModule : IModulePlugin
         return service as T ?? throw new InvalidOperationException($"Required host service is missing: {typeof(T).FullName}");
     }
 
-    private sealed class FileAdapterFactory(IFileMailbox mailbox, IEventSink events, IInboundAcks? acks) : IAdapterFactory
+    /// <summary>
+    /// One mailbox per account, asked for by the account in the spec: <c>io/file/&lt;accountId&gt;</c>.
+    ///
+    /// It used to be one mailbox handed to every file Adapter by the host, which meant a second instance read the
+    /// first one's inbox — and the host knew it, printing a warning instead of fixing it. The account id was already
+    /// there, so nothing had to be added to the configuration for this.
+    /// </summary>
+    private sealed class FileAdapterFactory(IFileMailboxFactory mailboxes, IEventSink events, IInboundAcks? acks)
+        : IAdapterFactory
     {
         public string TypeId => "adapter.file";
-        public IChatAdapter Create(AdapterSpec spec) => new FileAdapter(spec, mailbox, events, acks);
+
+        public IChatAdapter Create(AdapterSpec spec) => new FileAdapter(spec,
+            mailboxes.For(string.IsNullOrWhiteSpace(spec.Descriptor.AccountId) ? "file-1" : spec.Descriptor.AccountId),
+            events, acks);
     }
 }

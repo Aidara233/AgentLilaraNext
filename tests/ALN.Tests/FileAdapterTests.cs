@@ -217,6 +217,23 @@ public sealed class FileAdapterTests : IDisposable
     }
 
     [Fact]
+    public void A_mailbox_is_per_account_so_two_adapters_never_read_one_inbox()
+    {
+        var factory = new FileMailboxFactory(_directory);
+
+        var one = factory.For("file-1");
+        var two = factory.For("work-2");
+
+        Assert.NotEqual(((FileMailbox)one).Root, ((FileMailbox)two).Root);
+        Assert.EndsWith(Path.Combine("io", "file", "work-2"), ((FileMailbox)two).Root, StringComparison.Ordinal);
+        // Asking twice is asking for the same mailbox, not for a second reader of one directory.
+        Assert.Same(one, factory.For("file-1"));
+        // The account becomes a path segment, so a name that would climb out of io/file is refused rather than joined.
+        Assert.Throws<ArgumentException>(() => factory.For(".."));
+        Assert.Throws<ArgumentException>(() => factory.For("file/1"));
+    }
+
+    [Fact]
     public void Data_directory_resolves_relative_path_from_current_directory()
     {
         var current = Environment.CurrentDirectory;
