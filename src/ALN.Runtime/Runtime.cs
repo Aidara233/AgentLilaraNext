@@ -106,7 +106,7 @@ public sealed class AdapterTypeCatalog : IModuleTypeRegistry
 }
 
 [Module(AdapterManagerId, Category = "adapter", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class AdapterManager : IAdapterManager, IModuleIndex, IModuleWiring, IInstanceSink, ILifecycleParticipant, IModule
+public sealed partial class AdapterManager : IAdapterManager, IModuleIndex, IModuleWiring, IInstanceSink, ILifecycleParticipant, IModule
 {
     public const string AdapterManagerId = ModuleNames.AdapterManager;
     public ModuleId Id { get; } = new(AdapterManagerId);

@@ -15,14 +15,11 @@ namespace ALN.Runtime;
 /// </summary>
 public static class CoreActions
 {
+    /// <summary>Who this process is and how it is doing. The host's own verbs stay here: the kernel's table is not
+    /// anybody else's to describe.</summary>
     public const string SystemInfo = "system.info";
-    public const string AdaptersList = "adapters.list";
-    public const string AdaptersStart = "adapters.start";
-    public const string AdaptersStop = "adapters.stop";
-    public const string AdaptersCreate = "adapters.create";
-    public const string AdaptersDestroy = "adapters.destroy";
-    // The channel verbs live with the Channel module now (ALN.Channel/ChannelManager.Actions.cs): the ids are in
-    // ALN.Contracts.ChannelActions, and the manager registers them itself.
+    // The channel and adapter verbs live with their modules now (ALN.Channel / ALN.Runtime AdapterManager.Actions):
+    // the ids are in ALN.Contracts.ChannelActions / AdapterActions, and each manager registers them itself.
     // The three edge actions were graph.* until the graph grew modules (docs/15). They live under modules.edge now, and
     // the old names stay registered for one release, pointing at the same handlers: a client that says graph.mount
     // should get a mount, not a lesson in naming.
@@ -33,7 +30,8 @@ public static class CoreActions
     public const string GraphMount = "graph.mount";
     public const string GraphUnmount = "graph.unmount";
     public const string ParamsList = "params.list";
-    public const string ParamsSet = "params.set";    public const string ModelsList = "models.list";
+    public const string ParamsSet = "params.set";
+    public const string ModelsList = "models.list";
     public const string ModelsProviderGet = "models.provider.get";
     public const string ModelsProviderSave = "models.provider.save";
     public const string ModelsProviderDestroy = "models.provider.destroy";
@@ -95,30 +93,6 @@ public static class CoreActions
                         badEdges = (status?.BadEdges ?? []).Select(EdgeOf).ToArray()
                     })));
                 }),
-
-            (new(AdaptersList, "List adapters without credentials.", Capabilities.AdaptersRead, false),
-                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(
-                    adapters.List().Select(a => new
-                    {
-                        address = a.Address.ToString(),
-                        platform = a.Descriptor.PlatformId,
-                        // The declared label, and — when the adapter can learn it — who it actually is.
-                        account = Identity(a.Address)?.AccountId ?? a.Descriptor.AccountId,
-                        declaredAccount = a.Descriptor.AccountId,
-                        displayName = Identity(a.Address)?.DisplayName,
-                        direction = a.Descriptor.Direction.ToString(),
-                        state = a.State.ToString(),
-                        // Whether the connection behind the state is actually up. Null when the adapter
-                        // type has no opinion, so "false" never means "unknown".
-                        connected = Health(a.Address)?.Connected,
-                        detail = Health(a.Address)?.HealthDetail
-                    }))))),
-
-            (new(AdaptersStart, "Start one adapter.", Capabilities.AdaptersControl, true), StartAdapter),
-            (new(AdaptersStop, "Stop one adapter.", Capabilities.AdaptersControl, true), StopAdapter),
-            (new(AdaptersCreate, "Create one adapter instance (instance is named by the caller, or by the type plus a fresh suffix): {\"type\", \"instance\", \"platform\", \"account\", \"direction\", \"settings\"}.", Capabilities.AdaptersControl, true), CreateAdapter),
-            (new(AdaptersDestroy, "Destroy one adapter instance and forget its spec.", Capabilities.AdaptersControl, true), DestroyAdapter),
-
             (new(EdgesList, "List mounted scripts, durable mount rules, and which rules are still waiting.", Capabilities.ModulesRead, false), ListEdges),
             // One release of forwarding: same handler, same capability, so an old client keeps working and gets the
             // new body. The description says where it went, because that is the only place a caller will look.
@@ -433,77 +407,6 @@ public static class CoreActions
 
         /// <summary>"This process has no graph to talk about" — a different answer from "the graph says zero".</summary>
         static Result<JsonElement> Unavailable(string message) => Result<JsonElement>.Failure(new(ErrorCode.Unavailable, message));
-
-        async ValueTask<Result<JsonElement>> DestroyAdapter(JsonElement arguments, CancellationToken ct)
-        {
-            var target = ReadAddress(arguments, "address");
-            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
-            var destroyed = await adapters.DestroyAsync(target.Value, ct).ConfigureAwait(false);
-            return destroyed.Ok
-                ? Result<JsonElement>.Success(ToJson(new { address = target.Value.ToString(), destroyed = true }))
-                : Result<JsonElement>.Failure(destroyed.Error!);
-        }
-
-        /// <summary>
-        /// Creates one adapter from a form's worth of arguments.
-        ///
-        /// The address is built from the type and the instance name, never from arguments that spell it out: an
-        /// address is a name, and a caller that can choose "adapter.file#x" while naming type "adapter.qq" is a
-        /// caller that can make the two disagree before the spec is even stored.
-        /// </summary>
-        async ValueTask<Result<JsonElement>> CreateAdapter(JsonElement arguments, CancellationToken ct)
-        {
-            if (!TryReadText(arguments, "type", out var typeId) || typeId.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "adapters.create requires 'type'."));
-            var type = typeId.Trim();
-            if (moduleTypes is not { } adapterTypes)
-                return Unavailable("No type tree in this process; adapter types cannot be checked.");
-            if (!adapterTypes.IsAssignableTo(type, "adapter"))
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Not an adapter type: {type}"));
-            if (!adapterTypes.IsConcrete(type))
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"Adapter type is not registered in this process: {type}"));
-            // C-01: an instance is named when it is created and never renamed. A caller may name it; if it does not,
-            // the name is the type's own prefix plus a fresh suffix — readable to a person, never parsed by the code.
-            var instanceName = TryReadText(arguments, "instance", out var asked) && asked.Trim().Length > 0
-                ? asked.Trim()
-                : ModuleId.NewSuffix();
-            var address = BuildAddress(type, instanceName);
-            if (!address.Ok) return Result<JsonElement>.Failure(address.Error!);
-
-            var platform = TryReadText(arguments, "platform", out var platformText) && platformText.Trim().Length > 0
-                ? platformText.Trim()
-                : address.Value.Kind!;
-            var account = TryReadText(arguments, "account", out var accountText) && accountText.Trim().Length > 0
-                ? accountText.Trim()
-                : instanceName;
-            // Direction decides which half of IChatAdapter anyone may call, so a typo must be refused rather than
-            // defaulted: "inboud" quietly becoming Both turns an inbound-only account into a sender.
-            var direction = AdapterDirection.Both;
-            if (TryReadText(arguments, "direction", out var directionText) && directionText.Trim().Length > 0)
-            {
-                if (!Enum.TryParse<AdapterDirection>(directionText.Trim(), ignoreCase: true, out direction) || !Enum.IsDefined(direction))
-                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
-                        $"adapters.create 'direction' must be inbound, outbound or both, not '{directionText}'."));
-            }
-
-            var settings = ReadSettings(arguments, out var settingsError);
-            if (settingsError is not null) return Result<JsonElement>.Failure(settingsError);
-
-            var spec = new AdapterSpec(address.Value, new AdapterDescriptor(platform, account, direction), type, settings);
-            var created = await adapters.CreateAsync(spec, ct).ConfigureAwait(false);
-            if (!created.Ok || created.Value is null) return Result<JsonElement>.Failure(created.Error ?? new(ErrorCode.Unavailable, "Adapter could not be created."));
-            return Result<JsonElement>.Success(ToJson(new
-            {
-                address = address.Value.ToString(),
-                type,
-                platform,
-                account,
-                direction = direction.ToString().ToLowerInvariant()
-            }));
-        }
-
-        // ---- model configuration: the files a person edits, behind the same single execution point ----------
-
         /// <summary>"openai-chat" → "chat": the file's category comes from the type, not from the kind in the address.</summary>
         string CategoryOfKind(string kind)
         {
@@ -836,33 +739,6 @@ public static class CoreActions
             })));
         }
 
-        async ValueTask<Result<JsonElement>> StartAdapter(JsonElement arguments, CancellationToken ct)
-        {
-            var target = ReadAddress(arguments, "address");
-            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
-            var started = await adapters.StartAsync(target.Value, ct).ConfigureAwait(false);
-            return started.Ok
-                ? Result<JsonElement>.Success(ToJson(new { address = target.Value.ToString(), state = "running" }))
-                : Result<JsonElement>.Failure(started.Error!);
-        }
-
-        async ValueTask<Result<JsonElement>> StopAdapter(JsonElement arguments, CancellationToken ct)
-        {
-            var target = ReadAddress(arguments, "address");
-            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
-            var stopped = await adapters.StopAsync(target.Value, ct).ConfigureAwait(false);
-            return stopped.Ok
-                ? Result<JsonElement>.Success(ToJson(new { address = target.Value.ToString(), state = "stopped" }))
-                : Result<JsonElement>.Failure(stopped.Error!);
-        }
-        // Optional per-adapter health: the state says whether somebody asked it to run, this says
-        // whether it is actually connected right now.
-        IAdapterHealth? Health(Address address)
-        {
-            var found = adapters.Get(address);
-            return found.Ok ? found.Value as IAdapterHealth : null;
-        }
-
         async ValueTask<Result<JsonElement>> MountScript(JsonElement arguments, CancellationToken ct)
         {
             if (!TryReadText(arguments, "script", out var scriptId) || scriptId.Trim().Length == 0)
@@ -1048,12 +924,6 @@ public static class CoreActions
             return values.Length == 0 ? null : values;
         }
 
-        IAdapterIdentity? Identity(Address address)
-        {
-            var found = adapters.Get(address);
-            return found.Ok ? found.Value as IAdapterIdentity : null;
-        }
-
         ValueTask<Result<JsonElement>> RecentSignals(JsonElement arguments, CancellationToken ct)
         {
             var limit = 200;
@@ -1093,34 +963,6 @@ public static class CoreActions
         if (!Address.TryParse($"{typeId}#{instance}", out var address) || !address.IsInstance)
             return Result<Address>.Failure(new(ErrorCode.Invalid, $"Not an instance address: {typeId}#{instance}"));
         return Result<Address>.Success(address);
-    }
-
-    /// <summary>
-    /// Adapter settings as a flat string map. Strict on purpose: an object value here would be stored as
-    /// "[object Object]" by whoever reads it next, and a number that silently became "1.0" is a config bug
-    /// nobody can see in the file.
-    /// </summary>
-    private static IReadOnlyDictionary<string, string>? ReadSettings(JsonElement arguments, out Error? error)
-    {
-        error = null;
-        if (arguments.ValueKind != JsonValueKind.Object || !arguments.TryGetProperty("settings", out var settings) ||
-            settings.ValueKind == JsonValueKind.Null) return null;
-        if (settings.ValueKind != JsonValueKind.Object)
-        {
-            error = new(ErrorCode.Invalid, "adapters.create 'settings' must be an object of string values.");
-            return null;
-        }
-        var map = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var property in settings.EnumerateObject())
-        {
-            if (property.Value.ValueKind != JsonValueKind.String)
-            {
-                error = new(ErrorCode.Invalid, $"Setting '{property.Name}' must be a string.");
-                return null;
-            }
-            map[property.Name] = property.Value.GetString() ?? "";
-        }
-        return map;
     }
 
     private static bool TryReadText(JsonElement arguments, string property, out string value)

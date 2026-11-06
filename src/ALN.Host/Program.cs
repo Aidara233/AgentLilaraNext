@@ -106,6 +106,15 @@ var reloadState = new ModuleReloadStateStore();
 // used to find no control plane to register with. Whoever implements a verb announces it; the host only hands out
 // the table. This is also why it is in host services: a module reaches it the same way it reaches the signal log.
 var controlPlane = new ControlPlane(auditSink, signalLog);
+// The adapter manager is built here rather than inside a package, so it registers here. A manager a package builds
+// registers from that package's start — the rule is the same either way: the implementer announces, and a failure to
+// register is a startup failure, because a verb that silently does not exist is only discovered by whoever tries it.
+var adapterActions = adapters.RegisterActions(controlPlane);
+if (!adapterActions.Ok)
+{
+    Console.Error.WriteLine(adapterActions.Error?.Message ?? "Adapter action registration failed.");
+    return 1;
+}
 var hostServices = new HostServiceProvider(
     (typeof(IControlPlane), controlPlane),
     (typeof(IAdapterManager), adapters),

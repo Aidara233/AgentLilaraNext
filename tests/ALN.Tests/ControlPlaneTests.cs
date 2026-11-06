@@ -384,23 +384,27 @@ public sealed class ControlPlaneTests : IDisposable
         // what the instance happens to be.
         var types = new AdapterTypeCatalog();
         Assert.True(types.RegisterPackageTypes("test.pack", [new("adapter.file", "adapter")]).Ok);
-        var adapters = new FakeAdapters();
+        // The verbs belong to the Adapter manager now, so this builds the real one over a factory that records what it
+        // was asked to make: the naming rule is the manager's, and a fake would be a second implementation of it.
+        var factories = new RecordingAdapterFactories();
+        var adapters = new AdapterManager(types, new QuietBindings(), factories);
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(adapters.RegisterActions(plane).Ok);
         Assert.True(CoreActions.RegisterAll(plane, adapters, new FakeChannels(), new FakeModels(null),
-            _signals, new FakeGraph(), new FakeParameters(), moduleTypes: types).Ok);
+            _signals, new FakeGraph(), new FakeParameters()).Ok);
 
         var unnamed = JsonSerializer.SerializeToElement(new { type = "adapter.file", direction = "inbound" });
-        Assert.True((await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate, unnamed, default)).Ok);
-        Assert.True((await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate, unnamed, default)).Ok);
+        Assert.True((await plane.InvokeAsync(User(Capabilities.AdaptersControl), AdapterActions.Create, unnamed, default)).Ok);
+        Assert.True((await plane.InvokeAsync(User(Capabilities.AdaptersControl), AdapterActions.Create, unnamed, default)).Ok);
 
-        Assert.Equal(2, adapters.Created.Count);
-        Assert.All(adapters.Created, spec => Assert.StartsWith("adapter.file#", spec.Address.ToString(), StringComparison.Ordinal));
-        Assert.NotEqual(adapters.Created[0].Address, adapters.Created[1].Address);
+        Assert.Equal(2, factories.Created.Count);
+        Assert.All(factories.Created, spec => Assert.StartsWith("adapter.file#", spec.Address.ToString(), StringComparison.Ordinal));
+        Assert.NotEqual(factories.Created[0].Address, factories.Created[1].Address);
 
         // A name the caller gives is used as given: "instance" is a name, not a suggestion to be reformatted.
-        Assert.True((await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate,
+        Assert.True((await plane.InvokeAsync(User(Capabilities.AdaptersControl), AdapterActions.Create,
             JsonSerializer.SerializeToElement(new { type = "adapter.file", instance = "main" }), default)).Ok);
-        Assert.Equal("adapter.file#main", adapters.Created[2].Address.ToString());
+        Assert.Equal("adapter.file#main", factories.Created[2].Address.ToString());
     }
 
     [Fact]
@@ -408,19 +412,21 @@ public sealed class ControlPlaneTests : IDisposable
     {
         var types = new AdapterTypeCatalog();
         Assert.True(types.RegisterPackageTypes("test.pack", [new("adapter.file", "adapter")]).Ok);
-        var adapters = new FakeAdapters();
+        var factories = new RecordingAdapterFactories();
+        var adapters = new AdapterManager(types, new QuietBindings(), factories);
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(adapters.RegisterActions(plane).Ok);
         Assert.True(CoreActions.RegisterAll(plane, adapters, new FakeChannels(), new FakeModels(null),
-            _signals, new FakeGraph(), new FakeParameters(), moduleTypes: types).Ok);
+            _signals, new FakeGraph(), new FakeParameters()).Ok);
 
-        var created = await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate,
+        var created = await plane.InvokeAsync(User(Capabilities.AdaptersControl), AdapterActions.Create,
             JsonSerializer.SerializeToElement(new
             {
                 type = "adapter.file", instance = "file-2", direction = "inbound",
                 settings = new Dictionary<string, string> { ["mailbox"] = "io/file/file-2" }
             }), default);
         Assert.True(created.Ok, created.Error?.Message);
-        var spec = Assert.Single(adapters.Created);
+        var spec = Assert.Single(factories.Created);
         // The address comes from type + instance, so the two can never disagree in the stored spec.
         Assert.Equal("adapter.file#file-2", spec.Address.ToString());
         Assert.Equal("file", spec.Descriptor.PlatformId);   // default: the type's own name
@@ -428,32 +434,37 @@ public sealed class ControlPlaneTests : IDisposable
         Assert.Equal(AdapterDirection.Inbound, spec.Descriptor.Direction);
         Assert.Equal("io/file/file-2", spec.Settings!["mailbox"]);
         Assert.Equal("adapter.file", spec.TypeId);
+        // A freshly created adapter is stopped, and the answer says so rather than leaving the caller to guess.
+        using (var answer = JsonDocument.Parse(created.Value.GetRawText()))
+            Assert.Contains("adapters.start", answer.RootElement.GetProperty("note").GetString());
 
         // A direction typo is refused: defaulting it to "both" would quietly turn a reader into a sender.
-        var typo = await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate,
+        var typo = await plane.InvokeAsync(User(Capabilities.AdaptersControl), AdapterActions.Create,
             JsonSerializer.SerializeToElement(new { type = "adapter.file", instance = "file-3", direction = "inboud" }), default);
         Assert.Equal(ErrorCode.Invalid, typo.Error!.Code);
         // A type nothing registered cannot be built, so the form must not be able to ask for it.
-        var unknown = await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate,
+        var unknown = await plane.InvokeAsync(User(Capabilities.AdaptersControl), AdapterActions.Create,
             JsonSerializer.SerializeToElement(new { type = "adapter.nope", instance = "x" }), default);
         Assert.Equal(ErrorCode.Invalid, unknown.Error!.Code);
         // A settings value that is not a string is refused rather than stringified into the file.
-        var badSetting = await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersCreate,
+        var badSetting = await plane.InvokeAsync(User(Capabilities.AdaptersControl), AdapterActions.Create,
             JsonSerializer.SerializeToElement(new { type = "adapter.file", instance = "file-4", settings = new { retry = 3 } }), default);
         Assert.Equal(ErrorCode.Invalid, badSetting.Error!.Code);
-        Assert.Single(adapters.Created);
+        Assert.Single(factories.Created);
 
         // Creating changes things; reading the list does not.
-        Assert.Equal(Capabilities.AdaptersControl, Assert.Single(plane.Catalog, a => a.Id == CoreActions.AdaptersCreate).Capability);
-        Assert.True(Assert.Single(plane.Catalog, a => a.Id == CoreActions.AdaptersDestroy).Mutating);
-        var denied = await plane.InvokeAsync(User(Capabilities.AdaptersRead), CoreActions.AdaptersDestroy,
+        Assert.Equal(Capabilities.AdaptersControl, Assert.Single(plane.Catalog, a => a.Id == AdapterActions.Create).Capability);
+        Assert.True(Assert.Single(plane.Catalog, a => a.Id == AdapterActions.Destroy).Mutating);
+        Assert.All(plane.Catalog.Where(a => a.Id.StartsWith("adapters.", StringComparison.Ordinal)),
+            action => Assert.False(string.IsNullOrWhiteSpace(action.ParamsJson)));
+        var denied = await plane.InvokeAsync(User(Capabilities.AdaptersRead), AdapterActions.Destroy,
             JsonSerializer.SerializeToElement(new { address = "adapter.file#file-2" }), default);
         Assert.Equal(ErrorCode.Denied, denied.Error!.Code);
 
-        var destroyed = await plane.InvokeAsync(User(Capabilities.AdaptersControl), CoreActions.AdaptersDestroy,
+        var destroyed = await plane.InvokeAsync(User(Capabilities.AdaptersControl), AdapterActions.Destroy,
             JsonSerializer.SerializeToElement(new { address = "adapter.file#file-2" }), default);
         Assert.True(destroyed.Ok, destroyed.Error?.Message);
-        Assert.Equal("adapter.file#file-2", Assert.Single(adapters.Destroyed).ToString());
+        Assert.False(adapters.Get(new Address("adapter", "file", "file-2")).Ok);
     }
 
     [Fact]
@@ -732,6 +743,44 @@ public sealed class ControlPlaneTests : IDisposable
         public IReadOnlyList<AdapterInfo> List() => [];
         public ValueTask<Result<IReadOnlyList<AdapterInfo>>> SnapshotByTypeAsync(string typeId, CancellationToken ct) =>
             ValueTask.FromResult(Result<IReadOnlyList<AdapterInfo>>.Success([]));
+    }
+
+    /// <summary>
+    /// A factory registry that makes the adapter asked for and writes down the spec, so a test can read what the
+    /// manager decided instead of what a fake manager was told.
+    /// </summary>
+    private sealed class RecordingAdapterFactories : IAdapterFactoryRegistry
+    {
+        public List<AdapterSpec> Created { get; } = [];
+        private IAdapterFactory? _factory = new StubAdapterFactory("adapter.file");
+
+        public Result Register(string packageId, IAdapterFactory factory)
+        {
+            _factory = factory;
+            return Result.Success();
+        }
+
+        public Result BeginDrain(string packageId) => Result.Success();
+        public Result Resume(string packageId) => Result.Success();
+        public Result RemovePackage(string packageId)
+        {
+            _factory = null;
+            return Result.Success();
+        }
+
+        public Result<IChatAdapter> Create(string typeId, AdapterSpec spec)
+        {
+            if (_factory is null || !string.Equals(_factory.TypeId, typeId, StringComparison.Ordinal))
+                return Result<IChatAdapter>.Failure(new(ErrorCode.Invalid, $"No factory for adapter type {typeId}."));
+            Created.Add(spec);
+            return Result<IChatAdapter>.Success(new StubAdapter(spec));
+        }
+    }
+
+    private sealed class StubAdapterFactory(string typeId) : IAdapterFactory
+    {
+        public string TypeId { get; } = typeId;
+        public IChatAdapter Create(AdapterSpec spec) => new StubAdapter(spec);
     }
 
     private sealed class StubAdapter(AdapterSpec spec) : IChatAdapter

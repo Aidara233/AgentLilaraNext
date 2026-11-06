@@ -167,9 +167,20 @@ public interface IAdapterFactoryRegistry : IModulePackageResourceRegistry
 /// <param name="IsAbstract">An abstract type names a family; only concrete ones can be instantiated.</param>
 public sealed record ModuleTypeEntry(string TypeId, string? ParentTypeId, bool IsAbstract);
 
-public interface IModuleTypeCatalog
+/// <summary>
+/// The action ids the Adapter module answers to. Here for the same reason as <see cref="ChannelActions"/>: an id is
+/// part of the interface, and the module that implements the verb must not be the only place it is written down.
+/// </summary>
+public static class AdapterActions
 {
-    bool IsKnownAbstract(string typeId);
+    public const string List = "adapters.list";
+    public const string Start = "adapters.start";
+    public const string Stop = "adapters.stop";
+    public const string Create = "adapters.create";
+    public const string Destroy = "adapters.destroy";
+}
+public interface IModuleTypeCatalog
+{    bool IsKnownAbstract(string typeId);
     bool IsConcrete(string typeId);
     bool IsAssignableTo(string concreteTypeId, string abstractTypeId);
 
