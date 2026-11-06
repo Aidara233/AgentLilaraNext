@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace ALN.Contracts;
 
 /// <summary>
@@ -142,3 +144,18 @@ public interface ICatalog
     Result Detach(ModuleId id);
 }
 
+
+/// <summary>
+/// An instance that can say what state it is in right now, in its own words.
+///
+/// It exists so that "what is this Channel aimed at" has one answer, held by the thing that owns it — rather than a
+/// host that reaches into every kind of instance to build a summary it will have to keep in step with all of them. An
+/// instance that says nothing is not an error: a tool shows what it can see and says the rest was not offered.
+///
+/// The shape is a JSON object because the fields differ per kind and nothing here should have to learn them: the
+/// reader is a person or a model, not a compiler.
+/// </summary>
+public interface IInstanceSnapshot
+{
+    JsonElement Snapshot();
+}

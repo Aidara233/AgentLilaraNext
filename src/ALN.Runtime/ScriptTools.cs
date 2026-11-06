@@ -57,7 +57,8 @@ public static class ScriptReload
 ///
 /// Neither tool speaks to anyone: they change what runs, not what the conversation hears.
 /// </summary>
-public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog, ScriptLibrary? library = null)
+public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog, ScriptLibrary? library = null,
+    ICatalog? modules = null)
     : ISessionToolSource
 {
     public const string SourceId = "system.script-tools";
@@ -66,10 +67,12 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
     public const string MountToolName = "scripts_mount";
     public const string UnmountToolName = "scripts_unmount";
     public const string InstancesToolName = "instances_list";
+    public const string InstanceToolName = "instances_show";
 
     private readonly IGraphRuntime _graph = graph;
     private readonly IGraphScriptCatalog _catalog = catalog;
     private readonly ScriptLibrary? _library = library;
+    private readonly ICatalog? _modules = modules;
 
     public string Id => SourceId;
 
@@ -121,6 +124,16 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
          "additionalProperties":false}
         """);
 
+    public static readonly ModelToolDefinition InstanceDefinition = new(InstanceToolName,
+        "One instance in full: its type and category, the scripts mounted on it, and — when the instance can describe "
+        + "itself — its current state (for a channel: what it is aimed at, whether it is running, its window). Use this "
+        + "after changing something to see what actually happened, instead of assuming it worked.",
+        """
+        {"type":"object","properties":{
+          "address":{"type":"string","description":"The instance address, exactly as instances_list shows it."}},
+         "required":["address"],"additionalProperties":false}
+        """);
+
     public ValueTask<Result<IReadOnlyList<SessionToolOffer>>> ToolsAsync(RoundContextRequest request,
         CancellationToken cancellationToken)
     {
@@ -136,7 +149,10 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
             new(new UnmountTool(this), UnmountDefinition, ActsExternally: false),
             // Reading addresses, for the same reason the mount tool exists: an address cannot be guessed, and the
             // moment a model can mount it needs to see what there is to mount onto.
-            new(new InstancesTool(this), InstancesDefinition, ActsExternally: false)
+            new(new InstancesTool(this), InstancesDefinition, ActsExternally: false),
+            // And one instance in full: the list says what is there, this says what it is doing — which is the question
+            // after a change, and the difference between editing and guessing.
+            new(new InstanceTool(this), InstanceDefinition, ActsExternally: false)
         ];
         return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(offers));
     }
@@ -365,6 +381,58 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
             return ValueTask.FromResult(Result<SessionToolResult>.Success(new(text.ToString())));
         }
     }
+
+    /// <summary>
+    /// One instance in full: what it is, what it is doing, what is mounted on it, and — when it can say — its own state.
+    ///
+    /// The list answers "what is there"; this answers "what is this one doing now", which is the question somebody has
+    /// after changing something. The state block is the instance's own: the host does not know what a Channel is aimed
+    /// at, and an instance that cannot describe itself says nothing rather than being guessed at.
+    /// </summary>
+    private sealed class InstanceTool(ScriptTools owner) : ISessionTool
+    {
+        public string Name => InstanceToolName;
+        public bool EndsTurn => false;
+
+        public ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var arguments = ToolArguments.Parse(call.ArgumentsJson);
+            var text = arguments is { } root ? ToolArguments.Text(root, "address")?.Trim() : null;
+            if (string.IsNullOrWhiteSpace(text) || !Address.TryParse(text, out var address) || !address.IsInstance)
+                return ValueTask.FromResult(Result<SessionToolResult>.Failure(
+                    new(ErrorCode.Invalid, "instances_show requires 'address' as an instance address.")));
+
+            var id = new ModuleId(address.ToString());
+            var row = owner._modules?.Describe(id);
+            var module = owner._modules?.Find(id);
+            if (row is null && module is null)
+                return ValueTask.FromResult(Result<SessionToolResult>.Success(new(
+                    $"{address}: no such instance. instances_list shows what exists; an address cannot be invented.")));
+
+            var body = new StringBuilder();
+            body.Append(address).Append(" [").Append(row?.TypeId ?? address.TypeId).Append(']');
+            if (row is not null) body.Append(' ').Append(row.Category).Append(' ').Append(row.Role.ToString().ToLowerInvariant());
+
+            var mounted = owner._graph.Mounted.Where(entry => entry.Target == address).ToArray();
+            body.Append("\nscripts: ").Append(mounted.Length == 0
+                ? "none — nothing answers this instance's events"
+                : string.Join(", ", mounted.Select(entry => entry.Package.Manifest.Id).Order(StringComparer.Ordinal)));
+            foreach (var mount in mounted.Where(entry => entry.RuleId is { Length: > 0 }))
+                body.Append("\n  rule: ").Append(mount.RuleId);
+
+            if (module is IInstanceSnapshot snapshot)
+            {
+                body.Append("\nstate: ");
+                try { body.Append(snapshot.Snapshot().GetRawText()); }
+                catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException)
+                { body.Append("(the instance could not describe itself: ").Append(ex.Message).Append(')'); }
+            }
+            else body.Append("\nstate: this instance does not describe itself.");
+
+            return ValueTask.FromResult(Result<SessionToolResult>.Success(new(body.ToString())));
+        }
+    }
 }
 
 /// <summary>
@@ -383,13 +451,13 @@ public sealed class ScriptToolsModule(ModuleId id, ScriptTools tools, ISessionEx
     public ModuleId Id { get; } = id;
 
     public static Result<IKernelModule> FromManifest(ModuleManifest manifest, IGraphRuntime graph, IGraphScriptCatalog catalog,
-        ISessionExtensionRegistry extensions, ScriptLibrary? scripts = null)
+        ISessionExtensionRegistry extensions, ScriptLibrary? scripts = null, ICatalog? modules = null)
     {
         ArgumentNullException.ThrowIfNull(manifest);
         if (!string.Equals(manifest.Type, TypeId, StringComparison.Ordinal))
             return Result<IKernelModule>.Failure(new(ErrorCode.Invalid, $"This factory builds {TypeId}, not {manifest.Type}."));
         return Result<IKernelModule>.Success(
-            new ScriptToolsModule(manifest.Id, new ScriptTools(graph, catalog, scripts), extensions));
+            new ScriptToolsModule(manifest.Id, new ScriptTools(graph, catalog, scripts, modules), extensions));
     }
 
     public ValueTask<Result> InitializeAsync(CancellationToken cancellationToken)

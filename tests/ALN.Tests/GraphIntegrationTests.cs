@@ -621,6 +621,48 @@ public sealed class GraphIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task Showing_one_instance_answers_what_it_is_aimed_at_rather_than_what_it_is_called()
+    {
+        var channel = new Address("channel", "conversation", "chat-7");
+        // The graph has to be loaded before an instance can be attached to it — an instance exists on the graph.
+        Assert.True((await _graph.LoadAsync([], default)).Ok);
+        var created = await _channels.CreateAsync(new(channel, "chat-7",
+            [new ChannelBinding(_adapterAddress, "room-7")], ChannelTypes.Conversation), default);
+        Assert.True(created.Ok, created.Error?.Message + " / " + created.Error?.Detail);
+        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root),
+            new ScriptLibrary(_root), _catalog);
+        var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
+        var show = offers.Value!.Single(offer => offer.Definition.Name == ScriptTools.InstanceToolName).Tool;
+
+        var answer = await show.ExecuteAsync(new("c1", ScriptTools.InstanceToolName,
+            """{"address":"channel.conversation#chat-7"}"""), default);
+
+        Assert.True(answer.Ok, answer.Error?.Message);
+        // The state is the instance's own answer, so what it is aimed at appears without the host knowing what a
+        // channel is: this is the same text channels.list would show, not a second opinion.
+        Assert.Contains("room-7", answer.Value!.Content);
+        Assert.Contains("\"running\":", answer.Value!.Content);
+        // An instance that cannot describe itself must say that rather than be described by a guess.
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"),
+            _ => _adapter, default)).Ok);
+        Assert.Contains("does not describe itself", await NothingToDescribe(offers.Value!));
+
+        var invented = await show.ExecuteAsync(new("c2", ScriptTools.InstanceToolName,
+            """{"address":"channel.conversation#nope"}"""), default);
+        Assert.True(invented.Ok);
+        Assert.Contains("no such instance", invented.Value!.Content);
+    }
+
+    /// <summary>An instance that cannot describe itself must say that, not be described by a guess.</summary>
+    private async Task<string> NothingToDescribe(IReadOnlyList<SessionToolOffer> offers)
+    {
+        var show = offers.Single(offer => offer.Definition.Name == ScriptTools.InstanceToolName).Tool;
+        var answer = await show.ExecuteAsync(new("c3", ScriptTools.InstanceToolName,
+            """{"address":"adapter.file#test-1"}"""), default);
+        return answer.Value!.Content;
+    }
+
+    [Fact]
     public async Task Routing_without_the_route_capability_is_denied()
     {
         var intake = new ScriptPackage(

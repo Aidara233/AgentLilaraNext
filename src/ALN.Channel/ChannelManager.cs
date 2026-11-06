@@ -649,7 +649,7 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
         return Result.Success();
     }
 
-    private sealed class ChannelInstance(ChannelSpec spec) : IAddressed, IModule
+    private sealed class ChannelInstance(ChannelSpec spec) : IAddressed, IModule, IInstanceSnapshot
     {
         public Address Address { get; } = spec.Address;
         /// <summary>The address is the name; the catalog and the graph reach the instance by this.</summary>
@@ -679,6 +679,27 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
         public string TypeId => spec.TypeId;
 
         public ChannelInfo ToInfo() => new(Address, Name, Bindings, Running, spec.TypeId, MaxMessages, ModelProfile);
+
+        /// <summary>
+        /// What this Channel is right now, in the words a caller can act on: aimed at what, switched on or off, and how
+        /// much history one turn may carry. "Nothing" is spelled as an empty binding list rather than a missing field —
+        /// a disconnected Channel is a fact, not an absence.
+        /// </summary>
+        public JsonElement Snapshot() => JsonSerializer.SerializeToElement(new
+        {
+            address = Address.ToString(),
+            type = spec.TypeId,
+            name = Name,
+            running = Running,
+            draining = Draining,
+            bindings = Bindings.Select(binding => new
+            {
+                adapter = binding.Adapter.ToString(),
+                conversation = binding.PlatformConversationId
+            }),
+            maxMessages = MaxMessages,
+            modelProfile = ModelProfile
+        }, JsonOptions);
 
         public IParameterTarget Parameters(ChannelManager owner) => new ChannelParameters(this, owner);
     }
