@@ -1109,17 +1109,34 @@ public sealed class GraphManager : IGraphRuntime, IModule
             else
             {
                 channelAddress = new Address("channel", "conversation", channelId);
-                var spec = new ChannelSpec(channelAddress, string.IsNullOrWhiteSpace(options.Name) ? channelId : options.Name!,
-                    [new ChannelBinding(envelope.Adapter, envelope.PlatformConversationId)], ChannelTypes.Conversation);
-                var minted = await channels.CreateAsync(spec, cancellationToken).ConfigureAwait(false);
-                if (!minted.Ok) throw new InvalidOperationException(minted.Error?.Message ?? "Channel creation failed.");
-                var started = await channels.StartAsync(channelAddress, cancellationToken).ConfigureAwait(false);
-                if (!started.Ok)
+                var aimed = new ChannelBinding(envelope.Adapter, envelope.PlatformConversationId);
+                // A Channel under that name may already exist, serving another conversation. Routing says "deliver here"
+                // and a conversation belongs to one Channel, so the conversation moves — which is the same operation the
+                // channels.connect action performs, not a second implementation of it.
+                if (channels.Get(channelAddress).Ok)
                 {
-                    await channels.DestroyAsync(channelAddress, CancellationToken.None).ConfigureAwait(false);
-                    throw new InvalidOperationException(started.Error?.Message ?? "Channel start failed.");
+                    var moved = await channels.ConnectAsync(channelAddress, aimed, cancellationToken).ConfigureAwait(false);
+                    if (!moved.Ok) throw new InvalidOperationException(moved.Error?.Message ?? "Channel could not be re-aimed.");
+                    if (!channels.Get(channelAddress).Value!.Running)
+                    {
+                        var woken = await channels.StartAsync(channelAddress, cancellationToken).ConfigureAwait(false);
+                        if (!woken.Ok) throw new InvalidOperationException(woken.Error?.Message ?? "Channel start failed.");
+                    }
                 }
-                created = true;
+                else
+                {
+                    var spec = new ChannelSpec(channelAddress, string.IsNullOrWhiteSpace(options.Name) ? channelId : options.Name!,
+                        [aimed], ChannelTypes.Conversation);
+                    var minted = await channels.CreateAsync(spec, cancellationToken).ConfigureAwait(false);
+                    if (!minted.Ok) throw new InvalidOperationException(minted.Error?.Message ?? "Channel creation failed.");
+                    var started = await channels.StartAsync(channelAddress, cancellationToken).ConfigureAwait(false);
+                    if (!started.Ok)
+                    {
+                        await channels.DestroyAsync(channelAddress, CancellationToken.None).ConfigureAwait(false);
+                        throw new InvalidOperationException(started.Error?.Message ?? "Channel start failed.");
+                    }
+                    created = true;
+                }
             }
 
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id, channelAddress,

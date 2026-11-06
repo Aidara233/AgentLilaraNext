@@ -26,9 +26,6 @@ public sealed partial class ChannelManager
 
     private static readonly JsonSerializerOptions BindingJson = new(JsonSerializerDefaults.Web);
 
-    /// <summary>What a move did, in the words a caller needs to hear it in.</summary>
-    public sealed record BindingChange(Address Channel, ChannelBinding? Binding, ChannelBinding? Dropped, Address? TakenFrom);
-
     /// <summary>Reads the table. Absent or unreadable is an empty table, not a failure: nothing has been said yet.</summary>
     private async ValueTask<Dictionary<string, ChannelBinding?>> ReadBindingsAsync(CancellationToken cancellationToken)
     {
@@ -73,13 +70,13 @@ public sealed partial class ChannelManager
     /// stopped receiving anything — because a caller that cannot see that has no way to notice it did the wrong thing,
     /// and will simply try again.
     /// </summary>
-    public async ValueTask<Result<BindingChange>> ConnectAsync(Address address, ChannelBinding binding,
+    public async ValueTask<Result<ChannelWiringChange>> ConnectAsync(Address address, ChannelBinding binding,
         CancellationToken cancellationToken)
     {
         if (address.Instance is null)
-            return Result<BindingChange>.Failure(new(ErrorCode.Invalid, "A Channel address is required."));
+            return Result<ChannelWiringChange>.Failure(new(ErrorCode.Invalid, "A Channel address is required."));
         if (!binding.Adapter.IsInstance || string.IsNullOrWhiteSpace(binding.PlatformConversationId))
-            return Result<BindingChange>.Failure(new(ErrorCode.Invalid, "A binding needs an Adapter instance and a conversation."));
+            return Result<ChannelWiringChange>.Failure(new(ErrorCode.Invalid, "A binding needs an Adapter instance and a conversation."));
 
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -91,7 +88,7 @@ public sealed partial class ChannelManager
             {
                 _channels.TryGetValue(IdOf(address), out channel);
                 if (channel is null)
-                    return Result<BindingChange>.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
+                    return Result<ChannelWiringChange>.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
                 dropped = channel.Binding;
                 takenFrom = _channels.Values.FirstOrDefault(other => !ReferenceEquals(other, channel) && other.Binding == binding);
             }
@@ -103,14 +100,14 @@ public sealed partial class ChannelManager
             if (takenFrom is not null) table[takenFrom.Address.ToString()] = null;
 
             var written = await WriteBindingsAsync(table, cancellationToken).ConfigureAwait(false);
-            if (!written.Ok) return Result<BindingChange>.Failure(written.Error!);
+            if (!written.Ok) return Result<ChannelWiringChange>.Failure(written.Error!);
 
             lock (_gate)
             {
                 channel.Aim(binding);
                 takenFrom?.Aim(null);
             }
-            return Result<BindingChange>.Success(new BindingChange(address, binding, dropped, takenFrom?.Address));
+            return Result<ChannelWiringChange>.Success(new ChannelWiringChange(address, binding, dropped, takenFrom?.Address));
         }
         finally { _lifecycle.Release(); }
     }
@@ -119,7 +116,7 @@ public sealed partial class ChannelManager
     /// Lets go of the conversation. The Channel keeps existing and keeps its history: it simply stops receiving, which
     /// the answer says out loud — "it worked" and "it can no longer hear anything" are easy to confuse.
     /// </summary>
-    public async ValueTask<Result<BindingChange>> DisconnectAsync(Address address, CancellationToken cancellationToken)
+    public async ValueTask<Result<ChannelWiringChange>> DisconnectAsync(Address address, CancellationToken cancellationToken)
     {
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -130,17 +127,17 @@ public sealed partial class ChannelManager
             {
                 _channels.TryGetValue(IdOf(address), out channel);
                 if (channel is null)
-                    return Result<BindingChange>.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
+                    return Result<ChannelWiringChange>.Failure(new(ErrorCode.Invalid, $"Channel not found: {address}"));
                 dropped = channel.Binding;
             }
 
             var table = await ReadBindingsAsync(cancellationToken).ConfigureAwait(false);
             table[address.ToString()] = null;
             var written = await WriteBindingsAsync(table, cancellationToken).ConfigureAwait(false);
-            if (!written.Ok) return Result<BindingChange>.Failure(written.Error!);
+            if (!written.Ok) return Result<ChannelWiringChange>.Failure(written.Error!);
 
             lock (_gate) channel.Aim(null);
-            return Result<BindingChange>.Success(new BindingChange(address, null, dropped, null));
+            return Result<ChannelWiringChange>.Success(new ChannelWiringChange(address, null, dropped, null));
         }
         finally { _lifecycle.Release(); }
     }

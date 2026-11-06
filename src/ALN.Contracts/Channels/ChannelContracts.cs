@@ -5,6 +5,13 @@ namespace ALN.Contracts;
 public sealed record ChannelBinding(Address Adapter, string PlatformConversationId);
 
 /// <summary>
+/// What re-aiming a Channel did. Named rather than anonymous because the caller has to be able to say it: the
+/// conversation's new home, the binding this Channel dropped to take it, and the other Channel that has just gone
+/// silent. A caller that cannot see the third part has no way to notice it did the wrong thing.
+/// </summary>
+public sealed record ChannelWiringChange(Address Channel, ChannelBinding? Binding, ChannelBinding? Dropped, Address? TakenFrom);
+
+/// <summary>
 /// The action ids the Channel module answers to. They live in contracts for the same reason
 /// <see cref="Capabilities"/> does: an id is part of the interface, and the module that implements the verb and the
 /// caller that reads the answer must not each spell it out.
@@ -204,6 +211,23 @@ public interface IChannelManager
     ValueTask<Result> StartAsync(Address address, CancellationToken cancellationToken);
     ValueTask<Result> StopAsync(Address address, CancellationToken cancellationToken);
     ValueTask<Result> DestroyAsync(Address channel, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Points one Channel at one conversation, taking it away from wherever it was (docs/09 §6.7). Both ends let go in
+    /// the same write, because a conversation belongs to one Channel and a Channel serves one conversation.
+    ///
+    /// Defaulted so a stand-in still compiles — but a stand-in that cannot be re-aimed must say so rather than return
+    /// success, which is why the default refuses.
+    /// </summary>
+    ValueTask<Result<ChannelWiringChange>> ConnectAsync(Address channel, ChannelBinding binding, CancellationToken cancellationToken) =>
+        ValueTask.FromResult(Result<ChannelWiringChange>.Failure(
+            new(ErrorCode.Unavailable, "This Channel manager cannot be re-aimed.")));
+
+    /// <summary>Lets go of the conversation. The Channel keeps existing; it simply stops receiving.</summary>
+    ValueTask<Result<ChannelWiringChange>> DisconnectAsync(Address channel, CancellationToken cancellationToken) =>
+        ValueTask.FromResult(Result<ChannelWiringChange>.Failure(
+            new(ErrorCode.Unavailable, "This Channel manager cannot be re-aimed.")));
+
     ValueTask<Result<int>> AcceptAsync(AdapterEnvelope envelope, CancellationToken cancellationToken);
 
     /// <summary>

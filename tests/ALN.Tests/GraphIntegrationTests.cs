@@ -597,6 +597,30 @@ public sealed class GraphIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task Routing_to_a_name_that_already_serves_another_conversation_moves_it()
+    {
+        var intake = new ScriptPackage(
+            new("adapter.router-move", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
+                [ScriptCapabilities.ChannelRoute], TrustDomain.Builtin),
+            "async function onEvent(event, ctx) { return await ctx.channel.route({ channelId: 'shared' }); }");
+        Assert.True((await _graph.LoadAsync([intake], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        await _adapters.StartAsync(_adapterAddress, default);
+
+        Assert.True((await DispatchEnvelopeAsync(new(_adapterAddress, "file", "one", "m-1", "hello", DateTimeOffset.UtcNow))).Ok);
+        var channel = Assert.Single(_channels.List());
+        Assert.Equal("one", Assert.Single(channel.Bindings).PlatformConversationId);
+
+        // Same name, different conversation: one channel serves one conversation, so routing re-aims it through the same
+        // operation channels.connect performs — not by minting a second channel under a name that is already taken.
+        Assert.True((await DispatchEnvelopeAsync(new(_adapterAddress, "file", "two", "m-2", "hello", DateTimeOffset.UtcNow))).Ok);
+
+        channel = Assert.Single(_channels.List());
+        Assert.Equal(new Address("channel", "conversation", "shared"), channel.Address);
+        Assert.Equal("two", Assert.Single(channel.Bindings).PlatformConversationId);
+    }
+
+    [Fact]
     public async Task Routing_without_the_route_capability_is_denied()
     {
         var intake = new ScriptPackage(
