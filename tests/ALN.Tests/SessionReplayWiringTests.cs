@@ -147,6 +147,53 @@ public sealed class SessionReplayWiringTests : IDisposable
             $"the request still carries {model.Requests.Last().Messages.Count} messages");
     }
 
+    [Fact]
+    public async Task The_model_is_told_its_remaining_room_and_can_ask_to_fold_the_past_away()
+    {
+        // The scaffold's own advice is not enough: a model that cannot see its budget either ignores it until a call is
+        // refused, or compacts out of nervousness on every turn. One number per turn, and a tool to act on it.
+        var model = new ReplayModel(
+            [
+                [new ToolCallDelta(0, "call_c", "compact", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(10, 10))],
+                [new ToolCallDelta(0, "call_w", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(10, 10))]
+            ],
+            contextWindow: 4_000,
+            summary: "## 已承诺\n无\n## 已做过\n读了一堆文件\n## 还悬着\n还有没读完的");
+        var spec = new SessionSpec("default", "Keep reading.", "1", Tools: [ReadShape]);
+        var toolbox = new ReplayToolbox(new ReadingTool("短文"));
+
+        Assert.True((await new SessionManager(_root, model).TurnAsync("s-1", spec, Guid.NewGuid(),
+            new SessionTurnInput([], null, null), toolbox, default)).Ok);
+        await SeedAsync(40);
+
+        var ran = await new SessionManager(_root, model).TurnAsync("s-1", spec, Guid.NewGuid(),
+            new SessionTurnInput([], null, null), toolbox, default);
+
+        Assert.True(ran.Ok, ran.Error?.Detail ?? ran.Error?.Message);
+        var messages = model.Requests.Last().Messages;
+        // The room is stated, and stated as an estimate.
+        Assert.Contains(messages, message => message.Content?.Contains("tokens（估算）", StringComparison.Ordinal) == true);
+        // Asking for it worked, and the answer says what changed and what did not.
+        Assert.Contains(messages, message => message.Content?.Contains("已压缩", StringComparison.Ordinal) == true);
+        var history = await File.ReadAllLinesAsync(Path.Combine(_root, "modules", "s-1", "history.jsonl"));
+        Assert.Single(history, line => line.Contains("\"role\":\"system\"", StringComparison.Ordinal));
+    }
+
+    /// <summary>Turns of history as the loop would have written them, so a segment exists to summarize.</summary>
+    private async Task SeedAsync(int activations)
+    {
+        var path = Path.Combine(_root, "modules", "s-1", "history.jsonl");
+        var lines = new List<string>(await File.ReadAllLinesAsync(path));
+        for (var turn = 0; turn < activations; turn++)
+        {
+            var activation = $"seeded-{turn:D2}";
+            var call = new ModelToolCall($"seed_{turn}", "read", $$"""{"path":"memory/{{turn}}.md"}""");
+            lines.Add(Json(new($"{activation}:assistant", activation, turn, "assistant", null, At, ToolCalls: [call])));
+            lines.Add(Json(new($"{activation}:tool", activation, turn, "tool", $"第 {turn} 个文件的内容", At, ToolCallId: call.Id)));
+        }
+        await File.WriteAllLinesAsync(path, lines);
+    }
+
     private static readonly DateTimeOffset At = new(2026, 11, 6, 12, 0, 0, TimeSpan.Zero);
 
     private static string Json(SessionHistoryEntry entry) =>

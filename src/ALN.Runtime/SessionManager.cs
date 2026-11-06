@@ -411,12 +411,31 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
         "做完了、或者要停下来等下一次，就调用 wait。</framework>";
 
     /// <summary>
+    /// The second tool every Session has: putting the past behind it.
+    ///
+    /// Offered on every turn rather than only when the budget runs low, because the tool list is part of the request
+    /// prefix every provider caches — a list that appears and disappears costs more than the tool carries. It is
+    /// described as what it is: a summary that costs a model call and loses detail, so it is worth doing when what came
+    /// before is finished with, not as a habit.
+    /// </summary>
+    private static class CompactTool
+    {
+        public const string ToolName = "compact";
+
+        public static readonly ModelToolDefinition Definition = new(ToolName,
+            "Replace the older part of this conversation with a short summary of it, so that later turns have room to "
+            + "work. The records are not deleted — this only changes what future turns are shown. Do it when a piece of "
+            + "work is finished with and its details will not be needed again; it costs one extra model call, and the "
+            + "summary keeps what was promised, what was done and what is still open, not the wording.",
+            """{"type":"object","properties":{},"additionalProperties":false}""");
+    }
+
+    /// <summary>
     /// The one tool every Session has: going quiet. Stopping is an action the model takes, not something the
     /// framework infers from a step that happened to end without a tool call — otherwise a model that forgot to
     /// act looks exactly like a model that is done.
     /// </summary>
-    private sealed class WaitTool : ISessionTool
-    {
+    private sealed class WaitTool : ISessionTool    {
         public const string ToolName = "wait";
         private const int MaxWaitSeconds = 7 * 24 * 60 * 60;
 
@@ -524,7 +543,7 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     /// </summary>
     private static Result<ResolvedTools> ResolveTools(SessionSpec spec, ISessionToolbox? toolbox, IReadOnlyList<SessionToolOffer> offered)
     {
-        var visible = new List<ModelToolDefinition> { WaitTool.Definition };
+        var visible = new List<ModelToolDefinition> { WaitTool.Definition, CompactTool.Definition };
         var byName = new Dictionary<string, ISessionTool>(StringComparer.Ordinal);
         var acting = 0;
         foreach (var offer in offered)
@@ -774,7 +793,12 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             history = record.History;
 
             var channelTimeline = CollectChannelTimeline(history);
-            var channelContext = RenderChannelContext(channelTimeline, collected.Value.RoundContext);
+            // How much room is left is a fact about this request, so it goes in the round block like the time does —
+            // never into history, and last, because it is the note rather than the subject.
+            var roundContext = collected.Value.RoundContext
+                .Append(BudgetNote(TokenEstimator.Estimate(messages) + TokenEstimator.Estimate(visible), window))
+                .ToArray();
+            var channelContext = RenderChannelContext(channelTimeline, roundContext);
             if (channelContext.Length > 0) messages.Add(new ModelMessage("user", channelContext));
             var turnUsage = new ModelUsage(0, 0);
             var executedCalls = new List<ModelToolCall>();
@@ -941,14 +965,30 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                     // "wait" belongs to the loop and resolves even when nothing else does: it is how a turn ends
                     // without saying anything. Everything else comes from a module that offered it this round.
                     var isWait = string.Equals(call.Name, WaitTool.ToolName, StringComparison.Ordinal);
+                    var isCompact = string.Equals(call.Name, CompactTool.ToolName, StringComparison.Ordinal);
                     ISessionTool? tool = isWait
                         ? stop
-                        : resolved.Value.ByName.TryGetValue(call.Name, out var offeredTool)
-                            ? offeredTool
-                            : ResolveHosted(tools, call.Name);
+                        : isCompact
+                            ? null
+                            : resolved.Value.ByName.TryGetValue(call.Name, out var offeredTool)
+                                ? offeredTool
+                                : ResolveHosted(tools, call.Name);
                     var found = tools?.Find(call.Name);
                     Result<SessionToolResult> execution;
-                    if (outOfRoom && !isWait)
+                    if (isCompact)
+                    {
+                        // The one tool whose effect is not in the world but in what the next request will carry, so the
+                        // answer says exactly that — including that this round's request is already built and will not
+                        // shrink underneath it.
+                        var compacted = await TryCompactAsync(record, activationId, replayBudget, replay.EstimatedTokens,
+                            cancellationToken).ConfigureAwait(false);
+                        execution = compacted
+                            ? Result<SessionToolResult>.Success(new SessionToolResult(
+                                "（已压缩：较早的部分写成了一份简报，下一轮请求会从它开始。这一轮已经装好的内容不变。）", null))
+                            : Result<SessionToolResult>.Failure(new(ErrorCode.Conflict,
+                                "现在没有可以压缩的部分：要压的那段要么已经压过，要么还在最近几轮里，还不到放手的时候。"));
+                    }
+                    else if (outOfRoom && !isWait)
                     {
                         // Refused for room, in the same shape as any other refusal — the round still commits, the call
                         // still gets an answer, and nothing had an effect. Ending a turn stays possible, because wait
@@ -1831,6 +1871,30 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             .FirstOrDefault(candidate => string.Equals(candidate.Id, spec.ModelProfileId, StringComparison.Ordinal));
         return profile?.EffectiveContextWindow ?? ModelProfile.AssumedContextWindow;
     }
+
+    /// <summary>
+    /// What the model is told about its own room, as a floating field. A model that cannot see the ceiling either
+    /// ignores it until a call is refused, or compacts out of nervousness; showing the number once per turn is what makes
+    /// "compact now" and "read three more files" decisions it can actually take.
+    ///
+    /// The numbers are estimates, and the note says so — a precise-looking figure that is 15% wrong would be worse than
+    /// a rough one that is labelled.
+    /// </summary>
+    private static CollectedRoundContext BudgetNote(int used, int window)
+    {
+        var share = window <= 0 ? 0 : (int)(100L * used / window);
+        var note = $"上下文：这一轮大约已用 {used} / {window} tokens（估算）。";
+        note += share >= BudgetWarnPercent
+            ? "已经接近上限：手上的事做完就用 wait 收尾；如果有一件旧事已经办完、细节不再需要，可以调用 compact 先把它折成简报。"
+            : "还有余量。";
+        return new CollectedRoundContext("session.budget", "budget", "budget", note, BudgetNoteOrder);
+    }
+
+    /// <summary>Where the budget note sits among the floating fields: last, after the messages and the status facts.</summary>
+    private const int BudgetNoteOrder = 200;
+
+    /// <summary>At this share of the window, the note stops being a number and becomes advice.</summary>
+    public const int BudgetWarnPercent = 70;
 
     /// <summary>
     /// Where a turn must stop growing: past this, the model is being asked to answer inside what is left of its own
