@@ -61,7 +61,8 @@ public sealed partial class ChannelManager
                 """, Subject: "address"), SendThroughChannelAsync),
 
             (new(ChannelActions.Create, "Create one channel instance from its own arguments. " + ToolHint
-                    + " It needs exactly one binding: a channel serves one conversation.", Capabilities.ChannelsControl, true,
+                    + " It needs exactly one binding: a channel serves one conversation. It is created stopped: "
+                    + "call channels.start when it should begin receiving, or nothing will ever arrive.", Capabilities.ChannelsControl, true,
                 ParamsJson: """
                 {"type":"object","properties":{
                   "type":{"type":"string","description":"A concrete channel type, e.g. channel.conversation."},
@@ -223,7 +224,10 @@ public sealed partial class ChannelManager
                 adapter = binding.Adapter.ToString(),
                 conversation = binding.PlatformConversationId
             }),
-            maxMessages
+            maxMessages,
+            // Said out loud because a freshly made Channel is stopped: a caller that assumes otherwise waits for
+            // messages that can never arrive, and concludes the wiring is wrong.
+            note = created.Value.Running ? "created and running" : "created stopped: call channels.start to make it receive"
         }));
     }
 
