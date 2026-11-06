@@ -6,32 +6,38 @@ namespace ALN.Runtime;
 /// How big a request is, in the unit the window is measured in.
 ///
 /// Exact token counts need the provider's own tokenizer, which is not in this process and is not the same between
-/// providers. So this counts characters and converts, and the conversion is calibrated rather than guessed: one real
-/// request from the live deployment was 341,890 characters of messages and was answered as 81,355 input tokens —
-/// 4.20 characters per token, with 5.5% of those characters Chinese.
+/// providers. So this counts characters and converts, and the conversion is fitted to the one pairing that could be
+/// checked end to end: a stored model call from the live deployment, whose 414 messages held 125,436 characters (17.2% of
+/// them Chinese, the rest JSON, paths, tool output) and which the provider charged ~74k input tokens for — 0.59 tokens
+/// per character between them.
 ///
-/// Two classes, because the average is a trap: a Chinese character costs roughly one token while Latin text costs
-/// roughly a quarter of one, so a single ratio calibrated on a mixed conversation under-estimates a conversation that
-/// is entirely in Chinese by a factor of two. The classes are the smallest split that keeps that from happening.
+/// Two classes, because the average is a trap: a Chinese character costs roughly one and a half tokens while Latin text
+/// costs roughly a quarter of one, so a single ratio fitted here under-prices a conversation that is entirely in Chinese
+/// by a factor of three. The classes are the smallest split that keeps that from happening.
 ///
-/// Every constant here leans the same way — estimate high. Being wrong high means a Session folds history or compacts
-/// a little earlier than it had to; being wrong low means the provider refuses the request outright, and since the
-/// history that made it too big is still there, every request after it is refused too.
+/// ⚠️ The first version of this file was wrong by 2.6×, and the reason is worth keeping: it was calibrated against a
+/// file measured in <b>bytes</b>, not characters. Chinese is three bytes per character in UTF-8 and six in an escaped
+/// JSON string, so the denominator was inflated and the estimate came out comfortable and useless. A request estimated at
+/// 51k was really being charged 81k.
+///
+/// Every constant here leans the same way — estimate high. Being wrong high means a Session folds history or compacts a
+/// little earlier than it had to; being wrong low means the provider refuses the request outright, and since the history
+/// that made it too big is still there, every request after it is refused too.
 /// </summary>
 public static class TokenEstimator
 {
     /// <summary>
-    /// Tokens one CJK character costs. Measured Chinese in modern BPE vocabularies sits between 0.7 and 1.7 tokens per
-    /// character; 0.85 is the low end of that, which is the safe end here (it makes the estimate larger).
+    /// Tokens one CJK character costs. Chinese in modern BPE vocabularies sits between 0.7 and 1.7 tokens per character.
     /// </summary>
-    private const double TokensPerCjkChar = 0.85;
+    private const double TokensPerCjkChar = 1.5;
 
     /// <summary>
-    /// Tokens one other character costs. The measured corpus was 4.20 chars/token overall with 5.5% CJK, which works
-    /// out to about 6 characters per token for its Latin part; 0.23 (4.35 chars/token) keeps ~15% of headroom over
-    /// that, because a request full of short JSON keys and paths tokenizes worse than a prose one.
+    /// Tokens one other character costs, which is not the same as "text": these requests are full of JSON keys, paths,
+    /// GUIDs and separators, and a run of punctuation costs about one token per character the way a word does not.
+    /// 0.40 (2.5 chars/token) is fitted to the one pairing that could be checked — see the class comment — and prose
+    /// alone would come out cheaper; over-pricing prose is the safe direction, under-pricing code is not.
     /// </summary>
-    private const double TokensPerOtherChar = 0.23;
+    private const double TokensPerOtherChar = 0.40;
 
     /// <summary>
     /// What one message costs before its content: a role, two delimiters, and the field names around them. Not zero,

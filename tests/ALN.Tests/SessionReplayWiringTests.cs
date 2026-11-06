@@ -157,7 +157,7 @@ public sealed class SessionReplayWiringTests : IDisposable
                 [new ToolCallDelta(0, "call_c", "compact", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(10, 10))],
                 [new ToolCallDelta(0, "call_w", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(10, 10))]
             ],
-            contextWindow: 4_000,
+            contextWindow: 12_000,
             summary: "## 已承诺\n无\n## 已做过\n读了一堆文件\n## 还悬着\n还有没读完的");
         var spec = new SessionSpec("default", "Keep reading.", "1", Tools: [ReadShape]);
         var toolbox = new ReplayToolbox(new ReadingTool("短文"));

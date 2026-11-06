@@ -16,14 +16,17 @@ public sealed class TokenEstimatorTests
     [Fact]
     public void A_settled_fact_is_estimated_high_but_not_absurdly_high()
     {
-        // The measured mix: 5.5% Chinese, the rest Latin, JSON keys, paths and punctuation.
-        var (sample, actualTokens) = Measured(341_890, cjkShare: 0.055);
+        // The one pairing that could be checked end to end: a stored call from the live deployment, 414 messages holding
+        // 125,436 characters, 17.2% of them Chinese, charged ~74k input tokens once the tool schemas are taken out.
+        var (sample, actualTokens) = Measured(125_436, cjkShare: 0.172);
 
         var estimated = TokenEstimator.Estimate(sample);
 
-        Assert.True(estimated > actualTokens, $"estimate {estimated} should not under-shoot {actualTokens}");
+        Assert.True(estimated >= actualTokens * 0.95,
+            $"estimate {estimated} is far under {actualTokens}");
         // 30% is the ceiling: a Session that compacts a third earlier than needed is annoying, one that does not
-        // compact at all is dead.
+        // compact at all is dead. (The first constants in this file were 2.6× low and would have passed a loose test
+        // here only because they were measured in bytes — the numbers below are characters.)
         Assert.True(estimated < actualTokens * 1.30, $"estimate {estimated} is more than 30% over {actualTokens}");
     }
 
@@ -74,8 +77,8 @@ public sealed class TokenEstimatorTests
     }
 
     /// <summary>
-    /// A body with the composition of the measured one, and what the provider actually charged for it. The characters
-    /// are synthetic — the shape is what the constants were calibrated on.
+    /// A body with the composition of the measured one, and what the provider charged for it. The characters are
+    /// synthetic — the shape is what the constants were fitted on.
     /// </summary>
     private static (string Sample, int Tokens) Measured(int characters, double cjkShare)
     {
@@ -93,8 +96,8 @@ public sealed class TokenEstimatorTests
             }
             else builder.Append(latin);
         }
-        // 4.20 characters per token is the measurement; the sample is trimmed to the same length afterwards.
+        // 0.59 tokens per character on this composition, which is what the stored call worked out to.
         var sample = builder.ToString(0, characters);
-        return (sample, (int)Math.Round(characters / 4.20));
+        return (sample, (int)Math.Round(characters * 0.59));
     }
 }
