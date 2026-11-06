@@ -735,11 +735,12 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             if (!promptSet.Ok || promptSet.Value is null) return Result<SessionTurnResult>.Failure(promptSet.Error!);
             if (!promptSet.Value.IsEmpty) messages.Add(new ModelMessage("system", promptSet.Value.Text));
             messages.Add(new ModelMessage("user", record.Spec.Objective));
-            // Scratch is not conversation. A step that produced text and called no tool said nothing anyone saw,
-            // and replaying it would make the model re-read its own thinking every turn — and put two assistant
-            // turns back to back in the request. Which of the two meanings that text has depends on whether this
-            // Session has tools at all: without them, the text *was* the reply.
-            messages.AddRange(history.Where(entry => ShouldReplay(entry, actingTools > 0)).Select(ToModelMessage));
+            // What goes in is a view of the timeline, not a copy of it. Old work traces are folded to their outline so
+            // that the request stays inside the model's window; the records themselves are untouched (SessionReplay).
+            var replayBudget = ReplayBudget(record.Spec);
+            var replay = SessionReplay.Build(history, actingTools > 0, replayBudget);
+            messages.AddRange(replay.Messages);
+            RecordReplay(sessionId, replay, replayBudget);
             var collected = await CollectRoundContextAsync(request, cancellationToken).ConfigureAwait(false);
             if (!collected.Ok || collected.Value is null) return Result<SessionTurnResult>.Failure(collected.Error!);
 
@@ -1772,24 +1773,51 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
         return messages;
     }
 
-    private static ModelMessage ToModelMessage(SessionHistoryEntry entry) =>
-        new(entry.Role, entry.Content, entry.ToolCalls, entry.ToolCallId);
+    /// <summary>
+    /// How much of the model's window one request may spend on history.
+    ///
+    /// The rest is not slack: the system prompt, the objective, the round block and the tool schemas are all sent on
+    /// every request and are not history, and the model needs room to answer at all. 55% leaves a request whose
+    /// history can be folded further without ever arriving at a provider as something it must refuse.
+    /// </summary>
+    public const int ReplayBudgetPercent = 55;
+
+    /// <summary>The window this Session's model declared, or the floor when it declared nothing.</summary>
+    private int ReplayBudget(SessionSpec spec)
+    {
+        var profile = Models.ListProfiles()
+            .FirstOrDefault(candidate => string.Equals(candidate.Id, spec.ModelProfileId, StringComparison.Ordinal));
+        var window = profile?.EffectiveContextWindow ?? ModelProfile.AssumedContextWindow;
+        return (int)(window * (long)ReplayBudgetPercent / 100);
+    }
 
     /// <summary>
-    /// Whether a timeline entry belongs in a later request.
-    ///
-    /// A step that carried tool calls is structural, not chat: its results are in the timeline, and a request
-    /// that leaves the call out answers a call nobody made — which every provider rejects outright. So those
-    /// entries always go in, even if an older build happened to attach a channel view to them.
-    ///
-    /// Everything else with a channel view is carried by the <c>&lt;channel_messages&gt;</c> block instead, so
-    /// replaying it would say the same thing twice. Pure-text assistant entries are scratch: nobody saw them,
-    /// and in a Session with tools the model already has its own words through that block. Sessions without
-    /// tools keep the old meaning — the text was the reply, so it must be replayed.
+    /// One line per turn about how big the request got and how much of it was an outline. Written whenever anything was
+    /// folded, which is the steady state of a long Session: "when did this start to grow" is the first question a
+    /// refused request asks, and the answer should not have to be reconstructed from the provider's error text.
     /// </summary>
-    private static bool ShouldReplay(SessionHistoryEntry entry, bool scratchIsNotConversation) =>
-        entry.ToolCalls is { Count: > 0 } ||
-        (entry.ChannelMessages is null && !(scratchIsNotConversation && entry.Role == "assistant"));
+    private void RecordReplay(string sessionId, ReplayPlan replay, int budget)
+    {
+        if (replay.FoldedEntries == 0) return;
+        _signalLog.Write(new()
+        {
+            Id = Guid.NewGuid(),
+            ParentId = SignalScope.CurrentId,
+            Group = "session",
+            Name = "replay",
+            Mechanism = "session.replay",
+            Outcome = replay.EstimatedTokens > budget ? "over-budget" : "folded",
+            Level = replay.EstimatedTokens > budget ? SignalLevel.Warn : SignalLevel.Info,
+            Detail = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["session"] = sessionId,
+                ["estimatedTokens"] = replay.EstimatedTokens.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["budgetTokens"] = budget.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["keptActivations"] = replay.KeptActivations.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["foldedEntries"] = replay.FoldedEntries.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            }
+        });
+    }
 
     private async ValueTask<Result<CollectedRoundContextSnapshot>> CollectRoundContextAsync(
         RoundContextRequest request, CancellationToken cancellationToken)
