@@ -154,14 +154,19 @@ public static class SessionCompaction
     /// <summary>
     /// The summary as it should be stored: trimmed to what a checkpoint may cost, and refused when it is empty. A
     /// checkpoint with no content would silently erase the segment it claims to stand for.
+    ///
+    /// Over-length is cut from the middle rather than the end: the last section is what is still open, and dropping it to
+    /// keep an anecdote from the middle would lose the only part the next turn cannot reconstruct.
     /// </summary>
     public static string? Accept(string? summary)
     {
         var trimmed = summary?.Trim();
         if (string.IsNullOrEmpty(trimmed)) return null;
-        return trimmed.Length <= MaxSummaryChars
-            ? trimmed
-            : string.Concat(trimmed.AsSpan(0, MaxSummaryChars), "\n（简报被截断：它超过了上限）");
+        if (trimmed.Length <= MaxSummaryChars) return trimmed;
+        const string marker = "\n（简报过长，中段已省略）\n";
+        var head = (int)(MaxSummaryChars * 0.6);
+        var tail = MaxSummaryChars - head - marker.Length;
+        return string.Concat(trimmed.AsSpan(0, head), marker, trimmed.AsSpan(trimmed.Length - tail));
     }
 }
 

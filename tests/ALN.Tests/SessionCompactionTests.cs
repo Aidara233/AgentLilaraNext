@@ -86,10 +86,16 @@ public sealed class SessionCompactionTests
     {
         Assert.Null(SessionCompaction.Accept(null));
         Assert.Null(SessionCompaction.Accept("   \n  "));
-        var long_ = new string('s', SessionCompaction.MaxSummaryChars + 500);
+        var long_ = "## 已承诺\n" + new string('s', SessionCompaction.MaxSummaryChars) + "\n## 还悬着\n等一个回复。";
         var accepted = SessionCompaction.Accept(long_);
         Assert.NotNull(accepted);
-        Assert.Contains("被截断", accepted!, StringComparison.Ordinal);
+        Assert.Contains("中段已省略", accepted!, StringComparison.Ordinal);
+        // Both ends survive: what was promised at the top, and what is still open at the bottom — the last section is
+        // the one nothing else can reconstruct.
+        Assert.StartsWith("## 已承诺", accepted, StringComparison.Ordinal);
+        Assert.EndsWith("等一个回复。", accepted, StringComparison.Ordinal);
+        Assert.True(accepted.Length <= SessionCompaction.MaxSummaryChars,
+            $"a checkpoint may not cost {accepted.Length} characters");
         // A checkpoint that says nothing would silently erase the segment it claims to stand for.
         Assert.Equal("## 已承诺\n无", SessionCompaction.Accept("  ## 已承诺\n无  "));
     }

@@ -1907,8 +1907,14 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                 ("outcome", "not written"), ("reason", committed.Error?.Message ?? ""));
             return false;
         }
+        // Which pass this was, and what span it now stands for: after ten compactions the useful question is "what does
+        // the summary in the request actually cover", and the log has to be able to answer it.
         WriteSignal(activationId, "compact", SignalLevel.Info,
-            ("outcome", "checkpoint"), ("entries", plan.Entries.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            ("outcome", "checkpoint"),
+            ("pass", (record.History.Count(recorded => recorded.Role == SessionReplay.CheckpointRole) + 1)
+                .ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            ("covered", $"{plan.FirstCovered}..{plan.LastCovered}"),
+            ("entries", plan.Entries.ToString(System.Globalization.CultureInfo.InvariantCulture)),
             ("summaryChars", summary.Length.ToString(System.Globalization.CultureInfo.InvariantCulture)),
             ("tokensBefore", before.ToString(System.Globalization.CultureInfo.InvariantCulture)),
             ("previous", plan.PreviousCheckpoint ?? "none"));
