@@ -46,7 +46,10 @@ public static class SessionReplay
         int keepActivations = KeepRecentActivations)
     {
         ArgumentNullException.ThrowIfNull(history);
-        var replayable = history.Where(entry => ShouldReplay(entry, toolsActExternally)).ToArray();
+        // A request starts where the last checkpoint left off. Everything before it is still in the timeline and still
+        // readable — it is simply not what the next answer needs, and carrying it is what made requests grow.
+        var checkpoint = LastCheckpoint(history);
+        var replayable = history.Skip(checkpoint).Where(entry => ShouldReplay(entry, toolsActExternally)).ToArray();
         var calls = CallNames(replayable);
         for (var keep = Math.Clamp(keepActivations, 0, CountActivations(replayable)); ; keep--)
         {
@@ -62,9 +65,10 @@ public static class SessionReplay
     /// <summary>
     /// Whether a timeline entry belongs in a later request.
     ///
-    /// A step that carried tool calls is structural, not chat: its results are in the timeline, and a request that
-    /// leaves the call out answers a call nobody made — which every provider rejects outright. So those entries always
-    /// go in, even if an older build happened to attach a channel view to them.
+    /// A checkpoint always does — it is the only thing standing for everything before it. A step that carried tool calls
+    /// also always does: its results are in the timeline, and a request that leaves the call out answers a call nobody
+    /// made, which every provider rejects outright. So those go in even if an older build happened to attach a channel
+    /// view to them.
     ///
     /// Everything else with a channel view is carried by the <c>&lt;channel_messages&gt;</c> block instead, so
     /// replaying it would say the same thing twice. Pure-text assistant entries are scratch: nobody saw them, and in a
@@ -72,8 +76,23 @@ public static class SessionReplay
     /// meaning — the text was the reply, so it must be replayed.
     /// </summary>
     public static bool ShouldReplay(SessionHistoryEntry entry, bool scratchIsNotConversation) =>
+        entry.Role == CheckpointRole ||
         entry.ToolCalls is { Count: > 0 } ||
         (entry.ChannelMessages is null && !(scratchIsNotConversation && entry.Role == "assistant"));
+
+    /// <summary>
+    /// The role a checkpoint is written with. System, because that is what it is: not something anybody said, and not
+    /// something the model said — a statement about the conversation, made by the loop that kept it.
+    /// </summary>
+    public const string CheckpointRole = "system";
+
+    /// <summary>Where the request may start: the last checkpoint, or the first record when there is none.</summary>
+    public static int LastCheckpoint(IReadOnlyList<SessionHistoryEntry> history)
+    {
+        for (var index = history.Count - 1; index >= 0; index--)
+            if (history[index].Role == CheckpointRole) return index;
+        return 0;
+    }
 
     private static IReadOnlyList<ModelMessage> Messages(IReadOnlyList<SessionHistoryEntry> replayable, int oldestKept,
         IReadOnlyDictionary<string, string> calls, out int folded)
@@ -89,7 +108,13 @@ public static class SessionReplay
                 continue;
             }
             // Old: the structure stays, the payload goes. A tool call without its matching result is refused by every
-            // provider, so both halves are kept — only their sizes are cut, never their pairing.
+            // provider, so both halves are kept — only their sizes are cut, never their pairing. A checkpoint is never
+            // folded: it is already the smallest thing that can stand for what came before it.
+            if (entry.Role == CheckpointRole)
+            {
+                messages.Add(new ModelMessage(entry.Role, entry.Content));
+                continue;
+            }
             var toolCalls = entry.ToolCalls is { Count: > 0 } ? entry.ToolCalls.Select(FoldArguments).ToArray() : null;
             var content = entry.Role == "tool" ? FoldedResult(entry, calls) : entry.Content;
             if (toolCalls is not null || entry.Role == "tool") folded++;

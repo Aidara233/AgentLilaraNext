@@ -97,6 +97,65 @@ public sealed class SessionReplayWiringTests : IDisposable
         Assert.Contains("wait", refusal.Content, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task A_history_whose_outline_no_longer_fits_gets_a_checkpoint_and_a_shorter_request()
+    {
+        // Folding cannot fix a timeline that is nothing but outline: at some point the outline itself is the request.
+        // This is the case compaction exists for, and the window is small here so that it arrives in a few seconds.
+        var model = new ReplayModel(Turn(), contextWindow: 1_000, summary: "## 已承诺\n无\n## 已做过\n看了一堆文件\n## 还悬着\n还没看完");
+        var read = new ReadingTool("短文");
+        var spec = new SessionSpec("default", "Keep reading.", "1", Tools: [ReadShape]);
+
+        var first = await new SessionManager(_root, model).TurnAsync("s-1", spec, Guid.NewGuid(),
+            new SessionTurnInput([], null, null), new ReplayToolbox(read), default);
+        Assert.True(first.Ok, first.Error?.Detail ?? first.Error?.Message);
+
+        // Sixty turns of history, written as the loop would have written them.
+        var path = Path.Combine(_root, "modules", "s-1", "history.jsonl");
+        var lines = new List<string>(await File.ReadAllLinesAsync(path));
+        for (var turn = 0; turn < 60; turn++)
+        {
+            var activation = $"seeded-{turn:D2}";
+            var call = new ModelToolCall($"seed_{turn}", "read", $$"""{"path":"memory/{{turn}}.md"}""");
+            lines.Add(Json(new($"{activation}:assistant", activation, turn, "assistant", null, At, ToolCalls: [call])));
+            lines.Add(Json(new($"{activation}:tool", activation, turn, "tool",
+                $"第 {turn} 个文件的内容", At, ToolCallId: call.Id)));
+        }
+        await File.WriteAllLinesAsync(path, lines);
+
+        var second = await new SessionManager(_root, model).TurnAsync("s-1", spec, Guid.NewGuid(),
+            new SessionTurnInput([], null, null), new ReplayToolbox(read), default);
+        Assert.True(second.Ok, second.Error?.Detail ?? second.Error?.Message);
+
+        // A summary was asked for, and what it was shown is the old part of the timeline.
+        var asked = Assert.Single(model.Summaries);
+        Assert.Contains("【材料】", asked.Messages[1].Content, StringComparison.Ordinal);
+
+        // The checkpoint is on disk as a record — the timeline is not edited, it is read from further along.
+        var history = await File.ReadAllLinesAsync(path);
+        var checkpoint = Deserialize(Assert.Single(history,
+            line => line.Contains("\"role\":\"system\"", StringComparison.Ordinal)));
+        Assert.Equal(SessionReplay.CheckpointRole, checkpoint.Role);
+        Assert.False(string.IsNullOrWhiteSpace(checkpoint.CoversUpTo));
+        Assert.Contains("还没看完", checkpoint.Content, StringComparison.Ordinal);
+
+        // And the request that follows starts at the summary: the sixty seeded turns are no longer in it.
+        var messages = model.Requests.Last().Messages;
+        Assert.Contains(messages, message => message.Role == "system" && message.Content!.Contains("## 已承诺", StringComparison.Ordinal));
+        Assert.DoesNotContain(messages, message => message.Content?.Contains("第 0 个文件的内容", StringComparison.Ordinal) == true);
+        Assert.True(model.Requests.Last().Messages.Count < 10,
+            $"the request still carries {model.Requests.Last().Messages.Count} messages");
+    }
+
+    private static readonly DateTimeOffset At = new(2026, 11, 6, 12, 0, 0, TimeSpan.Zero);
+
+    private static string Json(SessionHistoryEntry entry) =>
+        System.Text.Json.JsonSerializer.Serialize(entry, new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web));
+
+    private static SessionHistoryEntry Deserialize(string line) =>
+        System.Text.Json.JsonSerializer.Deserialize<SessionHistoryEntry>(line,
+            new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web))!;
+
     /// <summary>One turn's script: read a file, then stop.</summary>
     private static ModelEvent[][] Turn()
     {
@@ -133,13 +192,23 @@ public sealed class SessionReplayWiringTests : IDisposable
     }
 
     /// <summary>A model that answers with the same steps forever and keeps every request it was given.</summary>
-    private sealed class ReplayModel(ModelEvent[][] script, int? contextWindow = null) : IModelManager
+    private sealed class ReplayModel(ModelEvent[][] script, int? contextWindow = null, string? summary = null) : IModelManager
     {
         public List<ModelRequest> Requests { get; } = [];
+        public List<ModelRequest> Summaries { get; } = [];
 
         public ValueTask<Result<IAsyncEnumerable<ModelEvent>>> CompleteAsync(string profileId, ModelRequest request,
             CancellationToken cancellationToken)
         {
+            // A summarizing call is the one request with a system message and no tools. Answering it with the scripted
+            // turn would make the test about the wrong thing.
+            if (summary is not null && request.Tools is null &&
+                request.Messages.Count > 0 && request.Messages[0].Role == "system")
+            {
+                Summaries.Add(request);
+                return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Success(Stream(
+                    [new TextDelta(summary), new ModelCompleted(StopReason.EndTurn, new ModelUsage(10, 10))])));
+            }
             Requests.Add(request);
             var step = script[(Requests.Count - 1) % script.Length];
             return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Success(Stream(step)));

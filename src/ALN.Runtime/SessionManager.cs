@@ -751,6 +751,15 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             var window = ContextWindow(record.Spec);
             var replayBudget = (int)(window * (long)ReplayBudgetPercent / 100);
             var replay = SessionReplay.Build(history, actingTools > 0, replayBudget);
+            // Folding first, because it is free and true. Compaction only when even the outline does not fit: it costs a
+            // model call and loses detail, and neither is worth paying while an outline would do.
+            if (replay.EstimatedTokens > replayBudget &&
+                await TryCompactAsync(record, activationId, replayBudget, replay.EstimatedTokens, cancellationToken).ConfigureAwait(false))
+            {
+                state = record.State;
+                history = record.History;
+                replay = SessionReplay.Build(history, actingTools > 0, replayBudget);
+            }
             messages.AddRange(replay.Messages);
             RecordReplay(sessionId, replay, replayBudget);
             var turnCeiling = (int)(window * (long)TurnCeilingPercent / 100);
@@ -1837,6 +1846,74 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     private const string TurnCeilingNote =
         "（系统）这一轮的上下文已经到上限，这个调用没有执行。要么把已经查到的说完，要么用 wait 结束这一轮；" +
         "还需要看别的东西，就在下一轮开始后再说。不要把这次调用当成已经做过。";
+
+    /// <summary>
+    /// Replace the oldest part of the timeline with a checkpoint, and say whether anything was written.
+    ///
+    /// A checkpoint is a record, not an edit: nothing is deleted, and the request simply starts later. The model is asked
+    /// for three things and given nothing else to write about — what was promised, what was done, what is still open —
+    /// because a narrative of a long session is exactly as long as the session.
+    ///
+    /// Failing here is not fatal: the turn goes on with the folded history it already had, and the signal says so. A
+    /// Session that cannot summarize is still a Session; one that refuses to run because summarizing failed is not.
+    /// </summary>
+    private async ValueTask<bool> TryCompactAsync(SessionRecord record, Guid activationId, int budgetTokens,
+        int before, CancellationToken cancellationToken)
+    {
+        var activation = activationId.ToString("N");
+        var plan = SessionCompaction.Plan(record.History, budgetTokens);
+        if (plan is null) return false;
+        var text = new StringBuilder();
+        Error? failure = null;
+        var request = new ModelRequest(
+        [
+            new ModelMessage("system", SessionCompaction.Instruction(SessionCompaction.MaxSummaryChars)),
+            new ModelMessage("user", plan.Prompt)
+        ]);
+        try
+        {
+            var started = await Models.CompleteAsync(record.Spec.ModelProfileId, request, cancellationToken).ConfigureAwait(false);
+            if (!started.Ok || started.Value is null) failure = started.Error ?? new(ErrorCode.Unavailable, "Summarizing failed.");
+            else
+            {
+                await foreach (var item in started.Value.WithCancellation(cancellationToken).ConfigureAwait(false))
+                {
+                    switch (item)
+                    {
+                        case TextDelta delta: text.Append(delta.Text); break;
+                        case ModelFailed failed: failure = failed.Error; break;
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception ex) { failure = new(ErrorCode.Unavailable, "Summarizing failed.", ex.Message); }
+
+        var summary = failure is null ? SessionCompaction.Accept(text.ToString()) : null;
+        if (summary is null)
+        {
+            WriteSignal(activationId, "compact", SignalLevel.Warn,
+                ("outcome", "not written"), ("reason", failure?.Message ?? "the summary came back empty"));
+            return false;
+        }
+
+        var state = record.State with { Revision = record.State.Revision + 1 };
+        var entry = new SessionHistoryEntry($"checkpoint:{activation}:{plan.LastCovered}", $"{activation}:compaction",
+            state.StepNumber, SessionReplay.CheckpointRole, summary, DateTimeOffset.UtcNow, CoversUpTo: plan.LastCovered);
+        var committed = await CommitAsync(record, new SessionPendingCommit(state, [entry]), cancellationToken).ConfigureAwait(false);
+        if (!committed.Ok)
+        {
+            WriteSignal(activationId, "compact", SignalLevel.Warn,
+                ("outcome", "not written"), ("reason", committed.Error?.Message ?? ""));
+            return false;
+        }
+        WriteSignal(activationId, "compact", SignalLevel.Info,
+            ("outcome", "checkpoint"), ("entries", plan.Entries.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            ("summaryChars", summary.Length.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            ("tokensBefore", before.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            ("previous", plan.PreviousCheckpoint ?? "none"));
+        return true;
+    }
 
     /// <summary>
     /// One line per turn about how big the request got and how much of it was an outline. Written whenever anything was

@@ -69,6 +69,11 @@ public sealed record SessionUsage(long InputTokens, long OutputTokens, long Cach
 }
 
 /// <summary>A committed, immutable timeline record.</summary>
+/// <param name="CoversUpTo">
+/// Set on a checkpoint: the id of the last record its summary stands for. Everything up to and including that record is
+/// still in the timeline — a checkpoint is a view, not a deletion — but no request after it needs to carry it, and
+/// having the id here is what makes "does this summary already cover that?" a question with an answer.
+/// </param>
 public sealed record SessionHistoryEntry(
     string Id,
     string ActivationId,
@@ -80,7 +85,8 @@ public sealed record SessionHistoryEntry(
     string? ToolCallId = null,
     ModelUsage? Usage = null,
     StopReason? StopReason = null,
-    IReadOnlyList<SessionChannelMessage>? ChannelMessages = null);
+    IReadOnlyList<SessionChannelMessage>? ChannelMessages = null,
+    string? CoversUpTo = null);
 
 public sealed record SessionChannelMessage(
     string Id,
