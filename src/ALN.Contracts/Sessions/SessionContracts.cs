@@ -238,3 +238,9 @@ public interface ISessionManager
     /// </summary>
     ValueTask<Result> RestoreAsync(string sessionId, string sourceDirectory, CancellationToken cancellationToken);
 }
+
+/// <summary>The action ids the session manager answers to. Same rule as the other modules: the id is part of the interface.</summary>
+public static class SessionActions
+{
+    public const string List = "sessions.list";
+}

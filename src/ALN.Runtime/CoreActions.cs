@@ -40,8 +40,6 @@ public static class CoreActions
     public const string ModuleTypes = "system.types";
     public const string ScriptsList = "scripts.list";
     public const string ScriptsSet = "scripts.set";
-    public const string SignalsRecent = "signals.recent";
-    public const string SessionsList = "sessions.list";
     public const string ArchiveList = "archive.list";
     public const string ArchiveMove = "archive.move";
     public const string ArchiveRestore = "archive.restore";
@@ -259,28 +257,6 @@ public static class CoreActions
                         // Edges that still pointed at it: reported, not repaired. Their files say something the graph
                         // no longer has, and rewriting somebody else's file is not this action's business.
                         droppedEdges = unloaded.Value!.Select(EdgeOf)
-                    }));
-                }),
-            (new(SignalsRecent, "Recent signal records, newest last.", Capabilities.SignalsRead, false), RecentSignals),
-
-            // Sessions are the only thing in the data root that is created without a spec the operator ever
-            // wrote (a Channel's script mints them), so they are also the only thing that needs collecting.
-            (new(SessionsList, "Sessions on disk: whose they are, when they last spoke, how much room they take.", Capabilities.SessionsRead, false),
-                async (_, ct) =>
-                {
-                    if (sessions is null) return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "Session manager is unavailable."));
-                    var listed = await sessions.ListAsync(ct).ConfigureAwait(false);
-                    if (!listed.Ok || listed.Value is null) return Result<JsonElement>.Failure(listed.Error!);
-                    return Result<JsonElement>.Success(ToJson(new
-                    {
-                        sessions = listed.Value.Select(session => new
-                        {
-                            id = session.Id,
-                            channel = session.Channel,
-                            lastActiveAt = session.LastActiveAt,
-                            steps = session.Steps,
-                            bytes = session.Bytes
-                        })
                     }));
                 }),
             // The bin: what could go in, what is in it, and putting things back. Same two verbs for every kind,

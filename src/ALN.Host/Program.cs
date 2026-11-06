@@ -548,6 +548,12 @@ if (!modelActions.Ok)
     Console.Error.WriteLine(modelActions.Error?.Message ?? "Model action registration failed.");
     return 1;
 }
+var sessionActions = sessions.RegisterActions(controlPlane);
+if (!sessionActions.Ok)
+{
+    Console.Error.WriteLine(sessionActions.Error?.Message ?? "Session action registration failed.");
+    return 1;
+}
 var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes, graphStatus: () => kernel.Status, kernel: kernel, scriptCatalog: scriptCatalog.Value);
 if (!actionsRegistered.Ok)
 {

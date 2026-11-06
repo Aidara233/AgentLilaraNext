@@ -12,7 +12,7 @@ namespace ALN.Runtime;
 
 /// <summary>Runs one serialized model step per activation and persists completed turns.</summary>
 [Module(SessionManagerId, Category = "session", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWiring, IInstanceSink, IModule, IRequireModules
+public sealed partial class SessionManager : ISessionManager, IModuleIndex, IModuleWiring, IInstanceSink, IModule, IRequireModules
 {
     public const string SessionManagerId = ModuleNames.SessionManager;
     public const string SessionTypeId = "session.chat";
