@@ -158,7 +158,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     public async ValueTask<Result<ISession>> GetAsync(string sessionId, CancellationToken cancellationToken)
     {
         if (!IsValidSessionId(sessionId))
-            return Result<ISession>.Failure(new(ErrorCode.Invalid, "Session id must use 1-128 ASCII letters, digits, '-' or '_'."));
+            return Result<ISession>.Failure(new(ErrorCode.Invalid, IdRule));
         var directory = ResolveSessionDirectory(sessionId);
         if (!Directory.Exists(directory))
             return Result<ISession>.Failure(new(ErrorCode.Invalid, $"No Session is called {sessionId}."));
@@ -177,7 +177,7 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
         CancellationToken cancellationToken)
     {
         if (!IsValidSessionId(sessionId))
-            return Result<SessionRecord>.Failure(new(ErrorCode.Invalid, "Session id must use 1-128 ASCII letters, digits, '-' or '_'."));
+            return Result<SessionRecord>.Failure(new(ErrorCode.Invalid, IdRule));
         if (_loaded.TryGetValue(sessionId, out var cached))
         {
             NoteSpecDrift(sessionId, cached.Spec, requestedSpec);
@@ -2000,11 +2000,18 @@ public sealed class SessionManager : ISessionManager, IModuleIndex, IModuleWirin
     private string ResolveSessionDirectory(string sessionId) => Path.Combine(ModulesRoot, sessionId);
 
     /// <summary>
-    /// A Session's name is validated as a module id and nothing else: letters, digits, '.', '#', '-' and '_'. The
-    /// old rule was narrower because a name used to be a hash; adding '.' and '#' is what lets a Session be named
-    /// after its type like every other instance (C-01, C-02).
+    /// A Session's name is validated as a module id and nothing else. The old rule was narrower because a name used to
+    /// be a hash; the module-id rule is what lets a Session be named after its type like every other instance
+    /// (C-01, C-02).
     /// </summary>
     private static bool IsValidSessionId(string value) => ModuleId.IsLegal(value);
+
+    /// <summary>
+    /// Said instead of the rules. This message used to spell out a narrower alphabet than
+    /// <see cref="ModuleId.IsLegal"/> enforces, so a name it refused was announced with the wrong reason — nothing
+    /// read the two together to notice. A failure that names the rule cannot drift from it.
+    /// </summary>
+    private const string IdRule = "A Session id must be a legal module id (ModuleId.IsLegal).";
 
     private sealed record LoadedSession(SessionSpec Spec, SessionState State);
     private sealed record LoadedRecovery(SessionState State, IReadOnlyList<SessionHistoryEntry> History);
