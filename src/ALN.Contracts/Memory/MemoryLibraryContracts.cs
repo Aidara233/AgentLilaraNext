@@ -192,6 +192,16 @@ public interface IMemoryLibrary
     ValueTask<Result<IReadOnlyList<MemoryLine>>> ReadLinesAsync(string name, IReadOnlyList<string> ids,
         CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Removes one fragment by id, from whichever file now holds it. True when it was there, false when it was already
+    /// gone — "forget this" is a statement, not a request to check.
+    ///
+    /// The line is what a block may quote, so deleting it makes that quote unanswerable; the reader says "that line is
+    /// gone" rather than silently dropping the sentence. That is the honest failure: an entry that was wrong should be
+    /// deletable, and a conclusion resting on it should stop looking backed.
+    /// </summary>
+    ValueTask<Result<bool>> DropLineAsync(string name, string id, CancellationToken cancellationToken);
+
     /// <summary>Removes a whole group, block and fragments together. A name that is not there is a success.</summary>
     ValueTask<Result> DropGroupAsync(string name, CancellationToken cancellationToken);
 }

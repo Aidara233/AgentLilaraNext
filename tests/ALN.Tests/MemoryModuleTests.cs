@@ -79,7 +79,8 @@ public sealed class MemoryModuleTests : IDisposable
         Assert.DoesNotContain("部署改到周五", section.Content, StringComparison.Ordinal);
 
         var tools = await _extensions.Tools.Single().ToolsAsync(new RoundContextRequest("s-1", Guid.NewGuid(), 1), default);
-        Assert.Equal(["remember", "read_memory"], tools.Value!.Select(offer => offer.Tool.Name).ToArray());
+        Assert.Equal(["remember", "read_memory", "search_memory", "forget"],
+            tools.Value!.Select(offer => offer.Tool.Name).ToArray());
         // Writing memory down is not speaking to anyone: the loop must not treat a turn that only did this as a reply.
         Assert.All(tools.Value!, offer => Assert.False(offer.ActsExternally));
     }

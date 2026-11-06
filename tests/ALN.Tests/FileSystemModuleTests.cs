@@ -107,6 +107,26 @@ public sealed class FileSystemModuleTests : IDisposable
         Assert.True((await module.StopAsync(default)).Ok);
     }
 
+    [Fact]
+    public async Task A_module_declared_the_way_the_host_declares_it_gets_its_whitelist()
+    {
+        // The whole travel of a configuration: written by the host, scanned by the kernel, parsed by the module. This is
+        // exactly the chain that broke — the file carried "configJson" (an escaped string) while the scan read
+        // "config", so the module came up with an empty whitelist and offered no tools at all. Every other test here
+        // started from a hand-built manifest and could not have seen it.
+        var store = new ModuleManifestStore(_root);
+        Assert.True((await store.WriteIfMissingAsync(
+            new ModuleManifest(new ModuleId(FileSystemModule.TypeId), FileSystemModule.TypeId, Enabled: true,
+                ConfigJson: FileSystemModule.DefaultConfig), default)).Ok);
+
+        var scan = await store.ScanAsync(types: null, default);
+        var manifest = Assert.Single(scan.Manifests);
+        var built = FileSystemModule.FromManifest(manifest, Access(), new SessionExtensionRegistry());
+
+        Assert.True(built.Ok, built.Error?.Message);
+        Assert.Equal([FileScopes.Memory], ((FileSystemModule)built.Value!).Scopes);
+    }
+
     // ---- what the model experiences -------------------------------------------------------------
 
     private static async Task<Result<SessionToolResult>> CallAsync(ISessionToolSource source, string tool, string arguments)

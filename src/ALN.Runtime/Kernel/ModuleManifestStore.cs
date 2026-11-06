@@ -46,18 +46,51 @@ public sealed class ModuleManifestStore(string root)
         try
         {
             Directory.CreateDirectory(directory);
-            var json = JsonSerializer.Serialize(manifest, new JsonSerializerOptions(JsonSerializerDefaults.Web)
-            {
-                WriteIndented = true,
-                Converters = { new ModuleIdJsonConverter() }
-            });
-            await File.WriteAllTextAsync(path, json, cancellationToken).ConfigureAwait(false);
+            await File.WriteAllTextAsync(path, Render(manifest), cancellationToken).ConfigureAwait(false);
             return Result.Success();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return Result.Failure(new(ErrorCode.Internal, $"Could not write {path}: {ex.Message}"));
         }
+        catch (JsonException ex)
+        {
+            // The configuration handed in is not JSON. Writing it anyway would produce a file this class cannot read
+            // back, which is the exact failure this method exists to avoid.
+            return Result.Failure(new(ErrorCode.Invalid, $"Module config for {manifest.Id} is not valid JSON.", ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// The file's shape, written from the manifest. <c>config</c> is written as the object it is, not as an escaped
+    /// string: the scan reads <c>config</c>, so anything else would be written and never read — a module that loads
+    /// with an empty configuration and quietly offers nothing.
+    /// </summary>
+    private static string Render(ModuleManifest manifest)
+    {
+        var document = new Dictionary<string, object?>
+        {
+            ["id"] = manifest.Id.Value,
+            ["type"] = manifest.Type,
+            ["enabled"] = manifest.Enabled
+        };
+        if (!string.IsNullOrWhiteSpace(manifest.ConfigJson))
+        {
+            using var config = JsonDocument.Parse(manifest.ConfigJson);
+            document["config"] = config.RootElement.Clone();
+        }
+        if (manifest.Slaves is { Count: > 0 })
+            document["slaves"] = manifest.Slaves
+                .Select(slave => new { id = slave.Id.Value, kinds = slave.Kinds, requireAll = slave.RequireAll })
+                .ToArray();
+        if (manifest.Dependencies is { Count: > 0 })
+            document["dependencies"] = manifest.Dependencies.Select(dependency => dependency.Value).ToArray();
+
+        return JsonSerializer.Serialize(document, new JsonSerializerOptions(JsonSerializerDefaults.Web)
+        {
+            WriteIndented = true,
+            Converters = { new ModuleIdJsonConverter() }
+        });
     }
 
     public async ValueTask<ManifestScan> ScanAsync(IModuleFactoryRegistry? types, CancellationToken cancellationToken) =>
@@ -186,11 +219,16 @@ public sealed class ModuleManifestStore(string root)
             if (broken) continue;
 
             seen[id.Value] = path;
+            // Two spellings of one thing: the object this class writes now, and the escaped string an older version
+            // wrote. Reading both is what keeps an existing file from loading a module with an empty configuration.
+            var configJson = raw.Config is { ValueKind: not JsonValueKind.Null } config
+                ? config.GetRawText()
+                : string.IsNullOrWhiteSpace(raw.ConfigJson) ? null : raw.ConfigJson;
             manifests.Add(new ModuleManifest(
                 id,
                 raw.Type,
                 raw.Enabled ?? true,
-                raw.Config?.GetRawText(),
+                configJson,
                 slaves,
                 dependencies));
         }
@@ -198,12 +236,17 @@ public sealed class ModuleManifestStore(string root)
         return new(manifests, issues);
     }
 
-    /// <summary>The file's shape, as written. Absent fields stay absent so that "not said" is not read as "false".</summary>
+    /// <summary>
+    /// The file's shape, as read. Absent fields stay absent so that "not said" is not read as "false".
+    /// <c>ConfigJson</c> is the older spelling this class used to write; it is read so that a file produced by that
+    /// version still yields its configuration instead of silently loading a module with nothing.
+    /// </summary>
     private sealed record RawManifest(
         string? Id,
         string? Type,
         bool? Enabled,
         JsonElement? Config,
+        string? ConfigJson,
         RawSlave[]? Slaves,
         string[]? Dependencies);
 

@@ -352,6 +352,17 @@ internal static class ToolArguments
     public static bool Flag(JsonElement root, string name) =>
         root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;
 
+    /// <summary>A number, or a number written as a string — providers differ, and both mean the same thing here.</summary>
+    public static int? Number(JsonElement root, string name)
+    {
+        if (!root.TryGetProperty(name, out var value)) return null;
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number)) return number;
+        if (value.ValueKind == JsonValueKind.String &&
+            int.TryParse(value.GetString(), System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out number)) return number;
+        return null;
+    }
+
     public static Result<SessionToolResult> Ok(string content) =>
         Result<SessionToolResult>.Success(new SessionToolResult(content));
 

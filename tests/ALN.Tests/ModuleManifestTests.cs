@@ -1,3 +1,4 @@
+using System.Text.Json;
 using ALN.Contracts;
 using ALN.Runtime;
 
@@ -150,6 +151,44 @@ public sealed class ModuleManifestTests : IDisposable
 
         Assert.False(created.Ok);
         Assert.Contains("instead of", created.Error!.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_manifest_the_host_writes_reads_back_with_its_configuration()
+    {
+        // The chain a module's configuration actually travels: written by the host, scanned by the kernel, parsed by the
+        // module. Testing only the last leg let a mismatch between the first two ship — the file said "configJson" (an
+        // escaped string) while the scan looked for "config", so the module loaded with an empty configuration and
+        // quietly offered nothing.
+        var store = new ModuleManifestStore(_root);
+        var manifest = new ModuleManifest(new ModuleId("filesystem.local"), "filesystem.local", Enabled: true,
+            ConfigJson: """{"scopes":["memory"]}""");
+        Assert.True((await store.WriteIfMissingAsync(manifest, default)).Ok);
+
+        var text = await File.ReadAllTextAsync(Path.Combine(_root, "modules", "filesystem.local", "module.json"));
+        Assert.Contains("\"config\"", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("configJson", text, StringComparison.Ordinal);
+
+        var scan = await store.ScanAsync(types: null, default);
+        var scanned = Assert.Single(scan.Manifests);
+        // Compared as JSON, not as text: the file is written indented, and "the same configuration" is a fact about
+        // what it means, not about its whitespace.
+        using var config = JsonDocument.Parse(scanned.ConfigJson!);
+        Assert.Equal("memory", config.RootElement.GetProperty("scopes")[0].GetString());
+    }
+
+    [Fact]
+    public async Task A_file_with_the_older_escaped_spelling_still_yields_its_configuration()
+    {
+        // Files written by the version that produced {"configJson":"…"} exist on disk. Refusing to read them would mean
+        // asking somebody to delete their own configuration to get a module working again.
+        Write("filesystem.local",
+            """{ "id": "filesystem.local", "type": "filesystem.local", "enabled": true, "configJson": "{\"scopes\":[\"memory\"]}" }""");
+
+        var scan = await new ModuleManifestStore(_root).ScanAsync(types: null, default);
+        var scanned = Assert.Single(scan.Manifests);
+        using var config = JsonDocument.Parse(scanned.ConfigJson!);
+        Assert.Equal("memory", config.RootElement.GetProperty("scopes")[0].GetString());
     }
 
     private void Write(string id, string json)

@@ -21,6 +21,11 @@ public sealed class MemoryTools(IMemoryLibrary library, TimeProvider? timeProvid
     public const string SourceId = "system.memory-tools";
     public const string RememberToolName = "remember";
     public const string ReadToolName = "read_memory";
+    public const string SearchToolName = "search_memory";
+    public const string ForgetToolName = "forget";
+
+    /// <summary>What one search may return. Beyond this the answer is a list nobody reads instead of a few they do.</summary>
+    private const int MaxSearchHits = 20;
 
     /// <summary>Most characters one read returns. A group can hold megabytes of fragments; a read that pasted them all
     /// would cost the round its budget and hide the body it came to show.</summary>
@@ -53,15 +58,40 @@ public sealed class MemoryTools(IMemoryLibrary library, TimeProvider? timeProvid
          "required":["group"]}
         """);
 
+    public static readonly ModelToolDefinition SearchDefinition = new(SearchToolName,
+        "Find fragments inside one memory group by what they say. Ranked by how much of the query they match and how "
+        + "recent they are, quotes included — this is how you find the original words, not how you read a group's "
+        + "body (that is read_memory). An empty query returns the recent ones.",
+        """
+        {"type":"object","properties":{
+          "group":{"type":"string","description":"Which memory group to search."},
+          "query":{"type":"string","description":"What to look for. Omit for the recent fragments."},
+          "limit":{"type":"integer","minimum":1,"maximum":50,"description":"How many fragments at most. Default 20."}},
+         "required":["group"]}
+        """);
+
+    public static readonly ModelToolDefinition ForgetDefinition = new(ForgetToolName,
+        "Remove one fragment by id, wherever it now lives (active or archived). Use it on a fragment that was wrong, or "
+        + "on one a block has already stopped resting on. If a block still quotes it, that quote will be reported as "
+        + "gone — deleting a fact is allowed, pretending the conclusion is still backed is not.",
+        """
+        {"type":"object","properties":{
+          "group":{"type":"string","description":"Which memory group the fragment is in."},
+          "id":{"type":"string","description":"The fragment id, e.g. l-3f2a9c11."}},
+         "required":["group","id"]}
+        """);
+
     public ValueTask<Result<IReadOnlyList<SessionToolOffer>>> ToolsAsync(RoundContextRequest request,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         IReadOnlyList<SessionToolOffer> offers =
         [
-            // Neither speaks to anyone: a turn that only wrote something down has not replied (docs/08 §5.1).
+            // None of these speaks to anyone: a turn that only wrote something down has not replied (docs/08 §5.1).
             new(new RememberTool(this), RememberDefinition, ActsExternally: false),
-            new(new ReadTool(this), ReadDefinition, ActsExternally: false)
+            new(new ReadTool(this), ReadDefinition, ActsExternally: false),
+            new(new SearchTool(this), SearchDefinition, ActsExternally: false),
+            new(new ForgetTool(this), ForgetDefinition, ActsExternally: false)
         ];
         return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(offers));
     }
@@ -168,6 +198,78 @@ public sealed class MemoryTools(IMemoryLibrary library, TimeProvider? timeProvid
             return $"[{line.Id}] {when} · {who}{line.Text}";
         }
     }
+
+    private sealed class SearchTool(MemoryTools owner) : ISessionTool
+    {
+        public string Name => SearchToolName;
+        public bool EndsTurn => false;
+
+        public async ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken)
+        {
+            if (ToolArguments.Parse(call.ArgumentsJson) is not { } arguments) return ToolArguments.BadJson(Name);
+            var group = ToolArguments.Text(arguments, "group")?.Trim();
+            if (string.IsNullOrEmpty(group))
+                return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid, "search_memory needs a group name."));
+            var query = ToolArguments.Text(arguments, "query")?.Trim() ?? "";
+            var limit = Math.Clamp(ToolArguments.Number(arguments, "limit") ?? MaxSearchHits, 1, 50);
+
+            var group0 = await owner._library.GroupAsync(group, cancellationToken).ConfigureAwait(false);
+            if (group0.Error is { } groupError) return Result<SessionToolResult>.Failure(groupError);
+            if (group0.Value is null)
+                return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid, $"没有「{group}」这个记忆组。"));
+
+            var found = await owner._library.SearchLinesAsync(group, query, limit, owner._time.GetUtcNow(), cancellationToken)
+                .ConfigureAwait(false);
+            if (found.Error is { } searchError) return Result<SessionToolResult>.Failure(searchError);
+            var hits = found.Value!.Hits;
+
+            var builder = new StringBuilder();
+            if (hits.Count == 0)
+                builder.Append(query.Length == 0
+                    ? $"「{group}」里还没有碎片。"
+                    : $"「{group}」里没有和「{query}」对得上的碎片。");
+            else
+            {
+                builder.Append($"「{group}」").Append(query.Length == 0 ? "最近的 " : $"和「{query}」相关的 ")
+                    .Append(hits.Count).AppendLine(" 条碎片：");
+                foreach (var hit in hits) builder.AppendLine(Render(hit.Line));
+                builder.Append("（这一组共 ").Append(group0.Value.Lines).Append(" 条碎片）");
+            }
+            // A file somebody mangled is a fact about the group; saying how many lines were skipped keeps "it isn't
+            // there" from looking like "it never happened".
+            if (found.Value.Skipped > 0)
+                builder.Append("；有 ").Append(found.Value.Skipped).Append(" 行读不出来，已跳过");
+            return ToolArguments.Ok(builder.ToString());
+        }
+    }
+
+    private sealed class ForgetTool(MemoryTools owner) : ISessionTool
+    {
+        public string Name => ForgetToolName;
+        public bool EndsTurn => false;
+
+        public async ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken)
+        {
+            if (ToolArguments.Parse(call.ArgumentsJson) is not { } arguments) return ToolArguments.BadJson(Name);
+            var group = ToolArguments.Text(arguments, "group")?.Trim();
+            var id = ToolArguments.Text(arguments, "id")?.Trim();
+            if (string.IsNullOrEmpty(group) || string.IsNullOrEmpty(id))
+                return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid, "forget needs both group and id."));
+
+            var dropped = await owner._library.DropLineAsync(group, id, cancellationToken).ConfigureAwait(false);
+            if (dropped.Error is { } dropError) return Result<SessionToolResult>.Failure(dropError);
+            return ToolArguments.Ok(dropped.Value
+                ? $"忘了 {id}（在「{group}」里）。如果某篇正文还在引用它，读那一组时会说那一行不在了。"
+                : $"「{group}」里没有 {id}——可能本来就删掉了，或者 id 不对。");
+        }
+    }
+
+    private static string Render(MemoryLine line)
+    {
+        var when = line.At.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
+        var who = string.IsNullOrWhiteSpace(line.Who) ? "" : $"{line.Who} · ";
+        return $"[{line.Id}] {when} · {who}{line.Text}";
+    }
 }
 
 /// <summary>
@@ -203,7 +305,8 @@ public sealed class MemoryGroupsSource(IMemoryLibrary library) : IFloatingContex
         var names = groups.Value.Select(group => group.Name).ToList();
         var lines = new List<string>
         {
-            $"记忆库（{names.Count} 组）：{string.Join("、", names)}。要打开一组用 {MemoryTools.ReadToolName}，要记一条用 {MemoryTools.RememberToolName}。"
+            $"记忆库（{names.Count} 组）：{string.Join("、", names)}。" +
+            $"要打开一组用 {MemoryTools.ReadToolName}，要查一句用 {MemoryTools.SearchToolName}，要记一条用 {MemoryTools.RememberToolName}。"
         };
 
         var heavy = groups.Value.Where(group => group.NeedsConsolidation).Select(group => group.Name).ToList();

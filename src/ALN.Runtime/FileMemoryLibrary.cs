@@ -185,6 +185,51 @@ public sealed class FileMemoryLibrary(IFileSystemAccess access, TimeProvider? ti
         return Result<IReadOnlyList<MemoryLine>>.Success(ordered);
     }
 
+    public async ValueTask<Result<bool>> DropLineAsync(string name, string id, CancellationToken cancellationToken)
+    {
+        if (MemoryGroupNames.Validate(name).Error is { } invalid) return Result<bool>.Failure(invalid);
+        if (string.IsNullOrWhiteSpace(id))
+            return Result<bool>.Failure(new(ErrorCode.Invalid, "DropLine needs the id of the fragment to remove."));
+
+        var tree = await _access.TreeAsync(Scope, name, cancellationToken).ConfigureAwait(false);
+        if (tree.Error is { } treeError) return Result<bool>.Failure(treeError);
+        var files = (tree.Value ?? [])
+            .Where(node => !node.IsDirectory)
+            .Where(node => node.Path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        var dropped = false;
+        foreach (var file in files)
+        {
+            var path = $"{name}/{file.Path}";
+            var read = await _access.ReadAsync(Scope, path, cancellationToken).ConfigureAwait(false);
+            // A file that cannot be read is left exactly as it is: not deleting what we could not look at is the only
+            // safe answer, and the caller is told nothing was removed.
+            if (read.Error is not null || read.Value is null) continue;
+
+            var kept = new List<string>();
+            var hit = false;
+            foreach (var raw in read.Value.Text.Split('\n'))
+            {
+                if (raw.Trim().Length == 0) continue;
+                // Lines that do not parse are kept verbatim: this call removes one fragment, it does not tidy the file.
+                if (Parse(raw.Trim()) is { } line && string.Equals(line.Id, id, StringComparison.Ordinal))
+                {
+                    hit = true;
+                    continue;
+                }
+                kept.Add(raw);
+            }
+            if (!hit) continue;
+
+            var rewritten = kept.Count == 0 ? "" : string.Join('\n', kept) + "\n";
+            var written = await _access.WriteAsync(Scope, path, rewritten, cancellationToken).ConfigureAwait(false);
+            if (written.Error is { } writeError) return Result<bool>.Failure(writeError);
+            dropped = true;
+        }
+        return Result<bool>.Success(dropped);
+    }
+
     public async ValueTask<Result> DropGroupAsync(string name, CancellationToken cancellationToken)
     {
         if (MemoryGroupNames.Validate(name).Error is { } invalid) return Result.Failure(invalid);
