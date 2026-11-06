@@ -740,6 +740,102 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.Empty(_graph.RejectedScripts);
     }
 
+    /// <summary>One tool out of a source's offers, by name: the test calls what the model would be offered.</summary>
+    private static ISessionTool ToolOf(Result<IReadOnlyList<SessionToolOffer>> offers, string name) =>
+        offers.Value!.Single(offer => offer.Definition.Name == name).Tool;
+
+    /// <summary>
+    /// The model's side of the draft folder: it can ask what is loaded and ask for a re-read, and neither of those starts
+    /// anything. A draft becomes visible after a reload and still runs for nobody until a person mounts it.
+    /// </summary>
+    [Fact]
+    public async Task The_model_can_see_a_draft_and_reload_it_and_still_cannot_start_it()
+    {
+        var folder = Path.Combine(_root, "scripts", "draft", "say-hello");
+        Directory.CreateDirectory(folder);
+        await File.WriteAllTextAsync(Path.Combine(folder, "manifest.json"), ScriptSeed.ExampleManifest);
+        await File.WriteAllTextAsync(Path.Combine(folder, "main.js"), ScriptSeed.ExampleSource);
+
+        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
+        var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
+        Assert.True(offers.Ok, offers.Error?.Message);
+
+        // Nothing was read yet: the folders are read when somebody asks, which is what makes reload a decision.
+        Assert.Empty(_graph.Scripts);
+
+        var reloaded = await ToolOf(offers, ScriptTools.ReloadToolName)
+            .ExecuteAsync(new("c1", ScriptTools.ReloadToolName, "{}"), default);
+        Assert.True(reloaded.Ok, reloaded.Error?.Message);
+        Assert.Contains("channel.say-hello", reloaded.Value!.Content, StringComparison.Ordinal);
+        Assert.Contains("runs only after somebody mounts it", reloaded.Value.Content, StringComparison.Ordinal);
+
+        // Loaded, visible, mounted on nothing.
+        Assert.Contains(_graph.Scripts, entry => entry.Package.Manifest.Id == "channel.say-hello");
+        Assert.DoesNotContain(_graph.Mounted, mount => mount.Package.Manifest.Id == "channel.say-hello");
+
+        var listed = await ToolOf(offers, ScriptTools.ListToolName)
+            .ExecuteAsync(new("c2", ScriptTools.ListToolName, "{}"), default);
+        Assert.True(listed.Ok);
+        Assert.Contains("channel.say-hello", listed.Value!.Content, StringComparison.Ordinal);
+        Assert.Contains("[draft]", listed.Value.Content, StringComparison.Ordinal);
+        Assert.Contains("runs only once somebody mounts it", listed.Value.Content, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The half that makes the tools worth having: when a draft is refused, the model is told which rule it broke, in the
+    /// same answer — on the model's side of the wire, not only in a signal a person has to go looking for.
+    /// </summary>
+    [Fact]
+    public async Task The_model_is_told_why_its_draft_was_refused()
+    {
+        var folder = Path.Combine(_root, "scripts", "draft", "too-eager");
+        Directory.CreateDirectory(folder);
+        await File.WriteAllTextAsync(Path.Combine(folder, "manifest.json"),
+            ScriptSeed.ExampleManifest.Replace("\"mount\": \"manual\"", "\"mount\": \"default\""));
+        await File.WriteAllTextAsync(Path.Combine(folder, "main.js"), ScriptSeed.ExampleSource);
+
+        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
+        var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
+        await ToolOf(offers, ScriptTools.ReloadToolName).ExecuteAsync(new("c1", ScriptTools.ReloadToolName, "{}"), default);
+
+        var listed = await ToolOf(offers, ScriptTools.ListToolName)
+            .ExecuteAsync(new("c2", ScriptTools.ListToolName, "{}"), default);
+        Assert.True(listed.Ok);
+        Assert.Contains("refused by the graph", listed.Value!.Content, StringComparison.Ordinal);
+        Assert.Contains("mounted by hand", listed.Value.Content, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>An empty graph is said out loud: "no scripts" and "silently answering nobody" are different problems.</summary>
+    [Fact]
+    public async Task With_no_scripts_the_list_says_nothing_would_answer()
+    {
+        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
+        var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
+
+        var listed = await ToolOf(offers, ScriptTools.ListToolName)
+            .ExecuteAsync(new("c", ScriptTools.ListToolName, "{}"), default);
+
+        Assert.True(listed.Ok);
+        Assert.Contains("nothing would answer", listed.Value!.Content, StringComparison.Ordinal);
+    }
+
+    /// <summary>They are a module's tools, so they arrive and leave with that module: nothing keeps feeding rounds.</summary>
+    [Fact]
+    public async Task The_script_control_module_offers_its_tools_and_takes_them_back()
+    {
+        var extensions = new SessionExtensionRegistry();
+        var manifest = new ModuleManifest(new ModuleId(ScriptToolsModule.TypeId), ScriptToolsModule.TypeId, Enabled: true);
+        var built = ScriptToolsModule.FromManifest(manifest, _graph,
+            new JsonScriptCatalog(Path.Combine(_root, "program"), _root), extensions);
+        Assert.True(built.Ok, built.Error?.Message);
+
+        Assert.True((await built.Value!.InitializeAsync(default)).Ok);
+        Assert.Contains(extensions.Tools, source => source.Id == ScriptTools.SourceId);
+
+        Assert.True((await built.Value.StopAsync(default)).Ok);
+        Assert.DoesNotContain(extensions.Tools, source => source.Id == ScriptTools.SourceId);
+    }
+
     private async Task WriteInputAsync(string conversation, string text)
     {
         var directory = Path.Combine(_mailbox.Root, "inbox", conversation);

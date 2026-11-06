@@ -875,10 +875,9 @@ public static class CoreActions
         }
 
         /// <summary>
-        /// Re-reads every script folder and hands the result to the graph. Reading is a full replacement, so this is a
-        /// reload rather than an addition: same id, new body, no unmount. A script that will not load keeps the body it
-        /// already had (the graph does that), which is why a broken edit does not go quiet — it is reported and the old
-        /// behaviour carries on.
+        /// Re-reads every script folder and hands the result to the graph. The reading and the rules live in
+        /// <see cref="ScriptReload"/> because the same question has two doors — this action and the model's tool — and an
+        /// answer that depends on the door is a second implementation waiting to disagree.
         /// </summary>
         ValueTask<Result<JsonElement>> ReloadScripts(CancellationToken ct)
         {
@@ -889,28 +888,20 @@ public static class CoreActions
 
             async ValueTask<Result<JsonElement>> ReloadScriptsCore()
             {
-                var read = await scriptCatalog.LoadAsync(ct).ConfigureAwait(false);
-                if (!read.Ok || read.Value is null)
-                    return Result<JsonElement>.Failure(read.Error ?? new(ErrorCode.Internal, "Script loading failed."));
-
-                var applied = await graph.LoadAsync(read.Value, ct).ConfigureAwait(false);
-                // Both kinds of issue: the file the catalogue could not use, and the script the graph refused. A caller
-                // that asks "did my edit take" needs both lists, or it reads "loaded" on an empty scripts array.
-                var issues = scriptCatalog.LastIssues.Concat(graph.RejectedScripts).ToArray();
-                var payload = new
+                var reloaded = await ScriptReload.RunAsync(graph, scriptCatalog, ct).ConfigureAwait(false);
+                if (!reloaded.Ok || reloaded.Value is null)
+                    return Result<JsonElement>.Failure(reloaded.Error ?? new(ErrorCode.Internal, "Reload failed."));
+                return Result<JsonElement>.Success(ToJson(new
                 {
-                    loaded = applied.Ok,
-                    scripts = graph.Scripts.Select(entry => new
+                    loaded = true,
+                    scripts = reloaded.Value.Scripts.Select(status => new
                     {
-                        id = entry.Package.Manifest.Id,
-                        library = string.IsNullOrWhiteSpace(entry.Package.Origin) ? "user" : entry.Package.Origin,
-                        enabled = entry.Enabled
+                        id = status.Id,
+                        library = status.Library,
+                        enabled = status.Enabled
                     }).ToArray(),
-                    rejected = issues.Select(issue => new { path = issue.Path, reason = issue.Reason }).ToArray()
-                };
-                return applied.Ok
-                    ? Result<JsonElement>.Success(ToJson(payload))
-                    : Result<JsonElement>.Failure(applied.Error ?? new(ErrorCode.Internal, "The graph refused the catalogue."));
+                    rejected = reloaded.Value.Rejected.Select(issue => new { path = issue.Path, reason = issue.Reason }).ToArray()
+                }));
             }
         }
 

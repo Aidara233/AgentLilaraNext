@@ -303,6 +303,10 @@ var factories = new ModuleFactoryRegistry();
 // gets the manifest and decides what its config means. The whitelist is therefore an edit, not a recompile.
 factories.Register(FileSystemModule.TypeId,
     manifest => FileSystemModule.FromManifest(manifest, fileAccess, sessionExtensions));
+// The script control tools are a module too: "who may reload scripts" is answerable by looking at the graph instead of
+// at the host's source, and the two tools it offers read whatever the graph holds at the moment they are called.
+factories.Register(ScriptToolsModule.TypeId,
+    manifest => ScriptToolsModule.FromManifest(manifest, graph, scriptCatalog.Value!, sessionExtensions));
 foreach (var type in adapterTypes.ListTypes().Where(type => adapterTypes.IsConcrete(type.TypeId)))
     factories.RegisterOwned(type.TypeId);
 foreach (var type in modelManager.ListTypes())
@@ -394,6 +398,18 @@ var fileSystemFile = await new ModuleManifestStore(data.Root).WriteIfMissingAsyn
 if (!fileSystemFile.Ok)
 {
     Console.Error.WriteLine(fileSystemFile.Error?.Message ?? "File system module declaration failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
+// The script control tools have no configuration, but they still get a file: a module that is on the graph is findable
+// there, and one the host invents silently cannot be removed by editing a file.
+var scriptToolsFile = await new ModuleManifestStore(data.Root).WriteIfMissingAsync(
+    new ModuleManifest(new ModuleId(ScriptToolsModule.TypeId), ScriptToolsModule.TypeId, Enabled: true),
+    CancellationToken.None);
+if (!scriptToolsFile.Ok)
+{
+    Console.Error.WriteLine(scriptToolsFile.Error?.Message ?? "Script control module declaration failed.");
     shutdown.Cancel();
     queue.Complete();
     return 1;

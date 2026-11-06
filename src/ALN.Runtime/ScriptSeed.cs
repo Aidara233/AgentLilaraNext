@@ -208,14 +208,17 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     - 事件名拼错 → 拒绝。只有 `adapter.envelope` 和 `channel.message.accepted` 两个。
     - 语法错误 → 拒绝，原因里带解释器的话。
 
-    被拒不会弄坏宿主：那个脚本不会出现，其余的照常运行；原因会在 `scripts.reload` 的返回里、以及信号里。
+    被拒不会弄坏宿主：那个脚本不会出现，其余的照常运行；原因会在 `scripts_reload` 的返回里、在 `scripts_list` 里，
+    以及信号里。
 
     ## 写完以后
 
-    1. 让人执行 `scripts.reload`（或重启）。这时你的脚本出现在 `scripts.list` 里，但仍未运行。
+    1. 用 `scripts_reload` 让宿主重读所有文件夹。这时你的脚本出现在 `scripts_list` 里，**但仍未运行**；
+       如果它没出现，`scripts_list` 会告诉你为什么。
     2. 让人把它挂到目标实例上：`modules.edge.mount { "script": "<id>", "target": "<实例地址>" }`。
 
-    草稿永远不会自己接管任何东西——这是这条路的全部意义。
+    草稿永远不会自己接管任何东西——这是这条路的全部意义。`scripts_list` 与 `scripts_reload` 能看见和重读，
+    挂载是唯一不能由脚本这一侧完成的事。
     """;
 
     /// <summary>
