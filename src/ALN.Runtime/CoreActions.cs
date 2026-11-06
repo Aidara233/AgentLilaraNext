@@ -60,6 +60,8 @@ public static class CoreActions
     public const string PromptsGet = "prompts.get";
     public const string PromptsSet = "prompts.set";
     public const string ScriptsGet = "scripts.get";
+    /// <summary>Reads the script folders again and replaces what the graph is running (docs/25 §7).</summary>
+    public const string ScriptsReload = "scripts.reload";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -69,7 +71,7 @@ public static class CoreActions
         IModelManager models, ISignalLog signals, IGraphRuntime graph, IParameterRegistry parameters,
         IModuleCatalog? modules = null, ISessionManager? sessions = null, IArchiveRegistry? archive = null,
         IPromptLibrary? prompts = null, IModuleTypeCatalog? moduleTypes = null, IModelInstanceStore? modelInstances = null,
-        Func<ModuleGraphStatus>? graphStatus = null, Kernel? kernel = null)
+        Func<ModuleGraphStatus>? graphStatus = null, Kernel? kernel = null, IGraphScriptCatalog? scriptCatalog = null)
     {
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
@@ -378,6 +380,8 @@ public static class CoreActions
             (new(PromptsGet, "Read one prompt file's text so it can be edited.", Capabilities.PromptsRead, false), ReadPrompt),
             (new(PromptsSet, "Write one prompt file into the data root (the copy that wins).", Capabilities.PromptsWrite, true), WritePrompt),
             (new(ScriptsGet, "One script package as loaded: manifest and source.", Capabilities.GraphRead, false), ReadScript),
+            (new(ScriptsReload, "Read the script folders again and switch to what they now say. Failing scripts keep the body that already works.", Capabilities.GraphControl, false),
+                (_, ct) => ReloadScripts(ct)),
             (new(PromptsList, "Prompt groups and the files in them, with their origin and fingerprint.", Capabilities.PromptsRead, false),
                 (_, _) =>
                 {
@@ -868,6 +872,46 @@ public static class CoreActions
                 path = saved.Value,
                 bytes = System.Text.Encoding.UTF8.GetByteCount(textItem.GetString() ?? "")
             }));
+        }
+
+        /// <summary>
+        /// Re-reads every script folder and hands the result to the graph. Reading is a full replacement, so this is a
+        /// reload rather than an addition: same id, new body, no unmount. A script that will not load keeps the body it
+        /// already had (the graph does that), which is why a broken edit does not go quiet — it is reported and the old
+        /// behaviour carries on.
+        /// </summary>
+        ValueTask<Result<JsonElement>> ReloadScripts(CancellationToken ct)
+        {
+            if (scriptCatalog is null)
+                return ValueTask.FromResult(Result<JsonElement>.Failure(
+                    new(ErrorCode.Unavailable, "No script catalogue is wired to this process.")));
+            return ReloadScriptsCore();
+
+            async ValueTask<Result<JsonElement>> ReloadScriptsCore()
+            {
+                var read = await scriptCatalog.LoadAsync(ct).ConfigureAwait(false);
+                if (!read.Ok || read.Value is null)
+                    return Result<JsonElement>.Failure(read.Error ?? new(ErrorCode.Internal, "Script loading failed."));
+
+                var applied = await graph.LoadAsync(read.Value, ct).ConfigureAwait(false);
+                // Both kinds of issue: the file the catalogue could not use, and the script the graph refused. A caller
+                // that asks "did my edit take" needs both lists, or it reads "loaded" on an empty scripts array.
+                var issues = scriptCatalog.LastIssues.Concat(graph.RejectedScripts).ToArray();
+                var payload = new
+                {
+                    loaded = applied.Ok,
+                    scripts = graph.Scripts.Select(entry => new
+                    {
+                        id = entry.Package.Manifest.Id,
+                        library = string.IsNullOrWhiteSpace(entry.Package.Origin) ? "user" : entry.Package.Origin,
+                        enabled = entry.Enabled
+                    }).ToArray(),
+                    rejected = issues.Select(issue => new { path = issue.Path, reason = issue.Reason }).ToArray()
+                };
+                return applied.Ok
+                    ? Result<JsonElement>.Success(ToJson(payload))
+                    : Result<JsonElement>.Failure(applied.Error ?? new(ErrorCode.Internal, "The graph refused the catalogue."));
+            }
         }
 
         ValueTask<Result<JsonElement>> ReadScript(JsonElement arguments, CancellationToken ct)

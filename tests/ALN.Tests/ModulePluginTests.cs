@@ -165,13 +165,17 @@ public sealed class ModulePluginTests : IDisposable
 
         var packages = await catalog.LoadAsync(default);
 
-        Assert.False(packages.Ok);
-        Assert.Equal(ErrorCode.Denied, packages.Error!.Code);
-        Assert.Contains("sample.clock", packages.Error.Message, StringComparison.Ordinal);
+        // A shipped script cannot claim to be builtin from a folder a person can edit. It is skipped and said so —
+        // refusing the whole catalogue would turn one bad file into a host that does not start.
+        Assert.True(packages.Ok, packages.Error?.Message);
+        Assert.DoesNotContain(packages.Value!, package => package.Manifest.Id == "sample.clock");
+        var issue = Assert.Single(catalog.LastIssues);
+        Assert.Contains("trustDomain", issue.Reason, StringComparison.Ordinal);
+        Assert.Contains("sample.clock", issue.Path, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task Two_scripts_with_one_id_are_refused_with_both_paths()
+    public async Task Two_scripts_with_one_id_keep_the_first_and_report_the_second()
     {
         WriteSamplePluginFolder();
         // A hand-written script with the same id as the one the plugin ships.
@@ -183,8 +187,14 @@ public sealed class ModulePluginTests : IDisposable
 
         var packages = await catalog.LoadAsync(default);
 
-        Assert.Equal(ErrorCode.Conflict, packages.Error!.Code);
-        Assert.Contains("sample.clock", packages.Error.Message, StringComparison.Ordinal);
+        // Not a merge and not a silent pick: the operator's copy is loaded, the plugin's is skipped with both paths
+        // named. One duplicated name is a script that does not run, not a catalogue that does not load.
+        Assert.True(packages.Ok, packages.Error?.Message);
+        var clock = Assert.Single(packages.Value!, package => package.Manifest.Id == "sample.clock");
+        Assert.Equal("user", clock.Origin);
+        var issue = Assert.Single(catalog.LastIssues);
+        Assert.Contains("sample.clock", issue.Reason, StringComparison.Ordinal);
+        Assert.Contains("already loaded from", issue.Reason, StringComparison.Ordinal);
     }
 
     /// <summary>The plugin folder as it ships: manifest beside the scripts (the assembly is not needed here).</summary>

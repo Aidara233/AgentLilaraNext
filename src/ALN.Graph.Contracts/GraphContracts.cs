@@ -50,6 +50,12 @@ public interface IGraphRuntime : IInstanceBindings
     /// <summary>Every catalogued script with its library and whether it is allowed to run.</summary>
     IReadOnlyList<(ScriptPackage Package, bool Enabled)> Scripts { get; }
 
+    /// <summary>
+    /// Scripts the last load refused, and why. They are not in <see cref="Scripts"/>: a rejected script was never
+    /// catalogued, and saying so is the difference between "the draft did nothing" and "the draft was not loadable".
+    /// </summary>
+    IReadOnlyList<ScriptIssue> RejectedScripts { get; }
+
     /// <summary>Switches one script (<c>id</c>) or one library (<c>bundled</c>, <c>user</c>, <c>plugin:<id></c>) on or off.</summary>
     ValueTask<Result> SetScriptEnabledAsync(string target, bool enabled, CancellationToken cancellationToken);
 
@@ -97,9 +103,18 @@ public interface IScriptApi
     void Log(string level, string message, string? detailJson);
 }
 
+/// <summary>
+/// One script file that could not be used, and why. Reported instead of refusing the catalogue: a host that will not
+/// start because one edited script has a typo costs every other script too (docs/25 §6).
+/// </summary>
+public sealed record ScriptIssue(string Path, string Reason);
+
 public interface IGraphScriptCatalog
 {
     ValueTask<Result<IReadOnlyList<ScriptPackage>>> LoadAsync(CancellationToken cancellationToken);
+
+    /// <summary>What the last load could not use: one entry per skipped file, with the file it came from.</summary>
+    IReadOnlyList<ScriptIssue> LastIssues { get; }
 }
 
 public sealed record ScriptFileManifest(

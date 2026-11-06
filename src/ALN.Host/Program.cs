@@ -60,7 +60,7 @@ if (!channelInfoSource.Ok) { Console.Error.WriteLine(channelInfoSource.Error?.Me
 // Everything a model may reach on disk goes through this one port, and the scopes it knows are registered here and
 // nowhere else. The memory library is the first; another is added by registering it here and naming it in that
 // module's own module.json — never by a module inventing a path.
-var fileAccess = new LocalFileSystemAccess(data.Root, [FileScopes.Memory]);
+var fileAccess = new LocalFileSystemAccess(data.Root, [FileScopes.Memory, FileScopes.ScriptsDraft]);
 // Memory is a module of its own: it registers its own line and its own tools, and nothing else knows it exists. It
 // reads and writes through the port above, so "the model may tidy memory with file tools" needs no special case:
 // they reach the same files by the same rules.
@@ -227,11 +227,14 @@ foreach (var dropped in await DroppedModules.LoadAsync(modulePackages, Path.Comb
 // Before the catalogue is read, and only once per script: the shipped scripts get a copy in the operator's tree,
 // where they can be edited and reloaded. Never rewritten afterwards (C-03) — see ScriptSeed for why the copy is
 // not byte-identical.
-var seededScripts = await new ScriptSeed(AppContext.BaseDirectory, data.Root).CopyMissingAsync(CancellationToken.None);
+var seed = new ScriptSeed(AppContext.BaseDirectory, data.Root);
+var seededScripts = await seed.CopyMissingAsync(CancellationToken.None);
 if (seededScripts.AddedAnything)
     restore.Note("scripts", $"copied to scripts/trusted: {string.Join(", ", seededScripts.Copied)}");
 foreach (var (seedId, seedReason) in seededScripts.Failed)
     restore.Note("scripts", $"could not copy {seedId}: {seedReason}");
+if (await seed.EnsureDraftGuideAsync(CancellationToken.None))
+    restore.Note("scripts", $"wrote scripts/draft/{ScriptSeed.GuideFileName}");
 
 var scriptCatalog = moduleServices.GetService<IGraphScriptCatalog>("graph.script-catalog");
 if (!scriptCatalog.Ok || scriptCatalog.Value is null)
@@ -464,7 +467,7 @@ if (receipt.Ready == 0)
 // The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
 // WebUI itself — it exposes actions, and a separate project consumes them.
 var controlPlane = new ControlPlane(auditSink, signalLog);
-var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes, modelInstances, graphStatus: () => kernel.Status, kernel: kernel);
+var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes, modelInstances, graphStatus: () => kernel.Status, kernel: kernel, scriptCatalog: scriptCatalog.Value);
 if (!actionsRegistered.Ok)
 {
     Console.Error.WriteLine(actionsRegistered.Error?.Message ?? "Action registration failed.");

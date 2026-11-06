@@ -121,10 +121,12 @@ public sealed class FileSystemModuleTests : IDisposable
 
         var scan = await store.ScanAsync(types: null, default);
         var manifest = Assert.Single(scan.Manifests);
-        var built = FileSystemModule.FromManifest(manifest, Access(), new SessionExtensionRegistry());
+        var built = FileSystemModule.FromManifest(manifest, Access(FileScopes.Memory, FileScopes.ScriptsDraft),
+            new SessionExtensionRegistry());
 
         Assert.True(built.Ok, built.Error?.Message);
-        Assert.Equal([FileScopes.Memory], ((FileSystemModule)built.Value!).Scopes);
+        // The default configuration is what the host writes: the memory library, plus the folder a script is drafted in.
+        Assert.Equal([FileScopes.Memory, FileScopes.ScriptsDraft], ((FileSystemModule)built.Value!).Scopes);
     }
 
     // ---- what the model experiences -------------------------------------------------------------

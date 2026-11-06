@@ -165,9 +165,10 @@ public sealed class GraphIntegrationTests : IDisposable
             new("channel.bound-reply", 2, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted],
                 "onEvent", ["channel.teleport"], TrustDomain.Builtin),
             "async function onEvent(event, ctx) { }");
-        var reload = await _graph.LoadAsync([AdapterIntake(), refused], default);
-        Assert.False(reload.Ok);
-        Assert.Equal(ErrorCode.Denied, reload.Error!.Code);
+        // The load succeeds and the script does not: refusing an edited body must not take the working one away.
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), refused], default)).Ok);
+        Assert.Contains(_graph.RejectedScripts, issue => issue.Reason.Contains("capability", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(_graph.Scripts, entry => entry.Package.Manifest.Id == "channel.bound-reply");
 
         await WriteInputAsync("chat-1", "two");
         Assert.Equal(1, (await PulseAdapterAsync()).Value);
@@ -446,9 +447,14 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         Assert.True((await _graph.LoadAsync([AdapterIntake(), ChannelReply()], default)).Ok);
         var badCapability = AdapterIntake() with { Manifest = AdapterIntake().Manifest with { Capabilities = ["filesystem.root"] } };
-        Assert.False((await _graph.LoadAsync([badCapability], default)).Ok);
+        // The load succeeds and that script does not: a refusal costs the script, not the catalogue.
+        Assert.True((await _graph.LoadAsync([badCapability], default)).Ok);
+        Assert.Contains(_graph.RejectedScripts, issue => issue.Reason.Contains("capability", StringComparison.OrdinalIgnoreCase));
+        // The body that was already there stays: a refused replacement never replaced anything.
+        Assert.DoesNotContain(_graph.Scripts, entry => entry.Package.Manifest.Capabilities.Contains("filesystem.root"));
         var restricted = AdapterIntake() with { Manifest = AdapterIntake().Manifest with { TrustDomain = TrustDomain.Restricted } };
-        Assert.False((await _graph.LoadAsync([restricted], default)).Ok);
+        Assert.True((await _graph.LoadAsync([restricted], default)).Ok);
+        Assert.Contains(_graph.RejectedScripts, issue => issue.Reason.Contains("Restricted", StringComparison.Ordinal));
         Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
         var invalid = await _channels.CreateAsync(new(new("channel", "conversation", "bad"), "bad", [new(_adapterAddress, "../escape")], "channel.conversation"), default);
         Assert.False(invalid.Ok);
@@ -704,6 +710,34 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.False(Directory.Exists(Path.Combine(_mailbox.Root, "outbox", "chat-1")));
         // The responder is mounted and healthy — it simply never hears an event.
         Assert.Contains(_graph.Mounted, m => m.Package.Manifest.Id == "channel.bound-reply");
+    }
+
+    /// <summary>
+    /// A draft may be written by anything that can reach the draft folder, so it may not attach itself: what a model
+    /// writes is something a person still has to mount. The same body mounted by hand is fine — it is the attaching,
+    /// not the script, that a draft may not do.
+    /// </summary>
+    [Fact]
+    public async Task A_draft_cannot_attach_itself_to_a_type()
+    {
+        var attaching = ChannelReply() with
+        {
+            Origin = "draft",
+            Manifest = ChannelReply().Manifest with { Mount = MountMode.Default }
+        };
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), attaching], default)).Ok);
+        Assert.Contains(_graph.RejectedScripts,
+            issue => issue.Reason.Contains("draft must be mounted by hand", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(_graph.Scripts, entry => entry.Package.Manifest.Id == "channel.bound-reply");
+
+        var manual = ChannelReply() with
+        {
+            Origin = "draft",
+            Manifest = ChannelReply().Manifest with { Mount = MountMode.Manual }
+        };
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), manual], default)).Ok);
+        Assert.Contains(_graph.Scripts, entry => entry.Package.Manifest.Id == "channel.bound-reply");
+        Assert.Empty(_graph.RejectedScripts);
     }
 
     private async Task WriteInputAsync(string conversation, string text)

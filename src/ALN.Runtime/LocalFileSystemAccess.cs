@@ -45,11 +45,16 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess
         {
             // Refused, not rewritten: a scope that needed fixing is a configuration mistake, and fixing it here would
             // mean the host and this class disagree about which directory a caller can reach.
-            if (FilePaths.Split(scope) is not { Ok: true } split || split.Value!.Count != 1)
-                throw new ArgumentException($"A scope must be one legal path segment: '{scope}'.", nameof(scopes));
-            if (registered.Contains(split.Value[0], StringComparer.Ordinal))
+            //
+            // A scope is a relative path, not necessarily one segment. "scripts/draft" is a directory under the data
+            // root like any other, and naming it that way keeps "the folder the model may write" visibly apart from
+            // "the folder the catalogue loads" without introducing a second root.
+            if (FilePaths.Split(scope) is not { Ok: true } split || split.Value!.Count == 0)
+                throw new ArgumentException($"A scope must be a legal relative path: '{scope}'.", nameof(scopes));
+            var canonical = string.Join("/", split.Value);
+            if (registered.Contains(canonical, StringComparer.Ordinal))
                 throw new ArgumentException($"Scope is registered twice: '{scope}'.", nameof(scopes));
-            registered.Add(split.Value[0]);
+            registered.Add(canonical);
         }
         _scopes = registered.AsReadOnly();
 

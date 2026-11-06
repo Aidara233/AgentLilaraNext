@@ -105,6 +105,13 @@ public static class FileScopes
 {
     /// <summary>The memory library: groups of fragments and one block each (docs/21).</summary>
     public const string Memory = "memory";
+
+    /// <summary>
+    /// Where a script is written before anyone decides it may run: <c>&lt;dataRoot&gt;/scripts/draft</c>, next to
+    /// <c>scripts/trusted</c> and deliberately not the same directory (docs/25). A scope is a directory, so the model
+    /// can be given the draft folder without also being given the one the catalogue loads.
+    /// </summary>
+    public const string ScriptsDraft = "scripts/draft";
 }
 
 /// <summary>

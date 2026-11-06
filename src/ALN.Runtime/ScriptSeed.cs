@@ -39,6 +39,9 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     public string BundledRoot => Path.Combine(programRoot, "resources", "scripts", "builtin");
     public string TrustedRoot => Path.Combine(dataRoot, "scripts", "trusted");
 
+    /// <summary>Where a script is written before anyone decides it may run (docs/25). A scope, not a catalogue root...</summary>
+    public string DraftRoot => Path.Combine(dataRoot, "scripts", "draft");
+
     public async ValueTask<ScriptSeedReport> CopyMissingAsync(CancellationToken cancellationToken)
     {
         var copied = new List<string>();
@@ -83,5 +86,156 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
         }
 
         return new(copied, kept, failed);
+    }
+
+    public const string GuideFileName = "GUIDE.md";
+
+    /// <summary>
+    /// The example the guide shows and a test loads. Kept as data rather than prose so that "what the reader is told to
+    /// write" is the same string "what the host accepts" is checked against — a guide that has drifted is worse than no
+    /// guide, because it teaches a shape that gets refused.
+    /// </summary>
+    public const string ExampleManifest = """
+    {
+      "id": "channel.say-hello",
+      "version": 1,
+      "targetType": "channel",
+      "mount": "manual",
+      "events": ["channel.message.accepted"],
+      "entryPoint": "onEvent",
+      "capabilities": ["channel.bound-send"],
+      "trustDomain": "trusted"
+    }
+    """;
+
+    public const string ExampleSource = """
+    async function onEvent(event, ctx) {
+      if (ctx.eventName !== "channel.message.accepted") return;
+      const text = String(event.text ?? "");
+      if (!text.startsWith("!hello")) return;
+      await ctx.channel.reply({
+        platformConversationId: event.binding.platformConversationId,
+        text: "hello"
+      });
+    }
+    """;
+
+    /// <summary>
+    /// The guide, written into the draft folder once and read with the same file tools that wrote the script. Not
+    /// injected into every turn: it is reference material, needed while writing, and a page of it per turn would cost
+    /// more than it ever saves.
+    /// </summary>
+    public static readonly string DraftGuide = $$"""
+    # 在这里写脚本
+
+    你现在在 `scripts/draft/`。这个目录你可以写，但写在这里的脚本**不会自动运行**：要有人执行 `scripts.reload`
+    （或重启宿主）才被看见，而且要有人手工挂载才开始工作。这是刻意的：你能写的地方，不应该就是能生效的地方。
+
+    ## 一个脚本是一个目录
+
+    ```
+    scripts/draft/<目录名>/
+      manifest.json   描述它是什么
+      main.js         它做什么
+    ```
+
+    目录名只是方便你自己找；脚本的身份是 manifest 里的 `id`。
+
+    ## manifest.json
+
+    | 字段 | 必填 | 说明 |
+    |---|---|---|
+    | `id` | 是 | 全库唯一。与已有的重复时你这份会被跳过并报告，不会顶掉别人 |
+    | `version` | 是 | 整数，至少 1 |
+    | `targetType` | 是 | `adapter` 或 `channel`：挂在哪一类实例上 |
+    | `mount` | 是 | 草稿必须是 `manual`。`default` 会被拒绝——能写脚本的东西不能自己接管一类实例 |
+    | `events` | 是 | `adapter.envelope`（adapter 收到消息）或 `channel.message.accepted`（频道收到消息） |
+    | `entryPoint` | 是 | `main.js` 里的函数名。加载时会真的执行脚本并检查它确实是函数 |
+    | `capabilities` | 是 | 你打算用的能力，见下表。越界会被拒绝加载；没声明的能力在运行时会失败 |
+    | `trustDomain` | 是 | 必须是 `"trusted"`。写 `builtin` 会被拒绝：那是随程序发布、本地不可改的东西 |
+    | `maxStatements` | 否 | 默认 10000，1–1000000 |
+    | `timeoutMilliseconds` | 否 | 默认 1000，1–60000 |
+    | `memoryLimitBytes` | 否 | 默认 16 MiB，1 MiB–256 MiB |
+
+    ## 能力
+
+    | 能力 | 你可以调用 | 用在哪 |
+    |---|---|---|
+    | `channel.accept` | `ctx.channel.accept()` | adapter 事件：把这条消息交给认领它的频道 |
+    | `channel.route` | `ctx.channel.route(options)` | adapter 事件 |
+    | `channel.bound-send` | `ctx.channel.reply(message)` | channel 事件：往这个频道回一句 |
+    | `model.complete` | `ctx.model.complete(profileId, request)` | 一次模型调用，无会话、无工具 |
+    | `session.run` | `ctx.session.run(spec, text)` | channel 事件：跑一轮会话并拿回结果 |
+    | `session.activate` | `ctx.session.activate(spec)` | channel 事件：唤醒会话，不等结果 |
+    | `self.adapter.send` | `ctx.self.adapter.send(message)` | adapter 事件 |
+    | `self.adapter.poll` | `ctx.self.adapter.poll()` | adapter 事件 |
+
+    不需要声明的两样：`ctx.log.info/warn/error(message, detail)` 和 `ctx.state.get/set/delete(key)`
+    （持久记忆，跨重启，按挂载点隔离）。
+
+    能力既是"我打算用什么"，也是"用别的会怎样"：没有声明的能力，调用时会被拒绝并留下一段审计记录。
+
+    ## 沙箱
+
+    脚本在一个解释器里跑，没有 CLR 互操作、没有文件、没有网络、没有 `require`。可用的只有 `event`、`ctx`、
+    语言本身和 `JSON`。执行还受 `maxStatements` / `timeoutMilliseconds` / `memoryLimitBytes` 限制——超了是一次失败，
+    不是一次等待。写循环之前先想清楚它会不会停下来。
+
+    ## 最小可用例子
+
+    `manifest.json`：
+
+    ```
+    {{ExampleManifest}}
+    ```
+
+    `main.js`：
+
+    ```
+    {{ExampleSource}}
+    ```
+
+    这个例子只在消息以 `!hello` 开头时回一句 `hello`，其余什么都不做。
+
+    ## 常见的被拒原因
+
+    - `id` 漏了 → 整个文件被跳过并报告，不会加载。
+    - `trustDomain` 写了 `builtin` → 跳过：`builtin` 只属于随程序发布并放在程序目录里的脚本。
+    - `mount` 写了 `default` → 拒绝：草稿不能自动挂载。
+    - `targetType` 写了具体类型（如 `channel.conversation`）→ 拒绝：这里要的是抽象类型名。
+    - `capabilities` 里有表外的东西 → 拒绝加载。
+    - `entryPoint` 名字和函数名不一致 → 拒绝：加载时会检查函数是否存在。
+    - 事件名拼错 → 拒绝。只有 `adapter.envelope` 和 `channel.message.accepted` 两个。
+    - 语法错误 → 拒绝，原因里带解释器的话。
+
+    被拒不会弄坏宿主：那个脚本不会出现，其余的照常运行；原因会在 `scripts.reload` 的返回里、以及信号里。
+
+    ## 写完以后
+
+    1. 让人执行 `scripts.reload`（或重启）。这时你的脚本出现在 `scripts.list` 里，但仍未运行。
+    2. 让人把它挂到目标实例上：`modules.edge.mount { "script": "<id>", "target": "<实例地址>" }`。
+
+    草稿永远不会自己接管任何东西——这是这条路的全部意义。
+    """;
+
+    /// <summary>
+    /// Writes the guide into the draft folder, once. Returns false when it is already there or could not be written:
+    /// the guide is help, not a requirement, and a host that will not start because it could not write a .md file would
+    /// be getting its priorities wrong.
+    /// </summary>
+    public async ValueTask<bool> EnsureDraftGuideAsync(CancellationToken cancellationToken)
+    {
+        var path = Path.Combine(DraftRoot, GuideFileName);
+        if (File.Exists(path)) return false;
+        try
+        {
+            Directory.CreateDirectory(DraftRoot);
+            await File.WriteAllTextAsync(path, DraftGuide, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 }

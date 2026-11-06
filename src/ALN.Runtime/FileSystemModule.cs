@@ -23,7 +23,7 @@ public sealed class FileSystemModule(ModuleId id, FileSystemTools tools, ISessio
 
     /// <summary>Default configuration written by the host when no <c>module.json</c> exists yet: the memory library, and
     /// nowhere else. Granting more is an edit, not a default.</summary>
-    public const string DefaultConfig = """{"scopes":["memory"]}""";
+    public const string DefaultConfig = """{"scopes":["memory","scripts/draft"]}""";
 
     private bool _registered;
 

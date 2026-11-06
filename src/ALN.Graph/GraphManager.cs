@@ -81,25 +81,29 @@ public sealed class GraphManager : IGraphRuntime, IModule
     {
         var incoming = packages.ToArray();
         var candidate = new Dictionary<string, ScriptPackage>(StringComparer.Ordinal);
+        var rejected = new List<ScriptIssue>();
         foreach (var package in incoming)
         {
-            var m = package.Manifest;
-            if (string.IsNullOrWhiteSpace(m.Id) || !candidate.TryAdd(m.Id, package) || m.Version < 1 ||
-                string.IsNullOrWhiteSpace(m.TargetType) || !_types.IsKnownAbstract(m.TargetType) || m.Events is null || m.Events.Length == 0 ||
-                m.Events.Any(e => e is not (EventNames.AdapterEnvelope or EventNames.ChannelMessageAccepted)) || string.IsNullOrWhiteSpace(m.EntryPoint) ||
-                m.MaxStatements is < 1 or > 1_000_000 || m.TimeoutMilliseconds is < 1 or > 60_000 ||
-                m.MemoryLimitBytes is < 1_048_576 or > 268_435_456)
-                return Result.Failure(new(ErrorCode.Invalid, $"Invalid script manifest: {m.Id}"));
-            if (m.TrustDomain == TrustDomain.Restricted)
-                return Result.Failure(new(ErrorCode.Denied, "Restricted scripts require the process-isolated runner, which is not part of this initial host."));
-            if (m.Capabilities is null || m.Capabilities.Any(c => !AllowedCapabilities.Contains(c)))
-                return Result.Failure(new(ErrorCode.Denied, $"Script {m.Id} requests an unsupported capability."));
-            if (m.Mount is not (MountMode.Default or MountMode.Manual))
-                return Result.Failure(new(ErrorCode.Invalid, $"Invalid mount mode: {m.Id}"));
-            if (string.IsNullOrWhiteSpace(package.Source) || package.Source.Length > 256_000)
-                return Result.Failure(new(ErrorCode.Invalid, $"Empty or oversized source: {m.Id}"));
+            // One script at a time, and a refusal that costs only that script. The alternative — refusing the whole
+            // catalogue — makes one typo in one edited file a host that will not start, which is worse than a host
+            // that starts and names the file it skipped.
+            if (WhyRejected(package) is { } reason)
+            {
+                rejected.Add(new(package.Manifest.Id ?? "", reason));
+                continue;
+            }
+            if (candidate.ContainsKey(package.Manifest.Id!))
+            {
+                rejected.Add(new(package.Manifest.Id!, "Duplicate script id in one catalogue."));
+                continue;
+            }
             var validated = await _executor.ValidateAsync(package, cancellationToken).ConfigureAwait(false);
-            if (!validated.Ok) return validated;
+            if (!validated.Ok)
+            {
+                rejected.Add(new(package.Manifest.Id!, validated.Error?.Message ?? "The script's source is invalid."));
+                continue;
+            }
+            candidate[package.Manifest.Id!] = package;
         }
 
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -108,8 +112,18 @@ public sealed class GraphManager : IGraphRuntime, IModule
             var restored = await RestoreRulesAsync(cancellationToken).ConfigureAwait(false);
             if (!restored.Ok) return restored;
             await RestoreDisabledAsync(cancellationToken).ConfigureAwait(false);
+            _rejected = rejected;
+            var previous = new Dictionary<string, ScriptPackage>(_packages, StringComparer.Ordinal);
             _packages.Clear();
             foreach (var pair in candidate) _packages.Add(pair.Key, pair.Value);
+            // A refused script keeps the body it already had: refusing an edit is a reason to leave things as they are,
+            // not a reason for a channel that was answering to go quiet. A script that was never loaded simply does not
+            // appear — there is nothing to fall back to, and the issue says so.
+            foreach (var issue in rejected)
+            {
+                if (!_packages.ContainsKey(issue.Path) && previous.TryGetValue(issue.Path, out var prior))
+                    _packages[issue.Path] = prior;
+            }
             RebuildMounts();
             _loaded = true;
             ReportRestore();
@@ -291,6 +305,42 @@ public sealed class GraphManager : IGraphRuntime, IModule
 
     private readonly HashSet<string> _disabled = new(StringComparer.Ordinal);
 
+    /// <summary>What the last load refused: not in <see cref="_packages"/>, and named so the caller can say why.</summary>
+    private IReadOnlyList<ScriptIssue> _rejected = [];
+
+    /// <summary>
+    /// Why one script cannot be used, or null when it can. Checked per script because the answer is per script: a
+    /// catalogue is not one document that stands or falls, it is a list of behaviours (docs/25 §6).
+    /// </summary>
+    private string? WhyRejected(ScriptPackage package)
+    {
+        var m = package.Manifest;
+        if (string.IsNullOrWhiteSpace(m.Id)) return "A script needs an id.";
+        if (m.Version < 1) return $"Version must be at least 1 (got {m.Version}).";
+        if (string.IsNullOrWhiteSpace(m.TargetType) || !_types.IsKnownAbstract(m.TargetType))
+            return $"targetType must be a known abstract type, and '{m.TargetType}' is not one.";
+        if (m.Events is null || m.Events.Length == 0) return "A script must declare at least one event.";
+        if (m.Events.Any(e => e is not (EventNames.AdapterEnvelope or EventNames.ChannelMessageAccepted)))
+            return $"Unknown event; the only ones are {EventNames.AdapterEnvelope} and {EventNames.ChannelMessageAccepted}.";
+        if (string.IsNullOrWhiteSpace(m.EntryPoint)) return "A script needs an entry point.";
+        if (m.MaxStatements is < 1 or > 1_000_000) return $"maxStatements must be 1..1000000 (got {m.MaxStatements}).";
+        if (m.TimeoutMilliseconds is < 1 or > 60_000) return $"timeoutMilliseconds must be 1..60000 (got {m.TimeoutMilliseconds}).";
+        if (m.MemoryLimitBytes is < 1_048_576 or > 268_435_456)
+            return $"memoryLimitBytes must be 1 MiB..256 MiB (got {m.MemoryLimitBytes}).";
+        if (m.TrustDomain == TrustDomain.Restricted)
+            return "Restricted scripts need the process-isolated runner, which this host does not have.";
+        if (m.Capabilities is null || m.Capabilities.Any(c => !AllowedCapabilities.Contains(c)))
+            return $"Unsupported capability: {string.Join(", ", m.Capabilities ?? [])}. " +
+                   $"Allowed: {string.Join(", ", AllowedCapabilities.Order(StringComparer.Ordinal))}.";
+        if (m.Mount is not (MountMode.Default or MountMode.Manual)) return $"Unknown mount mode: {m.Mount}.";
+        if (string.IsNullOrWhiteSpace(package.Source) || package.Source.Length > 256_000) return "Empty or oversized source.";
+        // A draft is written by whoever may write the draft folder, so it may not take a type over by itself: what a
+        // model can write must be something a person still has to mount (docs/25 §5).
+        if (string.Equals(package.Origin, "draft", StringComparison.Ordinal) && m.Mount == MountMode.Default)
+            return "A draft must be mounted by hand: it cannot attach itself to a type.";
+        return null;
+    }
+
     /// <summary>Every catalogued script, with the library it came from and whether it is currently allowed to run.</summary>
     public IReadOnlyList<(ScriptPackage Package, bool Enabled)> Scripts
     {
@@ -300,6 +350,12 @@ public sealed class GraphManager : IGraphRuntime, IModule
             try { return _packages.Values.Select(package => (package, IsEnabled(package))).ToArray(); }
             finally { _gate.Release(); }
         }
+    }
+
+    /// <summary>What the last load refused, and why. Empty when everything offered was usable.</summary>
+    public IReadOnlyList<ScriptIssue> RejectedScripts
+    {
+        get { _gate.Wait(); try { return _rejected.ToArray(); } finally { _gate.Release(); } }
     }
 
     /// <summary>Named after the package a script arrived in; the operator's own tree is simply "user".</summary>
@@ -1364,23 +1420,38 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
 {
     private static readonly JsonSerializerOptions Options = new()
     { PropertyNameCaseInsensitive = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase, Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) } };
+
+    private IReadOnlyList<ScriptIssue> _issues = [];
+
+    /// <inheritdoc />
+    public IReadOnlyList<ScriptIssue> LastIssues => _issues;
+
+    /// <summary>
+    /// Every script the host can see, in the order that decides who wins when two files share an id.
+    ///
+    /// The draft root is the last of the writable ones (docs/25): what a model writes is loaded like any other script,
+    /// and still has to be mounted by hand — being visible is not being in charge. It sits after the operator's tree so
+    /// a draft cannot shadow a script somebody installed deliberately.
+    ///
+    /// A file that cannot be used is an issue, never a reason to refuse the rest. The host has to be able to start with
+    /// a bad draft in the folder, otherwise writing one would be a way to stop the system rather than to extend it.
+    /// </summary>
     public async ValueTask<Result<IReadOnlyList<ScriptPackage>>> LoadAsync(CancellationToken cancellationToken)
     {
         var packages = new List<ScriptPackage>();
         var seen = new Dictionary<string, (string Path, TrustDomain Domain)>(StringComparer.Ordinal);
+        var issues = new List<ScriptIssue>();
         try
         {
             var roots = new[]
             {
                 (Path.Combine(programRoot, "resources", "scripts", "builtin"), TrustDomain.Builtin, (string?)"bundled"),
                 (Path.Combine(dataRoot, "scripts", "trusted"), TrustDomain.Trusted, (string?)"user"),
+                (Path.Combine(dataRoot, "scripts", "draft"), TrustDomain.Trusted, (string?)"draft"),
                 (Path.Combine(dataRoot, "scripts", "restricted"), TrustDomain.Restricted, (string?)"user")
             };
             foreach (var (root, expectedDomain, origin) in roots)
-            {
-                var failure = await LoadRootAsync(root, expectedDomain, origin, packages, seen, cancellationToken).ConfigureAwait(false);
-                if (failure is not null) return Result<IReadOnlyList<ScriptPackage>>.Failure(failure);
-            }
+                await LoadRootAsync(root, expectedDomain, origin, packages, seen, issues, cancellationToken).ConfigureAwait(false);
 
             // Scripts shipped inside a plugin: dropping the plugin in is the trust decision, so they must declare
             // "trusted" — a shipped script cannot claim to be builtin. They are not written by the operator, so
@@ -1393,52 +1464,92 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
                     cancellationToken.ThrowIfCancellationRequested();
                     var scriptsRoot = Path.Combine(plugin, "scripts");
                     if (!Directory.Exists(scriptsRoot)) continue;
-                    if (await LoadRootAsync(scriptsRoot, TrustDomain.Trusted, "plugin:" + Path.GetFileName(plugin), packages, seen, cancellationToken)
-                        .ConfigureAwait(false) is { } failure) return Result<IReadOnlyList<ScriptPackage>>.Failure(failure);
+                    await LoadRootAsync(scriptsRoot, TrustDomain.Trusted, "plugin:" + Path.GetFileName(plugin), packages, seen, issues,
+                        cancellationToken).ConfigureAwait(false);
                 }
             }
+            _issues = issues;
             return Result<IReadOnlyList<ScriptPackage>>.Success(packages);
         }
         catch (OperationCanceledException) { throw; }
-        catch (Exception ex) { return Result<IReadOnlyList<ScriptPackage>>.Failure(new(ErrorCode.Invalid, "Could not load script catalog.", ex.Message)); }
+        catch (Exception ex)
+        {
+            // The walk itself failed — a root that cannot be read. Whatever it got through is still worth reporting.
+            _issues = [.. issues, new(dataRoot, ex.Message)];
+            return Result<IReadOnlyList<ScriptPackage>>.Failure(new(ErrorCode.Invalid, "Could not load script catalog.", ex.Message));
+        }
     }
 
     /// <summary>One source of script packages. Returns a failure to stop the whole catalog, null when fine.</summary>
-    private static async ValueTask<Error?> LoadRootAsync(string root, TrustDomain expectedDomain, string? origin,
-        List<ScriptPackage> packages, Dictionary<string, (string Path, TrustDomain Domain)> seen, CancellationToken cancellationToken)
+    /// <summary>
+    /// One source of script packages. A file that cannot be used becomes an issue and the walk continues: a catalogue
+    /// that refuses to load costs every other script too, and the caller finds out at the next start — a typo in one
+    /// file should not be a host that will not boot (docs/25 §6).
+    /// </summary>
+    private static async ValueTask LoadRootAsync(string root, TrustDomain expectedDomain, string? origin,
+        List<ScriptPackage> packages, Dictionary<string, (string Path, TrustDomain Domain)> seen, List<ScriptIssue> issues,
+        CancellationToken cancellationToken)
     {
-        if (!Directory.Exists(root)) return null;
+        if (!Directory.Exists(root)) return;
         foreach (var manifestPath in Directory.EnumerateFiles(root, "manifest.json", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var bytes = await File.ReadAllBytesAsync(manifestPath, cancellationToken).ConfigureAwait(false);
-            if (bytes.Length > 64_000) return new(ErrorCode.Invalid, "Script manifest exceeds 64 KB.");
-            var manifest = JsonSerializer.Deserialize<ScriptFileManifest>(bytes, Options);
-            if (manifest is null || manifest.TrustDomain != expectedDomain)
-                return new(ErrorCode.Denied, $"Invalid manifest or trust domain mismatch: {manifestPath}");
-            // Two scripts with one id would make graph.mount ambiguous; say which two, do not pick one.
-            //
-            // One exception, and it is the whole reason seeding exists: the operator's copy in scripts/trusted
-            // replaces the shipped one. Without it, the first start after seeding would find every shipped script
-            // twice and refuse the catalogue — "copy it out so it can be edited" would break the host it serves.
-            // Only an operator copy may win. Two operator copies, or a plugin claiming a name already taken, is
-            // still an ambiguity and still refused.
-            if (seen.TryGetValue(manifest.Id, out var first))
+            try
             {
-                if (first.Domain != TrustDomain.Builtin || origin != "user")
-                    return new(ErrorCode.Conflict, $"Duplicate script id {manifest.Id}: {first.Path} and {manifestPath}");
-                packages.RemoveAll(package => string.Equals(package.Manifest.Id, manifest.Id, StringComparison.Ordinal));
+                var bytes = await File.ReadAllBytesAsync(manifestPath, cancellationToken).ConfigureAwait(false);
+                if (bytes.Length > 64_000) { issues.Add(new(manifestPath, "Manifest exceeds 64 KB.")); continue; }
+                var manifest = JsonSerializer.Deserialize<ScriptFileManifest>(bytes, Options);
+                if (manifest is null || string.IsNullOrWhiteSpace(manifest.Id))
+                {
+                    // The id is checked here, not later: everything below keys on it, and a null would be an exception
+                    // rather than an answer.
+                    issues.Add(new(manifestPath, "A script manifest needs an \"id\"."));
+                    continue;
+                }
+                if (manifest.TrustDomain != expectedDomain)
+                {
+                    // Not "shipped": a file claiming builtin from a folder a person can edit. Said plainly, and skipped:
+                    // refusing the catalogue over it would let one bad file stop the host.
+                    issues.Add(new(manifestPath, $"trustDomain \"{manifest.TrustDomain}\" does not match this folder ({expectedDomain})."));
+                    continue;
+                }
+                if (seen.TryGetValue(manifest.Id, out var first))
+                {
+                    // The first file wins and the second is reported — never a merge, never a pick with no explanation.
+                    //
+                    // One exception, and it is the whole reason seeding exists: the operator's copy in scripts/trusted
+                    // replaces the shipped one. Without it, the first start after seeding would find every shipped
+                    // script twice — "copy it out so it can be edited" would break the host it serves. Only an operator
+                    // copy may win; a draft or a plugin does not displace what is already there.
+                    if (first.Domain == TrustDomain.Builtin && origin == "user")
+                        packages.RemoveAll(package => string.Equals(package.Manifest.Id, manifest.Id, StringComparison.Ordinal));
+                    else
+                    {
+                        issues.Add(new(manifestPath, $"Duplicate script id \"{manifest.Id}\"; already loaded from {first.Path}."));
+                        continue;
+                    }
+                }
+
+                var scriptPath = Path.Combine(Path.GetDirectoryName(manifestPath)!, "main.js");
+                if (!File.Exists(scriptPath))
+                {
+                    issues.Add(new(manifestPath, "No main.js next to this manifest."));
+                    continue;
+                }
+                var source = await File.ReadAllTextAsync(scriptPath, cancellationToken).ConfigureAwait(false);
+                if (source.Length > 256_000) { issues.Add(new(manifestPath, $"Script source exceeds 256 KB: {manifest.Id}")); continue; }
+
+                var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source)));
+                seen[manifest.Id] = (manifestPath, expectedDomain);
+                packages.Add(new(new(manifest.Id, manifest.Version, manifest.TargetType, manifest.Mount, manifest.Events,
+                    manifest.EntryPoint, manifest.Capabilities, manifest.TrustDomain, manifest.MaxStatements,
+                    manifest.TimeoutMilliseconds, manifest.MemoryLimitBytes), source, fingerprint,
+                    origin));
             }
-            var scriptPath = Path.Combine(Path.GetDirectoryName(manifestPath)!, "main.js");
-            var source = await File.ReadAllTextAsync(scriptPath, cancellationToken).ConfigureAwait(false);
-            if (source.Length > 256_000) return new(ErrorCode.Invalid, $"Script source exceeds 256 KB: {manifest.Id}");
-            var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source)));
-            seen[manifest.Id] = (manifestPath, expectedDomain);
-            packages.Add(new(new(manifest.Id, manifest.Version, manifest.TargetType, manifest.Mount, manifest.Events,
-                manifest.EntryPoint, manifest.Capabilities, manifest.TrustDomain, manifest.MaxStatements,
-                manifest.TimeoutMilliseconds, manifest.MemoryLimitBytes), source, fingerprint,
-                origin));
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+            {
+                issues.Add(new(manifestPath, ex.Message));
+            }
         }
-        return null;
     }
 }

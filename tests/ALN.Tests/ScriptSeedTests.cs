@@ -124,10 +124,14 @@ public sealed class ScriptSeedTests : IDisposable
         WriteUserScript(Path.Combine(DataRoot, "scripts", "trusted", "a", "chat"), "chat", "a();");
         WriteUserScript(Path.Combine(DataRoot, "scripts", "trusted", "b", "chat"), "chat", "b();");
 
-        var catalogue = await new JsonScriptCatalog(ProgramRoot, DataRoot).LoadAsync(default);
+        var catalog = new JsonScriptCatalog(ProgramRoot, DataRoot);
+        var catalogue = await catalog.LoadAsync(default);
 
-        Assert.False(catalogue.Ok);
-        Assert.Equal(ErrorCode.Conflict, catalogue.Error!.Code);
+        // Two operator copies of one name: the first wins, the second is reported. Not a catalogue failure — a host
+        // that will not start because a draft was copied twice is worse than one that says which copy it used.
+        Assert.True(catalogue.Ok, catalogue.Error?.Message);
+        Assert.Single(catalogue.Value!, package => package.Manifest.Id == "chat");
+        Assert.Single(catalog.LastIssues);
     }
 
     [Fact]
@@ -137,12 +141,16 @@ public sealed class ScriptSeedTests : IDisposable
         WriteUserScript(Path.Combine(DataRoot, "plugins", "someone.plugin", "scripts", "adapter.channel-intake"),
             "adapter.channel-intake", "plugin();");
 
-        var catalogue = await new JsonScriptCatalog(ProgramRoot, DataRoot).LoadAsync(default);
+        var catalog = new JsonScriptCatalog(ProgramRoot, DataRoot);
+        var catalogue = await catalog.LoadAsync(default);
 
-        // Only the operator's own tree may replace a shipped script: dropping a plugin in is a trust decision
-        // about code, not a licence to quietly take over a name the shipped behaviour answers to.
-        Assert.False(catalogue.Ok);
-        Assert.Equal(ErrorCode.Conflict, catalogue.Error!.Code);
+        // Only the operator's own tree may replace a shipped script: dropping a plugin in is a trust decision about
+        // code, not a licence to take over a name the shipped behaviour answers to. The shipped one keeps the name and
+        // the plugin's copy is reported instead of being loaded over it.
+        Assert.True(catalogue.Ok, catalogue.Error?.Message);
+        var intake = Assert.Single(catalogue.Value!, package => package.Manifest.Id == "adapter.channel-intake");
+        Assert.Equal("bundled", intake.Origin);
+        Assert.Contains(catalog.LastIssues, issue => issue.Reason.Contains("Duplicate", StringComparison.Ordinal));
     }
 
     [Fact]
