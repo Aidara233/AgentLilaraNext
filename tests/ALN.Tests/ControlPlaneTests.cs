@@ -122,12 +122,14 @@ public sealed class ControlPlaneTests : IDisposable
     [Fact]
     public async Task Model_listing_never_leaks_configuration_or_keys()
     {
-        var models = new FakeModels(new ModelProviderInfo(new Address("model", "openai-chat", "one"),
-            new ModelProviderDescriptor("chat", "openai-chat", "OpenAI", ModelCapabilities.Streaming), 0));
+        // A real registry with one live provider: the shape of the answer is the manager's, so asking a fake would pin
+        // a second implementation of it.
+        var models = NewModelManager();
+        Assert.True((await models.CreateAsync("chat", "one", """{"endpoint":"https://api.example.com","apiKey":"sk-real"}""", default)).Ok);
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
-        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), models, _signals, new FakeGraph(), new FakeParameters()).Ok);
+        Assert.True(models.RegisterActions(plane).Ok);
 
-        var result = await plane.InvokeAsync(User("models.read"), CoreActions.ModelsList, default, default);
+        var result = await plane.InvokeAsync(User("models.read"), ModelActions.List, default, default);
 
         Assert.True(result.Ok, result.Error?.Message);
         using var document = JsonDocument.Parse(result.Value.GetRawText());
@@ -546,12 +548,15 @@ public sealed class ControlPlaneTests : IDisposable
     public async Task A_saved_provider_is_written_to_disk_masked_on_the_way_back_and_enough_to_run()
     {
         var store = new FileModelInstanceStore(_root, ModelTypes());
-        var models = new FakeModels(null);
+        // The verbs belong to the model manager now, so this asks the real one over a factory that builds a stub
+        // provider: what the test is about (the file, the masking, "applied now" vs "restart") is all in the manager.
+        var models = NewModelManager();
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(models.RegisterActions(plane, store).Ok);
         Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), models,
-            _signals, new FakeGraph(), new FakeParameters(), modelInstances: store).Ok);
+            _signals, new FakeGraph(), new FakeParameters()).Ok);
 
-        var saved = await plane.InvokeAsync(User(Capabilities.ModelsControl), CoreActions.ModelsProviderSave,
+        var saved = await plane.InvokeAsync(User(Capabilities.ModelsControl), ModelActions.ProviderSave,
             JsonSerializer.SerializeToElement(new
             {
                 category = "chat", instance = "one",
@@ -561,12 +566,11 @@ public sealed class ControlPlaneTests : IDisposable
         Assert.True(saved.Ok, saved.Error?.Message);
         // Nothing was running, so the provider is built now instead of at the next restart.
         Assert.Equal("now", saved.Value.GetProperty("applied").GetString());
-        Assert.Equal("now", saved.Value.GetProperty("applied").GetString());
-        Assert.Equal("chat/one", Assert.Single(models.Created));
-        Assert.Equal("default", Assert.Single(models.Profiles).Id);
+        Assert.Equal("model.openai-chat#one", Assert.Single(models.List()).Address.ToString());
+        Assert.Equal("default", Assert.Single(models.ListProfiles()).Id);
 
         // Reading it back hides the key but keeps the shape an editor needs.
-        var read = await plane.InvokeAsync(User(Capabilities.ModelsRead), CoreActions.ModelsProviderGet,
+        var read = await plane.InvokeAsync(User(Capabilities.ModelsRead), ModelActions.ProviderGet,
             JsonSerializer.SerializeToElement(new { address = "model.openai-chat#one" }), default);
         Assert.True(read.Ok, read.Error?.Message);
         Assert.True(read.Value.GetProperty("found").GetBoolean());
@@ -574,8 +578,7 @@ public sealed class ControlPlaneTests : IDisposable
         Assert.Equal("https://api.example.com", read.Value.GetProperty("configuration").GetProperty("endpoint").GetString());
 
         // Saving the masked form back must not replace the key with "***".
-        models.Profiles.Clear();
-        var resaved = await plane.InvokeAsync(User(Capabilities.ModelsControl), CoreActions.ModelsProviderSave,
+        var resaved = await plane.InvokeAsync(User(Capabilities.ModelsControl), ModelActions.ProviderSave,
             JsonSerializer.SerializeToElement(new
             {
                 category = "chat", instance = "one",
@@ -592,25 +595,32 @@ public sealed class ControlPlaneTests : IDisposable
     public async Task Saving_a_provider_is_not_a_read()
     {
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
-        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null),
-            _signals, new FakeGraph(), new FakeParameters(),
-            modelInstances: new FileModelInstanceStore(_root, ModelTypes())).Ok);
+        var models = NewModelManager();
+        Assert.True(models.RegisterActions(plane, new FileModelInstanceStore(_root, ModelTypes())).Ok);
 
-        foreach (var id in new[] { CoreActions.ModelsProviderSave, CoreActions.ModelsProviderDestroy,
-                     CoreActions.ModelsProfileCreate, CoreActions.ModelsProfileRemove })
+        foreach (var id in new[] { ModelActions.ProviderSave, ModelActions.ProviderDestroy,
+                     ModelActions.ProfileCreate, ModelActions.ProfileRemove })
         {
             var action = Assert.Single(plane.Catalog, candidate => candidate.Id == id);
             Assert.Equal(Capabilities.ModelsControl, action.Capability);
             Assert.True(action.Mutating);
             Assert.False(User("*.read").Allows(action.Capability));
+            Assert.False(string.IsNullOrWhiteSpace(action.ParamsJson));
         }
-        Assert.Equal(Capabilities.ModelsRead, Assert.Single(plane.Catalog, a => a.Id == CoreActions.ModelsProviderGet).Capability);
+        Assert.Equal(Capabilities.ModelsRead, Assert.Single(plane.Catalog, a => a.Id == ModelActions.ProviderGet).Capability);
         // Without a store the actions are registered and say so, instead of half-working.
         var noStore = new ControlPlane(new CollectingAudit(_audit), _signals);
-        Assert.True(CoreActions.RegisterAll(noStore, new FakeAdapters(), new FakeChannels(), new FakeModels(null),
-            _signals, new FakeGraph(), new FakeParameters()).Ok);
-        var refused = await noStore.InvokeAsync(Actor.System, CoreActions.ModelsProviderGet, default, default);
+        Assert.True(NewModelManager().RegisterActions(noStore).Ok);
+        var refused = await noStore.InvokeAsync(Actor.System, ModelActions.ProviderGet, default, default);
         Assert.Equal(ErrorCode.Unavailable, refused.Error?.Code);
+    }
+
+    /// <summary>A real model registry with one provider kind, which is what every action here needs to resolve a name.</summary>
+    private static ModelManager NewModelManager()
+    {
+        var models = new ModelManager();
+        Assert.True(models.RegisterFactory("test.pack", new StubProviderFactory()).Ok);
+        return models;
     }
 
     [Fact]
@@ -869,6 +879,18 @@ public sealed class ControlPlaneTests : IDisposable
     {
         public ValueTask<Result> AttachAsync(Address target, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result> DetachAsync(Address target, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+    }
+
+    /// <summary>One provider kind, so the registry can turn "chat" into a type id. Builds a provider that never streams.</summary>
+    private sealed class StubProviderFactory : IModelProviderFactory
+    {
+        // The type id is the provider's own ("model.openai-chat"), and the address's "kind" is what follows the dot.
+        // Registering the short name here is what a real factory would get wrong first.
+        public string TypeId => "model.openai-chat";
+        public ModelProviderDescriptor Describe { get; } = new("model.openai-chat", "chat", "Stub", ModelCapabilities.Streaming);
+
+        public ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken) =>
+            ValueTask.FromResult(Result<IModelProvider>.Success(new StubProvider(spec.Address, Describe)));
     }
 
     private sealed class StubProvider(Address address, ModelProviderDescriptor describe) : IModelProvider    {

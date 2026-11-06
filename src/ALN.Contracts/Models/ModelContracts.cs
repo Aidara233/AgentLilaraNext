@@ -190,8 +190,7 @@ public interface IModelProvider : IAsyncDisposable, IAddressed, IModule
 }
 
 public interface IModelProviderFactory
-{
-    string TypeId { get; }
+{    string TypeId { get; }
     ModelProviderDescriptor Describe { get; }
     ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken);
 }
@@ -217,4 +216,18 @@ public interface IModelManager
     Result RemoveProfile(string profileId);
     IReadOnlyList<ModelProfile> ListProfiles();
     ValueTask<Result<IAsyncEnumerable<ModelEvent>>> CompleteAsync(string profileId, ModelRequest request, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// The action ids the model registry answers to. Same rule as the channel and adapter ones: an id is part of the
+/// interface, so it lives here rather than only in the module that happens to implement it today.
+/// </summary>
+public static class ModelActions
+{
+    public const string List = "models.list";
+    public const string ProviderGet = "models.provider.get";
+    public const string ProviderSave = "models.provider.save";
+    public const string ProviderDestroy = "models.provider.destroy";
+    public const string ProfileCreate = "models.profile.create";
+    public const string ProfileRemove = "models.profile.remove";
 }

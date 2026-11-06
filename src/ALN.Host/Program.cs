@@ -542,7 +542,13 @@ if (receipt.Ready == 0)
 // The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
 // WebUI itself — it exposes actions, and a separate project consumes them. The table itself came up long before
 // startup (see host services); this is where the host adds the verbs it owns itself.
-var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes, modelInstances, graphStatus: () => kernel.Status, kernel: kernel, scriptCatalog: scriptCatalog.Value);
+var modelActions = modelManager.RegisterActions(controlPlane, modelInstances);
+if (!modelActions.Ok)
+{
+    Console.Error.WriteLine(modelActions.Error?.Message ?? "Model action registration failed.");
+    return 1;
+}
+var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes, graphStatus: () => kernel.Status, kernel: kernel, scriptCatalog: scriptCatalog.Value);
 if (!actionsRegistered.Ok)
 {
     Console.Error.WriteLine(actionsRegistered.Error?.Message ?? "Action registration failed.");

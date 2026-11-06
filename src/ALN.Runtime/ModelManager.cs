@@ -6,7 +6,7 @@ namespace ALN.Runtime;
 
 /// <summary>Core registry and router for provider kinds, provider instances and model profiles.</summary>
 [Module(ModelManagerId, Category = "model", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class ModelManager(IArtifactStore? artifacts = null, ISignalLog? signalLog = null)
+public sealed partial class ModelManager(IArtifactStore? artifacts = null, ISignalLog? signalLog = null)
     : IModelManager, IModuleIndex, IModulePackageResourceRegistry, IModuleWiring, IInstanceSink, IModule
 {
     public const string ModelManagerId = ModuleNames.ModelManager;
