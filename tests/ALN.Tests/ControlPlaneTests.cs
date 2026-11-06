@@ -2,6 +2,8 @@ using System.Text.Json;
 using ALN.Api;
 using ALN.Channel;
 using ALN.Contracts;
+using ALN.Graph;
+using ALN.Scripting.Jint;
 using ALN.Contracts.Models;
 using ALN.Graph.Contracts;
 using ALN.Runtime;
@@ -194,12 +196,15 @@ public sealed class ControlPlaneTests : IDisposable
     [Fact]
     public async Task The_edge_actions_are_called_modules_edge_now_and_the_old_names_still_answer()
     {
+        // The graph registers its own mount verbs, and both names go to the same handler: a client that says graph.list
+        // gets the list, not a lesson in naming.
+        var graph = new GraphManager(new ModuleCatalog(), new AdapterTypeCatalog(), new JintScriptExecutor(),
+            new CollectingAudit(_audit), _signals);
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
-        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null), _signals,
-            new FakeGraph(), new FakeParameters()).Ok);
+        Assert.True(graph.RegisterActions(plane).Ok);
 
-        var viaOld = await plane.InvokeAsync(Actor.System, CoreActions.GraphList, default, default);
-        var viaNew = await plane.InvokeAsync(Actor.System, CoreActions.EdgesList, default, default);
+        var viaOld = await plane.InvokeAsync(Actor.System, GraphActions.DeprecatedList, default, default);
+        var viaNew = await plane.InvokeAsync(Actor.System, GraphActions.EdgeList, default, default);
 
         Assert.True(viaOld.Ok, viaOld.Error?.Message);
         Assert.True(viaNew.Ok, viaNew.Error?.Message);

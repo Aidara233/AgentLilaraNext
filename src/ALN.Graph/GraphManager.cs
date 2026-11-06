@@ -10,7 +10,7 @@ using ALN.Graph.Contracts;
 namespace ALN.Graph;
 
 [Module(GraphManagerId, Category = "graph", Role = ModuleRole.Manager, Singleton = true)]
-public sealed class GraphManager : IGraphRuntime, IModule
+public sealed partial class GraphManager : IGraphRuntime, IModule
 {
     public const string GraphManagerId = ModuleNames.GraphManager;
     public ModuleId Id { get; } = new(GraphManagerId);

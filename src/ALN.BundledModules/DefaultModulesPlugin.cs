@@ -65,6 +65,9 @@ public sealed class DefaultModulesPlugin : IModulePlugin
             var executor = new JintScriptExecutor();
             var graph = new GraphManager(catalog, types, executor, audit, journal, state, report);
             if (bindings is IInstanceBindingsProxy proxy) proxy.Bind(graph);
+            // The mount verbs are the graph's: it owns the rules, and it owns what a scope may name.
+            var graphActions = graph.RegisterActions(HostService<IControlPlane>(context));
+            if (!graphActions.Ok) return ValueTask.FromResult(graphActions);
 
             // Sessions know better than anyone which of their directories stopped being useful; the archive
             // only knows how to take things away. That is the whole point of a source.

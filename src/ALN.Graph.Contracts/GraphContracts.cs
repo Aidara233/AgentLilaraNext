@@ -173,3 +173,37 @@ public static class ChannelReplyModes
 /// </summary>
 public sealed record ChannelReplyRequest(string PlatformConversationId, string Text, string? Mode = null,
     string? ReplyTo = null);
+
+/// <summary>
+/// The action ids the graph answers to. The mount verbs were graph.* until the graph grew modules; the old names stay
+/// registered for one release and point at the same handlers, so a client that says graph.mount still gets a mount.
+/// </summary>
+public static class GraphActions
+{
+    public const string EdgeList = "modules.edge.list";
+    public const string EdgeMount = "modules.edge.mount";
+    public const string EdgeUnmount = "modules.edge.unmount";
+    public const string DeprecatedList = "graph.list";
+    public const string DeprecatedMount = "graph.mount";
+    public const string DeprecatedUnmount = "graph.unmount";
+
+    /// <summary>The mount/unmount argument shapes, written once: the deprecated aliases take exactly the same arguments.</summary>
+    public const string MountParams = """
+        {"type":"object","properties":{
+          "script":{"type":"string"},
+          "target":{"type":"string"},
+          "scope":{"type":"string","enum":["instance","type","module"]},
+          "selector":{"type":"string"},
+          "budget":{"type":"integer","minimum":1},
+          "stateScope":{"type":"string","enum":["perTarget","shared"]}},
+         "required":["script"],"additionalProperties":false}
+        """;
+
+    public const string UnmountParams = """
+        {"type":"object","properties":{
+          "rule":{"type":"string"},
+          "script":{"type":"string"},
+          "target":{"type":"string"}},
+         "additionalProperties":false}
+        """;
+}

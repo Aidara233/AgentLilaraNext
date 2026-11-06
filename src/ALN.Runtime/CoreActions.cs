@@ -23,12 +23,6 @@ public static class CoreActions
     // The three edge actions were graph.* until the graph grew modules (docs/15). They live under modules.edge now, and
     // the old names stay registered for one release, pointing at the same handlers: a client that says graph.mount
     // should get a mount, not a lesson in naming.
-    public const string EdgesList = "modules.edge.list";
-    public const string EdgesMount = "modules.edge.mount";
-    public const string EdgesUnmount = "modules.edge.unmount";
-    public const string GraphList = "graph.list";
-    public const string GraphMount = "graph.mount";
-    public const string GraphUnmount = "graph.unmount";
     public const string ParamsList = "params.list";
     public const string ParamsSet = "params.set";
     public const string ModelsList = "models.list";
@@ -86,17 +80,6 @@ public static class CoreActions
                         badEdges = (status?.BadEdges ?? []).Select(EdgeOf).ToArray()
                     })));
                 }),
-            (new(EdgesList, "List mounted scripts, durable mount rules, and which rules are still waiting.", Capabilities.ModulesRead, false), ListEdges),
-            // One release of forwarding: same handler, same capability, so an old client keeps working and gets the
-            // new body. The description says where it went, because that is the only place a caller will look.
-            (new(GraphList, "Deprecated: use modules.edge.list.", Capabilities.ModulesRead, false), ListEdges),
-
-            // Manual scripts are the per-instance policy switch: a script declared "mount": "manual" is
-            // not attached to anything by its lifecycle, so this is the only way it ever runs.
-            (new(EdgesMount, "Mount a manual script onto one instance.", Capabilities.ModulesControl, true), MountScript),
-            (new(GraphMount, "Deprecated: use modules.edge.mount.", Capabilities.ModulesControl, true), MountScript),
-            (new(EdgesUnmount, "Unmount a script from one instance.", Capabilities.ModulesControl, true), UnmountScript),
-            (new(GraphUnmount, "Deprecated: use modules.edge.unmount.", Capabilities.ModulesControl, true), UnmountScript),
 
             (new(ParamsList, "List every tunable the running components expose, with its current value.", Capabilities.ParamsRead, false),
                 (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
@@ -310,37 +293,6 @@ public static class CoreActions
         }
         return Result.Success();
 
-        ValueTask<Result<JsonElement>> ListEdges(JsonElement arguments, CancellationToken ct)
-        {
-            var pending = graph.PendingRules.Select(rule => rule.Id).ToHashSet(StringComparer.Ordinal);
-            return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
-            {
-                mounted = graph.Mounted.Select(m => new
-                {
-                    script = m.Package.Manifest.Id,
-                    version = m.Package.Manifest.Version,
-                    targetType = m.Package.Manifest.TargetType,
-                    events = m.Package.Manifest.Events,
-                    trustDomain = m.Package.Manifest.TrustDomain.ToString(),
-                    target = m.Target.ToString(),
-                    rule = m.RuleId,
-                    remaining = m.Remaining
-                }),
-                rules = graph.Rules.Select(rule => new
-                {
-                    id = rule.Id,
-                    script = rule.ScriptId,
-                    scope = JsonNamingPolicy.CamelCase.ConvertName(rule.Scope.Kind.ToString()),
-                    selector = rule.Scope.Selector,
-                    source = rule.Source,
-                    budget = rule.Budget,
-                    remaining = rule.Remaining,
-                    stateScope = JsonNamingPolicy.CamelCase.ConvertName(rule.StateScope.ToString()),
-                    pending = pending.Contains(rule.Id)
-                })
-            })));
-        }
-
         /// <summary>One bad edge as a client reads it: what, on what, and which kind of wrong.</summary>
         static object EdgeOf(BadEdge edge) => new
         {
@@ -464,87 +416,7 @@ public static class CoreActions
         /// <summary>"This process has no graph to talk about" — a different answer from "the graph says zero".</summary>
         static Result<JsonElement> Unavailable(string message) => Result<JsonElement>.Failure(new(ErrorCode.Unavailable, message));
 
-        async ValueTask<Result<JsonElement>> MountScript(JsonElement arguments, CancellationToken ct)
-        {
-            if (!TryReadText(arguments, "script", out var scriptId) || scriptId.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.mount requires 'script' (the script id)."));
 
-            int? budget = null;
-            if (arguments.ValueKind == JsonValueKind.Object && arguments.TryGetProperty("budget", out var budgetElement) &&
-                budgetElement.ValueKind != JsonValueKind.Null)
-            {
-                if (!budgetElement.TryGetInt32(out var requested) || requested < 1)
-                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.mount 'budget' must be a positive integer (1 = one dispatch only)."));
-                budget = requested;
-            }
-
-            var stateScope = ScriptStateScope.PerTarget;
-            if (TryReadText(arguments, "stateScope", out var stateScopeText))
-            {
-                if (!Enum.TryParse<ScriptStateScope>(stateScopeText.Trim(), ignoreCase: true, out var parsed))
-                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.mount 'stateScope' must be perTarget or shared."));
-                stateScope = parsed;
-            }
-
-            MountScope scope;
-            if (TryReadText(arguments, "scope", out var scopeKind) && scopeKind.Trim().Length > 0)
-            {
-                if (!TryReadText(arguments, "selector", out var selector) || selector.Trim().Length == 0)
-                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.mount with 'scope' also needs 'selector'."));
-                switch (scopeKind.Trim().ToLowerInvariant())
-                {
-                    case "instance": scope = new(MountScopeKind.Instance, selector.Trim()); break;
-                    case "type": scope = MountScope.ForType(selector.Trim()); break;
-                    case "module": scope = MountScope.ForModule(selector.Trim()); break;
-                    default:
-                        return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.mount 'scope' must be instance, type or module."));
-                }
-            }
-            else
-            {
-                // The original shape: one script, one instance.
-                var target = ReadAddress(arguments, "target");
-                if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
-                scope = MountScope.ForInstance(target.Value);
-            }
-
-            var added = await graph.AddRuleAsync(new(scriptId.Trim(), scope, budget, stateScope), ct).ConfigureAwait(false);
-            if (!added.Ok || added.Value is null) return Result<JsonElement>.Failure(added.Error ?? new(ErrorCode.Internal, "Mount rule was not created."));
-            var rule = added.Value;
-            return Result<JsonElement>.Success(ToJson(new
-            {
-                rule = rule.Id,
-                script = rule.ScriptId,
-                scope = JsonNamingPolicy.CamelCase.ConvertName(rule.Scope.Kind.ToString()),
-                selector = rule.Scope.Selector,
-                budget = rule.Budget,
-                stateScope = JsonNamingPolicy.CamelCase.ConvertName(rule.StateScope.ToString()),
-                // Empty means the rule is waiting: the instance it names does not exist yet.
-                targets = graph.Mounted.Where(m => m.RuleId == rule.Id).Select(m => m.Target.ToString()).ToArray()
-            }));
-        }
-
-        async ValueTask<Result<JsonElement>> UnmountScript(JsonElement arguments, CancellationToken ct)
-        {
-            // A rule is the durable thing; removing one takes its mounts with it.
-            if (TryReadText(arguments, "rule", out var ruleId) && ruleId.Trim().Length > 0)
-            {
-                var removedRule = await graph.RemoveRuleAsync(ruleId.Trim(), ct).ConfigureAwait(false);
-                return removedRule.Ok
-                    ? Result<JsonElement>.Success(ToJson(new { rule = ruleId.Trim(), removed = true }))
-                    : Result<JsonElement>.Failure(removedRule.Error!);
-            }
-
-            var target = ReadAddress(arguments, "target");
-            if (!target.Ok) return Result<JsonElement>.Failure(target.Error!);
-            if (!TryReadText(arguments, "script", out var scriptId) || scriptId.Trim().Length == 0)
-                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "graph.unmount requires 'rule', or 'script' and 'target'."));
-
-            var unmounted = await graph.UnmountAsync(scriptId.Trim(), target.Value, ct).ConfigureAwait(false);
-            return unmounted.Ok
-                ? Result<JsonElement>.Success(ToJson(new { script = scriptId.Trim(), target = target.Value.ToString(), mounted = false }))
-                : Result<JsonElement>.Failure(unmounted.Error!);
-        }
 
         async ValueTask<Result<JsonElement>> ListArchive(JsonElement arguments, CancellationToken ct)
         {
