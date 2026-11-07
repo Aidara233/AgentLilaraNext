@@ -55,6 +55,9 @@ public static class AccessLevels
         [Capabilities.GraphRead] = AccessLevel.Agent,
         // Publishing a draft is the model's own work: the folders it can write are the folders a reload can pick up.
         [Capabilities.ScriptsPublish] = AccessLevel.Agent,
+        // Reading the schedules is answering "when does this wake up"; writing one decides when the host acts alone.
+        [Capabilities.SchedulesRead] = AccessLevel.Agent,
+        [Capabilities.SchedulesControl] = AccessLevel.Operator,
 
         // Changing the shape of the process: a person's decision, made on purpose, written down in the audit.
         [Capabilities.AdaptersControl] = AccessLevel.Operator,
@@ -259,4 +262,16 @@ public static class Capabilities
     /// <see cref="GraphControl"/>.
     /// </summary>
     public const string ScriptsPublish = "scripts.publish";
+
+    /// <summary>
+    /// Seeing what this host will do on its own: the stored schedules. A read, because "when does this thing wake up"
+    /// is a question an assistant should be able to answer rather than guess.
+    /// </summary>
+    public const string SchedulesRead = "schedules.read";
+
+    /// <summary>
+    /// Writing a schedule down. Deeper than reading it: a row decides *when* something happens without anybody present,
+    /// which is a decision about the deployment rather than about one conversation.
+    /// </summary>
+    public const string SchedulesControl = "schedules.control";
 }

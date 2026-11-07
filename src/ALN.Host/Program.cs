@@ -350,6 +350,9 @@ factories.Register(ScriptToolsModule.TypeId,
 // a module that offers tools is a module like any other, and the tools read the table as it is when they are called.
 factories.Register(ActionToolsModule.TypeId,
     manifest => ActionToolsModule.FromManifest(manifest, controlPlane, sessionExtensions));
+// The read-only half of the schedules, offered as a module for the same reason the other tool modules are.
+factories.Register(ScheduleTools.TypeId,
+    manifest => ScheduleToolsModule.FromManifest(manifest, scheduleStore, sessionExtensions));
 foreach (var type in adapterTypes.ListTypes().Where(type => adapterTypes.IsConcrete(type.TypeId)))
     factories.RegisterOwned(type.TypeId);
 foreach (var type in modelManager.ListTypes())
@@ -469,6 +472,18 @@ if (!actionToolsFile.Ok)
     queue.Complete();
     return 1;
 }
+// The schedules, readable by the model through the same mechanism: a module with a file, so "may this Session see when
+// the host wakes up on its own" is answered by the graph. Writing a row is not offered here — that is an operator's.
+var scheduleToolsFile = await new ModuleManifestStore(data.Root).WriteIfMissingAsync(
+    new ModuleManifest(new ModuleId(ScheduleTools.TypeId), ScheduleTools.TypeId, Enabled: true),
+    CancellationToken.None);
+if (!scheduleToolsFile.Ok)
+{
+    Console.Error.WriteLine(scheduleToolsFile.Error?.Message ?? "Schedule tool module declaration failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
 // What the file system module will actually offer, said out loud. The scopes this host registers and the scopes that
 // module's own file declares are two different lists, and only their intersection is reachable — and the file is never
 // rewritten (C-03), so a module.json written before a scope existed keeps the old list forever. Without this line,
@@ -571,6 +586,12 @@ var sessionActions = sessions.RegisterActions(controlPlane);
 if (!sessionActions.Ok)
 {
     Console.Error.WriteLine(sessionActions.Error?.Message ?? "Session action registration failed.");
+    return 1;
+}
+var scheduleActions = ScheduleActions.Register(controlPlane, scheduleStore);
+if (!scheduleActions.Ok)
+{
+    Console.Error.WriteLine(scheduleActions.Error?.Message ?? "Schedule action registration failed.");
     return 1;
 }
 var scriptActions = ScriptActions.Register(controlPlane, graph, scriptCatalog.Value, new ScriptLibrary(data.Root));
