@@ -18,23 +18,11 @@ namespace ALN.Runtime;
 /// from the actor, the audit and the signal from the control plane's single execution point. A second place to keep a
 /// verb's rules is a second place for them to be wrong.
 /// </summary>
-public sealed class ActionTools(IControlPlane plane, AccessLevel? callerLevel = null) : ISessionToolSource
+public sealed class ActionTools(IControlPlane plane) : ISessionToolSource
 {
     public const string SourceId = "system.action-tools";
     public const string ListToolName = "actions_list";
     public const string CallToolName = "actions_call";
-
-    /// <summary>
-    /// What level the model acts at, kept in one place because the list and the call have to agree: a list that says
-    /// "needs an operator" while the call goes through is worse than either half being wrong on its own.
-    ///
-    /// <see cref="AccessLevel.Agent"/> is the whole point of the level: the model is an operator's assistant, not a
-    /// second operator. Everything it needs to do its job — read the graph, answer, keep notes, run its own Session,
-    /// mount a script it wrote — sits at that level; the verbs that change the shape of the process do not.
-    /// </summary>
-    public static AccessLevel ModelLevel { get; } = AccessLevel.Agent;
-
-    private readonly AccessLevel _level = callerLevel ?? ModelLevel;
 
     /// <summary>
     /// Who the model is when it calls an action. The id is not a display name: it is what the audit record says, so a
@@ -81,17 +69,23 @@ public sealed class ActionTools(IControlPlane plane, AccessLevel? callerLevel = 
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        // The level travels with the round, not with this object. It is the one number an operator may change while the
+        // Session runs, and this source is registered once for the whole process: reading it at construction made the
+        // change visible on disk, in the audit and in the signal while the model kept the authority it started with —
+        // which is the opposite of what setting a level is for. Both tools take it from the same request, so the list
+        // and the call cannot disagree about what this caller may reach.
+        var level = request.Level;
         IReadOnlyList<SessionToolOffer> offers =
         [
-            new(new ListActionTool(this), ListDefinition, ActsExternally: false),
+            new(new ListActionTool(this, level), ListDefinition, ActsExternally: false),
             // Calling an action can talk to the outside world (channels.send), but the tool itself is not the reply:
             // whatever the model wants a person to read, it still has to say.
-            new(new CallActionTool(this), CallDefinition, ActsExternally: false)
+            new(new CallActionTool(this, level), CallDefinition, ActsExternally: false)
         ];
         return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(offers));
     }
 
-    private sealed class ListActionTool(ActionTools owner) : ISessionTool
+    private sealed class ListActionTool(ActionTools owner, AccessLevel level) : ISessionTool
     {
         public string Name => ListToolName;
         public bool EndsTurn => false;
@@ -122,7 +116,7 @@ public sealed class ActionTools(IControlPlane plane, AccessLevel? callerLevel = 
                     .Append(action.Mutating ? " changes state" : " read-only");
                 // Only the lines this caller cannot reach name their level. A list where every line carries a number
                 // the reader already satisfies buries the one line that says "not yours to run".
-                if (owner._level < action.RequiredLevel)
+                if (level < action.RequiredLevel)
                     text.Append("\n  needs ").Append(AccessLevels.Describe(action.RequiredLevel))
                         .Append(" — somebody at that level runs this one.");
                 text.Append("\n  ").Append(action.Summary);
@@ -134,7 +128,7 @@ public sealed class ActionTools(IControlPlane plane, AccessLevel? callerLevel = 
         }
     }
 
-    private sealed class CallActionTool(ActionTools owner) : ISessionTool
+    private sealed class CallActionTool(ActionTools owner, AccessLevel level) : ISessionTool
     {
         public string Name => CallToolName;
         public bool EndsTurn => false;
@@ -154,7 +148,7 @@ public sealed class ActionTools(IControlPlane plane, AccessLevel? callerLevel = 
                 ? args.Clone()
                 : JsonSerializer.SerializeToElement(new { });
 
-            var actor = new Actor(ActorId, ActorKind.Model, ModelCapabilities, owner._level);
+            var actor = new Actor(ActorId, ActorKind.Model, ModelCapabilities, level);
             var result = await owner._plane.InvokeAsync(actor, actionId, payload, cancellationToken).ConfigureAwait(false);
 
             var text = new StringBuilder();

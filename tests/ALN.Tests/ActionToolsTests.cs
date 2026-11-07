@@ -36,9 +36,12 @@ public sealed class ActionToolsTests : IDisposable
         return plane;
     }
 
-    private static async Task<ISessionTool> ToolAsync(ActionTools tools, string name)
+    private static async Task<ISessionTool> ToolAsync(ActionTools tools, string name, AccessLevel level = AccessLevel.Agent)
     {
-        var offers = await tools.ToolsAsync(new RoundContextRequest("s", Guid.NewGuid(), 1), default);
+        // The level is the request's, because that is where it comes from in a real turn (see SessionManager): the
+        // source is registered once for the process, so a level captured at construction would be a level that never
+        // changes again.
+        var offers = await tools.ToolsAsync(new RoundContextRequest("s", Guid.NewGuid(), 1, Level: level), default);
         Assert.True(offers.Ok, offers.Error?.Message);
         return offers.Value!.Single(offer => offer.Definition.Name == name).Tool;
     }
@@ -87,7 +90,7 @@ public sealed class ActionToolsTests : IDisposable
                 MinLevel: AccessLevel.Operator),
             (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(JsonSerializer.SerializeToElement(new { ok = 1 })))).Ok);
 
-        var agent = await ToolAsync(new ActionTools(plane, AccessLevel.Agent), ActionTools.ListToolName);
+        var agent = await ToolAsync(new ActionTools(plane), ActionTools.ListToolName);
         var all = Text(await agent.ExecuteAsync(new("c1", ActionTools.ListToolName, "{}"), default));
         Assert.Contains("needs L1 operator", all);
         // A verb that is an agent's own says nothing about levels: the marker has to be rare to be read.
@@ -95,7 +98,7 @@ public sealed class ActionToolsTests : IDisposable
         Assert.DoesNotContain("needs L", mine);
 
         // One level up, nothing is out of reach, so nothing is labelled — the same table, read by a different caller.
-        var deeper = await ToolAsync(new ActionTools(plane, AccessLevel.Operator), ActionTools.ListToolName);
+        var deeper = await ToolAsync(new ActionTools(plane), ActionTools.ListToolName, AccessLevel.Operator);
         var wider = Text(await deeper.ExecuteAsync(new("c3", ActionTools.ListToolName, "{}"), default));
         Assert.DoesNotContain("needs L1 operator", wider);
         Assert.Contains("test.deep", wider);
@@ -107,8 +110,8 @@ public sealed class ActionToolsTests : IDisposable
         var plane = PlaneWithChannels(out var channels);
         // An operator's session: creating a Channel is wiring, and wiring is not the model's to do (see the level test
         // below, where the same call is refused). What this test is about is the report, not the permission.
-        var tools = new ActionTools(plane, AccessLevel.Operator);
-        var call = await ToolAsync(tools, ActionTools.CallToolName);
+        var tools = new ActionTools(plane);
+        var call = await ToolAsync(tools, ActionTools.CallToolName, AccessLevel.Operator);
 
         var created = Text(await call.ExecuteAsync(new("c1", ActionTools.CallToolName,
             """{"action":"ACTION","args":{"type":"channel.conversation","instance":"probe-a","bindings":[{"adapter":"adapter.file#file-1","conversation":"probe-a"}]}}"""
@@ -134,7 +137,7 @@ public sealed class ActionToolsTests : IDisposable
             (_, _) => ValueTask.FromResult(Result<JsonElement>.Failure(new(ErrorCode.Invalid, "never reached")))).Ok);
 
         // The model as itself. Same table, all grants, shallowest level: what it meets first is the level.
-        var agentCall = await ToolAsync(new ActionTools(plane, AccessLevel.Agent), ActionTools.CallToolName);
+        var agentCall = await ToolAsync(new ActionTools(plane), ActionTools.CallToolName);
 
         var unknown = Text(await agentCall.ExecuteAsync(new("c1", ActionTools.CallToolName, """{"action":"nope.nothing"}"""), default));
         Assert.StartsWith("error: nope.nothing", unknown);
@@ -148,9 +151,8 @@ public sealed class ActionToolsTests : IDisposable
 
         // An operator with a narrower grant: the same verb now answers about the grant instead of the level, because
         // "somebody else's job" and "you were not given this" are two different things to do about a refusal.
-        var restricted = new ActionTools(new ControlPlaneWithGrant(plane, [Capabilities.ChannelsControl, Capabilities.ChannelsRead]),
-            AccessLevel.Operator);
-        var call = await ToolAsync(restricted, ActionTools.CallToolName);
+        var restricted = new ActionTools(new ControlPlaneWithGrant(plane, [Capabilities.ChannelsControl, Capabilities.ChannelsRead]));
+        var call = await ToolAsync(restricted, ActionTools.CallToolName, AccessLevel.Operator);
 
         var denied = Text(await call.ExecuteAsync(new("c3", ActionTools.CallToolName,
             """{"action":"test.control","args":{}}"""), default));
@@ -161,6 +163,37 @@ public sealed class ActionToolsTests : IDisposable
             """{"action":"channels.create","args":{"type":"channel.conversation"}}"""), default));
         Assert.Contains("code: invalid", invalid);
         Assert.Contains("actions_list", invalid);
+    }
+
+    [Fact]
+    public async Task Raising_a_Session_s_level_changes_what_the_next_round_may_call()
+    {
+        // Found on a running host: the level was written to disk, announced as a signal change, and the model kept the
+        // authority it had at startup — because the source is registered once and used to read the level at
+        // construction. The list said "needs L1 operator" while the call went through: exactly the disagreement the
+        // comment on this class warns about, arrived at from the other side.
+        var plane = PlaneWithChannels(out _);
+        Assert.True(plane.Register(new("test.deep", "Guarded.", Capabilities.ModelsControl, true,
+                MinLevel: AccessLevel.Operator),
+            (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(JsonSerializer.SerializeToElement(new { ok = 1 })))).Ok);
+
+        var tools = new ActionTools(plane);
+        var asAgent = await ToolAsync(tools, ActionTools.CallToolName, AccessLevel.Agent);
+        var refused = Text(await asAgent.ExecuteAsync(new("c1", ActionTools.CallToolName,
+            """{"action":"test.deep","args":{}}"""), default));
+        Assert.Contains("code: denied", refused);
+        Assert.Contains("needs L1 operator", refused);
+
+        // Same instance, the very next round, one level up: nothing was re-registered and nothing restarted.
+        var asOperator = await ToolAsync(tools, ActionTools.CallToolName, AccessLevel.Operator);
+        var allowed = Text(await asOperator.ExecuteAsync(new("c2", ActionTools.CallToolName,
+            """{"action":"test.deep","args":{}}"""), default));
+        Assert.StartsWith("ok: test.deep", allowed);
+
+        // And back down again: a level that could only go up would not be a level.
+        var backToAgent = await ToolAsync(tools, ActionTools.CallToolName, AccessLevel.Agent);
+        Assert.Contains("code: denied", Text(await backToAgent.ExecuteAsync(new("c3", ActionTools.CallToolName,
+            """{"action":"test.deep","args":{}}"""), default)));
     }
 
     /// <summary>A plane with the same table but a narrower actor, for the one test that needs a refusal.</summary>
