@@ -43,7 +43,7 @@ public static class SessionReplay
     /// nobody saw is scratch and is not replayed; without them, the text <b>was</b> the reply.
     /// </param>
     public static ReplayPlan Build(IReadOnlyList<SessionHistoryEntry> history, bool toolsActExternally, int budgetTokens,
-        int keepActivations = KeepRecentActivations)
+        int keepActivations = KeepRecentActivations, double correction = 1.0)
     {
         ArgumentNullException.ThrowIfNull(history);
         // A request starts where the last checkpoint left off. Everything before it is still in the timeline and still
@@ -51,10 +51,13 @@ public static class SessionReplay
         var checkpoint = LastCheckpoint(history);
         var replayable = history.Skip(checkpoint).Where(entry => ShouldReplay(entry, toolsActExternally)).ToArray();
         var calls = CallNames(replayable);
+        // The budget is in the provider's units; the estimate comes out of a character model. The correction turns one
+        // into the other, and it is applied to each candidate estimate rather than to the budget so that "how much does
+        // keeping one more round cost" stays comparable with the budget itself.
         for (var keep = Math.Clamp(keepActivations, 0, CountActivations(replayable)); ; keep--)
         {
             var messages = Messages(replayable, OldestKeptIndex(replayable, keep), calls, out var folded);
-            var tokens = TokenEstimator.Estimate(messages);
+            var tokens = TokenEstimator.Corrected(TokenEstimator.Estimate(messages), correction);
             // At zero kept activations there is nowhere left to go: what remains is the outline itself, and cutting
             // into that is compaction's job (a summary), not folding's.
             if (tokens <= budgetTokens || keep == 0)

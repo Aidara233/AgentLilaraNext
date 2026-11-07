@@ -73,6 +73,11 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     private readonly IPromptLibrary? _prompts;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SessionRecord> _loaded = new(StringComparer.Ordinal);
+    /// <summary>
+    /// What the provider's own counts say about this Session's estimates. In memory on purpose: it is evidence about the
+    /// requests this process has sent, not a fact about the Session that should outlive it.
+    /// </summary>
+    private readonly TokenCalibration _calibration = new();
     private IInstanceHost? _instances;
 
     /// <summary>
@@ -776,7 +781,10 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             // that the request stays inside the model's window; the records themselves are untouched (SessionReplay).
             var window = ContextWindow(record.Spec);
             var replayBudget = (int)(window * (long)ReplayBudgetPercent / 100);
-            var replay = SessionReplay.Build(history, actingTools > 0, replayBudget);
+            // What this Session's last request really cost, divided by what it was predicted to cost. The estimator is a
+            // fit; this is the provider's own count correcting it, one call at a time.
+            var correction = _calibration.For(sessionId);
+            var replay = SessionReplay.Build(history, actingTools > 0, replayBudget, correction: correction);
             // Folding first, because it is free and true. Compaction only when even the outline does not fit: it costs a
             // model call and loses detail, and neither is worth paying while an outline would do.
             if (replay.EstimatedTokens > replayBudget &&
@@ -784,10 +792,10 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             {
                 state = record.State;
                 history = record.History;
-                replay = SessionReplay.Build(history, actingTools > 0, replayBudget);
+                replay = SessionReplay.Build(history, actingTools > 0, replayBudget, correction: correction);
             }
             messages.AddRange(replay.Messages);
-            RecordReplay(sessionId, replay, replayBudget);
+            RecordReplay(sessionId, replay, replayBudget, correction);
             var turnCeiling = (int)(window * (long)TurnCeilingPercent / 100);
             var collected = await CollectRoundContextAsync(request, cancellationToken).ConfigureAwait(false);
             if (!collected.Ok || collected.Value is null) return Result<SessionTurnResult>.Failure(collected.Error!);
@@ -805,7 +813,8 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             // subject.
             var notes = collected.Value.RoundContext
                 .Append(IdleNote(state.LastActiveAt, DateTimeOffset.UtcNow))
-                .Append(BudgetNote(TokenEstimator.Estimate(messages) + TokenEstimator.Estimate(visible), window))
+                .Append(BudgetNote(TokenEstimator.Corrected(
+                    TokenEstimator.Estimate(messages) + TokenEstimator.Estimate(visible), correction), window))
                 .Where(note => note is not null)
                 .Select(note => note!)
                 .ToArray();
@@ -823,6 +832,10 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                 var modelRecordId = Guid.NewGuid();
                 var modelParentId = SignalScope.CurrentId;
                 using var modelScope = SignalScope.Enter(modelRecordId, activationId);
+                // What this very request was predicted to cost. Kept next to the call that tests it: the provider's own
+                // count comes back with the answer, and that pair is the only honest way to know how wrong the fit is.
+                var predictedInput = TokenEstimator.Corrected(
+                    TokenEstimator.Estimate(messages) + TokenEstimator.Estimate(visible), correction);
                 var modelStarted = await Models.CompleteAsync(record.Spec.ModelProfileId,
                     new ModelRequest(messages, visible.Count > 0 ? visible : null), cancellationToken).ConfigureAwait(false);
                 if (!modelStarted.Ok || modelStarted.Value is null)
@@ -887,6 +900,10 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
 
                 var completedUsage = usage ?? new ModelUsage(0, 0);
                 turnUsage = AddUsage(turnUsage, completedUsage);
+                // The measurement: what the provider charged for the request we just built versus what we predicted for
+                // it. Ignored when either side is zero (a provider that reports nothing is not evidence).
+                if (completedUsage.InputTokens > 0)
+                    _calibration.Observe(sessionId, predictedInput, completedUsage.InputTokens);
                 var completedCalls = toolCalls.Values.Select(c => c.ToModelToolCall()).ToArray();
                 if (completedCalls.Any(call => !visible.Any(definition => string.Equals(definition.Name, call.Name, StringComparison.Ordinal))))
                     return Result<SessionTurnResult>.Failure(new(ErrorCode.Invalid, "Model returned a tool call that was not offered to the Session."));
@@ -965,7 +982,8 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                 // A turn may run as long as it needs — nothing here counts steps — but not past the end of the window.
                 // One round of reads can be a whole budget on its own, and a request the provider refuses teaches
                 // nobody anything. Checked here because a round of tool calls is where a request grows.
-                var used = TokenEstimator.Estimate(messages) + TokenEstimator.Estimate(visible);
+                var used = TokenEstimator.Corrected(
+                    TokenEstimator.Estimate(messages) + TokenEstimator.Estimate(visible), correction);
                 var outOfRoom = used >= turnCeiling;
                 if (outOfRoom)
                     WriteSignal(activationId, "ceiling", SignalLevel.Warn,
@@ -2080,7 +2098,7 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     /// folded, which is the steady state of a long Session: "when did this start to grow" is the first question a
     /// refused request asks, and the answer should not have to be reconstructed from the provider's error text.
     /// </summary>
-    private void RecordReplay(string sessionId, ReplayPlan replay, int budget)
+    private void RecordReplay(string sessionId, ReplayPlan replay, int budget, double correction = 1.0)
     {
         if (replay.FoldedEntries == 0) return;
         _signalLog.Write(new()
@@ -2098,7 +2116,10 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                 ["estimatedTokens"] = replay.EstimatedTokens.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 ["budgetTokens"] = budget.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 ["keptActivations"] = replay.KeptActivations.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                ["foldedEntries"] = replay.FoldedEntries.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                ["foldedEntries"] = replay.FoldedEntries.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                // The correction is the interesting half of this record: it says whether the estimate that decided to fold
+                // was a good one. 1.00 means the estimator was right on the previous request for this Session.
+                ["correction"] = correction.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture)
             }
         });
     }

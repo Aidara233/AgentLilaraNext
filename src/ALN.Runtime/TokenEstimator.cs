@@ -105,6 +105,14 @@ public static class TokenEstimator
     /// </summary>
     public static double Error(int estimated, int actual) => estimated <= 0 ? 0 : (double)actual / estimated;
 
+    /// <summary>
+    /// The same estimate, adjusted by what the provider actually charged for this Session's last request. The constants
+    /// above are a starting point fitted once; this is the part that keeps being right afterwards (see
+    /// <see cref="TokenCalibration"/>).
+    /// </summary>
+    public static int Corrected(int estimated, double correction) =>
+        correction <= 0 ? estimated : (int)Math.Ceiling(estimated * correction);
+
     private static bool IsCjk(char character) => character switch
     {
         >= '\u4e00' and <= '\u9fff' => true,   // CJK unified ideographs
