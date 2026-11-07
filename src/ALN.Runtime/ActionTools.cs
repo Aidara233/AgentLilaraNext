@@ -18,11 +18,19 @@ namespace ALN.Runtime;
 /// from the actor, the audit and the signal from the control plane's single execution point. A second place to keep a
 /// verb's rules is a second place for them to be wrong.
 /// </summary>
-public sealed class ActionTools(IControlPlane plane) : ISessionToolSource
+public sealed class ActionTools(IControlPlane plane, AccessLevel? callerLevel = null) : ISessionToolSource
 {
     public const string SourceId = "system.action-tools";
     public const string ListToolName = "actions_list";
     public const string CallToolName = "actions_call";
+
+    /// <summary>
+    /// What level the model acts at, kept in one place because the list and the call have to agree: a list that says
+    /// "needs an operator" while the call goes through is worse than either half being wrong on its own.
+    /// </summary>
+    public static AccessLevel ModelLevel { get; } = AccessLevel.Full;
+
+    private readonly AccessLevel _level = callerLevel ?? ModelLevel;
 
     /// <summary>
     /// Who the model is when it calls an action. The id is not a display name: it is what the audit record says, so a
@@ -108,6 +116,11 @@ public sealed class ActionTools(IControlPlane plane) : ISessionToolSource
                 text.Append("\n- ").Append(action.Id)
                     .Append(" [").Append(action.Capability).Append(']')
                     .Append(action.Mutating ? " changes state" : " read-only");
+                // Only the lines this caller cannot reach name their level. A list where every line carries a number
+                // the reader already satisfies buries the one line that says "not yours to run".
+                if (owner._level < action.RequiredLevel)
+                    text.Append("\n  needs ").Append(AccessLevels.Describe(action.RequiredLevel))
+                        .Append(" — somebody at that level runs this one.");
                 text.Append("\n  ").Append(action.Summary);
                 var required = RequiredOf(action.ParamsJson);
                 text.Append("\n  args: ").Append(required.Length == 0 ? "none" : string.Join(", ", required));
@@ -137,7 +150,7 @@ public sealed class ActionTools(IControlPlane plane) : ISessionToolSource
                 ? args.Clone()
                 : JsonSerializer.SerializeToElement(new { });
 
-            var actor = new Actor(ActorId, ActorKind.Model, ModelCapabilities, AccessLevel.Full);
+            var actor = new Actor(ActorId, ActorKind.Model, ModelCapabilities, owner._level);
             var result = await owner._plane.InvokeAsync(actor, actionId, payload, cancellationToken).ConfigureAwait(false);
 
             var text = new StringBuilder();

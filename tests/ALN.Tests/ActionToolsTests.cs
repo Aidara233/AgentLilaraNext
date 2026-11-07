@@ -78,6 +78,30 @@ public sealed class ActionToolsTests : IDisposable
     }
 
     [Fact]
+    public async Task The_list_names_the_level_of_the_actions_this_caller_cannot_reach()
+    {
+        // An agent holds the whole table and still cannot reach all of it. The list has to say which lines are somebody
+        // else's, or the model spends rounds discovering that one denial at a time.
+        var plane = PlaneWithChannels(out _);
+        Assert.True(plane.Register(new("test.deep", "Guarded.", Capabilities.ModelsControl, true,
+                MinLevel: AccessLevel.Operator),
+            (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(JsonSerializer.SerializeToElement(new { ok = 1 })))).Ok);
+
+        var agent = await ToolAsync(new ActionTools(plane, AccessLevel.Agent), ActionTools.ListToolName);
+        var all = Text(await agent.ExecuteAsync(new("c1", ActionTools.ListToolName, "{}"), default));
+        Assert.Contains("needs L1 operator", all);
+        // A verb that is an agent's own says nothing about levels: the marker has to be rare to be read.
+        var mine = Text(await agent.ExecuteAsync(new("c2", ActionTools.ListToolName, """{"prefix":"channels.list"}"""), default));
+        Assert.DoesNotContain("needs L", mine);
+
+        // One level up, nothing is out of reach, so nothing is labelled — the same table, read by a different caller.
+        var deeper = await ToolAsync(new ActionTools(plane, AccessLevel.Operator), ActionTools.ListToolName);
+        var wider = Text(await deeper.ExecuteAsync(new("c3", ActionTools.ListToolName, "{}"), default));
+        Assert.DoesNotContain("needs L1 operator", wider);
+        Assert.Contains("test.deep", wider);
+    }
+
+    [Fact]
     public async Task Calling_goes_through_the_control_plane_and_reports_what_happened()
     {
         var plane = PlaneWithChannels(out var channels);
