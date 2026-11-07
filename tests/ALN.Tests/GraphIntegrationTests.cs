@@ -332,6 +332,56 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.Equal(2, _model.Requests);
     }
 
+    /// <summary>
+    /// A script hands a Session a spec, and a spec carries a level. What a script reaches is decided by the folder it
+    /// came from, so a Session it opens must not reach further than that: otherwise the shallowest place in the system
+    /// (a draft, written by the model itself) is one `level: "full"` away from the deepest.
+    /// </summary>
+    [Fact]
+    public async Task A_script_cannot_open_a_Session_deeper_than_the_folder_it_came_from()
+    {
+        _model.Enqueue(new TextDelta("ok"), new ModelCompleted(StopReason.EndTurn, new ModelUsage(1, 1)));
+
+        var deep = new ScriptPackage(
+            new("channel.deep", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",
+                [ScriptCapabilities.SessionActivate], TrustDomain.Trusted),
+            """
+            async function onEvent(event, ctx) {
+              // Reading the refusal is part of the behaviour: the call is rejected, and the script has to see that.
+              try {
+                await ctx.session.activate({
+                  modelProfileId: "default", objective: "深一点", formatVersion: "1", level: "full"
+                });
+              } catch (e) { await ctx.log.warn("refused: " + e); }
+            }
+            """,
+            Level: AccessLevel.Agent);
+
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), deep], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+
+        await WriteInputAsync("chat-1", "早");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+
+        // The Session the Channel got is stored on disk, and what it says about itself is the level in force from every
+        // turn after this one — so this is the place to look, not the reply the script got.
+        var modulesRoot = Path.Combine(_root, "modules");
+        var stored = (Directory.Exists(modulesRoot)
+                ? Directory.GetFiles(modulesRoot, "module.json", SearchOption.AllDirectories)
+                : [])
+            .Select(path => JsonDocument.Parse(File.ReadAllText(path)).RootElement)
+            .Where(json => json.TryGetProperty("type", out var type) && type.GetString() == "session.chat")
+            .Select(json => json.GetProperty("config").GetProperty("level").GetString())
+            .ToArray();
+        Assert.DoesNotContain("full", stored);
+        Assert.Contains(_audit.ReadAudit(),
+            entry => entry.Action == ScriptCapabilities.SessionActivate && entry.Outcome == "denied"
+                && (entry.Detail ?? "").Contains("full", StringComparison.OrdinalIgnoreCase));
+    }
+
     /// <summary>A model whose steps the test scripts: one array of events per call.</summary>
     private sealed class QueueModel : IModelManager
     {

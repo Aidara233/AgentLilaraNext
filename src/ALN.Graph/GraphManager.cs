@@ -982,7 +982,7 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
                 !channels.IsBound(current.Source, channelMessage.Binding.Adapter, channelMessage.Binding.PlatformConversationId))
                 await DenyAsync(ScriptCapabilities.SessionActivate, "Channel message does not match routed event.", cancellationToken).ConfigureAwait(false);
 
-            var spec = Parse<SessionSpec>(sessionSpecJson);
+            var spec = await SessionSpecFromScriptAsync(sessionSpecJson, ScriptCapabilities.SessionActivate, cancellationToken).ConfigureAwait(false);
             // The Channel may name the profile it wants; a spec that names none inherits it. Leftovers fall to
             // the host's own resolution (SessionManager), which says out loud what it picked.
             if (string.IsNullOrWhiteSpace(spec.ModelProfileId) &&
@@ -1016,6 +1016,28 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
             return JsonSerializer.Serialize(new { ok = true, result = result.Value }, JsonOptions);
         }
 
+        /// <summary>
+        /// The spec a script hands over, checked against the folder the script came from.
+        ///
+        /// A spec carries a level, and the level is written onto the Session — which means it is in force for every turn
+        /// after this one, long after the script that asked for it is gone. So the question "how deep does this reach"
+        /// has to be answered where the script's own depth is already known: a draft the model wrote must not be able to
+        /// name the kernel's level for a Session that then does the model's bidding. The folder decides, and it decides
+        /// here too — refused rather than quietly lowered, because a script that thinks it made a deep Session and did
+        /// not would go on to trust it.
+        /// </summary>
+        private async Task<SessionSpec> SessionSpecFromScriptAsync(string sessionSpecJson, string capability,
+            CancellationToken cancellationToken)
+        {
+            var spec = Parse<SessionSpec>(sessionSpecJson);
+            if (spec.Level <= mount.Package.Level) return spec;
+            await DenyAsync(capability,
+                $"This script is {AccessLevels.Describe(mount.Package.Level)} and asked for a "
+                + $"{AccessLevels.Describe(spec.Level)} Session. A Session is not opened from above the folder the script "
+                + "came from: the level would outlive this script and every turn after it.", cancellationToken);
+            return spec; // DenyAsync throws; this is here so the compiler sees an answer.
+        }
+
         private async Task<string> RunSessionCoreAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken)
         {
             await RequireCapabilityAsync(ScriptCapabilities.SessionRun, cancellationToken).ConfigureAwait(false);
@@ -1027,7 +1049,7 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
                 !channels.IsBound(current.Source, channelMessage.Binding.Adapter, channelMessage.Binding.PlatformConversationId) ||
                 !StringComparer.Ordinal.Equals(channelMessage.Text, userInput))
                 await DenyAsync(ScriptCapabilities.SessionRun, "Channel message does not match routed event.", cancellationToken).ConfigureAwait(false);
-            var spec = Parse<SessionSpec>(sessionSpecJson);
+            var spec = await SessionSpecFromScriptAsync(sessionSpecJson, ScriptCapabilities.SessionRun, cancellationToken).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(spec.ModelProfileId) &&
                 channels.Get(channelMessage.Channel).Value is { ModelProfile: { Length: > 0 } channelProfile })
                 spec = spec with { ModelProfileId = channelProfile };

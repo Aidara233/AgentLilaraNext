@@ -198,6 +198,11 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
 
     能力既是"我打算用什么"，也是"用别的会怎样"：没有声明的能力，调用时会被拒绝并留下一段审计记录。
 
+    有一样东西**不在**你能选的范围里：`ctx.session.run` / `ctx.session.activate` 那个 spec 里的 `level`。会话的等级
+    写在那份会话上，从今往后每一轮都生效——比你的脚本活得久。所以你能开出的会话不会比你自己深（`draft` / `live`
+    里的脚本 → `agent`）。写高了是一次**拒绝**，不是悄悄降级：一个以为自己造出了深会话的脚本会照着这个错误继续
+    信任它，所以宁可不做。
+
     ## 沙箱
 
     脚本在一个解释器里跑，没有 CLR 互操作、没有文件、没有网络、没有 `require`。可用的只有 `event`、`ctx`、
