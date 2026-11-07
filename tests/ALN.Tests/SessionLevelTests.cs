@@ -100,6 +100,32 @@ public sealed class SessionLevelTests : IDisposable
         Assert.False(Directory.Exists(Path.Combine(_root, "modules", "s-nope")));
     }
 
+    [Fact]
+    public async Task A_level_written_into_the_file_by_hand_is_in_force_when_the_Session_is_loaded()
+    {
+        // The other way a person gives a Session a level: they open module.json and type it. That file is the
+        // Session's own, so it wins over whatever a caller proposes — and it has to be readable spelled as a word.
+        var directory = Path.Combine(_root, "modules", "s-hand");
+        Directory.CreateDirectory(directory);
+        await File.WriteAllTextAsync(Path.Combine(directory, "module.json"), """
+            {
+              "id": "s-hand",
+              "type": "session.chat",
+              "config": {"modelProfileId": "default", "objective": "Answer briefly.", "formatVersion": "1", "level": "operator"}
+            }
+            """);
+
+        // The caller offers the default (agent) spec, which is what a fresh mount would carry.
+        var turn = await _sessions.TurnAsync("s-hand", Spec(), Guid.NewGuid(),
+            new SessionTurnInput([new("m-1", "user", "alice", "hello", DateTimeOffset.UtcNow)]), null, default);
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+        Assert.Equal(AccessLevel.Operator, Assert.Single(_recorder.Seen));
+
+        // And loading it once does not quietly rewrite the level back to the caller's proposal.
+        var spec = await File.ReadAllTextAsync(Path.Combine(directory, "module.json"));
+        Assert.Contains("\"level\": \"operator\"", spec);
+    }
+
     /// <summary>Remembers the level each round was assembled with. The whole point is that it is per round.</summary>
     private sealed class LevelRecorder : IFloatingContextSource
     {
