@@ -66,6 +66,21 @@ public sealed class ControlPlane(IAuditSink audit, ISignalLog signalLog) : ICont
 
         try
         {
+            // "You may delegate" must not become "you may promote yourself". A verb that hands out a level names the
+            // argument carrying it, and this is the one place that compares it with the caller's own — a handler that
+            // had to remember the rule would be a hole nobody could see from the outside.
+            if (entry.Descriptor.AssignsLevel is { Length: > 0 } assigns
+                && AssignedLevel(assigns, arguments) is { } handed && handed > actor.Level)
+            {
+                var overreach = $"Actor {actor.Id} is at {AccessLevels.Describe(actor.Level)} and cannot hand out "
+                    + $"{AccessLevels.Describe(handed)}: a level may only be given away at or below your own.";
+                await audit.AppendAsync(new(DateTimeOffset.UtcNow, Guid.Empty, actor.Id,
+                    new Address("control", "action", actionId), actionId, "denied", Describe(subject, overreach)),
+                    cancellationToken).ConfigureAwait(false);
+                await RecordAsync(actor, actionId, "denied", subject, overreach, cancellationToken).ConfigureAwait(false);
+                return Result<JsonElement>.Failure(new(ErrorCode.Denied, overreach));
+            }
+
             var result = await entry.Handler(arguments, cancellationToken).ConfigureAwait(false);
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, Guid.Empty, actor.Id,
                 new Address("control", "action", actionId), actionId, result.Ok ? "allowed" : "failed",
@@ -83,6 +98,24 @@ public sealed class ControlPlane(IAuditSink audit, ISignalLog signalLog) : ICont
             await RecordAsync(actor, actionId, "failed", subject, ex.Message, cancellationToken).ConfigureAwait(false);
             return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, $"Action failed: {actionId}", ex.Message));
         }
+    }
+
+    /// <summary>
+    /// The level an argument asks to hand out, or null when it says nothing readable — absent and unreadable both mean
+    /// "no opinion here", and the handler answers for its own arguments. Only a value above the caller's is this
+    /// class's business.
+    /// </summary>
+    private static AccessLevel? AssignedLevel(string argument, JsonElement arguments)
+    {
+        if (arguments.ValueKind != JsonValueKind.Object || !arguments.TryGetProperty(argument, out var value)) return null;
+        return value.ValueKind switch
+        {
+            JsonValueKind.Number when value.TryGetInt32(out var number) && Enum.IsDefined((AccessLevel)number)
+                => (AccessLevel)number,
+            JsonValueKind.String when Enum.TryParse<AccessLevel>(value.GetString(), ignoreCase: true, out var named)
+                => named,
+            _ => null
+        };
     }
 
     /// <summary>

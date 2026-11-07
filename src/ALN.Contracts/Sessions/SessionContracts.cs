@@ -25,7 +25,13 @@ public sealed record SessionSpec(
     string Objective,
     string FormatVersion,
     IReadOnlyDictionary<string, string>? Prompts = null,
-    IReadOnlyList<ModelToolDefinition>? Tools = null);
+    IReadOnlyList<ModelToolDefinition>? Tools = null,
+    /// <summary>
+    /// What this Session is trusted with. A Session created by nobody in particular is <see cref="AccessLevel.Agent"/>,
+    /// and that is the safe default on purpose: an operator raises a Session on purpose, and nobody raises their own.
+    /// It changes without a restart (sessions.setLevel) because it is one field, read when a turn is assembled.
+    /// </summary>
+    [property: JsonConverter(typeof(AccessLevelJson))] AccessLevel Level = AccessLevel.Agent);
 
 /// <summary>Persisted state. Phase is intentionally transient and is not stored here.</summary>
 public sealed record SessionState(
@@ -122,7 +128,13 @@ public sealed record RoundContextRequest(
     Guid ActivationId,
     int StepNumber,
     Address? Channel = null,
-    ChannelBinding? Binding = null);
+    ChannelBinding? Binding = null,
+    /// <summary>
+    /// The Session's level this round. Carried per round rather than captured once, because it is the one number an
+    /// operator may change while the Session runs: a source that cached it would keep offering what it was allowed
+    /// to offer when it started.
+    /// </summary>
+    AccessLevel Level = AccessLevel.Agent);
 
 /// <summary>Ephemeral context to render into this model request; it is never persisted in Session history.</summary>
 public sealed record RoundContextContribution(string Id, string Section, string Content, int Order = 0);
@@ -249,4 +261,9 @@ public interface ISessionManager
 public static class SessionActions
 {
     public const string List = "sessions.list";
+    /// <summary>
+    /// Raise or lower what one Session may reach. The only level anyone can change at runtime: an interface's level is
+    /// a fact about the code, so it takes a rebuild (and per script a re-mount, where the interface surface is settled).
+    /// </summary>
+    public const string SetLevel = "sessions.setLevel";
 }

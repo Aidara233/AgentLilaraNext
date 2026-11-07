@@ -749,7 +749,7 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             // offers are gathered before the model is shown anything. Assembly mistakes (a declared tool nobody
             // provides) fail here, before a single token is spent.
             var request = new RoundContextRequest(sessionId, activationId, state.StepNumber + 1,
-                input.Channel ?? PersistedChannel(state), input.Binding);
+                input.Channel ?? PersistedChannel(state), input.Binding, record.Spec.Level);
             var offered = await CollectToolsAsync(request, cancellationToken).ConfigureAwait(false);
             var resolved = ResolveTools(record.Spec, tools, offered);
             if (!resolved.Ok || resolved.Value is null) return Result<SessionTurnResult>.Failure(resolved.Error!);
@@ -1169,6 +1169,58 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                 : null;
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { return null; }
+    }
+
+    /// <summary>
+    /// Rewrites one Session's level on disk and answers with the one it had. There is no cache to invalidate: the spec
+    /// is read from disk when a turn is assembled, so the very next turn is already the first one under the new level —
+    /// which is what "change it while it runs" has to mean to be worth anything.
+    /// </summary>
+    public async ValueTask<Result<AccessLevel>> SetLevelAsync(string sessionId, AccessLevel level,
+        CancellationToken cancellationToken)
+    {
+        if (!IsValidSessionId(sessionId))
+            return Result<AccessLevel>.Failure(new(ErrorCode.Invalid, "Session id is invalid."));
+        string directory;
+        try { directory = ResolveSessionDirectory(sessionId); }
+        catch (IOException ex)
+        {
+            return Result<AccessLevel>.Failure(
+                new(ErrorCode.Conflict, "Session data exists in both old and new locations.", ex.Message));
+        }
+        // The spec is the thing being changed, so its absence is the answer: a name with nothing behind it must not
+        // become a directory just because somebody asked about it.
+        var spec = TryReadSpec(directory);
+        if (spec is null)
+            return Result<AccessLevel>.Failure(new(ErrorCode.Invalid, $"No Session is called {sessionId}."));
+        if (spec.Level == level) return Result<AccessLevel>.Success(spec.Level);
+
+        await WriteAtomicJsonAsync(Path.Combine(directory, ManifestFile), new
+        {
+            id = sessionId,
+            type = SessionTypeId,
+            config = spec with { Level = level }
+        }, cancellationToken).ConfigureAwait(false);
+
+        // The held record, when there is one, is what the next turn reads: writing the file and leaving memory behind
+        // would make the change take effect at the next restart, which nobody would call "immediately".
+        if (_loaded.TryGetValue(sessionId, out var held)) held.AdoptLevel(level);
+
+        // Recorded as a signal, not as a timeline entry: the conversation did not change, what the Session may reach did.
+        _signalLog.Write(new()
+        {
+            Group = "session",
+            Name = sessionId,
+            From = "operator",
+            Mechanism = "session.level",
+            Outcome = "changed",
+            Level = SignalLevel.Info,
+            Detail = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["from"] = spec.Level.ToString(), ["to"] = level.ToString()
+            }
+        });
+        return Result<AccessLevel>.Success(spec.Level);
     }
 
     public Result<SessionState> GetState(string sessionId)
@@ -2286,8 +2338,15 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
         private readonly List<SessionHistoryEntry> _history = [];
         private readonly HashSet<string> _ids = new(StringComparer.Ordinal);
 
-        public SessionSpec Spec { get; } = spec;
+        public SessionSpec Spec { get; private set; } = spec;
         public string Directory { get; } = directory;
+
+        /// <summary>
+        /// Takes a new level while the process runs. The level is the one field of a spec an operator changes mid-flight,
+        /// and this held record is what the next turn reads — leaving it stale would mean the change only lands after a
+        /// restart, which is the opposite of what the verb promises.
+        /// </summary>
+        public void AdoptLevel(AccessLevel level) => Spec = Spec with { Level = level };
         public SessionState State { get; set; } = null!;
         public IReadOnlyList<SessionHistoryEntry> History => _history;
 

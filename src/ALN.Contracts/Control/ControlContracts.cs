@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace ALN.Contracts;
 
@@ -44,6 +45,7 @@ public static class AccessLevels
         [Capabilities.ChannelsRead] = AccessLevel.Agent,
         [Capabilities.MessagesWrite] = AccessLevel.Agent,
         [Capabilities.SessionsRead] = AccessLevel.Agent,
+        [Capabilities.SessionsControl] = AccessLevel.Operator,
         [Capabilities.ModelsRead] = AccessLevel.Agent,
         [Capabilities.SignalsRead] = AccessLevel.Agent,
         [Capabilities.ParamsRead] = AccessLevel.Agent,
@@ -170,11 +172,17 @@ public sealed record Actor(string Id, ActorKind Kind, IReadOnlyList<string> Capa
 /// <c>modules.control</c>.
 /// </param>
 public sealed record ActionDescriptor(string Id, string Summary, string Capability, bool Mutating,
-    string? ParamsJson = null, string? Subject = null, AccessLevel? MinLevel = null)
+    string? ParamsJson = null, string? Subject = null, AccessLevel? MinLevel = null, string? AssignsLevel = null)
 {
     /// <summary>The level a caller must be at: the table answers for the family, this answers for the verb.</summary>
     public AccessLevel RequiredLevel => MinLevel ?? AccessLevels.Of(Capability);
 }
+
+/// <summary>
+/// Writes a level as its name and reads either the name or the number. A security setting that is a bare integer in a
+/// file a person opens is a setting somebody will get wrong: "3" and "1" look equally ordinary.
+/// </summary>
+public sealed class AccessLevelJson() : JsonStringEnumConverter<AccessLevel>(JsonNamingPolicy.CamelCase);
 
 /// <summary>
 /// Single execution point for every front-end (scripts today, the HTTP API next). Authorization,
@@ -220,6 +228,8 @@ public static class Capabilities
     public const string ModelsControl = "models.control";
     public const string SignalsRead = "signals.read";
     public const string SessionsRead = "sessions.read";
+    /// <summary>Changing what a Session is allowed to reach: its level. Never the level of an interface.</summary>
+    public const string SessionsControl = "sessions.control";
     public const string ArchiveRead = "archive.read";
     public const string ArchiveControl = "archive.control";
     public const string PromptsRead = "prompts.read";
