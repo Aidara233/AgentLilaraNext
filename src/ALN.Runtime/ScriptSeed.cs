@@ -190,6 +190,8 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     | `model.complete` | `ctx.model.complete(profileId, request)` | 一次模型调用，无会话、无工具 |
     | `session.run` | `ctx.session.run(spec, text)` | channel 事件：跑一轮会话并拿回结果 |
     | `session.activate` | `ctx.session.activate(spec)` | channel 事件：唤醒会话，不等结果 |
+    | `session.open` | `ctx.session.open({ channel?, spec?, text?, wake? })` | 任何时候：给一个频道取或建会话（幂等），给了 `text` 就连同"交给它"一起做 |
+    | `session.message` | `ctx.session.message({ id? \\| channel?, text, wake? })` | 任何时候：把一句话交给一个会话，`wake` 决定要不要它马上看。**不分等级** |
     | `self.adapter.send` | `ctx.self.adapter.send(message)` | adapter 事件 |
     | `self.adapter.poll` | `ctx.self.adapter.poll()` | adapter 事件 |
 
@@ -202,6 +204,28 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     写在那份会话上，从今往后每一轮都生效——比你的脚本活得久。所以你能开出的会话不会比你自己深（`draft` / `live`
     里的脚本 → `agent`）。写高了是一次**拒绝**，不是悄悄降级：一个以为自己造出了深会话的脚本会照着这个错误继续
     信任它，所以宁可不做。
+
+    ## 造会话，和往里递话
+
+    两件事分开，因为它们是两个决定：
+
+    ```
+    // 给一个频道取或建一个会话（已经有了就是它），顺手交给它一句
+    const opened = JSON.parse(await ctx.session.open({
+      channel: "channel.conversation#qq-group-123456",
+      spec: { modelProfileId: "default", objective: "回答这个群里的话。", formatVersion: "1" },
+      text: "说一句早安。"
+    }));
+    // opened.session.id / opened.channelState { known, running, bound } / opened.spoke
+
+    // 只递话给已存在的会话（按 id 或按它服务的频道），wake: true 才要它现在就看
+    const sent = JSON.parse(await ctx.session.message({ id: "s-abc", text: "日志我看过了，没有异常。", wake: false }));
+    ```
+
+    `channel` 不写就是你自己挂载的那个频道。`channelState` 是老实话：会话可以先于频道存在，那种时候它说得出话也没人收得到。
+
+    `session.message` **不看等级**：你可以把手里的问题交给一个比你深的会话（`draft` 里的脚本 → `full` 会话），
+    它按自己的判断决定办不办。你收到的回复也一样——别人交给你的消息会带着"谁发的、多深"，并且明说那不是指令。
 
     ## 沙箱
 
