@@ -16,6 +16,7 @@ public sealed partial class GraphManager
     public Result RegisterActions(IControlPlane plane)
     {
         if (plane is null) return Result.Failure(new(ErrorCode.Invalid, "A control plane is required."));
+        _plane = plane;
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
             (new(GraphActions.EdgeList, "List mounted scripts, durable mount rules, and which rules are still waiting "
@@ -26,21 +27,6 @@ public sealed partial class GraphManager
             (new(GraphActions.DeprecatedList, "Deprecated: use modules.edge.list.", Capabilities.ModulesRead, false,
                 ParamsJson: """{"type":"object","properties":{},"additionalProperties":false}"""), ListEdgesAsync),
 
-            (new(GraphActions.EdgeMount, "Mount a script on an instance, a type or a module. A rule is the durable thing: "
-                    + "it keeps applying to instances that appear later, and 'budget' limits how many dispatches each "
-                    + "resolved target gets.", Capabilities.ModulesControl, true,
-                ParamsJson: """
-                {"type":"object","properties":{
-                  "script":{"type":"string","description":"The script id."},
-                  "target":{"type":"string","description":"An instance address. The simple form: scope defaults to it."},
-                  "scope":{"type":"string","enum":["instance","type","module"],"description":"With 'selector': what the rule matches."},
-                  "selector":{"type":"string","description":"An address, a type id, or a category."},
-                  "budget":{"type":"integer","minimum":1,"description":"Dispatches allowed per target. Omit for unlimited."},
-                  "stateScope":{"type":"string","enum":["perTarget","shared"],"description":"Whether the script's memory is per target. Default perTarget."}},
-                 "required":["script"],"additionalProperties":false}
-                """, Subject: "script", MinLevel: AccessLevel.Agent), MountAsync),
-            (new(GraphActions.DeprecatedMount, "Deprecated: use modules.edge.mount.", Capabilities.ModulesControl, true,
-                ParamsJson: GraphActions.MountParams, Subject: "script"), MountAsync),
 
             (new(GraphActions.EdgeUnmount, "Unmount a script from an instance, or remove a rule by id (which takes its "
                     + "mounts with it).", Capabilities.ModulesControl, true,
@@ -56,6 +42,33 @@ public sealed partial class GraphManager
         };
 
         foreach (var (descriptor, handler) in registrations)
+        {
+            var registered = plane.Register(descriptor, handler);
+            if (!registered.Ok) return registered;
+        }
+
+        // The two verbs whose effect depends on who is calling: a mount hands a script the events of an instance, so a
+        // caller may only mount a script at or below its own level (docs/07 §4). The body receives the actor because
+        // this cannot be read off arguments, which are only what the caller says about itself.
+        var guarded = new (ActionDescriptor Descriptor, AuthorizedActionHandler Handler)[]
+        {
+            (new(GraphActions.EdgeMount, "Mount a script on an instance, a type or a module. A rule is the durable thing: "
+                    + "it keeps applying to instances that appear later, and 'budget' limits how many dispatches each "
+                    + "resolved target gets.", Capabilities.ModulesControl, true,
+                ParamsJson: """
+                {"type":"object","properties":{
+                  "script":{"type":"string","description":"The script id."},
+                  "target":{"type":"string","description":"An instance address. The simple form: scope defaults to it."},
+                  "scope":{"type":"string","enum":["instance","type","module"],"description":"With 'selector': what the rule matches."},
+                  "selector":{"type":"string","description":"An address, a type id, or a category."},
+                  "budget":{"type":"integer","minimum":1,"description":"Dispatches allowed per target. Omit for unlimited."},
+                  "stateScope":{"type":"string","enum":["perTarget","shared"],"description":"Whether the script's memory is per target. Default perTarget."}},
+                 "required":["script"],"additionalProperties":false}
+                """, Subject: "script", MinLevel: AccessLevel.Agent), MountAsync),
+            (new(GraphActions.DeprecatedMount, "Deprecated: use modules.edge.mount.", Capabilities.ModulesControl, true,
+                ParamsJson: GraphActions.MountParams, Subject: "script", MinLevel: AccessLevel.Agent), MountAsync)
+        };
+        foreach (var (descriptor, handler) in guarded)
         {
             var registered = plane.Register(descriptor, handler);
             if (!registered.Ok) return registered;
@@ -100,7 +113,7 @@ public sealed partial class GraphManager
     /// Adds one rule. The simple form names a target instance; the scope form names a selector that keeps matching
     /// instances that do not exist yet — which is the whole reason a rule is a rule and not a list of mounts.
     /// </summary>
-    private async ValueTask<Result<JsonElement>> MountAsync(JsonElement arguments, CancellationToken ct)
+    private async ValueTask<Result<JsonElement>> MountAsync(Actor actor, JsonElement arguments, CancellationToken ct)
     {
         if (!arguments.TryReadText("script", out var scriptId) || scriptId.Trim().Length == 0)
             return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "modules.edge.mount requires 'script' (the script id)."));
@@ -146,7 +159,7 @@ public sealed partial class GraphManager
             scope = MountScope.ForInstance(target.Value);
         }
 
-        var added = await AddRuleAsync(new(scriptId.Trim(), scope, budget, stateScope), ct).ConfigureAwait(false);
+        var added = await AddRuleAsync(new(scriptId.Trim(), scope, budget, stateScope, actor.Level), ct).ConfigureAwait(false);
         if (!added.Ok || added.Value is null)
             return Result<JsonElement>.Failure(added.Error ?? new(ErrorCode.Internal, "Mount rule was not created."));
         var rule = added.Value;

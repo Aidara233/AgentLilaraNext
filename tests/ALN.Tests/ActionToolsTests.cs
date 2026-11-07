@@ -168,6 +168,7 @@ public sealed class ActionToolsTests : IDisposable
     {
         public IReadOnlyList<ActionDescriptor> Catalog => inner.Catalog;
         public Result Register(ActionDescriptor descriptor, ActionHandler handler) => inner.Register(descriptor, handler);
+        public Result Register(ActionDescriptor descriptor, AuthorizedActionHandler handler) => inner.Register(descriptor, handler);
 
         public ValueTask<Result<JsonElement>> InvokeAsync(Actor actor, string action, JsonElement arguments,
             CancellationToken cancellationToken) =>

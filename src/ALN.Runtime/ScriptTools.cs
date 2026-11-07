@@ -144,8 +144,9 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
             new(new ReloadTool(this), ReloadDefinition, ActsExternally: false),
             // Mounting does change what a channel answers to from now on, but it says nothing to the conversation: the
             // next message does. Keeping it non-external is what lets a turn mount and then speak in the same step
-            // without the reply being taken for the effect.
-            new(new MountTool(this), MountDefinition, ActsExternally: false),
+            // without the reply being taken for the effect. The level travels with it: a Session mounts what it could be,
+            // not what somebody else is.
+            new(new MountTool(this, request.Level), MountDefinition, ActsExternally: false),
             new(new UnmountTool(this), UnmountDefinition, ActsExternally: false),
             // Reading addresses, for the same reason the mount tool exists: an address cannot be guessed, and the
             // moment a model can mount it needs to see what there is to mount onto.
@@ -237,7 +238,7 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
     /// move — and if the body then fails to load from its new place, the move is undone rather than leaving a rule
     /// pointing at something the catalogue no longer holds.
     /// </summary>
-    private sealed class MountTool(ScriptTools owner) : ISessionTool
+    private sealed class MountTool(ScriptTools owner, AccessLevel callerLevel) : ISessionTool
     {
         public string Name => MountToolName;
         public bool EndsTurn => false;
@@ -253,7 +254,7 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
                 return Result<SessionToolResult>.Failure(
                     new(ErrorCode.Invalid, "scripts_mount needs a 'target' instance address, e.g. channel.conversation#chat-auto."));
 
-            var mounted = await owner._graph.MountAsync(script, target, cancellationToken).ConfigureAwait(false);
+            var mounted = await owner._graph.MountAsync(script, target, cancellationToken, callerLevel).ConfigureAwait(false);
             if (!mounted.Ok) return Result<SessionToolResult>.Failure(mounted.Error!);
 
             var text = new StringBuilder($"Mounted {script} on {target}.");

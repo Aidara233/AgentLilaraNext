@@ -790,7 +790,8 @@ public sealed class ControlPlaneTests : IDisposable
     private sealed class FakeGraph(ScriptPackage? script = null) : IGraphRuntime
     {
         public ValueTask<Result> LoadAsync(IEnumerable<ScriptPackage> packages, CancellationToken ct) => ValueTask.FromResult(Result.Success());
-        public ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken ct) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken ct,
+            AccessLevel callerLevel = AccessLevel.Full) => ValueTask.FromResult(Result.Success());
         public ValueTask<Result> UnmountAsync(string scriptId, Address target, CancellationToken ct) => ValueTask.FromResult(Result.Success());
         public IReadOnlyList<MountedScript> Mounted => [];
         public IReadOnlyList<MountRule> Rules => [];

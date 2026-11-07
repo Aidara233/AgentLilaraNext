@@ -67,5 +67,12 @@ public sealed record MountRule(
 }
 
 /// <summary>A request to add a rule. The id and the timestamp belong to the graph, not the caller.</summary>
+/// <param name="CallerLevel">
+/// How deep the caller is. A mount hands a script the events of an instance, so mounting one deeper than yourself is the
+/// same privilege escalation as granting yourself its capabilities (docs/07 §4) — the graph answers it by refusing.
+/// The two doors that ask (the mount action and the model's mount tool) pass it; a request built in code is code, which
+/// is full.
+/// </param>
 public sealed record MountRequest(string ScriptId, MountScope Scope, int? Budget = null,
-    ScriptStateScope StateScope = ScriptStateScope.PerTarget);
+    ScriptStateScope StateScope = ScriptStateScope.PerTarget,
+    AccessLevel CallerLevel = AccessLevel.Full);

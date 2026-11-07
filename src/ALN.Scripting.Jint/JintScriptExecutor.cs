@@ -44,6 +44,8 @@ public sealed class JintScriptExecutor : IScriptExecutor
             engine.SetValue("__channelReply", new Func<string, Task<string>>(json => api.ReplyThroughChannelAsync(json, cancellationToken)));
             engine.SetValue("__channelRoute", new Func<string, Task<string>>(json => api.RouteIntoChannelAsync(json, cancellationToken)));
             engine.SetValue("__log", new Action<string, string, string>((level, message, detailJson) => api.Log(level, message, detailJson)));
+            engine.SetValue("__actionsList", new Func<Task<string>>(() => api.ListActionsAsync(cancellationToken)));
+            engine.SetValue("__actionsCall", new Func<string, string, Task<string>>((action, json) => api.CallActionAsync(action, json, cancellationToken)));
             // State is handed over as JSON text in both directions: the script decides what a value means,
             // the host only knows a namespace and a key.
             engine.SetValue("__stateGet", new Func<string, Task<string>>(key => api.ReadStateAsync(key, cancellationToken)));
@@ -74,6 +76,13 @@ public sealed class JintScriptExecutor : IScriptExecutor
                     warn: (message, detail) => __log("warn", String(message ?? ""), detail === undefined ? "" : JSON.stringify(detail)),
                     error: (message, detail) => __log("error", String(message ?? ""), detail === undefined ? "" : JSON.stringify(detail))
                   });
+                  // The control plane, as this script: listing says what exists and what is out of reach; calling is
+                  // authorized against the same table the model and a person are authorized against. A refusal comes
+                  // back as data, so a script can decide what to do next instead of dying on it.
+                  const actions = Object.freeze({
+                    list: async () => JSON.parse(await __actionsList()),
+                    call: async (id, args) => JSON.parse(await __actionsCall(String(id), args === undefined ? "{}" : JSON.stringify(args)))
+                  });
                   // The script's own durable memory: survives restarts, scoped by the host to this mount.
                   const state = Object.freeze({
                     get: async (key) => { const raw = await __stateGet(String(key)); return raw === "" ? undefined : JSON.parse(raw); },
@@ -87,6 +96,7 @@ public sealed class JintScriptExecutor : IScriptExecutor
                     channel: Object.freeze({ accept: () => acceptChannel(), route: (options) => routeChannel(JSON.stringify(options ?? {})), reply: (message) => replyChannel(JSON.stringify(message)) }),
                     log,
                     state,
+                    actions,
                     eventName
                   });
                   {{package.Source}}

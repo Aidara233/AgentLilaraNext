@@ -199,12 +199,26 @@ public interface IControlPlane
     /// </summary>
     Result Register(ActionDescriptor descriptor, ActionHandler handler);
 
+    /// <summary>
+    /// Registers a verb that needs to know who is calling it. Same table, same authorization, same record — the only
+    /// difference is that the body receives the actor the plane already built and authorized.
+    /// </summary>
+    Result Register(ActionDescriptor descriptor, AuthorizedActionHandler handler);
+
     ValueTask<Result<JsonElement>> InvokeAsync(Actor actor, string action, JsonElement arguments,
         CancellationToken cancellationToken);
 }
 
 /// <summary>A registered action body. Arguments are untrusted JSON; validate them here, not in transport.</summary>
 public delegate ValueTask<Result<JsonElement>> ActionHandler(JsonElement arguments, CancellationToken cancellationToken);
+
+/// <summary>
+/// The same, for a verb whose <b>effect</b> depends on who is calling — a mount, whose result hands a script the events
+/// of an instance. A handler that has to compare the caller's level with something else cannot do it from arguments
+/// alone, which are only what the caller says about itself.
+/// </summary>
+public delegate ValueTask<Result<JsonElement>> AuthorizedActionHandler(Actor actor, JsonElement arguments,
+    CancellationToken cancellationToken);
 
 /// <summary>Well-known capability names. Roles map onto these; actions name exactly one.</summary>
 public static class Capabilities

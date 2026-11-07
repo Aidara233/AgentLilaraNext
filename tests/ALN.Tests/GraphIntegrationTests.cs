@@ -1088,6 +1088,78 @@ public sealed class GraphIntegrationTests : IDisposable
         "async function onEvent(event, ctx) { await ctx.channel.accept(); }");
 
     /// <summary>A manual script: nothing attaches it, so it only runs once somebody mounts it by instance.</summary>
+    /// <summary>
+    /// A script reaches the action table as itself: its own id, what its manifest declared, the level its folder gave it.
+    /// The refusals arrive as data, so a script can plan around them — which is the difference between a door and a wall.
+    /// </summary>
+    [Fact]
+    public async Task A_script_asks_the_action_table_as_itself_and_reads_the_refusal()
+    {
+        var plane = new ControlPlane(_audit, _signals);
+        Assert.True(plane.Register(new("demo.read", "Reads.", Capabilities.ModulesRead, false),
+            (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(JsonSerializer.SerializeToElement(new { seen = 42 })))).Ok);
+        Assert.True(plane.Register(new("demo.deep", "Changes the world.", Capabilities.ModelsControl, true),
+            (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(JsonSerializer.SerializeToElement(new { ok = 1 })))).Ok);
+        // The graph keeps the plane it registers into, which is how the script reaches the same table.
+        Assert.True(_graph.RegisterActions(plane).Ok);
+
+        var prober = new ScriptPackage(
+            new("channel.prober", 1, "channel", MountMode.Manual, [EventNames.ChannelMessageAccepted], "onEvent",
+                [ScriptCapabilities.ChannelReply, Capabilities.ModulesRead], TrustDomain.Trusted),
+            """
+            async function onEvent(event, ctx) {
+              const listed = await ctx.actions.list();
+              const read = await ctx.actions.call("demo.read", {});
+              const deep = await ctx.actions.call("demo.deep", {});
+              await ctx.channel.reply({ platformConversationId: event.binding.platformConversationId, text: JSON.stringify({
+                level: listed.level,
+                listed: listed.actions.length,
+                reachableDeep: listed.actions.find(a => a.id === "demo.deep").reachable,
+                read: read.ok, seen: read.result.seen,
+                deepOk: deep.ok, code: deep.error && deep.error.code }) });
+            }
+            """,
+            // The model's level: the probe is standing in for a script the model wrote.
+            Level: AccessLevel.Agent);
+
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), prober], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        var channel = new Address("channel", "conversation", "chat-probe");
+        await AddChannelAsync(channel, "chat-probe");
+        Assert.True((await _graph.MountAsync("channel.prober", channel, default, AccessLevel.Agent)).Ok);
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+        await WriteInputAsync("chat-probe", "hi");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+
+        var sent = ReadOutbound(Assert.Single(Directory.GetFiles(
+            Path.Combine(_mailbox.Root, "outbox", "chat-probe"), "*.json"))).Text!;
+        // Exact substrings: JSON.stringify leaves no spaces, and the whole point is that the script could read every one
+        // of these values out of the answer it got.
+        Assert.Contains("\"level\":\"L0 agent\"", sent);
+        Assert.Contains("\"reachableDeep\":false", sent);
+        Assert.Contains("\"read\":true", sent);
+        Assert.Contains("\"seen\":42", sent);
+        Assert.Contains("\"deepOk\":false", sent);
+        Assert.Contains("\"code\":\"denied\"", sent);
+    }
+
+    [Fact]
+    public async Task A_script_may_not_declare_what_its_folder_does_not_reach()
+    {
+        static ScriptPackage Greedy() => new(
+            new("channel.greedy", 1, "channel", MountMode.Manual, [EventNames.ChannelMessageAccepted], "onEvent",
+                [Capabilities.ModelsControl], TrustDomain.Trusted),
+            "async function onEvent(event, ctx) { }",
+            Level: AccessLevel.Agent);
+
+        Assert.True((await _graph.LoadAsync([Greedy()], default)).Ok);
+        // Not catalogued, and the reason says which of the two halves failed — the load itself is an outcome, not a
+        // crash, so the rest of the folder still runs.
+        Assert.DoesNotContain(_graph.Scripts, entry => entry.Package.Manifest.Id == "channel.greedy");
+        Assert.Contains(_graph.RejectedScripts, issue => issue.Reason.Contains("L1 operator", StringComparison.Ordinal));
+    }
+
     private static ScriptPackage ManualTagger(string id, string text) => new(
         new(id, 1, "channel", MountMode.Manual, [EventNames.ChannelMessageAccepted], "onEvent",
             [ScriptCapabilities.ChannelReply], TrustDomain.Trusted),

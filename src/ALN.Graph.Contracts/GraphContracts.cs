@@ -21,7 +21,16 @@ public sealed record ScriptManifest(
 
 public sealed record ScriptPackage(ScriptManifest Manifest, string Source, string Fingerprint = "",
     /// <summary>Where it came from when that is not the operator's own script tree: "plugin:&lt;id&gt;".</summary>
-    string? Origin = null);
+    string? Origin = null,
+    /// <summary>
+    /// What this script is trusted with, decided by where it lives rather than by what its manifest says: the manifest
+    /// is a file the model can write, so a level read out of it would be a level the model grants itself. A script in
+    /// <c>scripts/draft</c> is the model's; one in <c>scripts/trusted</c> is a person's, vouched for by hand.
+    ///
+    /// The loader always sets this. The default is <see cref="AccessLevel.Full"/> because a package built in code is
+    /// code, and the folders are the only place the question has a second answer.
+    /// </summary>
+    AccessLevel Level = AccessLevel.Full);
 
 /// <summary>
 /// A rule resolved onto one instance. <paramref name="RuleId"/> is null for bundle mounts, which are not
@@ -34,7 +43,8 @@ public interface IGraphRuntime : IInstanceBindings
     ValueTask<Result> LoadAsync(IEnumerable<ScriptPackage> packages, CancellationToken cancellationToken);
 
     /// <summary>Mount a manual script on one instance. Equivalent to adding an instance-scoped rule.</summary>
-    ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken cancellationToken);
+    ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken cancellationToken,
+        AccessLevel callerLevel = AccessLevel.Full);
 
     /// <summary>Drop every mount of one script on one instance; an instance-scoped rule that produced them goes with it.</summary>
     ValueTask<Result> UnmountAsync(string scriptId, Address target, CancellationToken cancellationToken);
@@ -107,6 +117,19 @@ public interface IScriptApi
 
     /// <summary>Point log for script business narration. Level is info, warn or error; never throws.</summary>
     void Log(string level, string message, string? detailJson);
+
+    /// <summary>
+    /// The action table, as a JSON answer: what exists, what level each verb needs, and which of them this script can
+    /// reach. JSON in and JSON out because a script decides what a value means, and the host only knows the table.
+    /// </summary>
+    Task<string> ListActionsAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Runs one action as this script. Returns JSON — <c>{ ok, result }</c> or <c>{ ok: false, error }</c> — rather than
+    /// throwing: a refusal is something a script can route around, and an exception inside a script is a script that
+    /// stops mid-thought.
+    /// </summary>
+    Task<string> CallActionAsync(string action, string argumentsJson, CancellationToken cancellationToken);
 }
 
 /// <summary>

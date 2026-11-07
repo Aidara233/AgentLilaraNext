@@ -23,9 +23,22 @@ public sealed class ControlPlane(IAuditSink audit, ISignalLog signalLog) : ICont
         if (descriptor is null || string.IsNullOrWhiteSpace(descriptor.Id) || string.IsNullOrWhiteSpace(descriptor.Capability))
             return Result.Failure(new(ErrorCode.Invalid, "Action requires an id and a capability."));
         if (handler is null) return Result.Failure(new(ErrorCode.Invalid, "Action requires a handler."));
+        return Add(descriptor, new Entry(descriptor, handler, null));
+    }
+
+    public Result Register(ActionDescriptor descriptor, AuthorizedActionHandler handler)
+    {
+        if (descriptor is null || string.IsNullOrWhiteSpace(descriptor.Id) || string.IsNullOrWhiteSpace(descriptor.Capability))
+            return Result.Failure(new(ErrorCode.Invalid, "Action requires an id and a capability."));
+        if (handler is null) return Result.Failure(new(ErrorCode.Invalid, "Action requires a handler."));
+        return Add(descriptor, new Entry(descriptor, null, handler));
+    }
+
+    private Result Add(ActionDescriptor descriptor, Entry entry)
+    {
         lock (_gate)
         {
-            if (!_actions.TryAdd(descriptor.Id, new(descriptor, handler)))
+            if (!_actions.TryAdd(descriptor.Id, entry))
                 return Result.Failure(new(ErrorCode.Conflict, $"Action is already registered: {descriptor.Id}"));
         }
         return Result.Success();
@@ -81,7 +94,9 @@ public sealed class ControlPlane(IAuditSink audit, ISignalLog signalLog) : ICont
                 return Result<JsonElement>.Failure(new(ErrorCode.Denied, overreach));
             }
 
-            var result = await entry.Handler(arguments, cancellationToken).ConfigureAwait(false);
+            var result = entry.Authorized is { } authorized
+                ? await authorized(actor, arguments, cancellationToken).ConfigureAwait(false)
+                : await entry.Handler!(arguments, cancellationToken).ConfigureAwait(false);
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, Guid.Empty, actor.Id,
                 new Address("control", "action", actionId), actionId, result.Ok ? "allowed" : "failed",
                 Describe(subject, result.Ok ? null : result.Error?.Message)), cancellationToken).ConfigureAwait(false);
@@ -170,5 +185,5 @@ public sealed class ControlPlane(IAuditSink audit, ISignalLog signalLog) : ICont
         return ValueTask.CompletedTask;
     }
 
-    private sealed record Entry(ActionDescriptor Descriptor, ActionHandler Handler);
+    private sealed record Entry(ActionDescriptor Descriptor, ActionHandler? Handler, AuthorizedActionHandler? Authorized);
 }

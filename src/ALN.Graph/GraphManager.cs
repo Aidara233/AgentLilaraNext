@@ -16,7 +16,19 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
     public ModuleId Id { get; } = new(GraphManagerId);
 
     private static readonly HashSet<string> AllowedCapabilities = new(StringComparer.Ordinal)
-    { ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept, ScriptCapabilities.ChannelRoute, ScriptCapabilities.ChannelReply, ScriptCapabilities.ModelComplete, ScriptCapabilities.SessionRun, ScriptCapabilities.SessionActivate };
+    {
+        // The script's own ctx, then the action table it may ask about. Both are needed: a list that only knows the ctx
+        // could not say "you may read the graph", and a script that cannot name what it reaches cannot be checked.
+        ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept,
+        ScriptCapabilities.ChannelRoute, ScriptCapabilities.ChannelReply, ScriptCapabilities.ModelComplete,
+        ScriptCapabilities.SessionRun, ScriptCapabilities.SessionActivate,
+        Capabilities.SystemRead, Capabilities.AdaptersRead, Capabilities.AdaptersControl, Capabilities.ChannelsRead,
+        Capabilities.ChannelsControl, Capabilities.MessagesWrite, Capabilities.GraphRead, Capabilities.GraphControl,
+        Capabilities.ModulesRead, Capabilities.ModulesControl, Capabilities.ParamsRead, Capabilities.ParamsWrite,
+        Capabilities.ModelsRead, Capabilities.ModelsControl, Capabilities.SignalsRead, Capabilities.SessionsRead,
+        Capabilities.SessionsControl, Capabilities.ArchiveRead, Capabilities.ArchiveControl, Capabilities.PromptsRead,
+        Capabilities.PromptsWrite
+    };
     private readonly ICatalog _catalog;
     private readonly IModuleTypeCatalog _types;
     private readonly IScriptExecutor _executor;
@@ -33,6 +45,12 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
     private readonly Dictionary<Address, int> _activeDispatches = new();
     private readonly Dictionary<Address, TaskCompletionSource> _dispatchDrained = new();
     private readonly IStateStore? _state;
+    /// <summary>
+    /// The action table, kept from <see cref="RegisterActions"/> so a script can reach it. Held here rather than passed
+    /// per call because the graph already owns the verbs it registers into it: the plane is the same object, and a
+    /// second reference would be a second thing to keep in step.
+    /// </summary>
+    private IControlPlane? _plane;
     private readonly IRestoreReporter _report;
     private bool _loaded;
     private bool _rulesRestored;
@@ -167,6 +185,12 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
                 return Result<MountRule>.Failure(new(ErrorCode.Denied, "Default scripts are mounted by instance lifecycle."));
             if (!IsEnabled(package))
                 return Result<MountRule>.Failure(new(ErrorCode.Denied, $"Script {request.ScriptId} is switched off."));
+            // Mounting is borrowing: the script answers events as itself, with its own capabilities. Letting an agent
+            // wire a script that is deeper than the agent would hand it those capabilities one event at a time.
+            if (package.Level > request.CallerLevel)
+                return Result<MountRule>.Failure(new(ErrorCode.Denied,
+                    $"Script {request.ScriptId} is {AccessLevels.Describe(package.Level)} and this caller is "
+                    + $"{AccessLevels.Describe(request.CallerLevel)}: a script cannot be mounted from above its own level."));
             if (request.Budget is < 1)
                 return Result<MountRule>.Failure(new(ErrorCode.Invalid, $"Budget must be at least 1 or absent: {request.Budget}"));
             if (CheckScope(request.Scope) is { } scopeError) return Result<MountRule>.Failure(scopeError);
@@ -332,6 +356,15 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         if (m.Capabilities is null || m.Capabilities.Any(c => !AllowedCapabilities.Contains(c)))
             return $"Unsupported capability: {string.Join(", ", m.Capabilities ?? [])}. " +
                    $"Allowed: {string.Join(", ", AllowedCapabilities.Order(StringComparer.Ordinal))}.";
+        // What a script declares it may reach, it may only declare at its own level. A draft script lives at the model's
+        // level, so "read the graph" is available to it and "rewrite a provider" is not — and the refusal happens when
+        // the file is loaded, not when the call is attempted, because a script that can never succeed should say so
+        // where somebody is looking at it.
+        var tooDeep = m.Capabilities.FirstOrDefault(c => AccessLevels.Of(c) > package.Level);
+        if (tooDeep is not null)
+            return $"Capability '{tooDeep}' needs {AccessLevels.Describe(AccessLevels.Of(tooDeep))}, and this script is "
+                   + $"{AccessLevels.Describe(package.Level)}: a script reaches what the folder it came from reaches "
+                   + "(scripts/trusted is a person vouching for it; draft and live are the model's own).";
         if (m.Mount is not (MountMode.Default or MountMode.Manual)) return $"Unknown mount mode: {m.Mount}.";
         if (string.IsNullOrWhiteSpace(package.Source) || package.Source.Length > 256_000) return "Empty or oversized source.";
         // A draft is written by whoever may write the draft folder, so it may not take a type over by itself: what a
@@ -631,9 +664,11 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         finally { _gate.Release(); }
     }
 
-    public async ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken cancellationToken)
+    public async ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken cancellationToken,
+        AccessLevel callerLevel = AccessLevel.Full)
     {
-        var added = await AddRuleAsync(new MountRequest(scriptId, MountScope.ForInstance(target)), cancellationToken).ConfigureAwait(false);
+        var added = await AddRuleAsync(new MountRequest(scriptId, MountScope.ForInstance(target), CallerLevel: callerLevel),
+            cancellationToken).ConfigureAwait(false);
         return added.Ok ? Result.Success() : Result.Failure(added.Error!);
     }
 
@@ -729,7 +764,7 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
                 using (SignalScope.Enter(invocationId, routedEvent.EventId))
                 {
                     var api = new ScriptApi(Adapters, Channels, _audit, _signalLog, Models, Sessions, mount, routedEvent,
-                        stateScopes[handlerIndex], _state, deadline.Token);
+                        stateScopes[handlerIndex], _state, _plane, deadline.Token);
                     result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
                 }
                 // The record settles after the handler returns, but its id existed during it, so
@@ -799,8 +834,76 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
 
     private sealed class ScriptApi(IAdapterManager adapters, IChannelManager channels, IAuditSink audit,
         ISignalLog signalLog, IModelManager? models, ISessionManager? sessions, MountedScript mount, RoutedEvent current,
-        string? stateScope, IStateStore? state, CancellationToken ct) : IScriptApi
+        string? stateScope, IStateStore? state, IControlPlane? plane, CancellationToken ct) : IScriptApi
     {
+        /// <summary>
+        /// The action table, as this script: its own id, the capabilities its manifest declared, and the level its folder
+        /// gave it. The plane does the authorizing, so what a script may reach cannot drift from what the model or a
+        /// person may reach — one table, one comparison, one audit.
+        /// </summary>
+        private Actor Self => new(mount.Package.Manifest.Id, ActorKind.Script,
+            mount.Package.Manifest.Capabilities, mount.Package.Level);
+
+        public Task<string> ListActionsAsync(CancellationToken cancellationToken)
+        {
+            var missing = MissingPlane();
+            if (missing is not null) return Task.FromResult(missing);
+            cancellationToken.ThrowIfCancellationRequested();
+            // The same question a listing tool asks, answered for this caller: what exists, what it needs, and what is
+            // out of reach is named rather than hidden — a script that cannot see the table cannot ask about it.
+            var actions = plane!.Catalog.Select(action => new
+            {
+                id = action.Id,
+                capability = action.Capability,
+                level = AccessLevels.Describe(action.RequiredLevel),
+                reachable = Self.Allows(action.Capability) && Self.Level >= action.RequiredLevel,
+                mutating = action.Mutating,
+                summary = action.Summary,
+                args = action.ParamsJson
+            }).ToArray();
+            return Task.FromResult(JsonSerializer.Serialize(new { ok = true, level = AccessLevels.Describe(Self.Level), actions }, JsonOptions));
+        }
+
+        public async Task<string> CallActionAsync(string action, string argumentsJson, CancellationToken cancellationToken)
+        {
+            var missing = MissingPlane();
+            if (missing is not null) return missing;
+            if (string.IsNullOrWhiteSpace(action))
+                return JsonSerializer.Serialize(new { ok = false, error = new { code = "invalid", message = "actions.call needs an id." } }, JsonOptions);
+            JsonElement arguments;
+            try
+            {
+                arguments = string.IsNullOrWhiteSpace(argumentsJson)
+                    ? JsonSerializer.SerializeToElement(new { })
+                    : JsonSerializer.Deserialize<JsonElement>(argumentsJson);
+            }
+            catch (JsonException ex)
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = new { code = "invalid", message = "arguments must be JSON.", detail = ex.Message } }, JsonOptions);
+            }
+
+            var called = await plane!.InvokeAsync(Self, action.Trim(), arguments, cancellationToken).ConfigureAwait(false);
+            // The refusal reaches the script as data, not as a thrown exception: a script that can read "denied, and why"
+            // can decide what to do next, which is the whole reason to give it the door at all. The code is a word, not
+            // the number an enum would serialize to — the reader is a script somebody wrote, or a model reading one.
+            return called.Ok
+                ? JsonSerializer.Serialize(new { ok = true, result = called.Value }, JsonOptions)
+                : JsonSerializer.Serialize(new
+                {
+                    ok = false,
+                    error = new
+                    {
+                        code = called.Error?.Code.ToString().ToLowerInvariant(),
+                        message = called.Error?.Message,
+                        detail = called.Error?.Detail
+                    }
+                }, JsonOptions);
+        }
+
+        private string? MissingPlane() => plane is null
+            ? JsonSerializer.Serialize(new { ok = false, error = new { code = "unavailable", message = "This host has no control plane." } }, JsonOptions)
+            : null;
+
         /// <summary>
         /// Script state: the component owns the meaning, the host owns where it lives. Keys are encoded, not
         /// trusted, and the size is capped — this is memory for a mounted script, not an artifact store.
@@ -1476,16 +1579,17 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
         {
             var roots = new[]
             {
-                (Path.Combine(programRoot, "resources", "scripts", "builtin"), TrustDomain.Builtin, (string?)"bundled"),
-                (Path.Combine(dataRoot, "scripts", "trusted"), TrustDomain.Trusted, (string?)"user"),
+                (Path.Combine(programRoot, "resources", "scripts", "builtin"), TrustDomain.Builtin, AccessLevel.Full, (string?)"bundled"),
+                // A person wrote these, or vouched for them by moving them here. That is the whole of the decision.
+                (Path.Combine(dataRoot, "scripts", "trusted"), TrustDomain.Trusted, AccessLevel.Full, (string?)"user"),
                 // Written by the model and in effect: the mount moved it here, which is why being in this folder and
-                // being mounted are the same fact.
-                (Path.Combine(dataRoot, "scripts", "live"), TrustDomain.Trusted, (string?)"live"),
-                (Path.Combine(dataRoot, "scripts", "draft"), TrustDomain.Trusted, (string?)"draft"),
-                (Path.Combine(dataRoot, "scripts", "restricted"), TrustDomain.Restricted, (string?)"user")
+                // being mounted are the same fact. Still the model's script, so still the model's level.
+                (Path.Combine(dataRoot, "scripts", "live"), TrustDomain.Trusted, AccessLevel.Agent, (string?)"live"),
+                (Path.Combine(dataRoot, "scripts", "draft"), TrustDomain.Trusted, AccessLevel.Agent, (string?)"draft"),
+                (Path.Combine(dataRoot, "scripts", "restricted"), TrustDomain.Restricted, AccessLevel.Full, (string?)"user")
             };
-            foreach (var (root, expectedDomain, origin) in roots)
-                await LoadRootAsync(root, expectedDomain, origin, packages, seen, issues, cancellationToken).ConfigureAwait(false);
+            foreach (var (root, expectedDomain, level, origin) in roots)
+                await LoadRootAsync(root, expectedDomain, level, origin, packages, seen, issues, cancellationToken).ConfigureAwait(false);
 
             // Scripts shipped inside a plugin: dropping the plugin in is the trust decision, so they must declare
             // "trusted" — a shipped script cannot claim to be builtin. They are not written by the operator, so
@@ -1498,8 +1602,8 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
                     cancellationToken.ThrowIfCancellationRequested();
                     var scriptsRoot = Path.Combine(plugin, "scripts");
                     if (!Directory.Exists(scriptsRoot)) continue;
-                    await LoadRootAsync(scriptsRoot, TrustDomain.Trusted, "plugin:" + Path.GetFileName(plugin), packages, seen, issues,
-                        cancellationToken).ConfigureAwait(false);
+                    await LoadRootAsync(scriptsRoot, TrustDomain.Trusted, AccessLevel.Full, "plugin:" + Path.GetFileName(plugin),
+                        packages, seen, issues, cancellationToken).ConfigureAwait(false);
                 }
             }
             _issues = issues;
@@ -1520,7 +1624,7 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
     /// that refuses to load costs every other script too, and the caller finds out at the next start — a typo in one
     /// file should not be a host that will not boot (docs/25 §6).
     /// </summary>
-    private static async ValueTask LoadRootAsync(string root, TrustDomain expectedDomain, string? origin,
+    private static async ValueTask LoadRootAsync(string root, TrustDomain expectedDomain, AccessLevel level, string? origin,
         List<ScriptPackage> packages, Dictionary<string, (string Path, TrustDomain Domain)> seen, List<ScriptIssue> issues,
         CancellationToken cancellationToken)
     {
@@ -1578,7 +1682,7 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
                 packages.Add(new(new(manifest.Id, manifest.Version, manifest.TargetType, manifest.Mount, manifest.Events,
                     manifest.EntryPoint, manifest.Capabilities, manifest.TrustDomain, manifest.MaxStatements,
                     manifest.TimeoutMilliseconds, manifest.MemoryLimitBytes), source, fingerprint,
-                    origin));
+                    origin, level));
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
             {
