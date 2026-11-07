@@ -82,7 +82,7 @@ public static class ScheduleActions
                   "until":{"type":"string","description":"ISO-8601 instant after which it no longer fires."}},
                  "required":["kind","expression","timeZone","target","targetId"],"additionalProperties":false}
                 """, Subject: "id"),
-                async (_, arguments, ct) => await SetAsync(arguments, store, clock.GetUtcNow(), ct).ConfigureAwait(false)),
+                async (actor, arguments, ct) => await SetAsync(actor, arguments, store, clock.GetUtcNow(), ct).ConfigureAwait(false)),
 
             (new(Cancel, "Remove one schedule. Saying it again is not an error: gone is the outcome that was wanted.",
                 Capabilities.SchedulesControl, true,
@@ -107,7 +107,7 @@ public static class ScheduleActions
         return Result.Success();
     }
 
-    private static async ValueTask<Result<JsonElement>> SetAsync(JsonElement arguments, ScheduleStore store,
+    private static async ValueTask<Result<JsonElement>> SetAsync(Actor actor, JsonElement arguments, ScheduleStore store,
         DateTimeOffset now, CancellationToken ct)
     {
         if (!arguments.TryReadText("kind", out var kindText) ||
@@ -179,7 +179,10 @@ public static class ScheduleActions
                 : null,
             Payload: arguments.TryReadText("payload", out var payload) && payload.Length > 0 ? payload : null,
             MaxRuns: maxRuns,
-            Until: until);
+            Until: until,
+            // Who wrote this version. A rule decides what happens with nobody in the room, so "who decided that" is
+            // part of the row rather than only a line in an audit log that has since rotated.
+            CreatedBy: string.IsNullOrWhiteSpace(actor.Id) ? null : actor.Id);
 
         var stored = await store.SetAsync(draft, now, ct).ConfigureAwait(false);
         if (!stored.Ok) return Result<JsonElement>.Failure(stored.Error!);
