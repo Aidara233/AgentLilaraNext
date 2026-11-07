@@ -126,6 +126,15 @@ public sealed class JintScriptExecutor : IScriptExecutor
             .LimitMemory(package.Manifest.MemoryLimitBytes)
             .TimeoutInterval(TimeSpan.FromMilliseconds(package.Manifest.TimeoutMilliseconds))
             .CancellationToken(cancellationToken);
+        // How long one await may sit on a host call. Jint's default here is ten seconds, which is not "no limit": a
+        // script whose whole job is to wait for something slow — channel.chat waits for a whole Session turn — was cut
+        // off at ten seconds while the work it started kept going, so every reply slower than that left a failed
+        // dispatch behind it and no record of why. The manifest's timeout is the number already meant to bound this
+        // handler (GraphManager arms the same value as the dispatch deadline), so it is the number used here too:
+        // a script that needs longer says so in its manifest, where a person can read it, instead of discovering a
+        // hidden ten seconds.
+        if (package.Manifest.TimeoutMilliseconds > 0)
+            options.Constraints.PromiseTimeout = TimeSpan.FromMilliseconds(package.Manifest.TimeoutMilliseconds);
         return new Engine(options);
     }
 }

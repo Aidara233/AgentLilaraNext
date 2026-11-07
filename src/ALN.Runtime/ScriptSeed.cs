@@ -204,6 +204,10 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     语言本身和 `JSON`。执行还受 `maxStatements` / `timeoutMilliseconds` / `memoryLimitBytes` 限制——超了是一次失败，
     不是一次等待。写循环之前先想清楚它会不会停下来。
 
+    `timeoutMilliseconds` 管的是**整个 handler**，包括等宿主的那段时间（等一轮会话、等一次模型调用）。除此之外
+    没有别的隐藏上限：要是你的脚本本来就要等很久（一轮会话可以慢到一分钟以上），把这条写大，别去猜。默认是
+    1000 毫秒，最多 60000。
+
     ## 最小可用例子
 
     `manifest.json`：

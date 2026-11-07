@@ -787,7 +787,13 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
                         ["event"] = routedEvent.Name,
                         ["script"] = mount.Package.Manifest.Id,
                         ["code"] = result.Error?.Code.ToString() ?? "unknown",
-                        ["message"] = result.Error?.Message ?? ""
+                        ["message"] = result.Error?.Message ?? "",
+                        // Why it failed is the only thing anyone reading this record wants, and it used to be dropped
+                        // here: a script that threw said "Script execution failed." and nothing else, which is not a
+                        // record of anything. Same reason the host's budget is written down beside it.
+                        ["detail"] = result.Error?.Detail ?? "",
+                        ["timeoutMs"] = mount.Package.Manifest.TimeoutMilliseconds.ToString(
+                            System.Globalization.CultureInfo.InvariantCulture)
                     }
                 });
                 if (!result.Ok) firstFailure ??= result.Error;
