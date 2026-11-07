@@ -151,9 +151,10 @@ public sealed class ScheduleSweepTests
         var targets = new Targets { Refuse = new(ErrorCode.Conflict, "Session s-1 is busy.", Retryable: true) };
         var sweep = new ScheduleSweep(store, targets);
 
+        // The pass starts the row and moves on; the row is where the outcome lands.
         var report = await sweep.PulseAsync(Now.AddHours(1), default);
-        Assert.Equal(1, report.Value!.Skipped);
-        Assert.Equal(0, report.Value.Fired);
+        await sweep.DrainAsync();
+        Assert.Equal(1, report.Value!.Fired);
         var after = await store.GetAsync(set.Value!.Id, default);
         Assert.Equal(0, after.Value!.Runs);
         Assert.Equal(1, after.Value.Skipped);
@@ -169,7 +170,8 @@ public sealed class ScheduleSweepTests
         var sweep = new ScheduleSweep(store, targets);
 
         var report = await sweep.PulseAsync(Now.AddHours(1), default);
-        Assert.Equal(1, report.Value!.Failed);
+        await sweep.DrainAsync();
+        Assert.Equal(1, report.Value!.Fired);
         var after = await store.GetAsync(set.Value!.Id, default);
         Assert.Equal(1, after.Value!.Runs);
         Assert.Equal("failed", after.Value.LastOutcome);
@@ -185,16 +187,15 @@ public sealed class ScheduleSweepTests
         var targets = new Targets { Block = true };
         var sweep = new ScheduleSweep(store, targets);
 
-        // First pass holds the row open; a second pass while it is still in flight must skip.
-        var first = sweep.PulseAsync(Now.AddMinutes(1), default).AsTask();
-        await Task.Delay(50);
+        // First pass starts the row and does not wait for it; a second pass while it is still in flight must skip.
+        var first = await sweep.PulseAsync(Now.AddMinutes(1), default);
+        Assert.Equal(1, first.Value!.Fired);
         var second = await sweep.PulseAsync(Now.AddMinutes(1), default);
         Assert.Equal(1, second.Value!.Skipped);
         Assert.Equal(0, second.Value.Fired);
 
         targets.Hold.SetResult();
-        var firstReport = await first;
-        Assert.Equal(1, firstReport.Value!.Fired);
+        await sweep.DrainAsync();
         var after = await store.GetAsync(set.Value!.Id, default);
         Assert.Equal(1, after.Value!.Runs);
         Assert.Equal(1, after.Value.Skipped);

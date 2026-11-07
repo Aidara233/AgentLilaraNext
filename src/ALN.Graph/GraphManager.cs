@@ -344,8 +344,17 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         if (string.IsNullOrWhiteSpace(m.TargetType) || !_types.IsKnownAbstract(m.TargetType))
             return $"targetType must be a known abstract type, and '{m.TargetType}' is not one.";
         if (m.Events is null || m.Events.Length == 0) return "A script must declare at least one event.";
-        if (m.Events.Any(e => e is not (EventNames.AdapterEnvelope or EventNames.ChannelMessageAccepted)))
-            return $"Unknown event; the only ones are {EventNames.AdapterEnvelope} and {EventNames.ChannelMessageAccepted}.";
+        // A schedule fires an event too, and a script that wants to run on a rhythm is the main reason to have one:
+        // without this line the sweep dispatches an event nothing is allowed to listen for. Channel targets only —
+        // an adapter envelope is something an adapter produces, not something a clock can hand over.
+        if (m.Events.Any(e => e is not (EventNames.AdapterEnvelope or EventNames.ChannelMessageAccepted
+                or EventNames.ScheduleDue)))
+            return $"Unknown event; the ones a script may declare are {EventNames.AdapterEnvelope}, " +
+                   $"{EventNames.ChannelMessageAccepted} and {EventNames.ScheduleDue}.";
+        if (m.Events.Contains(EventNames.ScheduleDue, StringComparer.Ordinal) &&
+            !string.Equals(m.TargetType, "channel", StringComparison.Ordinal))
+            return $"{EventNames.ScheduleDue} is dispatched to a Channel instance; a schedule targeting " +
+                   $"'{m.TargetType}' would never reach this script.";
         if (string.IsNullOrWhiteSpace(m.EntryPoint)) return "A script needs an entry point.";
         if (m.MaxStatements is < 1 or > 1_000_000) return $"maxStatements must be 1..1000000 (got {m.MaxStatements}).";
         if (m.TimeoutMilliseconds is < 1 or > 60_000) return $"timeoutMilliseconds must be 1..60000 (got {m.TimeoutMilliseconds}).";

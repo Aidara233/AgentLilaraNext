@@ -16,26 +16,36 @@ public interface IScheduleTargets
     ValueTask<Result> DispatchAsync(Address source, string payloadJson, CancellationToken cancellationToken);
 }
 
-/// <summary>What one pass of the schedule sweep did. Reported rather than logged, so "found nothing" and "never ran"
-/// cannot look the same from outside.</summary>
+/// <summary>
+/// What one pass of the schedule sweep did. Reported rather than logged, so "found nothing" and "never ran" cannot look
+/// the same from outside.
+///
+/// <paramref name="Fired"/> counts the rows this pass <b>started</b>, not the ones that finished: a wake that runs a
+/// whole turn takes as long as the model takes, and waiting for it in the pass is how one slow Session stops every other
+/// schedule. The outcome lands in the row, in the signal, and — for a test that needs to see it — behind
+/// <see cref="ScheduleSweep.DrainAsync"/>.
+/// </summary>
 public sealed record ScheduleSweepReport(int Due, int Fired, int Skipped, int Missed, int Failed, int Unhandled)
 {
     public bool AnythingHappened => Due > 0;
 }
 
 /// <summary>
-/// One pass over the stored schedules: what is due, fire it, write down what happened.
+/// One pass over the stored schedules: what is due, start it, and write down what happened when it comes back.
 ///
-/// The three decisions this class is made of:
+/// The four decisions this class is made of:
 /// <list type="number">
+/// <item><b>Nothing waits for anything.</b> Each due row is dispatched on its own task. Waking a Session means running a
+/// turn, and a turn is as long as the model makes it — measured on a real host at seventeen model calls. Awaiting that
+/// inside the pass held every other schedule behind it, which is exactly the failure the scheduler must not have.</item>
 /// <item><b>Missed beats are counted, not replayed.</b> A host that was down three days runs an hourly rule once and
-/// records how many beats it slept through; the alternative is an afternoon of catch-up nobody asked for.</item>
-/// <item><b>A row does not overlap itself.</b> If the previous firing of the same row is still running, this one is
-/// skipped and counted — script dispatch is a single-file event stream and queueing beats turns one slow run into a
-/// backlog.</item>
-/// <item><b>Every firing advances the row, success or not.</b> A target that keeps failing must not become a hot loop
-/// that retries every thirty seconds; the row records the failure and moves to its next beat. The one exception is a
-/// busy Session, which is a "try again in a moment" rather than a failure — it is skipped, and the next pass retries.</item>
+/// records how many beats it slept through.</item>
+/// <item><b>A row does not overlap itself.</b> While a row's firing is still in flight, later beats are skipped and
+/// counted. A claim older than <see cref="MaxRunTime"/> is reported as stalled rather than re-dispatched: a second
+/// concurrent run of the same rule is worse than a missed one.</item>
+/// <item><b>Every completion advances the row, success or not.</b> A target that keeps failing must not become a hot
+/// loop that retries every thirty seconds. The exception is a busy Session, which is a "try again in a moment": it is
+/// skipped and left due.</item>
 /// </list>
 /// </summary>
 public sealed class ScheduleSweep(ScheduleStore store, IScheduleTargets? targets, ISignalLog? signals = null)
@@ -43,7 +53,14 @@ public sealed class ScheduleSweep(ScheduleStore store, IScheduleTargets? targets
     /// <summary>How often the host looks. Coarse on purpose: schedules are promises measured in minutes and hours.</summary>
     public static readonly TimeSpan Interval = TimeSpan.FromSeconds(30);
 
-    private readonly HashSet<string> _running = new(StringComparer.Ordinal);
+    /// <summary>
+    /// How long a firing may stay in flight before the row is called stalled. Ten minutes is longer than any turn should
+    /// take and shorter than "forever", which is the point: a wedge must show up as a number, not as silence.
+    /// </summary>
+    public static readonly TimeSpan MaxRunTime = TimeSpan.FromMinutes(10);
+
+    private readonly Dictionary<string, (DateTimeOffset Started, Task Work)> _inflight = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTimeOffset> _stallNoticed = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     public async ValueTask<Result<ScheduleSweepReport>> PulseAsync(DateTimeOffset now, CancellationToken cancellationToken)
@@ -61,80 +78,161 @@ public sealed class ScheduleSweep(ScheduleStore store, IScheduleTargets? targets
         foreach (var row in rows)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            // One row at a time: two passes of the sweep would otherwise both fire the same beat.
-            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-            var claim = false;
-            try { claim = _running.Add(row.Id); }
-            finally { _gate.Release(); }
-            if (!claim)
+            if (!await ClaimAsync(row, now, cancellationToken).ConfigureAwait(false))
             {
+                // Still in flight from an earlier pass: count the skip in the row and in the report, and leave it claimed.
                 await store.RecordSkipAsync(row.Id, now, cancellationToken).ConfigureAwait(false);
                 Write(row, "skipped", now, "the previous firing of this row is still running");
                 skipped++;
                 continue;
             }
 
-            try
+            var spec = ScheduleSpec.Parse(row.Kind, row.Expression, row.TimeZone, row.CreatedAt, row.Days);
+            if (!spec.Ok)
             {
-                var spec = ScheduleSpec.Parse(row.Kind, row.Expression, row.TimeZone, row.CreatedAt, row.Days);
-                if (!spec.Ok)
-                {
-                    // Stored rows were validated when written; one that no longer parses means this build reads the
-                    // expression differently. Say so and turn it off rather than firing on a guess.
-                    await store.RecordRunAsync(row.Id, now, "invalid", 0, cancellationToken).ConfigureAwait(false);
-                    Write(row, "failed", now, spec.Error?.Message ?? "the expression no longer parses");
-                    failed++;
-                    continue;
-                }
-                var behind = row.NextDue is { } planned
-                    ? spec.Value!.CountFiringsAfter(planned, now, cap: 1000)
-                    : 0;
-                if (targets is null)
-                {
-                    // Nothing can be fired in this host. The row is left due, so the next pass with a target fires it
-                    // — and the report says so instead of pretending the beat was spent.
-                    Write(row, "unhandled", now, "this host has nowhere to fire a schedule");
-                    unhandled++;
-                    continue;
-                }
-                var outcome = row.TargetKind == ScheduleTargetKind.Session
-                    ? await targets.WakeSessionAsync(row.TargetId, row.NextDue ?? now, row.Id, cancellationToken)
-                        .ConfigureAwait(false)
-                    : await targets.DispatchAsync(
-                            Address.TryParse(row.TargetAddress, out var source) ? source : new Address("schedule", "unbound", row.Id),
-                            PayloadOf(row, now), cancellationToken).ConfigureAwait(false);
-
-                if (!outcome.Ok && outcome.Error!.Retryable)
-                {
-                    // A busy target is "in a moment", not "failed": count the skip and leave the row due.
-                    await store.RecordSkipAsync(row.Id, now, cancellationToken).ConfigureAwait(false);
-                    Write(row, "skipped", now, outcome.Error.Message);
-                    skipped++;
-                    continue;
-                }
-
-                await store.RecordRunAsync(row.Id, now, outcome.Ok ? "ok" : "failed", behind, cancellationToken)
-                    .ConfigureAwait(false);
-                Write(row, outcome.Ok ? "ok" : "failed", now, outcome.Error?.Message, behind);
-                if (outcome.Ok) fired++; else failed++;
-                missed += behind;
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-            catch (Exception ex)
-            {
-                await store.RecordRunAsync(row.Id, now, "failed", 0, CancellationToken.None).ConfigureAwait(false);
-                Write(row, "failed", now, ex.Message);
+                // Stored rows were validated when written; one that no longer parses means this build reads the
+                // expression differently. Say so and turn it off rather than firing on a guess.
+                await store.RecordRunAsync(row.Id, now, "invalid", 0, cancellationToken).ConfigureAwait(false);
+                Write(row, "failed", now, spec.Error?.Message ?? "the expression no longer parses");
                 failed++;
+                continue;
             }
-            finally
+            if (targets is null)
             {
-                await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
-                try { _running.Remove(row.Id); }
-                finally { _gate.Release(); }
+                // Nothing can be fired in this host. The row is left due, so the next pass with a target fires it —
+                // and the report says so instead of pretending the beat was spent.
+                Write(row, "unhandled", now, "this host has nowhere to fire a schedule");
+                unhandled++;
+                continue;
+            }
+
+            var behind = row.NextDue is { } planned ? spec.Value!.CountFiringsAfter(planned, now, cap: 1000) : 0;
+            missed += behind;
+            fired++;
+            // Started, not awaited: see the type comment. The task records its own outcome and releases its claim.
+            var work = TrackedRunAsync(row, now, behind, cancellationToken);
+            await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            try { _inflight[row.Id] = (now, work); }
+            finally { _gate.Release(); }
+        }
+        return Result<ScheduleSweepReport>.Success(new(rows.Count, fired, skipped, missed, failed, unhandled));
+    }
+
+    /// <summary>
+    /// Waits for every firing currently in flight to come back. For tests and for shutdown: production never needs the
+    /// answer, which is the whole point of dispatching rather than awaiting inside the pass.
+    /// </summary>
+    public async ValueTask DrainAsync(CancellationToken cancellationToken = default)
+    {
+        Task[] working;
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try { working = _inflight.Values.Select(entry => entry.Work).ToArray(); }
+        finally { _gate.Release(); }
+        if (working.Length == 0) return;
+        await Task.WhenAll(working).ConfigureAwait(false);
+    }
+
+    private async Task TrackedRunAsync(ScheduleRow row, DateTimeOffset now, int behind, CancellationToken cancellationToken)
+    {
+        try { await RunAsync(row, now, behind, cancellationToken).ConfigureAwait(false); }
+        catch (OperationCanceledException) { /* the host is stopping; the row stays due */ }
+        catch (Exception ex) { Write(row, "failed", now, ex.Message); }
+        finally
+        {
+            await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            try { _inflight.Remove(row.Id); }
+            finally { _gate.Release(); }
+        }
+    }
+
+    private async Task RunAsync(ScheduleRow row, DateTimeOffset now, int behind, CancellationToken cancellationToken)
+    {
+        var skipped = false;
+        var recorded = true;
+        string outcome = "failed";
+        string? message = null;
+        try
+        {
+            var dispatched = row.TargetKind == ScheduleTargetKind.Session
+                ? await targets!.WakeSessionAsync(row.TargetId, row.NextDue ?? now, row.Id, cancellationToken)
+                    .ConfigureAwait(false)
+                : await targets!.DispatchAsync(
+                        Address.TryParse(row.TargetAddress, out var source) ? source : new Address("schedule", "unbound", row.Id),
+                        PayloadOf(row, now), cancellationToken).ConfigureAwait(false);
+
+            if (!dispatched.Ok && dispatched.Error!.Retryable)
+            {
+                // A busy target is "in a moment", not "failed": count the skip and leave the row due.
+                skipped = true;
+                message = dispatched.Error.Message;
+            }
+            else
+            {
+                outcome = dispatched.Ok ? "ok" : "failed";
+                message = dispatched.Error?.Message;
             }
         }
-        return Result<ScheduleSweepReport>.Success(
-            new(rows.Count, fired, skipped, missed, failed, unhandled));
+        catch (OperationCanceledException)
+        {
+            // The host stopped with this firing in flight. Nothing is recorded: the row stays due and the next start
+            // fires it again, which is the honest answer for work that never finished.
+            recorded = false;
+            message = "the host stopped while this firing was in flight; the row stays due";
+        }
+        catch (Exception ex)
+        {
+            message = ex.Message;
+        }
+
+        if (!recorded)
+        {
+            Write(row, "cancelled", now, message);
+            return;
+        }
+        if (skipped)
+        {
+            await store.RecordSkipAsync(row.Id, now, CancellationToken.None).ConfigureAwait(false);
+            Write(row, "skipped", now, message);
+            return;
+        }
+        // Recorded here rather than in the pass: this is where the answer exists, and a firing that comes back after
+        // the pass has moved on is still a firing that has to land in the row.
+        await store.RecordRunAsync(row.Id, now, outcome, behind, CancellationToken.None).ConfigureAwait(false);
+        Write(row, outcome, now, message, behind);
+    }
+
+    /// <summary>
+    /// Takes the claim for one row, or reports that it is already held. A claim older than
+    /// <see cref="MaxRunTime"/> is not taken over — a second concurrent run of the same rule is worse than a missed beat —
+    /// but it is reported once, so a wedged firing becomes a number in the log instead of silence.
+    /// </summary>
+    private async ValueTask<bool> ClaimAsync(ScheduleRow row, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_inflight.TryGetValue(row.Id, out var existing))
+            {
+                // A task that has already finished but has not been cleared yet is not a claim: the two orderings
+                // (task completes first / entry is registered first) both happen, and only one of them means "running".
+                if (existing.Work.IsCompleted)
+                {
+                    _inflight.Remove(row.Id);
+                    _stallNoticed.Remove(row.Id);
+                    return true;
+                }
+                if (now - existing.Started > MaxRunTime && !_stallNoticed.ContainsKey(row.Id))
+                {
+                    _stallNoticed[row.Id] = now;
+                    Write(row, "stalled", now,
+                        $"this firing has been in flight since {existing.Started:yyyy-MM-dd HH:mm:ss}; it is not re-dispatched");
+                }
+                return false;
+            }
+            _stallNoticed.Remove(row.Id);
+            return true;
+        }
+        finally { _gate.Release(); }
     }
 
     /// <summary>Runs <see cref="PulseAsync"/> on a beat until cancelled. A failure in one pass never stops the loop.</summary>

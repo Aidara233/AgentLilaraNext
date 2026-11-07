@@ -209,12 +209,15 @@ public sealed class ScheduleStore(IStateStore? state, ISignalLog? signals = null
             if (index < 0) return Result<ScheduleRow>.Failure(new(ErrorCode.Invalid, $"No schedule is called {id}."));
             var row = _rows[index];
             var spec = ScheduleSpec.Parse(row.Kind, row.Expression, row.TimeZone, row.CreatedAt, row.Days);
-            if (!spec.Ok) return Result<ScheduleRow>.Failure(spec.Error!);
-
             var runs = row.Runs + 1;
-            var next = row.MaxRuns is { } cap && runs >= cap
+            // A row whose expression this build cannot read cannot be advanced — but the firing is still a fact and is
+            // still recorded. Refusing to write it down would leave the row looking untouched while the sweep reported a
+            // failure, which is exactly the pair of statements that makes a stuck rule invisible.
+            var next = !spec.Ok
                 ? null
-                : spec.Value!.NextDueAfter(row.NextDue ?? row.CreatedAt, runAt);
+                : row.MaxRuns is { } cap && runs >= cap
+                    ? null
+                    : spec.Value!.NextDueAfter(row.NextDue ?? row.CreatedAt, runAt);
             var exhaustedByUntil = next is { } candidate && row.Until is { } until && candidate > until;
             var disabled = next is null || exhaustedByUntil;
             var advanced = row with
@@ -226,9 +229,11 @@ public sealed class ScheduleStore(IStateStore? state, ISignalLog? signals = null
                 NextDue = disabled ? row.NextDue : next,
                 Enabled = disabled ? false : row.Enabled,
                 DisabledReason = disabled
-                    ? next is null
-                        ? $"ran {runs} time(s), which is its maxRuns" + (row.MaxRuns is { } limit ? $" of {limit}" : "")
-                        : $"the next firing would be past its until ({row.Until:yyyy-MM-dd HH:mm zzz})"
+                    ? !spec.Ok
+                        ? $"the stored expression no longer parses: {spec.Error?.Message}"
+                        : next is null
+                            ? $"ran {runs} time(s), which is its maxRuns" + (row.MaxRuns is { } limit ? $" of {limit}" : "")
+                            : $"the next firing would be past its until ({row.Until:yyyy-MM-dd HH:mm zzz})"
                     : row.DisabledReason
             };
             _rows[index] = advanced;
