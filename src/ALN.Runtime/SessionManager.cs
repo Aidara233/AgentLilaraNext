@@ -296,7 +296,7 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     /// skipped, not queued — see the contract.
     /// </summary>
     public async ValueTask<Result<SessionTurnResult>> ActivateAsync(string sessionId, ActivationReason reason,
-        DateTimeOffset? at, CancellationToken cancellationToken)
+        DateTimeOffset? at, CancellationToken cancellationToken, string? schedule = null)
     {
         var loaded = await LoadAsync(sessionId, requestedSpec: null, cancellationToken).ConfigureAwait(false);
         if (!loaded.Ok || loaded.Value is null) return Result<SessionTurnResult>.Failure(loaded.Error!);
@@ -306,6 +306,8 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             // Nobody spoke. That is the whole content of the turn, and saying so is what stops the model from
             // inventing a message nobody sent.
             ActivationReason.DeadlineDue => new SessionTurnInput([], WokenAt: at ?? DateTimeOffset.UtcNow),
+            ActivationReason.ScheduleDue => new SessionTurnInput([], WokenAt: at ?? DateTimeOffset.UtcNow,
+                Schedule: schedule ?? "?"),
             _ => (SessionTurnInput?)null
         };
         if (input is null)
@@ -880,11 +882,17 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     /// It also says what the wake-up is for. "Nothing to say, you may keep waiting" read as permission to end the turn
     /// it had just been woken for; the point of a declared deadline is that something was meant to happen at it.
     /// </summary>
-    private static string? WakeNote(DateTimeOffset? wokenAt) => wokenAt is { } at
-        ? $"（系统）没有任何人说话。你自己在 {at.ToLocalTime():yyyy-MM-dd HH:mm:ss} 声明的等待到期了，因此你被叫醒了。" +
-          "这一刻是你自己要的：被叫醒意味着该看一眼，而不是再睡一次。" +
-          "如果你当初等它是为了某件事，现在把它做完；如果发现还有别的可做的，现在做。" +
-          "如果确实无事可做，就说一句、或者把下一次要看的时间往后挪——别用一次空转的 wait 结束这次唤醒。"
+    private static string? WakeNote(DateTimeOffset? wokenAt, string? schedule = null) => wokenAt is { } at
+        ? schedule is null
+            ? $"（系统）没有任何人说话。你自己在 {at.ToLocalTime():yyyy-MM-dd HH:mm:ss} 声明的等待到期了，因此你被叫醒了。" +
+              "这一刻是你自己要的：被叫醒意味着该看一眼，而不是再睡一次。" +
+              "如果你当初等它是为了某件事，现在把它做完；如果发现还有别的可做的，现在做。" +
+              "如果确实无事可做，就说一句、或者把下一次要看的时间往后挪——别用一次空转的 wait 结束这次唤醒。"
+            : $"（系统）没有任何人说话。一条定时规则（{schedule}）在 {at.ToLocalTime():yyyy-MM-dd HH:mm:ss} 到点了，" +
+              "因此这一轮是你自己起来的。" +
+              "到点不是为了让你再睡一次：这是这条规则当初被写下来要做的事，现在做。" +
+              "如果做完发现还有别的可做的，现在做；如果确实无事可做，就说一句，或者让人把这条规则改掉——" +
+              "别用一次空转的 wait 结束这次唤醒。"
         : null;
 
     private async ValueTask<Result<SessionTurnResult>> RunTurnCoreAsync(
@@ -967,7 +975,7 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                 activationUser = new SessionHistoryEntry($"{activation}:user", activation, state.StepNumber + 1,
                     // With no messages the note *is* the message, so it has to be replayed; an entry carrying a
                     // channel view is not replayed, because the channel block carries that instead.
-                    "user", WakeNote(input.WokenAt), DateTimeOffset.UtcNow,
+                    "user", WakeNote(input.WokenAt, input.Schedule), DateTimeOffset.UtcNow,
                     ChannelMessages: input.Messages is { Count: > 0 } carried ? carried : null);
                 var timelineState = state with
                 {

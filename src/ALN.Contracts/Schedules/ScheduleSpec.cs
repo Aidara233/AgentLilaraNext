@@ -139,6 +139,38 @@ public sealed record ScheduleSpec
     }
 
     /// <summary>
+    /// How many firings this schedule has after <paramref name="after"/> and up to and including
+    /// <paramref name="upTo"/> — the number a sweep reports as "missed". Capped, because the answer is used to write a
+    /// number down, not to build a queue: a row that slept through a year of minutes owes one run and one count.
+    /// </summary>
+    public int CountFiringsAfter(DateTimeOffset after, DateTimeOffset upTo, int cap = 1000)
+    {
+        if (upTo <= after) return 0;
+        switch (Kind)
+        {
+            case ScheduleKind.Every:
+                return (int)Math.Min(cap, Math.Floor((upTo - after).Ticks / (double)_interval!.Value.Ticks));
+            case ScheduleKind.Once:
+                return 0;
+            default:
+            {
+                var count = 0;
+                var cursor = after;
+                while (count < cap)
+                {
+                    // Ask for the next firing after the cursor without letting "now" skip ahead, so the walk counts
+                    // every beat instead of jumping to the end.
+                    var next = NextDueAfter(cursor, cursor);
+                    if (next is null || next.Value > upTo) return count;
+                    count++;
+                    cursor = next.Value;
+                }
+                return count;
+            }
+        }
+    }
+
+    /// <summary>
     /// The next clock time on a day this schedule names. Days are walked rather than minutes: a rule that only fires on
     /// the 29th of February must not cost half a million comparisons to answer "when next".
     ///

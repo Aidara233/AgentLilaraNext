@@ -318,6 +318,12 @@ var clockTask = clock.RunAsync(shutdown.Token);
 // the host stops it too — a sweep that outlived the host would act on state nothing else is maintaining.
 var deadlineSweepTask = sessions.RunDeadlineSweepAsync(deadlines, TimeProvider.System,
     SessionDeadlineHandler.Interval, shutdown.Token);
+// Schedules are the other half of "when": a row somebody wrote down, fired by a sweep rather than by a Session's own
+// wait. Same place in the lifecycle as the deadline loop, for the same reason — a sweep that outlived the host would
+// act on state nothing else is maintaining.
+var scheduleStore = new ScheduleStore(stateStore, signalLog);
+var scheduleSweep = new ScheduleSweep(scheduleStore, new HostScheduleTargets(sessions, graph), signalLog);
+var scheduleSweepTask = scheduleSweep.RunAsync(TimeProvider.System, shutdown.Token);
 // Stored model calls are derived data — a copy of a request that has already been answered — and they were the largest
 // thing on disk by far: 42 MB in one day of light use. Deleted on a timer rather than at exit, because the host this is
 // for is the one that does not exit.
@@ -547,6 +553,7 @@ if (receipt.Ready == 0)
     try { await pumpTask; } catch (OperationCanceledException) { }
     try { await clockTask; } catch (OperationCanceledException) { }
     try { await deadlineSweepTask; } catch (OperationCanceledException) { }
+    try { await scheduleSweepTask; } catch (OperationCanceledException) { }
     try { await retentionTask; } catch (OperationCanceledException) { }
     return 1;
 }
@@ -615,6 +622,7 @@ finally
     shutdown.Cancel();
     try { await clockTask; } catch (OperationCanceledException) { }
     try { await deadlineSweepTask; } catch (OperationCanceledException) { }
+    try { await scheduleSweepTask; } catch (OperationCanceledException) { }
     try { await retentionTask; } catch (OperationCanceledException) { }
     queue.Complete();
     try { await pumpTask.WaitAsync(TimeSpan.FromSeconds(10)); }

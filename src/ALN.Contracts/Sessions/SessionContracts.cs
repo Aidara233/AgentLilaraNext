@@ -132,7 +132,13 @@ public sealed record SessionTurnInput(
     /// for. The turn then carries a note saying so — a model that finds itself running with no new messages will
     /// otherwise invent a reason for it, and "the user just asked…" is the reason it invents.
     /// </summary>
-    DateTimeOffset? WokenAt = null);
+    DateTimeOffset? WokenAt = null,
+    /// <summary>
+    /// Set when a stored schedule is what woke the Session: the row's id, as <c>schedules.list</c> shows it. The note
+    /// then says a rule came due rather than "your own wait expired" — the two are different promises and the model
+    /// should not have to guess which it is keeping.
+    /// </summary>
+    string? Schedule = null);
 
 /// <summary>
 /// Why a Session is being run without anybody writing to it. Named rather than passed as text: the reason decides
@@ -141,7 +147,13 @@ public sealed record SessionTurnInput(
 public enum ActivationReason
 {
     /// <summary>The deadline this Session declared with <c>wait</c> has passed.</summary>
-    DeadlineDue
+    DeadlineDue,
+    /// <summary>
+    /// A stored schedule fired for this Session. Different from <see cref="DeadlineDue"/> in who asked: a deadline is
+    /// the Session's own <c>wait</c>, a schedule is a row somebody else wrote down. The turn says which one it was,
+    /// because "why am I awake" is the first thing a model gets wrong when the answer is "nobody said".
+    /// </summary>
+    ScheduleDue
 }
 
 public sealed record RoundContextRequest(
@@ -239,7 +251,7 @@ public interface ISessionManager
     /// would wake to seven notes and nothing to say.
     /// </summary>
     ValueTask<Result<SessionTurnResult>> ActivateAsync(string sessionId, ActivationReason reason,
-        DateTimeOffset? at, CancellationToken cancellationToken);
+        DateTimeOffset? at, CancellationToken cancellationToken, string? schedule = null);
 
     Result<SessionState> GetState(string sessionId);
 

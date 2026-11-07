@@ -10,4 +10,9 @@ public static class EventNames
     public const string LifecycleStop = "lifecycle.stop";
     /// <summary>Published once the whole tree finished starting, for observers that want the whole picture.</summary>
     public const string LifecycleStarted = "lifecycle.started";
+    /// <summary>
+    /// A stored schedule came due. The payload names the row, the instant it was meant to fire and how late it is —
+    /// "late" because a host that was down owes nobody a replay, but the script being handed the event should know.
+    /// </summary>
+    public const string ScheduleDue = "schedule.due";
 }
