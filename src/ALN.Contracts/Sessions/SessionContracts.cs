@@ -113,7 +113,24 @@ public sealed record SessionHistoryEntry(
     ModelUsage? Usage = null,
     StopReason? StopReason = null,
     IReadOnlyList<SessionChannelMessage>? ChannelMessages = null,
-    string? CoversUpTo = null);
+    string? CoversUpTo = null,
+    /// <summary>
+    /// Set when this record did not come from the Channel and did not come from the model: another component handed it
+    /// over. Kept as fields rather than only in the text, because "who sent this, and how deep were they" is the question
+    /// a person asks afterwards, and a sentence in the middle of a paragraph is not an answer you can query.
+    /// </summary>
+    SessionRelay? Relay = null);
+
+/// <summary>
+/// A message one component handed to a Session: the sender as the host spells it (<c>script:&lt;id&gt;@&lt;target&gt;</c>,
+/// <c>session:&lt;id&gt;</c>), the sender's level as the host knew it, and when.
+///
+/// The level is recorded because the message is <b>not</b> authority. Handing a message over is not a capability and
+/// cannot cross a level boundary in either direction: a shallow script may ask a deep Session for something, and the
+/// deep Session decides — with the sender's depth in front of it — whether the request deserves to be acted on. That is
+/// what makes asking upward possible without making it a promotion.
+/// </summary>
+public sealed record SessionRelay(string From, AccessLevel FromLevel, DateTimeOffset At);
 
 public sealed record SessionChannelMessage(
     string Id,
@@ -145,7 +162,13 @@ public sealed record SessionTurnInput(
     /// spends a round on a question the turn already knows the answer to. Still data from a file, not somebody
     /// speaking — the note says so.
     /// </summary>
-    string? SchedulePayload = null);
+    string? SchedulePayload = null,
+    /// <summary>
+    /// Set when another component handed this Session a message and asked for it to be looked at now: the sender, its
+    /// level, and when. The note this turn carries says the message was handed over rather than spoken, because that is
+    /// the difference between a request and an instruction.
+    /// </summary>
+    SessionRelay? Relay = null);
 
 /// <summary>
 /// Why a Session is being run without anybody writing to it. Named rather than passed as text: the reason decides
@@ -160,7 +183,13 @@ public enum ActivationReason
     /// the Session's own <c>wait</c>, a schedule is a row somebody else wrote down. The turn says which one it was,
     /// because "why am I awake" is the first thing a model gets wrong when the answer is "nobody said".
     /// </summary>
-    ScheduleDue
+    ScheduleDue,
+
+    /// <summary>
+    /// Another component handed this Session a message and asked for it to be looked at now. The message is already in
+    /// the timeline; the turn exists so that "somebody sent me something" is not mistaken for "the user just asked".
+    /// </summary>
+    Relayed
 }
 
 public sealed record RoundContextRequest(
@@ -259,7 +288,23 @@ public interface ISessionManager
     /// </summary>
     ValueTask<Result<SessionTurnResult>> ActivateAsync(string sessionId, ActivationReason reason,
         DateTimeOffset? at, CancellationToken cancellationToken, string? schedule = null,
-        string? schedulePayload = null);
+        string? schedulePayload = null, SessionRelay? relay = null);
+
+    /// <summary>
+    /// Hands one Session a message from another component, and optionally asks it to look now.
+    ///
+    /// <b>No level check, in either direction.</b> That is the point: a shallow script asking a deep Session for
+    /// something is the ordinary way work gets escalated, and a host that refused it would make "please do this, you are
+    /// allowed to" impossible. What keeps that from being a promotion is that the record carries the sender and the
+    /// sender's level (<see cref="SessionRelay"/>), the turn is told it was handed something rather than spoken to, and
+    /// nothing about the receiver's own level, tools or policy changes. A request is a request.
+    ///
+    /// <paramref name="wake"/> is the caller saying what it wants: false means "it will see this next time it runs",
+    /// true means "and it should run now" — which is skipped rather than queued when the Session is busy, exactly as
+    /// every other wake-up is.
+    /// </summary>
+    ValueTask<Result<SessionTurnResult>> DeliverAsync(string sessionId, string text, string from,
+        AccessLevel fromLevel, bool wake, CancellationToken cancellationToken);
 
     Result<SessionState> GetState(string sessionId);
 
@@ -307,4 +352,11 @@ public static class SessionActions
     /// a fact about the code, so it takes a rebuild (and per script a re-mount, where the interface surface is settled).
     /// </summary>
     public const string SetLevel = "sessions.setLevel";
+
+    /// <summary>
+    /// Hand one Session a message: <c>id</c> (or <c>channel</c>), <c>text</c>, and <c>wake</c> for "and look now".
+    /// The message lands in that Session's timeline marked with who sent it and how deep the sender was — a request,
+    /// not an instruction, whatever level either side sits at.
+    /// </summary>
+    public const string Message = "sessions.message";
 }

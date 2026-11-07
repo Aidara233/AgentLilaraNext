@@ -21,7 +21,8 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         // could not say "you may read the graph", and a script that cannot name what it reaches cannot be checked.
         ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept,
         ScriptCapabilities.ChannelRoute, ScriptCapabilities.ChannelReply, ScriptCapabilities.ModelComplete,
-        ScriptCapabilities.SessionRun, ScriptCapabilities.SessionActivate,
+        ScriptCapabilities.SessionRun, ScriptCapabilities.SessionActivate, ScriptCapabilities.SessionOpen,
+        ScriptCapabilities.SessionMessage,
         Capabilities.SystemRead, Capabilities.AdaptersRead, Capabilities.AdaptersControl, Capabilities.ChannelsRead,
         Capabilities.ChannelsControl, Capabilities.MessagesWrite, Capabilities.GraphRead, Capabilities.GraphControl,
         Capabilities.ModulesRead, Capabilities.ModulesControl, Capabilities.ParamsRead, Capabilities.ParamsWrite,
@@ -963,6 +964,12 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         public Task<string> RunSessionAsync(string sessionSpecJson, string userInput, CancellationToken cancellationToken) =>
             InvokeAsync(ScriptCapabilities.SessionRun, () => RunSessionCoreAsync(sessionSpecJson, userInput, cancellationToken));
 
+        public Task<string> OpenSessionAsync(string optionsJson, CancellationToken cancellationToken) =>
+            InvokeAsync(ScriptCapabilities.SessionOpen, () => OpenSessionCoreAsync(optionsJson, cancellationToken));
+
+        public Task<string> MessageSessionAsync(string optionsJson, CancellationToken cancellationToken) =>
+            InvokeAsync(ScriptCapabilities.SessionMessage, () => MessageSessionCoreAsync(optionsJson, cancellationToken));
+
         public Task<string> ActivateSessionAsync(string sessionSpecJson, CancellationToken cancellationToken) =>
             InvokeAsync(ScriptCapabilities.SessionActivate, () => ActivateSessionCoreAsync(sessionSpecJson, cancellationToken));
 
@@ -1015,6 +1022,193 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
                 mount.Target, ScriptCapabilities.SessionActivate, "completed", result.Value.SessionId), cancellationToken).ConfigureAwait(false);
             return JsonSerializer.Serialize(new { ok = true, result = result.Value }, JsonOptions);
         }
+
+        /// <summary>
+        /// The Session serving a Channel, created when there is none.
+        ///
+        /// Unlike <see cref="ActivateSessionCoreAsync"/> this asks nothing of the current event: a rule coming due is a
+        /// perfectly good reason to decide that a conversation should have somebody behind it. What it does <b>not</b>
+        /// loosen is the level: the spec still cannot name a level above the folder this script came from, because the
+        /// Session it makes outlives the script and every rule behind it.
+        /// </summary>
+        private async Task<string> OpenSessionCoreAsync(string optionsJson, CancellationToken cancellationToken)
+        {
+            await RequireCapabilityAsync(ScriptCapabilities.SessionOpen, cancellationToken).ConfigureAwait(false);
+            if (sessions is null) throw new InvalidOperationException("Session manager is unavailable.");
+
+            var asked = TryReadOptions(optionsJson, out var options, out var bad);
+            if (!asked) return bad!;
+
+            // The Channel: named, or the one this script is mounted on. A Channel that does not exist yet is accepted —
+            // the Session is data saying "I serve that conversation", and the conversation may arrive later.
+            var channelKey = TextOf(options, "channel") ?? mount.Target.ToString();
+            var spec = await SpecFromOptionsAsync(options, ScriptCapabilities.SessionOpen, cancellationToken)
+                .ConfigureAwait(false);
+
+            var opened = TextOf(options, "id") is { } id
+                ? await sessions.OpenAsync(id, spec, cancellationToken).ConfigureAwait(false)
+                : await sessions.OpenForChannelAsync(channelKey, spec, cancellationToken).ConfigureAwait(false);
+            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                mount.Target, ScriptCapabilities.SessionOpen, opened.Ok ? "allowed" : "failed",
+                opened.Ok && opened.Value is not null ? opened.Value.Id.Value : channelKey), cancellationToken)
+                .ConfigureAwait(false);
+            if (!opened.Ok || opened.Value is null)
+                return ErrorJson(opened.Error?.Code ?? ErrorCode.Unavailable, opened.Error?.Message ?? "Session could not be opened.");
+
+            var session = opened.Value;
+            object? spoke = null;
+            if (TextOf(options, "text") is { } text)
+            {
+                var delivered = await sessions.DeliverAsync(session.Id.Value, text, Sender, mount.Package.Level,
+                    WakeOf(options, otherwise: true), cancellationToken).ConfigureAwait(false);
+                spoke = delivered.Ok
+                    ? new { ok = true, step = delivered.Value!.StepNumber, text = delivered.Value.Text }
+                    : new { ok = false, error = delivered.Error?.Message };
+            }
+            return JsonSerializer.Serialize(new
+            {
+                ok = true,
+                session = new
+                {
+                    id = session.Id.Value,
+                    channel = session.State.Channel,
+                    level = AccessLevels.Describe(session.Spec.Level)
+                },
+                // Said out loud rather than assumed: a Session can exist for a conversation that has no Channel yet, and
+                // then nothing it says can leave. A script that reads this can tell "I prepared it" from "I said it".
+                channelState = ChannelStateOf(channelKey),
+                spoke
+            }, JsonOptions);
+        }
+
+        /// <summary>
+        /// Hands one Session a message from this script.
+        ///
+        /// The only rule is that the message is honestly labelled. Level is not consulted — a draft may ask a Full
+        /// Session for something it cannot do itself, which is the whole reason this door exists — and the receiving
+        /// turn is told the sender, the sender's level, and that a shallower request cannot require anything of it.
+        /// </summary>
+        private async Task<string> MessageSessionCoreAsync(string optionsJson, CancellationToken cancellationToken)
+        {
+            await RequireCapabilityAsync(ScriptCapabilities.SessionMessage, cancellationToken).ConfigureAwait(false);
+            if (sessions is null) throw new InvalidOperationException("Session manager is unavailable.");
+
+            var asked = TryReadOptions(optionsJson, out var options, out var bad);
+            if (!asked) return bad!;
+            if (TextOf(options, "text") is not { } text)
+                return ErrorJson(ErrorCode.Invalid, "session.message needs 'text'.");
+
+            var target = TextOf(options, "id");
+            if (target is null)
+            {
+                if (TextOf(options, "channel") is not { } channelKey)
+                    return ErrorJson(ErrorCode.Invalid, "session.message needs 'id' or 'channel'.");
+                var listed = await sessions.ListAsync(cancellationToken).ConfigureAwait(false);
+                if (!listed.Ok || listed.Value is null)
+                    return ErrorJson(listed.Error?.Code ?? ErrorCode.Unavailable, listed.Error?.Message ?? "Sessions could not be listed.");
+                var found = listed.Value.FirstOrDefault(summary =>
+                    string.Equals(summary.Channel, channelKey, StringComparison.Ordinal));
+                if (found is null)
+                    return ErrorJson(ErrorCode.Invalid,
+                        $"No Session serves {channelKey}. Use ctx.session.open to make one, or name a Session id.");
+                target = found.Id;
+            }
+
+            var wake = WakeOf(options, otherwise: false);
+            var delivered = await sessions.DeliverAsync(target, text, Sender, mount.Package.Level, wake, cancellationToken)
+                .ConfigureAwait(false);
+            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                mount.Target, ScriptCapabilities.SessionMessage, delivered.Ok ? "allowed" : "failed", target),
+                cancellationToken).ConfigureAwait(false);
+            if (!delivered.Ok)
+                // A busy Session is retryable by contract; passing the code through keeps "ask me again" apart from
+                // "that will never work", which a script can act on.
+                return ErrorJson(delivered.Error!.Code, delivered.Error.Message);
+
+            return JsonSerializer.Serialize(new
+            {
+                ok = true,
+                id = target,
+                from = Sender,
+                fromLevel = AccessLevels.Describe(mount.Package.Level),
+                wake,
+                step = delivered.Value!.StepNumber,
+                text = delivered.Value.Text
+            }, JsonOptions);
+        }
+
+        /// <summary>How this script is named in a relay: the manifest id and the mount it is acting from.</summary>
+        private string Sender => $"script:{mount.Package.Manifest.Id}@{mount.Target}";
+
+        /// <summary>
+        /// The spec an options object asks for, or the one a Session made by a script should have by default: answer this
+        /// conversation, with whatever profile the host resolves. Run through the level check either way.
+        /// </summary>
+        private async Task<SessionSpec> SpecFromOptionsAsync(JsonElement options, string capability,
+            CancellationToken cancellationToken)
+        {
+            if (options.ValueKind == JsonValueKind.Object && options.TryGetProperty("spec", out var specJson) &&
+                specJson.ValueKind == JsonValueKind.Object)
+                return await SessionSpecFromScriptAsync(specJson.GetRawText(), capability, cancellationToken)
+                    .ConfigureAwait(false);
+            return new SessionSpec("", "回答这个频道里的消息。", "1");
+        }
+
+        /// <summary>What a Channel key is right now: known to the host, and running with a binding or not.</summary>
+        private object ChannelStateOf(string channelKey)
+        {
+            ChannelInfo? info = Address.TryParse(channelKey, out var address) &&
+                                channels.Get(address) is { Ok: true, Value: { } found }
+                ? found
+                : null;
+            return new
+            {
+                key = channelKey,
+                known = info is not null,
+                running = info?.Running == true,
+                bound = info?.Bindings.Count > 0
+            };
+        }
+
+        private static bool TryReadOptions(string optionsJson, out JsonElement options, out string? error)
+        {
+            error = null;
+            if (string.IsNullOrWhiteSpace(optionsJson))
+            {
+                options = JsonSerializer.SerializeToElement(new { });
+                return true;
+            }
+            try
+            {
+                options = JsonSerializer.Deserialize<JsonElement>(optionsJson);
+                return true;
+            }
+            catch (JsonException ex)
+            {
+                options = default;
+                error = ErrorJson(ErrorCode.Invalid, "options must be JSON.", ex.Message);
+                return false;
+            }
+        }
+
+        private static string? TextOf(JsonElement options, string name) =>
+            options.ValueKind == JsonValueKind.Object && options.TryGetProperty(name, out var value) &&
+            value.ValueKind == JsonValueKind.String
+                ? value.GetString() is { Length: > 0 } text ? text : null
+                : null;
+
+        private static bool WakeOf(JsonElement options, bool otherwise) =>
+            options.ValueKind == JsonValueKind.Object && options.TryGetProperty("wake", out var value) &&
+            value.ValueKind is JsonValueKind.True or JsonValueKind.False
+                ? value.GetBoolean()
+                : otherwise;
+
+        private static string ErrorJson(ErrorCode code, string message, string? detail = null) =>
+            JsonSerializer.Serialize(new
+            {
+                ok = false,
+                error = new { code = JsonNamingPolicy.CamelCase.ConvertName(code.ToString()), message, detail }
+            }, JsonOptions);
 
         /// <summary>
         /// The spec a script hands over, checked against the folder the script came from.

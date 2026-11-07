@@ -344,13 +344,21 @@ public sealed class GraphIntegrationTests : IDisposable
 
         var deep = new ScriptPackage(
             new("channel.deep", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",
-                [ScriptCapabilities.SessionActivate], TrustDomain.Trusted),
+                [ScriptCapabilities.SessionActivate, ScriptCapabilities.SessionOpen], TrustDomain.Trusted),
             """
             async function onEvent(event, ctx) {
               // Reading the refusal is part of the behaviour: the call is rejected, and the script has to see that.
               try {
                 await ctx.session.activate({
                   modelProfileId: "default", objective: "深一点", formatVersion: "1", level: "full"
+                });
+              } catch (e) { await ctx.log.warn("refused: " + e); }
+              // The same ceiling holds for the verb that makes a Session rather than waking one: a Session that
+              // outlives this script must not outrank the folder it came from.
+              try {
+                await ctx.session.open({
+                  channel: "channel.conversation#chat-1",
+                  spec: { modelProfileId: "default", objective: "深一点", formatVersion: "1", level: "full" }
                 });
               } catch (e) { await ctx.log.warn("refused: " + e); }
             }
@@ -380,6 +388,59 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.Contains(_audit.ReadAudit(),
             entry => entry.Action == ScriptCapabilities.SessionActivate && entry.Outcome == "denied"
                 && (entry.Detail ?? "").Contains("full", StringComparison.OrdinalIgnoreCase));
+        // Making a Session goes through the same check, because the level it writes outlives the script that asked.
+        Assert.Contains(_audit.ReadAudit(),
+            entry => entry.Action == ScriptCapabilities.SessionOpen && entry.Outcome == "denied"
+                && (entry.Detail ?? "").Contains("full", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task A_script_woken_by_a_rule_can_give_a_channel_a_session_and_hand_it_something()
+    {
+        // The first thing the new Session does with that message is answer it; the script that made it does not get to
+        // write the answer, which is the whole reason to have a Session instead of a template.
+        _model.Enqueue(new TextDelta("早安。"), new ModelCompleted(StopReason.EndTurn, new ModelUsage(1, 1)));
+
+        var greeter = new ScriptPackage(
+            new("schedule.greeter", 1, "channel", MountMode.Default, [EventNames.ScheduleDue], "onEvent",
+                [ScriptCapabilities.SessionOpen], TrustDomain.Builtin),
+            """
+            async function onEvent(event, ctx) {
+              const out = JSON.parse(await ctx.session.open({
+                channel: "channel.conversation#chat-1",
+                spec: { modelProfileId: "default", objective: "回答这个频道里的消息。", formatVersion: "1" },
+                text: "说一句早安。"
+              }));
+              if (!out.ok) throw new Error(JSON.stringify(out.error));
+            }
+            """);
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), greeter], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        var channel = new Address("channel", "conversation", "chat-1");
+        await AddChannelAsync(channel, "chat-1");
+
+        // Nobody spoke: this is a rule coming due, and the script — not the Channel — decides that the conversation
+        // should now have somebody behind it.
+        var fired = await _graph.DispatchAsync(new RoutedEvent(EventNames.ScheduleDue, channel, Guid.NewGuid(), "{}"), default);
+        Assert.True(fired.Ok, fired.Error?.Message);
+        await DrainAsync();
+
+        var session = Directory.GetFiles(Path.Combine(_root, "modules"), "state.json", SearchOption.AllDirectories)
+            .Select(path => JsonDocument.Parse(File.ReadAllText(path)).RootElement)
+            .Where(state => state.TryGetProperty("channel", out var value) && value.GetString() == channel.ToString())
+            .Single();
+        Assert.Equal(channel.ToString(), session.GetProperty("channel").GetString());
+
+        var relayed = Directory.GetFiles(Path.Combine(_root, "modules"), "history.jsonl", SearchOption.AllDirectories)
+            .SelectMany(File.ReadAllLines)
+            .Select(line => JsonSerializer.Deserialize<SessionHistoryEntry>(line,
+                new JsonSerializerOptions(JsonSerializerDefaults.Web))!)
+            .Single(entry => entry.Relay is not null);
+        Assert.Equal($"script:schedule.greeter@{channel}", relayed.Relay!.From);
+        Assert.Contains("说一句早安。", relayed.Content);
+
+        // And the Session answered as itself: one model call, at its own level.
+        Assert.Equal(1, _model.Requests);
     }
 
     /// <summary>A model whose steps the test scripts: one array of events per call.</summary>

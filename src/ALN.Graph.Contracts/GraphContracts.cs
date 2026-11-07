@@ -97,6 +97,25 @@ public interface IScriptApi
     /// the request is assembled, not when the signal is sent.
     /// </summary>
     Task<string> ActivateSessionAsync(string sessionSpecJson, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The Session for a Channel — the one that serves it, or one created to serve it — with no requirement that this
+    /// script be mounted on that Channel. Two questions in one verb because they are one act: "is there somebody for
+    /// this conversation, and if not, may I make one". Creation carries the same ceiling it always did (a spec cannot
+    /// name a level above the folder the script came from), and nothing about the Channel's own state is assumed: a
+    /// Channel that does not exist yet gets a Session that is waiting for it.
+    /// </summary>
+    Task<string> OpenSessionAsync(string optionsJson, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Hand one Session a message from this script, optionally asking it to look now.
+    ///
+    /// This is the inward door, and it works in every direction: a draft script may hand a Full Session a request for
+    /// something it cannot do itself, and the Full Session decides. What the message is <b>not</b> is authority — the
+    /// receiving turn is told who sent it and how deep the sender was, and is told that a request from something
+    /// shallower cannot require anything of it.
+    /// </summary>
+    Task<string> MessageSessionAsync(string optionsJson, CancellationToken cancellationToken);
     Task<string> CompleteModelAsync(string profileId, string requestJson, CancellationToken cancellationToken);
     Task<string> SendSelfAsync(string outboundMessageJson, CancellationToken cancellationToken);
     Task<string> AcceptIntoChannelAsync(CancellationToken cancellationToken);
@@ -159,6 +178,10 @@ public static class ScriptCapabilities
 {
     public const string SessionRun = "session.run";
     public const string SessionActivate = "session.activate";
+    /// <summary>The Session serving a Channel, created if there is none. Not tied to a Channel-message event.</summary>
+    public const string SessionOpen = "session.open";
+    /// <summary>Hand one Session a message, optionally waking it. Allowed in every direction, by design.</summary>
+    public const string SessionMessage = "session.message";
     public const string ModelComplete = "model.complete";
     public const string SelfAdapterSend = "self.adapter.send";
     public const string ChannelAccept = "channel.accept";

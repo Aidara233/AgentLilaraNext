@@ -39,6 +39,47 @@ public sealed partial class SessionManager
             });
         if (!listed.Ok) return listed;
 
+        // Handing a Session a message. Agent-level on purpose and with no level check inside: a shallow Session asking
+        // a deeper one is how work gets escalated ("you are allowed to do this, please do"), and the thing that keeps it
+        // from being a promotion is the record — the message says who sent it and how deep they were, and it is a
+        // request rather than an instruction.
+        var delivered = plane.Register(
+            new(SessionActions.Message,
+                "Hand one Session a message: it lands in that Session's timeline marked with who sent it and how deep "
+                + "the sender was, and 'wake' asks it to look now (a busy Session is skipped, not queued). Works in any "
+                + "direction: a shallow Session may ask a deeper one for something it is not allowed to do itself — the "
+                + "deeper one decides, and the request carries no authority either way.",
+                Capabilities.SessionsWrite, true,
+                ParamsJson: """
+                {"type":"object","properties":{
+                  "id":{"type":"string","description":"The Session id, as sessions.list shows it."},
+                  "text":{"type":"string","description":"What to hand over. It is quoted as somebody else's words, not as the user's."},
+                  "wake":{"type":"boolean","description":"Also run a turn now. Default false: it will see this next time it runs."}},
+                 "required":["id","text"],"additionalProperties":false}
+                """,
+                Subject: "id"),
+            async (actor, arguments, ct) =>
+            {
+                if (!arguments.TryReadText("id", out var id) || id.Trim().Length == 0)
+                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "sessions.message requires 'id'."));
+                if (!arguments.TryReadText("text", out var text) || text.Trim().Length == 0)
+                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "sessions.message requires 'text'."));
+                var wake = arguments.TryGetProperty("wake", out var wakeJson) && wakeJson.ValueKind == JsonValueKind.True;
+                var sender = actor.Kind == ActorKind.Script ? $"script:{actor.Id}" : $"session:{actor.Id}";
+                var sent = await DeliverAsync(id.Trim(), text, sender, actor.Level, wake, ct).ConfigureAwait(false);
+                if (!sent.Ok) return Result<JsonElement>.Failure(sent.Error!);
+                return Result<JsonElement>.Success(ActionArgs.JsonOf(new
+                {
+                    id = id.Trim(),
+                    from = sender,
+                    fromLevel = AccessLevels.Describe(actor.Level),
+                    wake,
+                    step = sent.Value!.StepNumber,
+                    text = sent.Value.Text
+                }));
+            });
+        if (!delivered.Ok) return delivered;
+
         return plane.Register(
             new(SessionActions.SetLevel,
                 "Raise or lower what one Session may reach: agent, operator or full. Takes effect on the next turn — no "

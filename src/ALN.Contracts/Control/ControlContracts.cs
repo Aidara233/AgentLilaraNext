@@ -45,6 +45,9 @@ public static class AccessLevels
         [Capabilities.ChannelsRead] = AccessLevel.Agent,
         [Capabilities.MessagesWrite] = AccessLevel.Agent,
         [Capabilities.SessionsRead] = AccessLevel.Agent,
+        // Handing a Session a message is how work gets asked for, including upwards: a shallow component may ask a
+        // deeper one. Recorded, attributed, and carrying no authority — see SessionRelay.
+        [Capabilities.SessionsWrite] = AccessLevel.Agent,
         [Capabilities.SessionsControl] = AccessLevel.Operator,
         [Capabilities.ModelsRead] = AccessLevel.Agent,
         [Capabilities.SignalsRead] = AccessLevel.Agent,
@@ -74,6 +77,11 @@ public static class AccessLevels
         // Driving a session, answering, and calling a model are the script's own line of work.
         ["session.run"] = AccessLevel.Agent,
         ["session.activate"] = AccessLevel.Agent,
+        // Making a Session for a conversation, and handing one a message. Both are agent-level for the same reason:
+        // the inward door is how a shallow component asks a deeper one for something, and a door that only opened
+        // downward would not be a request path, it would be a broadcast.
+        ["session.open"] = AccessLevel.Agent,
+        ["session.message"] = AccessLevel.Agent,
         ["model.complete"] = AccessLevel.Agent,
         ["self.adapter.send"] = AccessLevel.Agent,
         ["self.adapter.poll"] = AccessLevel.Agent,
@@ -247,6 +255,12 @@ public static class Capabilities
     public const string ModelsControl = "models.control";
     public const string SignalsRead = "signals.read";
     public const string SessionsRead = "sessions.read";
+    /// <summary>
+    /// Handing one Session a message from somewhere else — a script, another Session, the operator. Not the same verb
+    /// as <see cref="MessagesWrite"/>: that one speaks outward through a Channel, this one speaks <i>inward</i>, into a
+    /// Session's own timeline, and it is deliberately allowed at every level in both directions.
+    /// </summary>
+    public const string SessionsWrite = "sessions.write";
     /// <summary>Changing what a Session is allowed to reach: its level. Never the level of an interface.</summary>
     public const string SessionsControl = "sessions.control";
     public const string ArchiveRead = "archive.read";

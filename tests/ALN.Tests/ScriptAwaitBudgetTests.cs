@@ -62,6 +62,8 @@ public sealed class ScriptAwaitBudgetTests
 
         public Task<string> CompleteModelAsync(string profileId, string requestJson, CancellationToken cancellationToken) =>
             Task.FromResult("{}");
+        public Task<string> OpenSessionAsync(string optionsJson, CancellationToken cancellationToken) => Task.FromResult("{}");
+        public Task<string> MessageSessionAsync(string optionsJson, CancellationToken cancellationToken) => Task.FromResult("{}");
         public Task<string> SendSelfAsync(string outboundMessageJson, CancellationToken cancellationToken) => Task.FromResult("{}");
         public Task<string> AcceptIntoChannelAsync(CancellationToken cancellationToken) => Task.FromResult("{}");
         public Task<string> RouteIntoChannelAsync(string optionsJson, CancellationToken cancellationToken) => Task.FromResult("{}");

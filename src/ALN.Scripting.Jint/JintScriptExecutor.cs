@@ -37,6 +37,8 @@ public sealed class JintScriptExecutor : IScriptExecutor
             engine.SetValue("__eventNameJson", JsonSerializer.Serialize(routedEvent.Name));
             engine.SetValue("__sessionRun", new Func<string, string, Task<string>>((specJson, input) => api.RunSessionAsync(specJson, input, cancellationToken)));
             engine.SetValue("__sessionActivate", new Func<string, Task<string>>(specJson => api.ActivateSessionAsync(specJson, cancellationToken)));
+            engine.SetValue("__sessionOpen", new Func<string, Task<string>>(json => api.OpenSessionAsync(json, cancellationToken)));
+            engine.SetValue("__sessionMessage", new Func<string, Task<string>>(json => api.MessageSessionAsync(json, cancellationToken)));
             engine.SetValue("__modelComplete", new Func<string, string, Task<string>>((profileId, json) => api.CompleteModelAsync(profileId, json, cancellationToken)));
             engine.SetValue("__sendSelf", new Func<string, Task<string>>(json => api.SendSelfAsync(json, cancellationToken)));
             engine.SetValue("__pollSelf", new Func<Task<string>>(() => api.PollSelfAsync(cancellationToken)));
@@ -65,6 +67,8 @@ public sealed class JintScriptExecutor : IScriptExecutor
                   const eventName = JSON.parse(__eventNameJson);
                   const runSession = (spec, input) => __sessionRun(JSON.stringify(spec), input);
                   const activateSession = (spec) => __sessionActivate(JSON.stringify(spec));
+                  const openSession = (options) => __sessionOpen(JSON.stringify(options ?? {}));
+                  const messageSession = (options) => __sessionMessage(JSON.stringify(options ?? {}));
                   const completeModel = (profileId, request) => __modelComplete(profileId, JSON.stringify(request));
                   const sendSelf = __sendSelf;
                   const pollSelf = __pollSelf;
@@ -90,7 +94,7 @@ public sealed class JintScriptExecutor : IScriptExecutor
                     delete: async (key) => { await __stateDelete(String(key)); }
                   });
                   const ctx = Object.freeze({
-                    session: Object.freeze({ run: (spec, input) => runSession(spec, input), activate: (spec) => activateSession(spec) }),
+                    session: Object.freeze({ run: (spec, input) => runSession(spec, input), activate: (spec) => activateSession(spec), open: (options) => openSession(options), message: (options) => messageSession(options) }),
                     model: Object.freeze({ complete: (profileId, request) => completeModel(profileId, request) }),
                     self: Object.freeze({ adapter: Object.freeze({ send: (message) => sendSelf(JSON.stringify(message)), poll: () => pollSelf() }) }),
                     channel: Object.freeze({ accept: () => acceptChannel(), route: (options) => routeChannel(JSON.stringify(options ?? {})), reply: (message) => replyChannel(JSON.stringify(message)) }),
