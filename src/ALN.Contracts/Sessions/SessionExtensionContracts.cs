@@ -52,7 +52,13 @@ public interface ITimelineSource
 /// needs to keep two things apart: a step that only wrote something down is not a step that spoke to anyone, and
 /// the difference decides whether this turn's text was its reply.
 /// </summary>
-public sealed record SessionToolOffer(ISessionTool Tool, ModelToolDefinition Definition, bool ActsExternally = true);
+public sealed record SessionToolOffer(ISessionTool Tool, ModelToolDefinition Definition, bool ActsExternally = true,
+    /// <summary>
+    /// How deep this tool sits. A tool is an interface like anything else: handing the model a name it can never call
+    /// successfully buys a wasted round and teaches it to distrust the list, so a tool above the round's level is not
+    /// offered at all.
+    /// </summary>
+    AccessLevel MinLevel = AccessLevel.Agent);
 
 /// <summary>
 /// The tools a module offers to this turn. The session routes calls; it does not know what any of them mean, and

@@ -31,7 +31,28 @@ public sealed record SessionSpec(
     /// and that is the safe default on purpose: an operator raises a Session on purpose, and nobody raises their own.
     /// It changes without a restart (sessions.setLevel) because it is one field, read when a turn is assembled.
     /// </summary>
-    [property: JsonConverter(typeof(AccessLevelJson))] AccessLevel Level = AccessLevel.Agent);
+    [property: JsonConverter(typeof(AccessLevelJson))] AccessLevel Level = AccessLevel.Agent,
+    /// <summary>
+    /// What this Session is allowed to call, under the ceiling its level already sets. Two lists because they answer
+    /// different questions: <c>only</c> is "this turn needs three tools, not twenty-one" — a focus decision;
+    /// <c>deny</c> is "not this one, ever" — a deployment decision about one Session. A level says what a caller may
+    /// reach at all; a policy says what this caller needs, which is always narrower.
+    /// </summary>
+    SessionToolPolicy? ToolPolicy = null);
+
+/// <summary>
+/// A narrowing of the tools a Session is offered, applied on top of its level. Absent means "everything the level
+/// allows", which is what every Session created before this field existed gets.
+/// </summary>
+public sealed record SessionToolPolicy(IReadOnlyList<string>? Only = null, IReadOnlyList<string>? Deny = null)
+{
+    /// <summary>Whether a tool by that name survives this policy. Having nothing to say means yes.</summary>
+    public bool Admits(string name)
+    {
+        if (Only is { Count: > 0 } only && !only.Contains(name, StringComparer.Ordinal)) return false;
+        return Deny is not { } deny || !deny.Contains(name, StringComparer.Ordinal);
+    }
+}
 
 /// <summary>Persisted state. Phase is intentionally transient and is not stored here.</summary>
 public sealed record SessionState(

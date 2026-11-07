@@ -546,8 +546,12 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
         var visible = new List<ModelToolDefinition> { WaitTool.Definition, CompactTool.Definition };
         var byName = new Dictionary<string, ISessionTool>(StringComparer.Ordinal);
         var acting = 0;
+        // The policy is the Session's own answer to "may I have fewer than my level allows": applied to what modules
+        // offered and to what the spec declares, before either reaches the model.
+        var policy = spec.ToolPolicy;
         foreach (var offer in offered)
         {
+            if (policy is not null && !policy.Admits(offer.Definition.Name)) continue;
             if (!byName.TryAdd(offer.Tool.Name, offer.Tool))
                 return Result<ResolvedTools>.Failure(new(ErrorCode.Conflict, $"Two modules offer a tool named '{offer.Tool.Name}'."));
             visible.Add(offer.Definition);
@@ -557,6 +561,9 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
         var missing = new List<string>();
         foreach (var declared in spec.Tools ?? [])
         {
+            // Denied by the Session's own policy is not a mistake to report: the spec said both things, and the narrower
+            // one wins. Declaring a tool nothing provides is still a failure, because that is an assembly mistake.
+            if (policy is not null && !policy.Admits(declared.Name)) continue;
             // A declared tool that a module already offers is the same tool; declaring it must not offer it twice.
             if (byName.ContainsKey(declared.Name)) continue;
             if (toolbox is not null && toolbox.Names.Contains(declared.Name, StringComparer.Ordinal))
@@ -591,7 +598,7 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                     ReportExtensionFailure(source.Id, "tools", request, produced.Error?.Message);
                     continue;
                 }
-                offers.AddRange(produced.Value);
+                offers.AddRange(produced.Value.Where(offer => offer.MinLevel <= request.Level));
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch (Exception ex) { ReportExtensionFailure(source.Id, "tools", request, ex.Message); }
