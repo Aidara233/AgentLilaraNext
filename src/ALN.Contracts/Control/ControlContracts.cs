@@ -53,6 +53,8 @@ public static class AccessLevels
         [Capabilities.PromptsRead] = AccessLevel.Agent,
         [Capabilities.ModulesRead] = AccessLevel.Agent,
         [Capabilities.GraphRead] = AccessLevel.Agent,
+        // Publishing a draft is the model's own work: the folders it can write are the folders a reload can pick up.
+        [Capabilities.ScriptsPublish] = AccessLevel.Agent,
 
         // Changing the shape of the process: a person's decision, made on purpose, written down in the audit.
         [Capabilities.AdaptersControl] = AccessLevel.Operator,
@@ -249,4 +251,12 @@ public static class Capabilities
     public const string PromptsRead = "prompts.read";
     /// Editing a prompt changes what the next turn says. A viewer with prompts.read may look, not rewrite.
     public const string PromptsWrite = "prompts.write";
+
+    /// <summary>
+    /// Asking the folders to be read again. Deliberately not <see cref="GraphControl"/>: a reload applies what is
+    /// already on disk, and the only place a model can write is <c>scripts/draft</c>, so the verb can publish the
+    /// model's own work and nothing else. Switching a script off, which does change what runs, stays at
+    /// <see cref="GraphControl"/>.
+    /// </summary>
+    public const string ScriptsPublish = "scripts.publish";
 }

@@ -629,8 +629,7 @@ public sealed class GraphIntegrationTests : IDisposable
         var created = await _channels.CreateAsync(new(channel, "chat-7",
             [new ChannelBinding(_adapterAddress, "room-7")], ChannelTypes.Conversation), default);
         Assert.True(created.Ok, created.Error?.Message + " / " + created.Error?.Detail);
-        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root),
-            new ScriptLibrary(_root), _catalog);
+        var tools = ScriptToolsWithPlane(new JsonScriptCatalog(Path.Combine(_root, "program"), _root), new ScriptLibrary(_root));
         var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
         var show = offers.Value!.Single(offer => offer.Definition.Name == ScriptTools.InstanceToolName).Tool;
 
@@ -812,6 +811,42 @@ public sealed class GraphIntegrationTests : IDisposable
     }
 
     /// <summary>One tool out of a source's offers, by name: the test calls what the model would be offered.</summary>
+    [Fact]
+    public async Task Reloading_from_a_tool_is_the_same_verb_as_reloading_from_an_action()
+    {
+        // Two doors, one answer. The reload tool used to call the same helper directly, which meant an agent-level actor
+        // reached a verb the table had at operator, and nothing was written down. The level that makes it an agent's
+        // verb is now the descriptor's own (scripts.publish); switching a script off stays deeper, because that changes
+        // what runs rather than applying what is already on disk.
+        Assert.Equal(AccessLevel.Agent, AccessLevels.Of(Capabilities.ScriptsPublish));
+        Assert.Equal(AccessLevel.Operator, AccessLevels.Of(Capabilities.GraphControl));
+
+        Assert.True((await _graph.LoadAsync([], default)).Ok);
+        var tools = ScriptToolsWithPlane(new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
+        var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1, Level: AccessLevel.Agent), default);
+        Assert.True(offers.Ok, offers.Error?.Message);
+        var reload = await ToolOf(offers, ScriptTools.ReloadToolName)
+            .ExecuteAsync(new("c1", ScriptTools.ReloadToolName, "{}"), default);
+        Assert.True(reload.Ok, reload.Error?.Message);
+        Assert.Contains("Reloaded.", reload.Value!.Content, StringComparison.Ordinal);
+
+        // Through the plane means the record exists: who asked, and for what.
+        Assert.Contains(_audit.ReadAudit(),
+            entry => entry.Action == ScriptActions.Reload && entry.Actor == ActionTools.ActorId);
+    }
+
+    /// <summary>
+    /// The script tools with a plane behind them, wired the way the host wires them: the reload tool asks
+    /// <c>scripts.reload</c> through the control plane, so a test that reloads needs one — and gets the audit record
+    /// that comes with it.
+    /// </summary>
+    private ScriptTools ScriptToolsWithPlane(IGraphScriptCatalog catalog, ScriptLibrary? library = null)
+    {
+        var plane = new ControlPlane(_audit, _signals);
+        Assert.True(ALN.Runtime.ScriptActions.Register(plane, _graph, catalog, library).Ok);
+        return new ScriptTools(_graph, catalog, library, _catalog, plane);
+    }
+
     private static ISessionTool ToolOf(Result<IReadOnlyList<SessionToolOffer>> offers, string name) =>
         offers.Value!.Single(offer => offer.Definition.Name == name).Tool;
 
@@ -830,8 +865,7 @@ public sealed class GraphIntegrationTests : IDisposable
         await File.WriteAllTextAsync(Path.Combine(draft, "manifest.json"), ScriptSeed.ExampleManifest);
         await File.WriteAllTextAsync(Path.Combine(draft, "main.js"), ScriptSeed.ExampleSource);
 
-        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root),
-            new ScriptLibrary(_root));
+        var tools = ScriptToolsWithPlane(new JsonScriptCatalog(Path.Combine(_root, "program"), _root), new ScriptLibrary(_root));
         var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
         await ToolOf(offers, ScriptTools.ReloadToolName).ExecuteAsync(new("c1", ScriptTools.ReloadToolName, "{}"), default);
         await AddChannelAsync(channel, "chat-1");
@@ -870,8 +904,7 @@ public sealed class GraphIntegrationTests : IDisposable
         await File.WriteAllTextAsync(Path.Combine(draft, "manifest.json"), ScriptSeed.ExampleManifest);
         await File.WriteAllTextAsync(Path.Combine(draft, "main.js"), ScriptSeed.ExampleSource);
 
-        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root),
-            new ScriptLibrary(_root));
+        var tools = ScriptToolsWithPlane(new JsonScriptCatalog(Path.Combine(_root, "program"), _root), new ScriptLibrary(_root));
         var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
         await ToolOf(offers, ScriptTools.ReloadToolName).ExecuteAsync(new("c1", ScriptTools.ReloadToolName, "{}"), default);
         await AddChannelAsync(first, "chat-1");
@@ -900,7 +933,7 @@ public sealed class GraphIntegrationTests : IDisposable
     [Fact]
     public async Task The_model_can_find_an_instance_address_and_narrow_the_list()
     {
-        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
+        var tools = ScriptToolsWithPlane(new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
         var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
         // The graph has to have been loaded before instances can be attached to it.
         Assert.True((await _graph.LoadAsync([AdapterIntake()], default)).Ok);
@@ -943,8 +976,7 @@ public sealed class GraphIntegrationTests : IDisposable
         await File.WriteAllTextAsync(Path.Combine(draft, "manifest.json"), ScriptSeed.ExampleManifest);
         await File.WriteAllTextAsync(Path.Combine(draft, "main.js"), ScriptSeed.ExampleSource);
 
-        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root),
-            new ScriptLibrary(_root));
+        var tools = ScriptToolsWithPlane(new JsonScriptCatalog(Path.Combine(_root, "program"), _root), new ScriptLibrary(_root));
         var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
         await ToolOf(offers, ScriptTools.ReloadToolName).ExecuteAsync(new("c1", ScriptTools.ReloadToolName, "{}"), default);
         await AddChannelAsync(channel, "chat-1");
@@ -972,7 +1004,7 @@ public sealed class GraphIntegrationTests : IDisposable
         await File.WriteAllTextAsync(Path.Combine(folder, "manifest.json"), ScriptSeed.ExampleManifest);
         await File.WriteAllTextAsync(Path.Combine(folder, "main.js"), ScriptSeed.ExampleSource);
 
-        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
+        var tools = ScriptToolsWithPlane(new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
         var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
         Assert.True(offers.Ok, offers.Error?.Message);
 
@@ -1010,7 +1042,7 @@ public sealed class GraphIntegrationTests : IDisposable
             ScriptSeed.ExampleManifest.Replace("\"mount\": \"manual\"", "\"mount\": \"default\""));
         await File.WriteAllTextAsync(Path.Combine(folder, "main.js"), ScriptSeed.ExampleSource);
 
-        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
+        var tools = ScriptToolsWithPlane(new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
         var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
         await ToolOf(offers, ScriptTools.ReloadToolName).ExecuteAsync(new("c1", ScriptTools.ReloadToolName, "{}"), default);
 
@@ -1025,7 +1057,7 @@ public sealed class GraphIntegrationTests : IDisposable
     [Fact]
     public async Task With_no_scripts_the_list_says_nothing_would_answer()
     {
-        var tools = new ScriptTools(_graph, new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
+        var tools = ScriptToolsWithPlane(new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
         var offers = await tools.ToolsAsync(new("s", Guid.NewGuid(), 1), default);
 
         var listed = await ToolOf(offers, ScriptTools.ListToolName)

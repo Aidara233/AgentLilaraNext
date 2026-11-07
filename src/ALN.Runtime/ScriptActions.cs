@@ -74,7 +74,9 @@ public static class ScriptActions
             }),
 
             (new(Reload, "Read the script folders again and switch to what they now say. A script whose new body is "
-                    + "refused keeps the body that already works.", Capabilities.GraphControl, false,
+                    + "refused keeps the body that already works. Publishing is agent's work: a reload applies what is "
+                    + "already on disk, and a model can only write drafts — switching a script off is the deeper verb.",
+                Capabilities.ScriptsPublish, false,
                 ParamsJson: """{"type":"object","properties":{},"additionalProperties":false}"""),
                 (_, ct) => ReloadAsync(graph, catalog, ct))
         };

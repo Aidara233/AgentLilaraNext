@@ -339,7 +339,7 @@ factories.Register(FileSystemModule.TypeId,
 // at the host's source, and the two tools it offers read whatever the graph holds at the moment they are called.
 factories.Register(ScriptToolsModule.TypeId,
     manifest => ScriptToolsModule.FromManifest(manifest, graph, scriptCatalog.Value!, sessionExtensions,
-        new ScriptLibrary(data.Root), modules));
+        new ScriptLibrary(data.Root), modules, controlPlane));
 // The action table reaches the model through a module too, and the plane it registers into came up long before this:
 // a module that offers tools is a module like any other, and the tools read the table as it is when they are called.
 factories.Register(ActionToolsModule.TypeId,

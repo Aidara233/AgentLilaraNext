@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using ALN.Contracts;
 using ALN.Contracts.Models;
 using ALN.Contracts.Sessions;
@@ -58,7 +59,7 @@ public static class ScriptReload
 /// Neither tool speaks to anyone: they change what runs, not what the conversation hears.
 /// </summary>
 public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog, ScriptLibrary? library = null,
-    ICatalog? modules = null)
+    ICatalog? modules = null, IControlPlane? plane = null)
     : ISessionToolSource
 {
     public const string SourceId = "system.script-tools";
@@ -73,6 +74,7 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
     private readonly IGraphScriptCatalog _catalog = catalog;
     private readonly ScriptLibrary? _library = library;
     private readonly ICatalog? _modules = modules;
+    private readonly IControlPlane? _plane = plane;
 
     public string Id => SourceId;
 
@@ -141,7 +143,7 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
         IReadOnlyList<SessionToolOffer> offers =
         [
             new(new ListTool(this), ListDefinition, ActsExternally: false),
-            new(new ReloadTool(this), ReloadDefinition, ActsExternally: false),
+            new(new ReloadTool(this, request.Level), ReloadDefinition, ActsExternally: false),
             // Mounting does change what a channel answers to from now on, but it says nothing to the conversation: the
             // next message does. Keeping it non-external is what lets a turn mount and then speak in the same step
             // without the reply being taken for the effect. The level travels with it: a Session mounts what it could be,
@@ -199,32 +201,58 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
         }
     }
 
-    private sealed class ReloadTool(ScriptTools owner) : ISessionTool
+    private sealed class ReloadTool(ScriptTools owner, AccessLevel level) : ISessionTool
     {
         public string Name => ReloadToolName;
         public bool EndsTurn => false;
 
         public async ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken)
         {
-            var reloaded = await ScriptReload.RunAsync(owner._graph, owner._catalog, cancellationToken).ConfigureAwait(false);
-            if (!reloaded.Ok || reloaded.Value is null)
-                return Result<SessionToolResult>.Failure(reloaded.Error ?? new(ErrorCode.Internal, "Reload failed."));
+            // Through the plane, not around it. The action and this tool are the same verb, and a verb with two doors at
+            // two depths — one audited, one not — is how a table stops being the answer to "who may do this". A host
+            // without a plane says so instead of quietly doing the work anyway.
+            if (owner._plane is null)
+                return Result<SessionToolResult>.Failure(new(ErrorCode.Unavailable, "This host has no control plane."));
+            var actor = new Actor(ActionTools.ActorId, ActorKind.Model, ActionTools.ModelCapabilities, level);
+            var acted = await owner._plane.InvokeAsync(actor, ScriptActions.Reload,
+                JsonSerializer.SerializeToElement(new { }), cancellationToken).ConfigureAwait(false);
+            if (!acted.Ok)
+            {
+                var refused = new StringBuilder();
+                refused.Append("error: ").Append(ScriptActions.Reload)
+                    .Append("\ncode: ").Append((acted.Error?.Code.ToString() ?? "failed").ToLowerInvariant())
+                    .Append("\n").Append(acted.Error?.Message ?? "Reload failed.");
+                if (!string.IsNullOrWhiteSpace(acted.Error?.Detail)) refused.Append("\n").Append(acted.Error!.Detail);
+                return Result<SessionToolResult>.Success(new(refused.ToString()));
+            }
+
+            var data = acted.Value;
+            var scripts = data.TryGetProperty("scripts", out var scriptRows) && scriptRows.ValueKind == JsonValueKind.Array
+                ? scriptRows.EnumerateArray().Select(row => new ScriptStatus(
+                    row.GetProperty("id").GetString() ?? "",
+                    row.TryGetProperty("library", out var lib) ? lib.GetString() ?? "user" : "user",
+                    !row.TryGetProperty("enabled", out var on) || on.ValueKind != JsonValueKind.False)).ToArray()
+                : [];
+            var rejected = data.TryGetProperty("rejected", out var issues) && issues.ValueKind == JsonValueKind.Array
+                ? issues.EnumerateArray().Select(row => new ScriptIssue(
+                    row.TryGetProperty("path", out var path) ? path.GetString() ?? "" : "",
+                    row.TryGetProperty("reason", out var reason) ? reason.GetString() ?? "" : "")).ToArray()
+                : [];
 
             var text = new StringBuilder();
-            var result = reloaded.Value;
-            text.Append(result.Scripts.Count == 0
+            text.Append(scripts.Length == 0
                 ? "Reloaded. No script is loaded: nothing would answer a message."
-                : $"Reloaded. {result.Scripts.Count} script(s) now loaded:");
-            foreach (var status in result.Scripts)
+                : $"Reloaded. {scripts.Length} script(s) now loaded:");
+            foreach (var status in scripts)
                 text.Append("\n- ").Append(status.Id).Append(" [").Append(status.Library).Append("] ")
                     .Append(status.Enabled ? "enabled" : "disabled")
                     .Append(string.Equals(status.Library, "draft", StringComparison.Ordinal)
                         ? " (draft: runs only after somebody mounts it)"
                         : "");
-            if (result.Rejected.Count > 0)
+            if (rejected.Length > 0)
             {
-                text.Append("\n\n").Append(result.Rejected.Count).Append(" refused:");
-                foreach (var issue in result.Rejected)
+                text.Append("\n\n").Append(rejected.Length).Append(" refused:");
+                foreach (var issue in rejected)
                     text.Append("\n- ").Append(issue.Path).Append(": ").Append(issue.Reason);
             }
             return Result<SessionToolResult>.Success(new(text.ToString()));
@@ -452,13 +480,14 @@ public sealed class ScriptToolsModule(ModuleId id, ScriptTools tools, ISessionEx
     public ModuleId Id { get; } = id;
 
     public static Result<IKernelModule> FromManifest(ModuleManifest manifest, IGraphRuntime graph, IGraphScriptCatalog catalog,
-        ISessionExtensionRegistry extensions, ScriptLibrary? scripts = null, ICatalog? modules = null)
+        ISessionExtensionRegistry extensions, ScriptLibrary? scripts = null, ICatalog? modules = null,
+        IControlPlane? plane = null)
     {
         ArgumentNullException.ThrowIfNull(manifest);
         if (!string.Equals(manifest.Type, TypeId, StringComparison.Ordinal))
             return Result<IKernelModule>.Failure(new(ErrorCode.Invalid, $"This factory builds {TypeId}, not {manifest.Type}."));
         return Result<IKernelModule>.Success(
-            new ScriptToolsModule(manifest.Id, new ScriptTools(graph, catalog, scripts, modules), extensions));
+            new ScriptToolsModule(manifest.Id, new ScriptTools(graph, catalog, scripts, modules, plane), extensions));
     }
 
     public ValueTask<Result> InitializeAsync(CancellationToken cancellationToken)
