@@ -112,6 +112,17 @@ public static class FileScopes
     /// can be given the draft folder without also being given the one the catalogue loads.
     /// </summary>
     public const string ScriptsDraft = "scripts/draft";
+
+    /// <summary>
+    /// The one place the model may make a mess in: <c>&lt;dataRoot&gt;/workspace</c>.
+    ///
+    /// It exists because the alternative is worse — without it, a half-finished draft, a scratch extract or a generated
+    /// file has to go somewhere, and the somewhere a model picks is whichever area it already has: the memory library,
+    /// which is the record. A workspace is a room where nothing is a fact yet, so a model can write freely there and be
+    /// told to. Nothing in this process reads it; it is the model's own corner, and the only scope where deleting
+    /// everything is not a loss.
+    /// </summary>
+    public const string Workspace = "workspace";
 }
 
 /// <summary>

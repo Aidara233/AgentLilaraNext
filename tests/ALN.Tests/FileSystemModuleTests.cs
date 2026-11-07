@@ -121,12 +121,13 @@ public sealed class FileSystemModuleTests : IDisposable
 
         var scan = await store.ScanAsync(types: null, default);
         var manifest = Assert.Single(scan.Manifests);
-        var built = FileSystemModule.FromManifest(manifest, Access(FileScopes.Memory, FileScopes.ScriptsDraft),
-            new SessionExtensionRegistry());
+        var built = FileSystemModule.FromManifest(manifest,
+            Access(FileScopes.Memory, FileScopes.Workspace, FileScopes.ScriptsDraft), new SessionExtensionRegistry());
 
         Assert.True(built.Ok, built.Error?.Message);
-        // The default configuration is what the host writes: the memory library, plus the folder a script is drafted in.
-        Assert.Equal([FileScopes.Memory, FileScopes.ScriptsDraft], ((FileSystemModule)built.Value!).Scopes);
+        // The default configuration is what the host writes: the memory library, a workspace for chores, plus the folder
+        // a script is drafted in.
+        Assert.Equal([FileScopes.Memory, FileScopes.Workspace, FileScopes.ScriptsDraft], ((FileSystemModule)built.Value!).Scopes);
     }
 
     // ---- what the model experiences -------------------------------------------------------------
@@ -163,6 +164,32 @@ public sealed class FileSystemModuleTests : IDisposable
         Assert.Equal(ErrorCode.Invalid, refused.Error!.Code);
         // A model that is told why can fix it on the next call; "denied" alone just gets tried again.
         Assert.Contains("parent", refused.Error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task The_workspace_is_a_normal_contained_scope_where_a_model_may_make_a_mess()
+    {
+        // The workspace exists so that half-finished things have somewhere to go that is not the record. It is not a
+        // special case in the port: same refusal of "..", same rules, one more registered directory — and the only one
+        // whose contents nothing else in this process reads.
+        var source = new FileSystemTools(Access(FileScopes.Memory, FileScopes.Workspace),
+            [FileScopes.Memory, FileScopes.Workspace]);
+
+        var written = await CallAsync(source, "fs_write",
+            """{"scope":"workspace","path":"草稿/分析.md","text":"先写到这儿，等确认再进记忆"}""");
+        Assert.True(written.Ok, written.Error?.Message);
+        var read = await CallAsync(source, "fs_read", """{"scope":"workspace","path":"草稿/分析.md"}""");
+        Assert.Equal("先写到这儿，等确认再进记忆", read.Value!.Content);
+
+        // Deleting it is not a loss, so `fs_remove` on the whole subtree is allowed here — that is what a scratch room is.
+        var removed = await CallAsync(source, "fs_remove", """{"scope":"workspace","path":"草稿","recursive":true}""");
+        Assert.True(removed.Ok, removed.Error?.Message);
+        var gone = await CallAsync(source, "fs_read", """{"scope":"workspace","path":"草稿/分析.md"}""");
+        Assert.Contains("不存在", gone.Value!.Content, StringComparison.Ordinal);
+
+        // Same containment as anywhere else: the workspace is a room, not an exit.
+        var refused = await CallAsync(source, "fs_read", """{"scope":"workspace","path":"../memory/block.md"}""");
+        Assert.Equal(ErrorCode.Invalid, refused.Error!.Code);
     }
 
     [Fact]

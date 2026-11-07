@@ -21,9 +21,12 @@ public sealed class FileSystemModule(ModuleId id, FileSystemTools tools, ISessio
 {
     public const string TypeId = "filesystem.local";
 
-    /// <summary>Default configuration written by the host when no <c>module.json</c> exists yet: the memory library, and
-    /// nowhere else. Granting more is an edit, not a default.</summary>
-    public const string DefaultConfig = """{"scopes":["memory","scripts/draft"]}""";
+    /// <summary>
+    /// Default configuration written by the host when no <c>module.json</c> exists yet: the memory library, the folder a
+    /// script is drafted in, and a workspace to do chores in. Granting more is an edit, not a default — these three are
+    /// the areas whose contents are already the model's responsibility, and none of them is read by the host itself.
+    /// </summary>
+    public const string DefaultConfig = """{"scopes":["memory","workspace","scripts/draft"]}""";
 
     private bool _registered;
 

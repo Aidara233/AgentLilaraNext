@@ -74,7 +74,7 @@ if (!channelInfoSource.Ok) { Console.Error.WriteLine(channelInfoSource.Error?.Me
 // Everything a model may reach on disk goes through this one port, and the scopes it knows are registered here and
 // nowhere else. The memory library is the first; another is added by registering it here and naming it in that
 // module's own module.json — never by a module inventing a path.
-var fileAccess = new LocalFileSystemAccess(data.Root, [FileScopes.Memory, FileScopes.ScriptsDraft]);
+var fileAccess = new LocalFileSystemAccess(data.Root, [FileScopes.Memory, FileScopes.ScriptsDraft, FileScopes.Workspace]);
 // Memory is a module of its own: it registers its own line and its own tools, and nothing else knows it exists. It
 // reads and writes through the port above, so "the model may tidy memory with file tools" needs no special case:
 // they reach the same files by the same rules.
