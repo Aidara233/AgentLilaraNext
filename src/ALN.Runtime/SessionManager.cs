@@ -349,7 +349,14 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
         var relay = new SessionRelay(from.Trim(), fromLevel, at);
         var entry = new SessionHistoryEntry($"relay:{Guid.NewGuid():N}", Guid.NewGuid().ToString("N"),
             record.State.StepNumber + 1, "user", RelayNote(text.Trim(), relay, record.Spec.Level), at, Relay: relay);
-        var state = record.State with { Revision = record.State.Revision + 1 };
+        // The step counter moves with the entry. Leaving it where it was made every delivery claim to be step 1 — the
+        // live probes showed two records numbered 1 next to a state that still said 0 — and the turn after them would
+        // have numbered its own entries over the top of theirs.
+        var state = record.State with
+        {
+            Revision = record.State.Revision + 1,
+            StepNumber = record.State.StepNumber + 1
+        };
         var committed = await CommitAsync(record, new SessionPendingCommit(state, [entry]), cancellationToken)
             .ConfigureAwait(false);
         if (!committed.Ok) return Result<SessionTurnResult>.Failure(committed.Error!);

@@ -73,6 +73,23 @@ public sealed class SessionDeliveryTests : IDisposable
     }
 
     [Fact]
+    public async Task Each_delivery_is_its_own_step_and_the_state_agrees()
+    {
+        Assert.True((await _sessions.OpenAsync("s-steps", Spec(AccessLevel.Operator), default)).Ok);
+        Assert.True((await _sessions.DeliverAsync("s-steps", "第一条", FromScript, AccessLevel.Agent, false, default)).Ok);
+        Assert.True((await _sessions.DeliverAsync("s-steps", "第二条", FromScript, AccessLevel.Agent, false, default)).Ok);
+
+        var entries = await ReadHistoryAsync("s-steps");
+        Assert.Equal([1, 2], entries.Where(entry => entry.Relay is not null).Select(entry => entry.StepNumber).ToArray());
+
+        // And the counter in state moved with them, so the next turn numbers its own entries after these.
+        var state = JsonSerializer.Deserialize<SessionState>(
+            await File.ReadAllTextAsync(Path.Combine(_root, "modules", "s-steps", "state.json")),
+            new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
+        Assert.Equal(2, state.StepNumber);
+    }
+
+    [Fact]
     public async Task A_sender_deeper_than_the_receiver_is_described_as_a_request_too_not_as_an_order()
     {
         // The live case that produced this test: a trusted script (full) handing a message to an agent Session. The
