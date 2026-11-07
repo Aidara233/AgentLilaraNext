@@ -27,8 +27,12 @@ public sealed class ActionTools(IControlPlane plane, AccessLevel? callerLevel = 
     /// <summary>
     /// What level the model acts at, kept in one place because the list and the call have to agree: a list that says
     /// "needs an operator" while the call goes through is worse than either half being wrong on its own.
+    ///
+    /// <see cref="AccessLevel.Agent"/> is the whole point of the level: the model is an operator's assistant, not a
+    /// second operator. Everything it needs to do its job — read the graph, answer, keep notes, run its own Session,
+    /// mount a script it wrote — sits at that level; the verbs that change the shape of the process do not.
     /// </summary>
-    public static AccessLevel ModelLevel { get; } = AccessLevel.Full;
+    public static AccessLevel ModelLevel { get; } = AccessLevel.Agent;
 
     private readonly AccessLevel _level = callerLevel ?? ModelLevel;
 

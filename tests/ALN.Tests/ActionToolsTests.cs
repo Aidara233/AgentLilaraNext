@@ -105,7 +105,9 @@ public sealed class ActionToolsTests : IDisposable
     public async Task Calling_goes_through_the_control_plane_and_reports_what_happened()
     {
         var plane = PlaneWithChannels(out var channels);
-        var tools = new ActionTools(plane);
+        // An operator's session: creating a Channel is wiring, and wiring is not the model's to do (see the level test
+        // below, where the same call is refused). What this test is about is the report, not the permission.
+        var tools = new ActionTools(plane, AccessLevel.Operator);
         var call = await ToolAsync(tools, ActionTools.CallToolName);
 
         var created = Text(await call.ExecuteAsync(new("c1", ActionTools.CallToolName,
@@ -125,25 +127,37 @@ public sealed class ActionToolsTests : IDisposable
     }
 
     [Fact]
-    public async Task Unknown_denied_and_invalid_are_three_different_answers()
+    public async Task Unknown_denied_and_invalid_stay_four_different_answers()
     {
         var plane = PlaneWithChannels(out _);
-        // An action the model may not call: a read grant is not the whole table.
         Assert.True(plane.Register(new("test.control", "Guarded.", Capabilities.ModulesControl, true),
             (_, _) => ValueTask.FromResult(Result<JsonElement>.Failure(new(ErrorCode.Invalid, "never reached")))).Ok);
-        var restricted = new ActionTools(new ControlPlaneWithGrant(plane, [Capabilities.ChannelsControl, Capabilities.ChannelsRead]));
-        var call = await ToolAsync(restricted, ActionTools.CallToolName);
 
-        var unknown = Text(await call.ExecuteAsync(new("c1", ActionTools.CallToolName, """{"action":"nope.nothing"}"""), default));
+        // The model as itself. Same table, all grants, shallowest level: what it meets first is the level.
+        var agentCall = await ToolAsync(new ActionTools(plane, AccessLevel.Agent), ActionTools.CallToolName);
+
+        var unknown = Text(await agentCall.ExecuteAsync(new("c1", ActionTools.CallToolName, """{"action":"nope.nothing"}"""), default));
         Assert.StartsWith("error: nope.nothing", unknown);
         Assert.Contains("code: invalid", unknown);
 
-        var denied = Text(await call.ExecuteAsync(new("c2", ActionTools.CallToolName,
+        var byLevel = Text(await agentCall.ExecuteAsync(new("c2", ActionTools.CallToolName,
+            """{"action":"channels.create","args":{"type":"channel.conversation"}}"""), default));
+        Assert.Contains("code: denied", byLevel);
+        Assert.Contains("needs L1 operator", byLevel);
+        Assert.DoesNotContain("lacks capability", byLevel);
+
+        // An operator with a narrower grant: the same verb now answers about the grant instead of the level, because
+        // "somebody else's job" and "you were not given this" are two different things to do about a refusal.
+        var restricted = new ActionTools(new ControlPlaneWithGrant(plane, [Capabilities.ChannelsControl, Capabilities.ChannelsRead]),
+            AccessLevel.Operator);
+        var call = await ToolAsync(restricted, ActionTools.CallToolName);
+
+        var denied = Text(await call.ExecuteAsync(new("c3", ActionTools.CallToolName,
             """{"action":"test.control","args":{}}"""), default));
         Assert.Contains("code: denied", denied);
         Assert.Contains("lacks capability", denied);
 
-        var invalid = Text(await call.ExecuteAsync(new("c3", ActionTools.CallToolName,
+        var invalid = Text(await call.ExecuteAsync(new("c4", ActionTools.CallToolName,
             """{"action":"channels.create","args":{"type":"channel.conversation"}}"""), default));
         Assert.Contains("code: invalid", invalid);
         Assert.Contains("actions_list", invalid);
