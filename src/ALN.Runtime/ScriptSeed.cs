@@ -134,6 +134,26 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     **挂载之后它会从这个目录移到 `scripts/live/`**——目录本身就记录了它是否在生效。卸载掉最后一个挂载点，
     它会移回 `scripts/draft/`。`scripts/trusted/` 是系统/用户放的脚本，不在这条移动线上。
 
+    ## 你的脚本是「模型级」的
+
+    脚本能碰多深的接口，**由它住在哪个目录决定，不由 manifest 决定**（manifest 是你能写的文件，所以不能当证据）：
+    `draft/` 和 `live/` 是模型级（agent），`trusted/` 和 `builtin/` 是受信级（full）。所以：
+
+    - manifest 的 `capabilities` 里写一个超出你这个等级的（比如 `models.control`），这个脚本**会被拒绝加载**，原因会写在
+      `scripts_reload` 的回答里；
+    - 想让它拿到更深的能力，人把它挪进 `scripts/trusted/` 再 reload —— 那是人替它背书，不是你能自己做的；
+    - 你的脚本也不能把比自己深的脚本挂到事件上。
+
+    ## 除了 ctx，还能问动作表
+
+    ```js
+    const all = await ctx.actions.list();          // { ok, level, actions: [{ id, capability, level, reachable, mutating }] }
+    const r = await ctx.actions.call("channels.list", {});   // { ok: true, result } 或 { ok: false, error: { code, message } }
+    ```
+
+    `call` 走的和控制面同一个入口：同一个能力名、同一次审计。够不着的时候它**返回**一句可读的拒绝（`code: denied`），
+    不抛异常——你可以照着改道走。`capabilities` 里没声明的能力，调了也是 denied。
+
     ## 一个脚本是一个目录
 
     ```
