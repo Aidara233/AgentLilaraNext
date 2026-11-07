@@ -40,7 +40,7 @@ public sealed record ApiSettings(string[] Urls, Dictionary<string, string[]> Rol
                 foreach (var role in candidate.Roles)
                     if (Roles.TryGetValue(role, out var granted))
                         capabilities.AddRange(granted);
-                return new Actor(candidate.Name, ActorKind.User, capabilities);
+                return new Actor(candidate.Name, ActorKind.User, capabilities, AccessLevel.Full);
             }
         }
         return null;

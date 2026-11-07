@@ -137,7 +137,7 @@ public sealed class ActionTools(IControlPlane plane) : ISessionToolSource
                 ? args.Clone()
                 : JsonSerializer.SerializeToElement(new { });
 
-            var actor = new Actor(ActorId, ActorKind.Model, ModelCapabilities);
+            var actor = new Actor(ActorId, ActorKind.Model, ModelCapabilities, AccessLevel.Full);
             var result = await owner._plane.InvokeAsync(actor, actionId, payload, cancellationToken).ConfigureAwait(false);
 
             var text = new StringBuilder();

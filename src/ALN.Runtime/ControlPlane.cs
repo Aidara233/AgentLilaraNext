@@ -47,9 +47,16 @@ public sealed class ControlPlane(IAuditSink audit, ISignalLog signalLog) : ICont
         // Read before the call: a handler that fails may still have changed something, and the thing it was asked to
         // change is the half of the story that survives.
         var subject = SubjectOf(entry.Descriptor, arguments);
-        if (!actor.Allows(entry.Descriptor.Capability))
+        if (!actor.Allows(entry.Descriptor.Capability) || actor.Level < entry.Descriptor.RequiredLevel)
         {
-            var reason = $"Actor {actor.Id} lacks capability {entry.Descriptor.Capability}.";
+            // Two refusals that read differently, because a caller can act on exactly one of them: "not your kind of
+            // work" is a wiring mistake or a role that has not been granted yet, while "not your depth" is a job for
+            // somebody else. Flattening them into one message teaches the model to retry the wrong thing.
+            var required = entry.Descriptor.RequiredLevel;
+            var reason = actor.IsGranted(entry.Descriptor.Capability) && actor.Level < required
+                ? $"Actor {actor.Id} is at {AccessLevels.Describe(actor.Level)}; {actionId} needs "
+                  + $"{AccessLevels.Describe(required)}. Somebody at that level has to run this one."
+                : $"Actor {actor.Id} lacks capability {entry.Descriptor.Capability}.";
             await audit.AppendAsync(new(DateTimeOffset.UtcNow, Guid.Empty, actor.Id,
                 new Address("control", "action", actionId), actionId, "denied", Describe(subject, reason)),
                 cancellationToken).ConfigureAwait(false);

@@ -42,7 +42,13 @@ public sealed class ControlPlaneTests : IDisposable
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
     }
 
-    private static Actor User(params string[] capabilities) => new("alice", ActorKind.User, capabilities);
+    /// <summary>
+    /// A person at the API. <see cref="AccessLevel.Full"/> on purpose: these tests are about grants and about the
+    /// plane's behaviour, and pinning them to a level would make all of them fail the day a verb's level moves.
+    /// The level's own behaviour is tested where it belongs — see the level tests further down.
+    /// </summary>
+    private static Actor User(params string[] capabilities) =>
+        new("alice", ActorKind.User, capabilities, AccessLevel.Full);
 
     [Fact]
     public async Task Unknown_action_is_invalid_not_denied()
@@ -112,12 +118,16 @@ public sealed class ControlPlaneTests : IDisposable
     [Fact]
     public void Wildcards_grant_a_group_but_not_everything()
     {
-        Assert.True(new Actor("ops", ActorKind.User, ["demo.*"]).Allows("demo.read"));
-        Assert.False(new Actor("ops", ActorKind.User, ["demo.*"]).Allows("system.read"));
-        Assert.True(new Actor("viewer", ActorKind.User, ["*.read"]).Allows("adapters.read"));
-        Assert.False(new Actor("viewer", ActorKind.User, ["*.read"]).Allows("adapters.control"));
+        // Deep on purpose: this test is about the shape of a grant, so the level must not be the reason for a "no".
+        static Actor Deep(string id, params string[] capabilities) =>
+            new(id, ActorKind.User, capabilities, AccessLevel.Full);
+
+        Assert.True(Deep("ops", "demo.*").Allows("demo.read"));
+        Assert.False(Deep("ops", "demo.*").Allows("system.read"));
+        Assert.True(Deep("viewer", "*.read").Allows("adapters.read"));
+        Assert.False(Deep("viewer", "*.read").Allows("adapters.control"));
         // Only one wildcard is understood; anything else fails closed.
-        Assert.False(new Actor("odd", ActorKind.User, ["*.*"]).Allows("demo.read"));
+        Assert.False(Deep("odd", "*.*").Allows("demo.read"));
         Assert.True(Actor.System.Allows("anything.at.all"));
     }
 
@@ -173,6 +183,67 @@ public sealed class ControlPlaneTests : IDisposable
         Assert.Equal(0, quiet.GetProperty("degraded").GetInt32());
     }
 
+    /// <summary>
+    /// A level is a comparison, not a switch. Two refusals stay two answers: "not granted" is a role that needs
+    /// wiring, "too shallow" is a job for somebody else, and a caller can only act on the difference.
+    /// </summary>
+    [Fact]
+    public async Task A_level_is_a_comparison_and_the_refusal_says_which_half_failed()
+    {
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(plane.Register(new("demo.operator", "Needs an operator.", Capabilities.ModelsControl, true),
+            (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(JsonSerializer.SerializeToElement(new { ok = 1 })))).Ok);
+        // One verb may sit deeper than its family: modules.read is an agent's, this one is the kernel's.
+        Assert.True(plane.Register(new("demo.kernel", "Needs the kernel.", Capabilities.ModulesRead, true,
+                MinLevel: AccessLevel.Full),
+            (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(JsonSerializer.SerializeToElement(new { ok = 1 })))).Ok);
+
+        var agent = new Actor("model", ActorKind.Model, [Actor.Any], AccessLevel.Agent);
+        var api = new Actor("alice", ActorKind.User, [Actor.Any], AccessLevel.Operator);
+
+        var refused = await plane.InvokeAsync(agent, "demo.operator", default, default);
+        Assert.Equal(ErrorCode.Denied, refused.Error!.Code);
+        Assert.Contains("L1 operator", refused.Error.Message);
+        Assert.DoesNotContain("lacks capability", refused.Error.Message);
+
+        // The same grant at the right depth goes through.
+        Assert.True((await plane.InvokeAsync(api, "demo.operator", default, default)).Ok);
+
+        var kernel = await plane.InvokeAsync(api, "demo.kernel", default, default);
+        Assert.Equal(ErrorCode.Denied, kernel.Error!.Code);
+        Assert.Contains("L2 full", kernel.Error.Message);
+        Assert.True((await plane.InvokeAsync(Actor.System, "demo.kernel", default, default)).Ok);
+
+        // Never granted at all stays the other answer, whatever the level.
+        var stranger = new Actor("viewer", ActorKind.User, ["demo.read"], AccessLevel.Full);
+        Assert.Contains("lacks capability",
+            (await plane.InvokeAsync(stranger, "demo.operator", default, default)).Error!.Message);
+    }
+
+    [Fact]
+    public void An_interface_nobody_registered_counts_as_the_deepest_there_is()
+    {
+        Assert.Equal(AccessLevel.Full, AccessLevels.Of("nothing.registered.this"));
+        Assert.Equal(AccessLevel.Full, AccessLevels.Of(null));
+        Assert.Equal(AccessLevel.Agent, AccessLevels.Of(Capabilities.ChannelsRead));
+        Assert.Equal(AccessLevel.Operator, AccessLevels.Of(Capabilities.ModelsControl));
+    }
+
+    [Fact]
+    public void Every_script_capability_has_a_level()
+    {
+        // The table spells these names out instead of referencing them (ScriptCapabilities lives one assembly up), so
+        // something has to hold the two lists together: a capability the runner accepts but the table never names
+        // would silently be kernel-deep — the kind of failure that looks like "it works" until an agent tries it.
+        string[] names =
+        [
+            ScriptCapabilities.SessionRun, ScriptCapabilities.SessionActivate, ScriptCapabilities.ModelComplete,
+            ScriptCapabilities.SelfAdapterSend, ScriptCapabilities.SelfAdapterPoll, ScriptCapabilities.ChannelAccept,
+            ScriptCapabilities.ChannelRoute, ScriptCapabilities.ChannelReply
+        ];
+        foreach (var name in names) Assert.Contains(name, AccessLevels.Known);
+    }
+
     private async Task<JsonElement> Raw(ControlPlane plane)
     {
         var result = await plane.InvokeAsync(User("system.read"), CoreActions.SystemInfo, default, default);
@@ -187,10 +258,14 @@ public sealed class ControlPlaneTests : IDisposable
         // Role files in the wild say graph.control, and the actions those grants guarded are modules.* now. Losing
         // mount rights because nobody edited a json file is exactly the kind of silent downgrade this vocabulary has
         // to not do.
-        Assert.True(new Actor("ops", ActorKind.User, ["graph.control"]).Allows(Capabilities.ModulesControl));
-        Assert.True(new Actor("ops", ActorKind.User, ["graph.read"]).Allows(Capabilities.ModulesRead));
+        // An operator's role file, which is the level the grant was written for.
+        static Actor Ops(params string[] capabilities) =>
+            new("ops", ActorKind.User, capabilities, AccessLevel.Operator);
+
+        Assert.True(Ops("graph.control").Allows(Capabilities.ModulesControl));
+        Assert.True(Ops("graph.read").Allows(Capabilities.ModulesRead));
         // One-way on purpose: the new name does not buy the old one, so the forwarding can be deleted later.
-        Assert.False(new Actor("ops", ActorKind.User, ["modules.control"]).Allows(Capabilities.GraphControl));
+        Assert.False(Ops("modules.control").Allows(Capabilities.GraphControl));
     }
 
     [Fact]

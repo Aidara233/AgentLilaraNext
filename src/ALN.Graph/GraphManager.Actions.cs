@@ -38,7 +38,7 @@ public sealed partial class GraphManager
                   "budget":{"type":"integer","minimum":1,"description":"Dispatches allowed per target. Omit for unlimited."},
                   "stateScope":{"type":"string","enum":["perTarget","shared"],"description":"Whether the script's memory is per target. Default perTarget."}},
                  "required":["script"],"additionalProperties":false}
-                """, Subject: "script"), MountAsync),
+                """, Subject: "script", MinLevel: AccessLevel.Agent), MountAsync),
             (new(GraphActions.DeprecatedMount, "Deprecated: use modules.edge.mount.", Capabilities.ModulesControl, true,
                 ParamsJson: GraphActions.MountParams, Subject: "script"), MountAsync),
 
@@ -50,7 +50,7 @@ public sealed partial class GraphManager
                   "script":{"type":"string","description":"With 'target': drop that script's mounts on that instance."},
                   "target":{"type":"string","description":"An instance address."}},
                  "additionalProperties":false}
-                """, Subject: "rule"), UnmountAsync),
+                """, Subject: "rule", MinLevel: AccessLevel.Agent), UnmountAsync),
             (new(GraphActions.DeprecatedUnmount, "Deprecated: use modules.edge.unmount.", Capabilities.ModulesControl, true,
                 ParamsJson: GraphActions.UnmountParams, Subject: "rule"), UnmountAsync)
         };

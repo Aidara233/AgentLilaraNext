@@ -5,16 +5,105 @@ namespace ALN.Contracts;
 public enum ActorKind { User = 0, Script = 1, System = 2, Model = 3 }
 
 /// <summary>
+/// How deep an interface sits, and how deep a caller is trusted. An <b>ordered</b> value, not a flag: a caller
+/// reaches an interface when its level is at least the interface's level, so "what may the model touch" and "what
+/// does this verb need" are two numbers compared once, rather than a list somebody keeps in step by hand.
+///
+/// The names are the roles, not numbers, because the question a refusal answers is a question about people: an
+/// interface that says <see cref="Operator"/> is one an operator has to come and run.
+/// </summary>
+public enum AccessLevel
+{
+    /// <summary>The model itself, and everything it made: its scripts, the sessions it runs.</summary>
+    Agent = 0,
+
+    /// <summary>A person driving this process on purpose — the API, the web UI, a console session.</summary>
+    Operator = 1,
+
+    /// <summary>Inside the process: host code, built-in modules, and scripts a person vouched for by hand.</summary>
+    Full = 2
+}
+
+/// <summary>
+/// Which level each interface sits at. It is a table in code and nothing else: there is deliberately no action that
+/// edits it, because an interface that said "you may raise levels" would be the only level that mattered.
+/// Changing this table is a change to the program (a recompile), and per script a re-mount; a caller's own level is
+/// the moving part, and it moves through <c>sessions.setLevel</c> without a restart.
+///
+/// An interface nobody registered is <see cref="AccessLevel.Full"/>: a verb that did not say how deep it is has not
+/// said it is shallow, and guessing shallow is the one direction that cannot be taken back.
+/// </summary>
+public static class AccessLevels
+{
+    private static readonly Dictionary<string, AccessLevel> Table = new(StringComparer.Ordinal)
+    {
+        // Reading, saying, and the session's own line of work: a model is an operator's assistant, and this is the
+        // part of operating that is its job.
+        [Capabilities.SystemRead] = AccessLevel.Agent,
+        [Capabilities.AdaptersRead] = AccessLevel.Agent,
+        [Capabilities.ChannelsRead] = AccessLevel.Agent,
+        [Capabilities.MessagesWrite] = AccessLevel.Agent,
+        [Capabilities.SessionsRead] = AccessLevel.Agent,
+        [Capabilities.ModelsRead] = AccessLevel.Agent,
+        [Capabilities.SignalsRead] = AccessLevel.Agent,
+        [Capabilities.ParamsRead] = AccessLevel.Agent,
+        [Capabilities.ArchiveRead] = AccessLevel.Agent,
+        [Capabilities.PromptsRead] = AccessLevel.Agent,
+        [Capabilities.ModulesRead] = AccessLevel.Agent,
+        [Capabilities.GraphRead] = AccessLevel.Agent,
+
+        // Changing the shape of the process: a person's decision, made on purpose, written down in the audit.
+        [Capabilities.AdaptersControl] = AccessLevel.Operator,
+        [Capabilities.ChannelsControl] = AccessLevel.Operator,
+        [Capabilities.ModelsControl] = AccessLevel.Operator,
+        [Capabilities.ParamsWrite] = AccessLevel.Operator,
+        [Capabilities.PromptsWrite] = AccessLevel.Operator,
+        [Capabilities.ArchiveControl] = AccessLevel.Operator,
+        [Capabilities.ModulesControl] = AccessLevel.Operator,
+        [Capabilities.GraphControl] = AccessLevel.Operator,
+
+        // What a mounted script may reach through its ctx. The names are spelled here rather than referenced because
+        // ScriptCapabilities lives one assembly up; a test holds the two lists to each other.
+        // Driving a session, answering, and calling a model are the script's own line of work.
+        ["session.run"] = AccessLevel.Agent,
+        ["session.activate"] = AccessLevel.Agent,
+        ["model.complete"] = AccessLevel.Agent,
+        ["self.adapter.send"] = AccessLevel.Agent,
+        ["self.adapter.poll"] = AccessLevel.Agent,
+        ["channel.bound-send"] = AccessLevel.Agent,
+        // Wiring a source into a Channel is not "replying": it decides what this process listens to, which is a
+        // decision about the deployment rather than about the conversation.
+        ["channel.accept"] = AccessLevel.Operator,
+        ["channel.route"] = AccessLevel.Operator
+    };
+
+    /// <summary>The level an interface sits at. Unregistered is <see cref="AccessLevel.Full"/>, never Agent.</summary>
+    public static AccessLevel Of(string? capability) =>
+        capability is not null && Table.TryGetValue(capability, out var level) ? level : AccessLevel.Full;
+
+    /// <summary>Every interface this table knows, so a test can prove no constant was forgotten.</summary>
+    public static IReadOnlyCollection<string> Known => Table.Keys;
+
+    /// <summary>"L1 operator" — the spelling a refusal and the action list both use, so they agree.</summary>
+    public static string Describe(AccessLevel level) => $"L{(int)level} {level.ToString().ToLowerInvariant()}";
+}
+
+/// <summary>
 /// Who is invoking an action. A script carries its mount identity; a user carries an account id.
 /// Capabilities are granted by whoever authenticated the actor, never by the caller's payload.
 /// </summary>
-public sealed record Actor(string Id, ActorKind Kind, IReadOnlyList<string> Capabilities)
+public sealed record Actor(string Id, ActorKind Kind, IReadOnlyList<string> Capabilities,
+    AccessLevel Level = AccessLevel.Agent)
 {
     public const string Any = "*";
 
-    public static Actor System { get; } = new("system", ActorKind.System, [Any]);
+    public static Actor System { get; } = new("system", ActorKind.System, [Any], AccessLevel.Full);
 
-    public bool Allows(string capability)
+    /// <summary>
+    /// Whether this actor was granted the capability at all — the first half of the question, and the one that
+    /// answers "is this your kind of work".
+    /// </summary>
+    public bool IsGranted(string capability)
     {
         if (string.IsNullOrEmpty(capability)) return false;
         foreach (var granted in Capabilities)
@@ -27,6 +116,15 @@ public sealed record Actor(string Id, ActorKind Kind, IReadOnlyList<string> Capa
         }
         return false;
     }
+
+    /// <summary>
+    /// Reaching an interface takes two answers, and they are not the same question: the grant says "this is your kind
+    /// of work", the level says "you are trusted this deep". A model that was granted everything still does not reach
+    /// a kernel interface, and an operator trusted with everything still needs the grant. Either half alone is a hole:
+    /// a grant list kept by hand drifts, and a level with no grant turns "operator" into "master key".
+    /// </summary>
+    public bool Allows(string capability) =>
+        IsGranted(capability) && Level >= AccessLevels.Of(capability);
 
     /// <summary>The capability a modules.* name was called before the graph grew modules.</summary>
     private static string? FormerName(string capability) =>
@@ -66,8 +164,17 @@ public sealed record Actor(string Id, ActorKind Kind, IReadOnlyList<string> Capa
 /// whole argument object: "who changed what" has to be answerable afterwards, and an argument object is the one
 /// place a credential would end up in a log (<c>models.provider.save</c> carries a key).
 /// </param>
+/// <param name="MinLevel">
+/// The level this verb needs, when it is not the one its capability sits at. Most verbs are their family's level;
+/// <c>modules.edge.mount</c> is a model's business and <c>modules.load</c> is the kernel's, and both hang off
+/// <c>modules.control</c>.
+/// </param>
 public sealed record ActionDescriptor(string Id, string Summary, string Capability, bool Mutating,
-    string? ParamsJson = null, string? Subject = null);
+    string? ParamsJson = null, string? Subject = null, AccessLevel? MinLevel = null)
+{
+    /// <summary>The level a caller must be at: the table answers for the family, this answers for the verb.</summary>
+    public AccessLevel RequiredLevel => MinLevel ?? AccessLevels.Of(Capability);
+}
 
 /// <summary>
 /// Single execution point for every front-end (scripts today, the HTTP API next). Authorization,
