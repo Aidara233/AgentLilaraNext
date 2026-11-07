@@ -14,9 +14,9 @@ namespace ALN.Runtime;
 public sealed class HostScheduleTargets(ISessionManager sessions, IGraphRuntime graph) : IScheduleTargets
 {
     public async ValueTask<Result> WakeSessionAsync(string sessionId, DateTimeOffset dueAt, string scheduleId,
-        CancellationToken cancellationToken)
+        string? payload, CancellationToken cancellationToken)
     {
-        var woken = await sessions.ActivateAsync(sessionId, ActivationReason.ScheduleDue, dueAt, cancellationToken, scheduleId)
+        var woken = await sessions.ActivateAsync(sessionId, ActivationReason.ScheduleDue, dueAt, cancellationToken, scheduleId, payload)
             .ConfigureAwait(false);
         // A busy Session is retryable by contract; the sweep turns that into a skip rather than a failed beat.
         return woken.Ok ? Result.Success() : Result.Failure(woken.Error!);

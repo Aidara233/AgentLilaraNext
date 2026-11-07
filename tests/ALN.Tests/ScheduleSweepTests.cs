@@ -39,17 +39,19 @@ public sealed class ScheduleSweepTests
     private sealed class Targets : IScheduleTargets
     {
         public List<(string SessionId, DateTimeOffset DueAt, string Schedule)> Woken { get; } = [];
+        public List<string> Payloads { get; } = [];
         public List<(Address Source, string Payload)> Dispatched { get; } = [];
         public TaskCompletionSource Hold { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool Block { get; init; }
         public Error? Refuse { get; init; }
 
         public async ValueTask<Result> WakeSessionAsync(string sessionId, DateTimeOffset dueAt, string scheduleId,
-            CancellationToken cancellationToken)
+            string? payload, CancellationToken cancellationToken)
         {
             if (Refuse is { } error) return Result.Failure(error);
             if (Block) await Hold.Task.WaitAsync(cancellationToken);
             Woken.Add((sessionId, dueAt, scheduleId));
+            Payloads.Add(payload ?? "");
             return Result.Success();
         }
 
@@ -72,17 +74,21 @@ public sealed class ScheduleSweepTests
     public async Task A_due_session_row_runs_once_and_advances_to_its_next_beat()
     {
         var store = new ScheduleStore(new MemoryState());
-        var set = await store.SetAsync(Draft(ScheduleKind.Every, "1h"), Now, default);
+        var set = await store.SetAsync(Draft(ScheduleKind.Every, "1h") with { Payload = "把昨天的日志汇总一下" },
+            Now, default);
         var targets = new Targets();
         var sweep = new ScheduleSweep(store, targets);
 
         var report = await sweep.PulseAsync(Now.AddHours(1), default);
         Assert.True(report.Ok, report.Error?.Message);
+        await sweep.DrainAsync();
         Assert.Equal(1, report.Value!.Due);
         Assert.Equal(1, report.Value.Fired);
         var woken = Assert.Single(targets.Woken);
         Assert.Equal(Now.AddHours(1), woken.DueAt);
         Assert.Equal(set.Value!.Id, woken.Schedule);
+        // The note travels with the wake: the row's own words, not just its id.
+        Assert.Equal("把昨天的日志汇总一下", Assert.Single(targets.Payloads));
 
         var after = await store.GetAsync(set.Value.Id, default);
         Assert.Equal(1, after.Value!.Runs);

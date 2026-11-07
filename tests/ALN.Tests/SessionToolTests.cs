@@ -463,6 +463,41 @@ public sealed class SessionToolTests : IDisposable
     }
 
     [Fact]
+    public async Task A_schedule_wake_carries_what_the_rule_was_written_to_do()
+    {
+        // A row's id is not a reason. The note carries the words whoever wrote the rule used, and says they are a note
+        // rather than somebody speaking — otherwise the model answers the note as if a person had just said it.
+        var model = new ScriptedModel([new TextDelta("ok"), new ModelCompleted(StopReason.EndTurn, new ModelUsage(1, 1))]);
+        var sessions = new SessionManager(Path.Combine(_root, "wake-schedule"), model);
+        Assert.True((await sessions.OpenAsync("s-rule", Spec(), default)).Ok);
+
+        var woken = await sessions.ActivateAsync("s-rule", ActivationReason.ScheduleDue,
+            DateTimeOffset.UtcNow.AddMinutes(-1), default, "sch-3f2a", "把昨天的日志汇总一下，只看错误");
+        Assert.True(woken.Ok, woken.Error?.Detail ?? woken.Error?.Message);
+
+        var note = Assert.Single(model.Requests[^1].Messages,
+            message => message.Content?.Contains("一条定时规则", StringComparison.Ordinal) == true);
+        Assert.Contains("sch-3f2a", note.Content!, StringComparison.Ordinal);
+        Assert.Contains("把昨天的日志汇总一下，只看错误", note.Content!, StringComparison.Ordinal);
+        Assert.Contains("不是有人在对你说话", note.Content!, StringComparison.Ordinal);
+        Assert.Equal("user", note.Role);
+    }
+
+    [Fact]
+    public async Task A_schedule_wake_without_a_note_says_only_that_a_rule_came_due()
+    {
+        var model = new ScriptedModel([new TextDelta("ok"), new ModelCompleted(StopReason.EndTurn, new ModelUsage(1, 1))]);
+        var sessions = new SessionManager(Path.Combine(_root, "wake-schedule-bare"), model);
+        Assert.True((await sessions.OpenAsync("s-rule", Spec(), default)).Ok);
+
+        Assert.True((await sessions.ActivateAsync("s-rule", ActivationReason.ScheduleDue,
+            DateTimeOffset.UtcNow.AddMinutes(-1), default, "sch-3f2a")).Ok);
+        var note = Assert.Single(model.Requests[^1].Messages,
+            message => message.Content?.Contains("一条定时规则", StringComparison.Ordinal) == true);
+        Assert.DoesNotContain("这条规则当初被写下来时说的事是", note.Content!, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task A_wake_up_that_arrives_while_the_session_is_busy_is_skipped_not_queued()
     {
         var model = new HeldModel();

@@ -138,7 +138,14 @@ public sealed record SessionTurnInput(
     /// then says a rule came due rather than "your own wait expired" — the two are different promises and the model
     /// should not have to guess which it is keeping.
     /// </summary>
-    string? Schedule = null);
+    string? Schedule = null,
+    /// <summary>
+    /// What that rule was written down to do, in the words of whoever wrote it. Carried into the note because the row's
+    /// id is not a reason: "sch-4f2a" tells a model nothing about why it is awake, and asking it to look the row up
+    /// spends a round on a question the turn already knows the answer to. Still data from a file, not somebody
+    /// speaking — the note says so.
+    /// </summary>
+    string? SchedulePayload = null);
 
 /// <summary>
 /// Why a Session is being run without anybody writing to it. Named rather than passed as text: the reason decides
@@ -251,7 +258,8 @@ public interface ISessionManager
     /// would wake to seven notes and nothing to say.
     /// </summary>
     ValueTask<Result<SessionTurnResult>> ActivateAsync(string sessionId, ActivationReason reason,
-        DateTimeOffset? at, CancellationToken cancellationToken, string? schedule = null);
+        DateTimeOffset? at, CancellationToken cancellationToken, string? schedule = null,
+        string? schedulePayload = null);
 
     Result<SessionState> GetState(string sessionId);
 

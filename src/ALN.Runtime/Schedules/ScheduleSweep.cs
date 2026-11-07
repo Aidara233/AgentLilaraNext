@@ -10,7 +10,8 @@ namespace ALN.Runtime;
 public interface IScheduleTargets
 {
     /// <summary>Runs a turn for a Session with nobody's message behind it.</summary>
-    ValueTask<Result> WakeSessionAsync(string sessionId, DateTimeOffset dueAt, string scheduleId, CancellationToken cancellationToken);
+    ValueTask<Result> WakeSessionAsync(string sessionId, DateTimeOffset dueAt, string scheduleId, string? payload,
+        CancellationToken cancellationToken);
 
     /// <summary>Hands a mounted script the event that says its schedule came due.</summary>
     ValueTask<Result> DispatchAsync(Address source, string payloadJson, CancellationToken cancellationToken);
@@ -154,7 +155,7 @@ public sealed class ScheduleSweep(ScheduleStore store, IScheduleTargets? targets
         try
         {
             var dispatched = row.TargetKind == ScheduleTargetKind.Session
-                ? await targets!.WakeSessionAsync(row.TargetId, row.NextDue ?? now, row.Id, cancellationToken)
+                ? await targets!.WakeSessionAsync(row.TargetId, row.NextDue ?? now, row.Id, row.Payload, cancellationToken)
                     .ConfigureAwait(false)
                 : await targets!.DispatchAsync(
                         Address.TryParse(row.TargetAddress, out var source) ? source : new Address("schedule", "unbound", row.Id),
