@@ -263,7 +263,8 @@ if (seededScripts.AddedAnything)
 foreach (var (seedId, seedReason) in seededScripts.Failed)
     restore.Note("scripts", $"could not copy {seedId}: {seedReason}");
 if (await seed.EnsureDraftGuideAsync(CancellationToken.None))
-    restore.Note("scripts", $"wrote scripts/draft/{ScriptSeed.GuideFileName}");
+    restore.Note("scripts", $"updated scripts/draft/{ScriptSeed.GuideFileName} " +
+        $"(the previous one is kept as {ScriptSeed.GuidePreviousFileName})");
 
 var scriptCatalog = moduleServices.GetService<IGraphScriptCatalog>("graph.script-catalog");
 if (!scriptCatalog.Ok || scriptCatalog.Value is null)

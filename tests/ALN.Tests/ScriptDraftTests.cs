@@ -67,11 +67,13 @@ public sealed class ScriptDraftTests : IDisposable
     }
 
     [Fact]
-    public async Task The_guide_is_written_where_the_same_tools_can_read_it_and_only_once()
+    public async Task The_guide_is_written_where_the_same_tools_can_read_it_and_kept_current()
     {
         var seed = new ScriptSeed(ProgramRoot, DataRoot);
 
         Assert.True(await seed.EnsureDraftGuideAsync(default));
+        // Nothing changed, so nothing is written: a start that rewrote it every time would make every launch a
+        // potential change of what the reader is taught.
         Assert.False(await seed.EnsureDraftGuideAsync(default));
 
         var guide = await Access().ReadAsync(FileScopes.ScriptsDraft, ScriptSeed.GuideFileName, default);
@@ -83,6 +85,32 @@ public sealed class ScriptDraftTests : IDisposable
         Assert.Contains("channel.accept", guide.Value.Text, StringComparison.Ordinal);
         Assert.Contains("scripts_reload", guide.Value.Text, StringComparison.Ordinal);
         Assert.Contains("scripts_mount", guide.Value.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_guide_from_an_older_build_is_replaced_and_the_old_one_is_kept()
+    {
+        // The shape every existing deployment is in: a guide written by a build that did not have today's features.
+        // Left alone it teaches a program that no longer exists, which is worse than teaching nothing.
+        var draft = Path.Combine(DataRoot, "scripts", "draft");
+        Directory.CreateDirectory(draft);
+        var path = Path.Combine(draft, ScriptSeed.GuideFileName);
+        await File.WriteAllTextAsync(path, "an older guide, with no ctx.actions in it\n");
+
+        var seed = new ScriptSeed(ProgramRoot, DataRoot);
+        Assert.True(await seed.EnsureDraftGuideAsync(default));
+
+        var current = await File.ReadAllTextAsync(path);
+        Assert.Equal(ScriptSeed.DraftGuide, current);
+        Assert.Contains("ctx.actions", current, StringComparison.Ordinal);
+
+        // Nothing is destroyed to keep it true: the replaced one is one file away.
+        var previous = await File.ReadAllTextAsync(Path.Combine(draft, ScriptSeed.GuidePreviousFileName));
+        Assert.Contains("an older guide", previous, StringComparison.Ordinal);
+
+        // And a second start leaves both alone.
+        Assert.False(await seed.EnsureDraftGuideAsync(default));
+        Assert.Equal(current, await File.ReadAllTextAsync(path));
     }
 
     [Fact]

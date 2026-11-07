@@ -249,18 +249,33 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     目录不同就是状态不同。
     """;
 
+    /// <summary>Where the replaced guide is kept, one generation, so a refresh never destroys what was there.</summary>
+    public const string GuidePreviousFileName = "GUIDE.previous.md";
+
     /// <summary>
-    /// Writes the guide into the draft folder, once. Returns false when it is already there or could not be written:
+    /// Keeps the guide in the draft folder current. Returns false when it was already current or could not be written:
     /// the guide is help, not a requirement, and a host that will not start because it could not write a .md file would
     /// be getting its priorities wrong.
+    ///
+    /// It used to be written once and never again, which made every existing deployment a place where this build's
+    /// features were undocumented — the reader was taught an older program. A guide that has fallen behind is worse
+    /// than no guide (it teaches a shape that gets refused), so it is refreshed. What it replaces is kept beside it as
+    /// <see cref="GuidePreviousFileName"/>: the copy is the program's page, not the reader's record, but neither is
+    /// anything thrown away to keep it true.
     /// </summary>
     public async ValueTask<bool> EnsureDraftGuideAsync(CancellationToken cancellationToken)
     {
         var path = Path.Combine(DraftRoot, GuideFileName);
-        if (File.Exists(path)) return false;
         try
         {
             Directory.CreateDirectory(DraftRoot);
+            if (File.Exists(path))
+            {
+                var current = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
+                if (string.Equals(current, DraftGuide, StringComparison.Ordinal)) return false;
+                await File.WriteAllTextAsync(Path.Combine(DraftRoot, GuidePreviousFileName), current, cancellationToken)
+                    .ConfigureAwait(false);
+            }
             await File.WriteAllTextAsync(path, DraftGuide, cancellationToken).ConfigureAwait(false);
             return true;
         }
