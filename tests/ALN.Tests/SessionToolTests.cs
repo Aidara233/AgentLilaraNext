@@ -306,9 +306,11 @@ public sealed class SessionToolTests : IDisposable
     }
 
     [Theory]
-    [InlineData("""{"release":true}""", "release needs a timeout")]
+    [InlineData("""{"release":true}""", "release needs a deadline")]
     [InlineData("""{"timeout":0}""", "between 1 and")]
     [InlineData("""{"timeout":60,"unit":"minutes"}""", "no argument named unit")]
+    [InlineData("""{"at":"08:00"}""", "wait.at needs wait.timeZone")]
+    [InlineData("""{"until":"2030-01-01T09:00:00"}""", "carries no offset")]
     public async Task Wait_refuses_arguments_it_does_not_understand_and_the_turn_carries_on(string arguments, string expected)
     {
         var model = new ScriptedModel(
@@ -454,6 +456,10 @@ public sealed class SessionToolTests : IDisposable
         var lines = await File.ReadAllLinesAsync(Path.Combine(_root, "wake", "modules", "s-wake", "history.jsonl"));
         var firstTurn = JsonSerializer.Deserialize<SessionHistoryEntry>(lines[0], new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
         Assert.Contains("没有任何人说话", firstTurn.Content!, StringComparison.Ordinal);
+        // And it says what the wake-up is for. The earlier wording — "nothing to say, you may keep waiting" — read as
+        // permission to end the very turn the Session had asked for, which is how a declared deadline became silence.
+        Assert.Contains("不是再睡一次", firstTurn.Content!, StringComparison.Ordinal);
+        Assert.Contains("空转", firstTurn.Content!, StringComparison.Ordinal);
     }
 
     [Fact]

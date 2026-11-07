@@ -440,21 +440,48 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     /// framework infers from a step that happened to end without a tool call — otherwise a model that forgot to
     /// act looks exactly like a model that is done.
     /// </summary>
-    private sealed class WaitTool : ISessionTool    {
+    private sealed class WaitTool : ISessionTool
+    {
         public const string ToolName = "wait";
         private const int MaxWaitSeconds = 7 * 24 * 60 * 60;
 
+        /// <summary>How far ahead an absolute time may be. A year is a promise; beyond it is a number with a mood.</summary>
+        private static readonly TimeSpan MaxHorizon = TimeSpan.FromDays(366);
+
+        /// <summary>
+        /// The description is a rule of thumb, not a signature.
+        ///
+        /// It used to say "call it when there is nothing more to say or do", and a model reading that with a question
+        /// on the table concluded that finishing the turn was the job. It is not: this tool is the only way a turn
+        /// ends, so it is also the only way to end one without having done anything. What it needs to say instead is
+        /// what has to be true first — that the question was answered, that what could be looked up was, and that
+        /// what is left genuinely waits on somebody else.
+        /// </summary>
         public static readonly ModelToolDefinition Definition = new(ToolName,
-            "Yield this turn and stop until something wakes the conversation again. Call it when there is nothing "
-            + "more to say or do — this is the only way a turn ends. With timeout, you are asking to be woken on your "
-            + "own after that many seconds; with release as well, you are asking to be archived if the deadline passes "
-            + "and nobody has written — and nothing is released if somebody does.",
+            "Stop this turn because the next thing to do waits on something outside this conversation — not because "
+            + "you would rather not answer. Before calling it, check three things: what the other person asked has "
+            + "been answered; everything you could find out yourself — the action list, an instance, a file, memory — "
+            + "has been looked up instead of guessed; and what remains really does wait on them or on a clock. If any "
+            + "of those is false, do that first. A turn that ends here having done nothing tells nobody anything, and "
+            + "a wake-up spent waiting again spends it for nothing. "
+            + "To be woken at a time of your own: `timeout` (seconds from now), or absolute — `at` as a clock time "
+            + "(\"08:00\", the next occurrence within a day) with a `timeZone`, or `until` as an ISO-8601 instant that "
+            + "carries its offset. There is no default time zone: a time without one is refused, because 8 o'clock "
+            + "without a zone is not a time. With `release`, the deadline ends in this session being archived if "
+            + "nobody writes — any inbound message cancels it.",
             """
             {"type":"object","properties":{
               "timeout":{"type":"integer","minimum":1,"maximum":604800,
-                "description":"Seconds from now. Omit to wait for somebody to write, with no deadline of your own."},
+                "description":"Seconds from now. Omit every time argument to wait for somebody to write, with no deadline of your own."},
+              "at":{"type":"string",
+                "description":"A clock time on the next day it occurs: \"HH:mm\" or \"HH:mm:ss\". Needs timeZone."},
+              "until":{"type":"string",
+                "description":"An absolute instant, ISO-8601. With an offset (+08:00 or Z) it stands alone; without one it needs timeZone."},
+              "timeZone":{"type":"string",
+                "description":"IANA id, e.g. Asia/Shanghai. Required with at, and with until when until carries no offset. There is no default."},
               "release":{"type":"boolean",
-                "description":"Only with timeout: when the deadline passes and nobody wrote, this session is archived. Any inbound message cancels it."}}}
+                "description":"With any deadline: when it passes and nobody wrote, this session is archived. Any inbound message cancels it."}},
+             "additionalProperties":false}
             """);
 
         /// <summary>
@@ -468,9 +495,12 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
 
         public ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken)
         {
-            var declared = Parse(call.ArgumentsJson, DateTimeOffset.UtcNow, out var error);
+            var now = DateTimeOffset.UtcNow;
+            var declared = Parse(call.ArgumentsJson, now, out var error);
             if (declared is null) return ValueTask.FromResult(Result<SessionToolResult>.Failure(error!));
             Declaration = declared;
+            // The instant is repeated back with its offset, so a zone mistake is visible in the answer instead of
+            // arriving as a surprise wake-up at the wrong hour.
             return ValueTask.FromResult(Result<SessionToolResult>.Success(new SessionToolResult(
                 JsonSerializer.Serialize(new { waited = true, until = declared.Value.Until, release = declared.Value.Release },
                     JsonOptions))));
@@ -499,6 +529,9 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                     return null;
                 }
                 int? timeout = null;
+                string? at = null;
+                string? until = null;
+                string? zoneId = null;
                 var release = false;
                 foreach (var property in root.EnumerateObject())
                 {
@@ -514,6 +547,30 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                             }
                             timeout = seconds;
                             break;
+                        case "at":
+                            if (property.Value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(property.Value.GetString()))
+                            {
+                                error = new(ErrorCode.Invalid, "wait.at must be a clock time as text, e.g. \"08:00\".");
+                                return null;
+                            }
+                            at = property.Value.GetString()!.Trim();
+                            break;
+                        case "until":
+                            if (property.Value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(property.Value.GetString()))
+                            {
+                                error = new(ErrorCode.Invalid, "wait.until must be an ISO-8601 instant as text.");
+                                return null;
+                            }
+                            until = property.Value.GetString()!.Trim();
+                            break;
+                        case "timeZone":
+                            if (property.Value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(property.Value.GetString()))
+                            {
+                                error = new(ErrorCode.Invalid, "wait.timeZone must be an IANA id as text, e.g. \"Asia/Shanghai\".");
+                                return null;
+                            }
+                            zoneId = property.Value.GetString()!.Trim();
+                            break;
                         case "release":
                             if (property.Value.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
                             {
@@ -527,14 +584,183 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                             return null;
                     }
                 }
-                if (release && timeout is null)
+
+                var deadlineCount = (timeout is null ? 0 : 1) + (at is null ? 0 : 1) + (until is null ? 0 : 1);
+                if (deadlineCount > 1)
                 {
                     error = new(ErrorCode.Invalid,
-                        "wait.release needs a timeout: asking to be released with no deadline would never release anything.");
+                        "wait takes one deadline: timeout (seconds), at (a clock time) or until (an instant) — not more than one.");
                     return null;
                 }
-                return (timeout is { } value ? now.AddSeconds(value) : null, release);
+                if (release && deadlineCount == 0)
+                {
+                    error = new(ErrorCode.Invalid,
+                        "wait.release needs a deadline: asking to be released with no deadline would never release anything.");
+                    return null;
+                }
+                if (zoneId is not null && deadlineCount == 0)
+                {
+                    error = new(ErrorCode.Invalid,
+                        "wait.timeZone only means something with at or until: without a time to interpret, there is nothing to place.");
+                    return null;
+                }
+
+                DateTimeOffset? due = timeout is { } value ? now.AddSeconds(value) : null;
+                if (at is not null)
+                {
+                    if (zoneId is null)
+                    {
+                        error = new(ErrorCode.Invalid,
+                            "wait.at needs wait.timeZone: \"08:00\" is not a time until it says in which zone. " +
+                            "There is no default — say e.g. timeZone: \"Asia/Shanghai\".");
+                        return null;
+                    }
+                    if (!TryZone(zoneId, out var zone, out error)) return null;
+                    if (!TryClock(at, out var clock))
+                    {
+                        error = new(ErrorCode.Invalid, "wait.at must look like \"HH:mm\" or \"HH:mm:ss\" (24-hour).");
+                        return null;
+                    }
+                    if (!TryLocalInstant(zone, now, clock, out var instant, out error)) return null;
+                    due = instant;
+                }
+                else if (until is not null)
+                {
+                    due = ResolveInstant(until, zoneId, out error);
+                    if (due is null) return null;
+                }
+
+                if (due is { } resolved)
+                {
+                    if (resolved <= now)
+                    {
+                        error = new(ErrorCode.Invalid,
+                            $"wait asked for {resolved:yyyy-MM-dd HH:mm:ss zzz}, which has already passed. " +
+                            "An absolute time in the past would wake this Session immediately or never.");
+                        return null;
+                    }
+                    if (resolved - now > MaxHorizon)
+                    {
+                        error = new(ErrorCode.Invalid,
+                            $"wait asked for {resolved:yyyy-MM-dd HH:mm:ss zzz}, more than {MaxHorizon.TotalDays:F0} days away. " +
+                            "Set a nearer one and renew it: a deadline that far out stops being a decision.");
+                        return null;
+                    }
+                }
+                return (due, release);
             }
+        }
+
+        private static bool TryZone(string id, out TimeZoneInfo zone, out Error? error)
+        {
+            error = null;
+            try
+            {
+                zone = TimeZoneInfo.FindSystemTimeZoneById(id);
+                return true;
+            }
+            catch (Exception ex) when (ex is TimeZoneNotFoundException or InvalidTimeZoneException)
+            {
+                zone = TimeZoneInfo.Utc;
+                error = new(ErrorCode.Invalid,
+                    $"wait.timeZone does not name a known zone: {id}. Use an IANA id such as Asia/Shanghai or Europe/Berlin.");
+                return false;
+            }
+        }
+
+        private static bool TryClock(string text, out TimeOnly clock) =>
+            TimeOnly.TryParseExact(text, ["HH:mm", "H:mm", "HH:mm:ss"], System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out clock);
+
+        /// <summary>
+        /// Which of the two readings of a wall-clock time to use.
+        ///
+        /// A local time that happens twice (the hour a zone falls back) resolves to the earlier instant, which is what
+        /// somebody waiting for "eight o'clock" means by it. Everything else has one offset and asks the zone for it —
+        /// <see cref="TimeZoneInfo.GetAmbiguousTimeOffsets(DateTime)"/> throws for the ordinary case rather than
+        /// answering, which is how this became a thrown tool failure instead of a resolved time.
+        /// </summary>
+        private static TimeSpan OffsetFor(TimeZoneInfo zone, DateTime local) =>
+            zone.IsAmbiguousTime(local) ? zone.GetAmbiguousTimeOffsets(local).Max() : zone.GetUtcOffset(local);
+
+        /// <summary>
+        /// The next time this clock reads that on the wall of that zone: today if it is still ahead, tomorrow if not.
+        /// A time that does not exist that day (the hour a zone skips ahead) cannot be honoured, so it is refused
+        /// rather than silently moved; a time that happens twice resolves to the first, which is what "eight o'clock"
+        /// means to somebody waiting for it.
+        /// </summary>
+        private static bool TryLocalInstant(TimeZoneInfo zone, DateTimeOffset now, TimeOnly clock,
+            out DateTimeOffset instant, out Error? error)
+        {
+            error = null;
+            var localNow = TimeZoneInfo.ConvertTime(now, zone);
+            var day = DateOnly.FromDateTime(localNow.DateTime);
+            for (var attempt = 0; attempt < 3; attempt++)
+            {
+                var local = day.ToDateTime(clock);
+                if (attempt == 0 && local <= localNow.DateTime) { day = day.AddDays(1); continue; }
+                if (zone.IsInvalidTime(local))
+                {
+                    instant = default;
+                    error = new(ErrorCode.Invalid,
+                        $"wait.at {clock:HH\\:mm} does not exist on {day:yyyy-MM-dd} in {zone.Id}: the clocks skip that hour. " +
+                        "Ask for a time on the other side of the change.");
+                    return false;
+                }
+                instant = new DateTimeOffset(local, OffsetFor(zone, local));
+                return true;
+            }
+            instant = default;
+            error = new(ErrorCode.Invalid, $"wait.at {clock:HH\\:mm} could not be placed on a calendar day in {zone.Id}.");
+            return false;
+        }
+
+        /// <summary>
+        /// An explicit offset is the whole answer; a bare local time needs a zone to be a time at all. Both paths end
+        /// in a single instant, which is what the sweep compares against.
+        /// </summary>
+        private static DateTimeOffset? ResolveInstant(string text, string? zoneId, out Error? error)
+        {
+            error = null;
+            var carriesOffset = text.EndsWith('Z') || text.EndsWith('z') ||
+                                (text.Length > 6 && (text[^6] is '+' or '-') && text[^3] == ':');
+            if (carriesOffset)
+            {
+                if (DateTimeOffset.TryParseExact(text, ["yyyy-MM-dd'T'HH:mm:sszzz", "yyyy-MM-dd'T'HH:mmzzz",
+                        "yyyy-MM-dd'T'HH:mm:ss'Z'", "yyyy-MM-dd'T'HH:mm'Z'", "O"],
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.AssumeUniversal, out var parsed))
+                    return parsed;
+                if (DateTimeOffset.TryParse(text, System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.AssumeUniversal, out parsed))
+                    return parsed;
+                error = new(ErrorCode.Invalid,
+                    $"wait.until \"{text}\" is not an instant this host can read. Use e.g. 2026-11-08T09:00:00+08:00.");
+                return null;
+            }
+
+            if (zoneId is null)
+            {
+                error = new(ErrorCode.Invalid,
+                    $"wait.until \"{text}\" carries no offset and no wait.timeZone was given: without one it is not an instant. " +
+                    "Add e.g. +08:00 to the value, or pass timeZone: \"Asia/Shanghai\".");
+                return null;
+            }
+            if (!TryZone(zoneId, out var zone, out error)) return null;
+            if (!DateTime.TryParse(text, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None, out var local))
+            {
+                error = new(ErrorCode.Invalid, $"wait.until \"{text}\" is not a date and time this host can read.");
+                return null;
+            }
+            local = DateTime.SpecifyKind(local, DateTimeKind.Unspecified);
+            if (zone.IsInvalidTime(local))
+            {
+                error = new(ErrorCode.Invalid,
+                    $"wait.until {local:yyyy-MM-dd HH:mm} does not exist in {zone.Id}: the clocks skip that hour.");
+                return null;
+            }
+            return new DateTimeOffset(local, OffsetFor(zone, local));
         }
     }
 
@@ -650,10 +876,15 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     /// A model that finds itself running with no new messages will otherwise invent a reason for it — "the user just
     /// asked…" is the reason it invents — and then answer a message nobody sent. So the note states the three facts
     /// the timeline does not carry: nobody spoke, this is its own deadline coming due, and here is when it asked.
+    ///
+    /// It also says what the wake-up is for. "Nothing to say, you may keep waiting" read as permission to end the turn
+    /// it had just been woken for; the point of a declared deadline is that something was meant to happen at it.
     /// </summary>
     private static string? WakeNote(DateTimeOffset? wokenAt) => wokenAt is { } at
         ? $"（系统）没有任何人说话。你自己在 {at.ToLocalTime():yyyy-MM-dd HH:mm:ss} 声明的等待到期了，因此你被叫醒了。" +
-          "没有人对你说过任何话，也没有人问你问题：要做的事就做，没话可说可以继续等。"
+          "这一刻是你自己要的：被叫醒意味着该看一眼，而不是再睡一次。" +
+          "如果你当初等它是为了某件事，现在把它做完；如果发现还有别的可做的，现在做。" +
+          "如果确实无事可做，就说一句、或者把下一次要看的时间往后挪——别用一次空转的 wait 结束这次唤醒。"
         : null;
 
     private async ValueTask<Result<SessionTurnResult>> RunTurnCoreAsync(
