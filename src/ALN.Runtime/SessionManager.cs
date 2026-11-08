@@ -188,7 +188,7 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     {
         if (_events is null || !target.IsInstance) return;
         var published = await _events.PublishAsync(new(name, target, Guid.NewGuid(),
-            JsonSerializer.Serialize(payload, JsonOptions), target), cancellationToken).ConfigureAwait(false);
+            JsonSerializer.Serialize(payload, LifecycleJson.Options), target), cancellationToken).ConfigureAwait(false);
         if (!published.Ok)
             _signalLog.Write(new()
             {

@@ -85,6 +85,42 @@ public sealed class ArtifactStoreTests : IDisposable
         await signals.DisposeAsync();
     }
 
+    /// <summary>
+    /// A provider is an instance like any other, and it was the last kind with no voice: a script mounted on it could be
+    /// told nothing at all. Both halves are pinned here — it is usable, it is going away — because a listener that only
+    /// heard one of them would be listening for a state that never changes back.
+    /// </summary>
+    [Fact]
+    public async Task A_provider_announces_when_it_is_usable_and_when_it_is_going_away()
+    {
+        var sink = new RecordingEvents();
+        var models = new ModelManager(null, null, sink);
+        Assert.True(models.RegisterFactory("test.models", new StubFactory()).Ok);
+        var providerAddress = new Address("model", "stub", "one");
+
+        Assert.True((await models.CreateAsync(new(providerAddress, "{}", "model.stub"), default)).Ok);
+        var started = Assert.Single(sink.Events);
+        Assert.Equal(EventNames.LifecycleStart, started.Name);
+        Assert.Equal(providerAddress.ToString(), started.Target?.ToString());
+        Assert.Contains("\"start\"", started.PayloadJson);
+
+        Assert.True((await models.DestroyAsync(providerAddress, default)).Ok);
+        Assert.Equal(2, sink.Events.Count);
+        Assert.Equal(EventNames.LifecycleStop, sink.Events[1].Name);
+        Assert.Contains("\"stop\"", sink.Events[1].PayloadJson);
+    }
+
+    private sealed class RecordingEvents : IEventSink
+    {
+        public List<RoutedEvent> Events { get; } = new();
+
+        public ValueTask<Result> PublishAsync(RoutedEvent routedEvent, CancellationToken cancellationToken)
+        {
+            Events.Add(routedEvent);
+            return ValueTask.FromResult(Result.Success());
+        }
+    }
+
     private sealed class StubFactory : IModelProviderFactory
     {
         public string TypeId => "model.stub";

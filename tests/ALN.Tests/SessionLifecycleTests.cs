@@ -200,7 +200,7 @@ public sealed class SessionLifecycleTests : IDisposable
         var sessionId = opened.Value!.Id.Value;
         Assert.Equal("channel.conversation#chat-1", start.Target?.ToString());
         Assert.Equal("channel.conversation#chat-1", start.Source.ToString());
-        var notice = JsonSerializer.Deserialize<SessionLifecycleNotice>(start.PayloadJson, Json)!;
+        var notice = JsonSerializer.Deserialize<SessionLifecycleNotice>(start.PayloadJson, LifecycleJson.Options)!;
         Assert.Equal(sessionId, notice.SessionId);
         Assert.Equal(LifecyclePhase.Start, notice.Signal.Phase);
         Assert.DoesNotContain(sink.Events, entry => entry.Name == EventNames.LifecycleStop);
@@ -213,9 +213,9 @@ public sealed class SessionLifecycleTests : IDisposable
         var stopped = sink.Events.Single(entry => entry.Name == EventNames.LifecycleStop);
         Assert.Equal("channel.conversation#chat-1", stopped.Target?.ToString());
         Assert.Equal(sessionId,
-            JsonSerializer.Deserialize<SessionLifecycleNotice>(stopped.PayloadJson, Json)!.SessionId);
+            JsonSerializer.Deserialize<SessionLifecycleNotice>(stopped.PayloadJson, LifecycleJson.Options)!.SessionId);
         Assert.Equal(LifecyclePhase.Stop,
-            JsonSerializer.Deserialize<SessionLifecycleNotice>(stopped.PayloadJson, Json)!.Signal.Phase);
+            JsonSerializer.Deserialize<SessionLifecycleNotice>(stopped.PayloadJson, LifecycleJson.Options)!.Signal.Phase);
     }
 
     /// <summary>

@@ -627,7 +627,7 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
                 return set;
             }
             await _events.PublishAsync(new(EventNames.LifecycleStart, spec.Address, Guid.NewGuid(),
-                JsonSerializer.Serialize(signal.For(spec.Address), JsonOptions), spec.Address), cancellationToken).ConfigureAwait(false);
+                JsonSerializer.Serialize(signal.For(spec.Address), LifecycleJson.Options), spec.Address), cancellationToken).ConfigureAwait(false);
         }
         if (revived + keptStopped > 0)
             _report.Note("channels", $"{revived} revived running, {keptStopped} kept stopped as they were left");
@@ -644,7 +644,7 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
             // Shutdown is not a change of wish: stop in memory, leave the stored state alone.
             SetRunning(address, running: false);
             await _events.PublishAsync(new(EventNames.LifecycleStop, address, Guid.NewGuid(),
-                JsonSerializer.Serialize(signal.For(address), JsonOptions), address), cancellationToken).ConfigureAwait(false);
+                JsonSerializer.Serialize(signal.For(address), LifecycleJson.Options), address), cancellationToken).ConfigureAwait(false);
         }
         return Result.Success();
     }

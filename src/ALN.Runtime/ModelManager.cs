@@ -6,7 +6,10 @@ namespace ALN.Runtime;
 
 /// <summary>Core registry and router for provider kinds, provider instances and model profiles.</summary>
 [Module(ModelManagerId, Category = "model", Role = ModuleRole.Manager, Singleton = true)]
-public sealed partial class ModelManager(IArtifactStore? artifacts = null, ISignalLog? signalLog = null)
+public sealed partial class ModelManager(IArtifactStore? artifacts = null, ISignalLog? signalLog = null,
+    /// <summary>Where a provider announces that it is usable. Optional: a test fake need not have a queue, and a
+    /// provider that cannot announce is still a provider.</summary>
+    IEventSink? events = null)
     : IModelManager, IModuleIndex, IModulePackageResourceRegistry, IModuleWiring, IInstanceSink, IModule
 {
     public const string ModelManagerId = ModuleNames.ModelManager;
@@ -138,7 +141,13 @@ public sealed partial class ModelManager(IArtifactStore? artifacts = null, ISign
                 return Result<IModelProvider>.Failure(announced.Error!);
             }
         }
+        // Usable is a fact worth announcing: a script mounted on a provider can now be told when it arrives, the same
+        // way it is told when a Channel or a Session does. A refusal from the queue does not undo the creation — the
+        // provider works, and a graph that could not be told so is a warning, not a reason to have no provider.
+        await AnnounceAsync(created.Value.Address, EventNames.LifecycleStart, LifecyclePhase.Start, cancellationToken)
+            .ConfigureAwait(false);
         return Result<IModelProvider>.Success(created.Value);
+
     }
 
     public ValueTask<Result<IModelProvider>> CreateAsync(string category, string instance, string configurationJson,
@@ -177,6 +186,10 @@ public sealed partial class ModelManager(IArtifactStore? artifacts = null, ISign
         }
         // Out of the graph before the provider is disposed: a instance whose target is gone is worse than no instance.
         // Data is not touched here — whether this provider's configuration is deleted is the caller's decision.
+        // The stop goes out first, while the provider is still disposed-but-present: a listener that answers by trying
+        // to use it gets an honest "not found" rather than a message about something already gone.
+        await AnnounceAsync(provider, EventNames.LifecycleStop, LifecyclePhase.Stop, CancellationToken.None)
+            .ConfigureAwait(false);
         if (_instances is not null)
             await _instances.ForgetAsync(new ModuleId(ModelManagerId), IdOf(provider), CancellationToken.None).ConfigureAwait(false);
         try { await instance.DisposeAsync().ConfigureAwait(false); return Result.Success(); }
@@ -344,5 +357,32 @@ public sealed partial class ModelManager(IArtifactStore? artifacts = null, ISign
                 Detail = new Dictionary<string, string> { ["message"] = ex.Message }
             });
         }
+    }
+
+    /// <summary>
+    /// Tells the graph a provider is usable, or is going away — the same shape as every other lifecycle announcement
+    /// (the signal is the payload; the address is both source and target, because a provider has no other address).
+    ///
+    /// A failed publish is a warning, never a failed creation or a failed destruction: a provider that works and could
+    /// not be announced is still better than no provider, and this is the one place that decision is made.
+    /// </summary>
+    private async ValueTask AnnounceAsync(Address provider, string name, LifecyclePhase phase,
+        CancellationToken cancellationToken)
+    {
+        if (events is null || !provider.IsInstance) return;
+        var published = await events.PublishAsync(new(name, provider, Guid.NewGuid(),
+            JsonSerializer.Serialize(new LifecycleSignal(phase, DateTimeOffset.UtcNow).For(provider),
+                LifecycleJson.Options), provider), cancellationToken).ConfigureAwait(false);
+        if (!published.Ok)
+            signalLog?.Write(new()
+            {
+                Group = "model",
+                Name = provider.ToString(),
+                Mechanism = "model.announce",
+                Outcome = "failed",
+                Level = SignalLevel.Warn,
+                Detail = new Dictionary<string, string>(StringComparer.Ordinal)
+                { ["error"] = published.Error?.Message ?? "refused" }
+            });
     }
 }

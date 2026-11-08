@@ -3,6 +3,20 @@ namespace ALN.Contracts;
 public enum LifecyclePhase { Start, Stop }
 
 /// <summary>
+/// How a lifecycle payload is written on the wire: <c>{"phase":"start", …}</c>, not <c>{"phase":0, …}</c>.
+///
+/// The phase is read by things that are not this program — a script's <c>event.phase === "start"</c> is the whole
+/// check in a handler that greets when a conversation comes up. An ordinal there is a number nobody can read and
+/// nobody writes down, and it would have been indistinguishable from a bug the first time somebody guessed wrong.
+/// </summary>
+public static class LifecycleJson
+{
+    public static readonly System.Text.Json.JsonSerializerOptions Options =
+        new(System.Text.Json.JsonSerializerDefaults.Web)
+        { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter(System.Text.Json.JsonNamingPolicy.CamelCase) } };
+}
+
+/// <summary>
 /// One uniform startup/shutdown signal, handed down the tree: the core sends it to managers, a
 /// manager re-sends the same shape to its children. Nothing starts because a field was set or a
 /// constructor ran — it starts because this signal reached it.

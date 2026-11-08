@@ -65,7 +65,7 @@ var artifacts = new FileArtifactStore(Path.Combine(data.Root, "artifacts"));
 const string ArtifactRetentionCategory = "model-calls";
 const int ArtifactRetentionDays = 7;
 const int ArtifactRetentionCheckHours = 6;
-var modelManager = new ModelManager(artifacts, signalLog);
+var modelManager = new ModelManager(artifacts, signalLog, events: queue);
 var sessionExtensions = new SessionExtensionRegistry();
 var timeSource = sessionExtensions.Register(new TimeContextSource());
 if (!timeSource.Ok) { Console.Error.WriteLine(timeSource.Error?.Message); return 1; }
@@ -581,7 +581,7 @@ foreach (var instance in graph.Instances)
 {
     var announced = await queue.PublishAsync(new(EventNames.LifecycleStarted, instance, Guid.NewGuid(),
         JsonSerializer.Serialize(new LifecycleSignal(LifecyclePhase.Start, DateTimeOffset.UtcNow).For(instance),
-            new JsonSerializerOptions(JsonSerializerDefaults.Web)), instance), CancellationToken.None);
+            LifecycleJson.Options), instance), CancellationToken.None);
     if (!announced.Ok)
         Console.Error.WriteLine($"Warning: {instance} could not be told the tree finished starting: {announced.Error?.Message}");
 }

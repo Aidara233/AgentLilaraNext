@@ -334,7 +334,7 @@ public sealed partial class AdapterManager : IAdapterManager, IModuleIndex, IMod
         if (_events is null) return Result.Success();
         // The same signal, one level down: whatever is mounted on this Adapter sees lifecycle.start.
         return await _events.PublishAsync(new(EventNames.LifecycleStart, address, Guid.NewGuid(),
-            JsonSerializer.Serialize(signal.For(address), new JsonSerializerOptions(JsonSerializerDefaults.Web)), address),
+            JsonSerializer.Serialize(signal.For(address), LifecycleJson.Options), address),
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -347,7 +347,7 @@ public sealed partial class AdapterManager : IAdapterManager, IModuleIndex, IMod
             if (!stopped.Ok && firstFailure.Ok) firstFailure = stopped;
             if (_events is not null)
                 await _events.PublishAsync(new(EventNames.LifecycleStop, address, Guid.NewGuid(),
-                    JsonSerializer.Serialize(signal.For(address), new JsonSerializerOptions(JsonSerializerDefaults.Web)), address),
+                    JsonSerializer.Serialize(signal.For(address), LifecycleJson.Options), address),
                     cancellationToken).ConfigureAwait(false);
         }
         return firstFailure;
