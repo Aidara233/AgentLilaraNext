@@ -195,6 +195,44 @@ public sealed class ScriptToolTests : IDisposable
         Assert.Equal(["tool.own", "tool.trusted"], full.Select(offer => offer.Definition.Name).Order().ToArray());
     }
 
+    [Fact]
+    public async Task A_manifest_file_reaches_the_graph_with_its_tool_fields_intact()
+    {
+        // The live check found this one: the loader read `call` and `tool` out of the JSON and then built the manifest
+        // without them, so every callable script quietly loaded as an ordinary one. Nothing failed — which is exactly why
+        // the test walks the file path rather than a hand-built package.
+        var directory = Path.Combine(_root, "scripts", "trusted", "tools.fromfile");
+        Directory.CreateDirectory(directory);
+        await File.WriteAllTextAsync(Path.Combine(directory, "manifest.json"), """
+            {
+              "id": "tools.fromfile",
+              "version": 1,
+              "targetType": "channel",
+              "mount": "manual",
+              "events": ["channel.message.accepted"],
+              "entryPoint": "onEvent",
+              "capabilities": [],
+              "trustDomain": "trusted",
+              "call": "onCall",
+              "tool": { "name": "tool.fromfile", "description": "From a file.", "parametersJson": "{\"type\":\"object\"}" }
+            }
+            """);
+        await File.WriteAllTextAsync(Path.Combine(directory, "main.js"),
+            "async function onEvent(event, ctx) { }\nasync function onCall(args, ctx) { return { ok: true }; }");
+
+        var read = await new JsonScriptCatalog(_root, _root).LoadAsync(default);
+        Assert.True(read.Ok, read.Error?.Message);
+        var package = Assert.Single(read.Value!, entry => entry.Manifest.Id == "tools.fromfile");
+        Assert.Equal("onCall", package.Manifest.Call);
+        Assert.Equal("tool.fromfile", package.Manifest.Tool!.Name);
+
+        // And the graph takes it the rest of the way: resolved, offered, callable.
+        Assert.True((await _graph.LoadAsync([package], default)).Ok);
+        Assert.Equal("tool.fromfile", Assert.Single(_graph.ToolScripts).Tool!.Name);
+        var called = await _graph.InvokeToolAsync("tools.fromfile", "{}", default);
+        Assert.True(called.Ok, called.Error?.Message);
+    }
+
     private sealed class Proxy : IInstanceBindings
     {
         private IInstanceBindings? _inner;

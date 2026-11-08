@@ -2060,8 +2060,8 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
                 seen[manifest.Id] = (manifestPath, expectedDomain);
                 packages.Add(new(new(manifest.Id, manifest.Version, manifest.TargetType, manifest.Mount, manifest.Events,
                     manifest.EntryPoint, manifest.Capabilities, manifest.TrustDomain, manifest.MaxStatements,
-                    manifest.TimeoutMilliseconds, manifest.MemoryLimitBytes), source, fingerprint,
-                    origin, level));
+                    manifest.TimeoutMilliseconds, manifest.MemoryLimitBytes, manifest.Call, manifest.Tool), source,
+                    fingerprint, origin, level));
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
             {
