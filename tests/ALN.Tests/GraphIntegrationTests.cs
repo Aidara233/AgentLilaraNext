@@ -1303,6 +1303,35 @@ public sealed class GraphIntegrationTests : IDisposable
         Assert.Contains(_graph.RejectedScripts, issue => issue.Reason.Contains("L1 operator", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// An event the host produces is an event a script may listen for. The old rule was a hand-written list of three
+    /// names, and `lifecycle.start` — which the host has published since the day it had adapters — was refused as
+    /// "unknown event": the refusal was about the list, not about the vocabulary. Whoever decides to listen, decides;
+    /// whether the event ever arrives is the mount's business, not the loader's.
+    /// </summary>
+    [Fact]
+    public async Task A_script_may_declare_any_event_the_host_produces()
+    {
+        var declared = new List<ScriptPackage>();
+        foreach (var name in EventNames.All)
+            declared.Add(ChannelReply() with
+            {
+                Manifest = ChannelReply().Manifest with { Id = $"declares-{name.Replace('.', '-')}", Events = [name] }
+            });
+
+        Assert.True((await _graph.LoadAsync(declared, default)).Ok);
+        Assert.Empty(_graph.RejectedScripts);
+        Assert.Equal(EventNames.All.Length, _graph.Scripts.Count);
+
+        // An invented name is still refused — and the answer says what the vocabulary is, so the author does not have
+        // to guess twice.
+        var invented = ChannelReply() with { Manifest = ChannelReply().Manifest with { Events = ["session.turn.start"] } };
+        Assert.True((await _graph.LoadAsync([invented], default)).Ok);
+        Assert.Contains(_graph.RejectedScripts,
+            issue => issue.Reason.Contains("Unknown event 'session.turn.start'", StringComparison.Ordinal)
+                     && issue.Reason.Contains(EventNames.LifecycleStart, StringComparison.Ordinal));
+    }
+
     private static ScriptPackage ManualTagger(string id, string text) => new(
         new(id, 1, "channel", MountMode.Manual, [EventNames.ChannelMessageAccepted], "onEvent",
             [ScriptCapabilities.ChannelReply], TrustDomain.Trusted),

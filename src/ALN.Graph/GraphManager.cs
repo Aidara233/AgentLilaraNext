@@ -503,13 +503,12 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         if (string.IsNullOrWhiteSpace(m.TargetType) || !_types.IsKnownAbstract(m.TargetType))
             return $"targetType must be a known abstract type, and '{m.TargetType}' is not one.";
         if (m.Events is null || m.Events.Length == 0) return "A script must declare at least one event.";
-        // A schedule fires an event too, and a script that wants to run on a rhythm is the main reason to have one:
-        // without this line the sweep dispatches an event nothing is allowed to listen for. Channel targets only —
-        // an adapter envelope is something an adapter produces, not something a clock can hand over.
-        if (m.Events.Any(e => e is not (EventNames.AdapterEnvelope or EventNames.ChannelMessageAccepted
-                or EventNames.ScheduleDue)))
-            return $"Unknown event; the ones a script may declare are {EventNames.AdapterEnvelope}, " +
-                   $"{EventNames.ChannelMessageAccepted} and {EventNames.ScheduleDue}.";
+        // The vocabulary is the host's, and it is one list (EventNames.All) rather than a whitelist written next to
+        // this check: a name the host publishes is a name a script may listen for. Whether the event ever reaches a
+        // given script is a different question — that is decided by the mount, which names one instance.
+        var unknown = m.Events.FirstOrDefault(e => !EventNames.IsKnown(e));
+        if (unknown is not null)
+            return $"Unknown event '{unknown}'; this host produces {EventNames.Describe()}.";
         if (m.Events.Contains(EventNames.ScheduleDue, StringComparer.Ordinal) &&
             !string.Equals(m.TargetType, "channel", StringComparison.Ordinal))
             return $"{EventNames.ScheduleDue} is dispatched to a Channel instance; a schedule targeting " +

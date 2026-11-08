@@ -573,6 +573,19 @@ if (receipt.Ready == 0)
     return 1;
 }
 
+// "The whole tree is up" as an event, because an event is the only thing a script can listen for — and an event is
+// dispatched to one instance, so a single global one would reach nobody. Published per instance rather than once,
+// which is also what makes the two questions different: "my instance started" is lifecycle.start, "everything this
+// host has is up" is this one. Nothing waits on it; a failed publish is a warning, not a startup failure.
+foreach (var instance in graph.Instances)
+{
+    var announced = await queue.PublishAsync(new(EventNames.LifecycleStarted, instance, Guid.NewGuid(),
+        JsonSerializer.Serialize(new LifecycleSignal(LifecyclePhase.Start, DateTimeOffset.UtcNow).For(instance),
+            new JsonSerializerOptions(JsonSerializerDefaults.Web)), instance), CancellationToken.None);
+    if (!announced.Ok)
+        Console.Error.WriteLine($"Warning: {instance} could not be told the tree finished starting: {announced.Error?.Message}");
+}
+
 // The network surface is opt-in: no api/server.json, no listener. The core knows nothing about the
 // WebUI itself — it exposes actions, and a separate project consumes them. The table itself came up long before
 // startup (see host services); this is where the host adds the verbs it owns itself.
