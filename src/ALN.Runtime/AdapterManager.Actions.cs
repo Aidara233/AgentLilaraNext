@@ -114,14 +114,16 @@ public sealed partial class AdapterManager
             return Result<JsonElement>.Failure(new(ErrorCode.Invalid, $"No adapter answers to {address}."));
 
         var verb = action.Trim();
+        // Named verbs win; everything else sits at the door's level, which is Full unless the instance lowered it. This is
+        // the convenience door, so its default is the deepest level and the only direction a configuration can move is down.
         var needed = live.Spec.RawActions is { } listed && listed.TryGetValue(verb, out var level)
             ? level
-            : AccessLevel.Operator;
+            : live.Spec.RawAccess;
         if (actor.Level < needed)
             return Result<JsonElement>.Failure(new(ErrorCode.Denied,
                 $"{verb} on {address} is {AccessLevels.Describe(needed)}; you are {AccessLevels.Describe(actor.Level)}. "
-                + $"Its rawActions entry is the decision: \"rawActions\": {{ \"{verb}\": \"agent\" }} lets this level call it.",
-                null, false));
+                + $"Two ways down: the instance's \"rawAccess\" for the whole door, or \"rawActions\": {{ \"{verb}\": \"agent\" }} "
+                + "for this verb alone.", null, false));
 
         if (live.Adapter is not IRawAdapter raw)
             return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
@@ -210,8 +212,19 @@ public sealed partial class AdapterManager
             }
         }
 
+        // The door's level for this instance. Full unless asked otherwise: the raw path is a convenience, so its default is
+        // the deepest level, and a configuration can only lower it.
+        var rawAccess = AccessLevel.Full;
+        if (arguments.TryReadText("rawAccess", out var rawAccessText) && rawAccessText.Trim().Length > 0)
+        {
+            if (!Enum.TryParse<AccessLevel>(rawAccessText.Trim(), ignoreCase: true, out rawAccess) ||
+                !Enum.IsDefined(rawAccess))
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
+                    $"adapters.create 'rawAccess' must be agent, operator or full, not '{rawAccessText}'."));
+        }
+
         var spec = new AdapterSpec(address.Value, new AdapterDescriptor(platform, account, direction), type, settings,
-            rawActions.Count > 0 ? rawActions : null);
+            rawActions.Count > 0 ? rawActions : null, rawAccess);
         var created = await CreateAsync(spec, ct).ConfigureAwait(false);
         if (!created.Ok || created.Value is null)
             return Result<JsonElement>.Failure(created.Error ?? new(ErrorCode.Unavailable, "Adapter could not be created."));

@@ -66,26 +66,53 @@ public sealed class RawAdapterActionTests
         "adapter.file", RawActions: raw);
 
     [Fact]
-    public async Task A_verb_the_instance_never_listed_is_an_operators_and_the_refusal_says_how_to_open_it()
+    public async Task An_unlisted_verb_sits_at_the_door_level_which_is_full_by_default()
     {
+        // The raw path is a convenience, so its default is the deepest level: a bridge that gains a verb tomorrow works
+        // without us or the config changing. That also means the *only* way a configuration moves is down.
         var (plane, manager) = SetUp();
-        var spec = Spec(new Dictionary<string, AccessLevel> { ["get_group_list"] = AccessLevel.Agent });
+        var spec = Spec(null);
         var adapter = new RawFileAdapter(spec);
         Assert.True((await manager.CreateAsync(spec, _ => adapter, default)).Ok);
 
-        var refused = await plane.InvokeAsync(At(AccessLevel.Agent, "model"), AdapterActions.Raw,
-            Args("adapter.file#test-1", "set_group_ban"), default);
-
-        Assert.Equal(ErrorCode.Denied, refused.Error!.Code);
-        Assert.Contains("set_group_ban", refused.Error.Message);
-        Assert.Contains("rawActions", refused.Error.Message);
+        foreach (var level in new[] { AccessLevel.Agent, AccessLevel.Operator })
+        {
+            var refused = await plane.InvokeAsync(At(level, "someone"), AdapterActions.Raw,
+                Args("adapter.file#test-1", "set_group_ban"), default);
+            Assert.Equal(ErrorCode.Denied, refused.Error!.Code);
+            Assert.Contains("rawAccess", refused.Error.Message);
+        }
         Assert.Empty(adapter.Calls);
 
-        // The same verb, from an operator: allowed, because an unlisted verb defaults to that level rather than to "never".
-        var allowed = await plane.InvokeAsync(At(AccessLevel.Operator, "ops"), AdapterActions.Raw,
+        var allowed = await plane.InvokeAsync(At(AccessLevel.Full, "kernel"), AdapterActions.Raw,
             Args("adapter.file#test-1", "set_group_ban"), default);
         Assert.True(allowed.Ok, allowed.Error?.Message);
         Assert.Equal("set_group_ban", Assert.Single(adapter.Calls).Action);
+    }
+
+    [Fact]
+    public async Task An_instance_can_lower_the_door_and_name_exceptions_without_listing_every_verb()
+    {
+        // The shape that does not rot: one number for the whole door, and lines only for the exceptions somebody cares
+        // about. A verb nobody wrote works at the door's level — that is what "we never wrapped it" has to mean.
+        var (plane, manager) = SetUp();
+        var spec = new AdapterSpec(
+            new Address("adapter", "file", "test-1"), new AdapterDescriptor("file", "acc", AdapterDirection.Both),
+            "adapter.file", RawAccess: AccessLevel.Agent,
+            RawActions: new Dictionary<string, AccessLevel> { ["set_group_ban"] = AccessLevel.Full });
+        var adapter = new RawFileAdapter(spec);
+        Assert.True((await manager.CreateAsync(spec, _ => adapter, default)).Ok);
+
+        // Unlisted: the door's level, so the model may call it.
+        var open = await plane.InvokeAsync(At(AccessLevel.Agent, "model"), AdapterActions.Raw,
+            Args("adapter.file#test-1", "get_group_list"), default);
+        Assert.True(open.Ok, open.Error?.Message);
+
+        // Named: its own level, so this one stays a person's.
+        var kept = await plane.InvokeAsync(At(AccessLevel.Agent, "model"), AdapterActions.Raw,
+            Args("adapter.file#test-1", "set_group_ban"), default);
+        Assert.Equal(ErrorCode.Denied, kept.Error!.Code);
+        Assert.Single(adapter.Calls);
     }
 
     [Fact]
@@ -130,9 +157,10 @@ public sealed class RawAdapterActionTests
     }
 
     [Fact]
-    public async Task With_no_verbs_listed_nothing_is_callable_below_an_operator()
+    public async Task With_no_list_and_no_door_level_an_agent_caller_gets_nothing()
     {
-        // Silence is the safe reading: an instance that never wrote rawActions opens nothing to the model.
+        // Silence is still the strict reading for anyone below full: the default door is full, so a model finds it closed
+        // until somebody lowers the door to its level.
         var (plane, manager) = SetUp();
         var bare = Spec(null);
         var adapter = new RawFileAdapter(bare);
@@ -142,11 +170,6 @@ public sealed class RawAdapterActionTests
             Args("adapter.file#test-1", "get_group_list"), default);
         Assert.Equal(ErrorCode.Denied, refused.Error!.Code);
         Assert.Empty(adapter.Calls);
-
-        var operatorCall = await plane.InvokeAsync(At(AccessLevel.Operator, "ops"), AdapterActions.Raw,
-            Args("adapter.file#test-1", "get_group_list"), default);
-        Assert.True(operatorCall.Ok, operatorCall.Error?.Message);
-        Assert.Single(adapter.Calls);
     }
 
     /// <summary>An adapter that implements nothing extra — the shape a platform with no raw verbs has.</summary>

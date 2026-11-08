@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using System.Text.Json;
 namespace ALN.Contracts;
 
@@ -88,14 +89,23 @@ public sealed record AdapterSpec(Address Address, AdapterDescriptor Descriptor,
     string TypeId,
     IReadOnlyDictionary<string, string>? Settings = null,
     /// <summary>
-    /// Which of the platform's own operations this instance will carry, and how deep each one sits. Absent or empty means
-    /// "none": nothing raw is callable below an operator's level, and a verb that is not named here is an operator's.
+    /// Which of the platform's own operations this instance will carry, and how deep each one sits. Absent means "none
+    /// named here" — the door's level (<see cref="RawAccess"/>) applies instead, which is <see cref="AccessLevel.Full"/>
+    /// until somebody says otherwise.
     ///
-    /// This is a person's written decision, not the adapter's opinion — it is the one place that says "the model may call
-    /// get_group_list, and nobody but me may call set_group_ban". Wrapping each platform verb would need the host to know
-    /// every bridge's feature list; this needs two words per verb and no code at all.
+    /// This is a person's written decision, not the adapter's opinion. Its job is the exception, not the inventory: an
+    /// instance that wants the model to have the bridge's verbs writes one number, and only the handful it wants to keep
+    /// away from something shallower get a line here.
     /// </summary>
-    IReadOnlyDictionary<string, AccessLevel>? RawActions = null);
+    IReadOnlyDictionary<string, AccessLevel>? RawActions = null,
+    /// <summary>
+    /// How deep the whole door sits for this instance, for every verb <see cref="RawActions"/> does not name.
+    ///
+    /// Full by default: this path is a convenience, not a capability — it exists so that a bridge gaining a feature does
+    /// not need a release from us, and the deployment says who may use it. Lower it on an instance that should not hand
+    /// the platform to whoever can reach the action table.
+    /// </summary>
+    [property: JsonConverter(typeof(AccessLevelJson))] AccessLevel RawAccess = AccessLevel.Full);
 
 public sealed record RoutedEvent(string Name, Address Source, Guid EventId, string PayloadJson, Address? Target = null)
 {
