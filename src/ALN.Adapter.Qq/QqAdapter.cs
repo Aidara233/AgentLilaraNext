@@ -117,13 +117,7 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
             return Result<JsonElement>.Failure(called.Error ?? new(ErrorCode.Unavailable, "OneBot call failed."));
 
         var reply = called.Value;
-        return Result<JsonElement>.Success(JsonSerializer.SerializeToElement(new
-        {
-            ok = reply.Response.Ok,
-            retcode = reply.Response.RetCode,
-            message = reply.Response.Message,
-            data = reply.Data
-        }));
+        return Result<JsonElement>.Success(OneBotProtocol.BuildRawAnswer(reply.Response, reply.Data));
     }
 
     public override async ValueTask<Result> StopAsync(CancellationToken cancellationToken)

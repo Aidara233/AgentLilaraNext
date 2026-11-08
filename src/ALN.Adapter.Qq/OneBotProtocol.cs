@@ -170,6 +170,23 @@ public static partial class OneBotProtocol
     public static string BuildRaw(string echo, string action, JsonElement parameters) =>
         JsonSerializer.Serialize(new { action, @params = parameters, echo }, Json);
 
+    /// <summary>
+    /// What a raw call answers: the platform's own verdict, with its <c>retcode</c> intact.
+    ///
+    /// The one thing to get right is that a reply may carry no <c>data</c> at all — a poke, a set_*, half of OneBot's
+    /// verbs answer with nothing but a status. That arrives as a default <see cref="JsonElement"/>, and serialising one
+    /// of those throws "Operation is not valid due to the current state of the object" — which is how a successful poke
+    /// reaches the model as a failure and gets retried until it looks like something is wrong.
+    /// </summary>
+    public static JsonElement BuildRawAnswer(OneBotResponse response, JsonElement data) =>
+        JsonSerializer.SerializeToElement(new
+        {
+            ok = response.Ok,
+            retcode = response.RetCode,
+            message = response.Message,
+            data = data.ValueKind == JsonValueKind.Undefined ? (JsonElement?)null : data
+        }, Json);
+
     /// <summary><c>get_login_info</c>: how the account id is learned instead of typed in by hand.</summary>
     public static string BuildLoginInfo(string echo) =>
         JsonSerializer.Serialize(new { action = "get_login_info", @params = new { }, echo }, Json);

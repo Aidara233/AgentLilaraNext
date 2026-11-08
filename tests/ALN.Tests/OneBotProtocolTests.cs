@@ -321,4 +321,48 @@ public sealed class OneBotProtocolTests
         if (action == "get_group_member_info") Assert.Equal(123456, parameters.GetProperty("group_id").GetInt64());
         if (action != "get_friend_list") Assert.False(parameters.GetProperty("no_cache").GetBoolean());
     }
+
+    [Fact]
+    public void A_raw_action_carries_the_verb_and_the_parameters_untouched()
+    {
+        var parameters = Parse("""{"group_id": 123456, "user_id": 654321}""");
+        var built = Parse(OneBotProtocol.BuildRaw("echo-1", "set_group_ban", parameters));
+
+        Assert.Equal("set_group_ban", built.GetProperty("action").GetString());
+        Assert.Equal("echo-1", built.GetProperty("echo").GetString());
+        Assert.Equal(123456, built.GetProperty("params").GetProperty("group_id").GetInt64());
+        // Untouched means untouched: no renaming, no filtering, no defaults invented on the way.
+        Assert.Equal(2, built.GetProperty("params").EnumerateObject().Count());
+    }
+
+    [Fact]
+    public void A_reply_with_no_data_is_an_answer_with_a_null_data_not_an_exception()
+    {
+        // Half of OneBot's verbs answer with a status and nothing else — a poke, a set_*. The reply's `data` is then a
+        // default JsonElement, and writing one of those throws "Operation is not valid due to the current state of the
+        // object": a successful poke arrived at the model as a failure, which is exactly how a poke gets retried four
+        // times with four different parameter shapes.
+        var answered = OneBotProtocol.BuildRawAnswer(new OneBotResponse(true, null, 0, null), default);
+
+        Assert.True(answered.GetProperty("ok").GetBoolean());
+        Assert.Equal(0, answered.GetProperty("retcode").GetInt32());
+        Assert.Equal(JsonValueKind.Null, answered.GetProperty("data").ValueKind);
+
+        // And when there is data, it goes through whole — retcode and message included, because those are the platform's
+        // own words about what happened.
+        var withData = OneBotProtocol.BuildRawAnswer(OneBotResponseOf("""{"retcode":1200,"message":"消息体无法解析","data":{"x":1}}"""),
+            Parse("""{"x":1}"""));
+        Assert.Equal(1200, withData.GetProperty("retcode").GetInt32());
+        Assert.Equal("消息体无法解析", withData.GetProperty("message").GetString());
+        Assert.Equal(1, withData.GetProperty("data").GetProperty("x").GetInt32());
+    }
+
+    private static OneBotResponse OneBotResponseOf(string json)
+    {
+        var root = Parse(json);
+        return new OneBotResponse(root.GetProperty("retcode").GetInt32() == 0,
+            root.TryGetProperty("message_id", out var id) ? id.ToString() : null,
+            root.GetProperty("retcode").GetInt32(),
+            root.TryGetProperty("message", out var message) ? message.GetString() : null);
+    }
 }
