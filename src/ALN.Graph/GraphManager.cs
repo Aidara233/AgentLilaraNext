@@ -142,6 +142,16 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
                     rejected.Add(new(package.Manifest.Id!, nameError));
                     continue;
                 }
+                // A tool's own permission is the author's choice, capped by the author's own level: a maker may keep a
+                // tool to itself, or open it to everyone, but may not build one that outranks the folder it came from.
+                if (spec.Access > package.Level)
+                {
+                    rejected.Add(new(package.Manifest.Id!,
+                        $"Tool \"{spec.Name}\" asks to be callable by {AccessLevels.Describe(spec.Access)}, and this "
+                        + $"script is {AccessLevels.Describe(package.Level)}. A tool's permission may sit at or below its "
+                        + "maker's, never above: the tool runs with the maker's reach, and who may call it cannot exceed it."));
+                    continue;
+                }
                 if (toolNames.TryGetValue(spec.Name, out var owner))
                 {
                     rejected.Add(new(package.Manifest.Id!,

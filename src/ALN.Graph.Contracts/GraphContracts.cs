@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using ALN.Contracts;
 using ALN.Contracts.Sessions;
 
@@ -37,7 +38,17 @@ public sealed record ScriptManifest(
 /// the safest thing to say about that is nothing at all: two sources offering one name is a failed turn in every
 /// conversation, so a name that could collide is refused when the script is loaded, not discovered at 3am.
 /// </summary>
-public sealed record ScriptToolSpec(string Name, string Description, string ParametersJson);
+public sealed record ScriptToolSpec(string Name, string Description, string ParametersJson,
+    /// <summary>
+    /// Who may call it, decided by whoever wrote the tool. Default <see cref="AccessLevel.Agent"/>: anybody.
+    ///
+    /// This is a <b>barrier</b>, not a grant, so a maker may only set it at or below its own level — that is what keeps
+    /// "the tool's own permission never exceeds its maker's" true in both directions. A person can build a tool out of
+    /// interfaces the model cannot reach and still open it to the model; they can also build one and keep it to
+    /// themselves. What nobody can do is hand out a tool that reaches further than they do: the tool runs at the maker's
+    /// level, and this field only narrows who gets to ask it for things.
+    /// </summary>
+    [property: JsonConverter(typeof(AccessLevelJson))] AccessLevel Access = AccessLevel.Agent);
 
 public sealed record ScriptPackage(ScriptManifest Manifest, string Source, string Fingerprint = "",
     /// <summary>Where it came from when that is not the operator's own script tree: "plugin:&lt;id&gt;".</summary>

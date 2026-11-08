@@ -44,6 +44,11 @@ public sealed class ScriptToolTests : IDisposable
         var graph = new GraphManager(ModuleWiring.With(adapters, channels, new ClockSource(events), sessions), adapterTypes,
             new JintScriptExecutor(), _audit, _signals, state: null);
         bindings.Bind(graph);
+        // A control plane with real session verbs on it: the authority a tool runs at is only observable through an
+        // action that would refuse a shallower caller, so the table has to exist here.
+        var plane = new ControlPlane(_audit, _signals);
+        Assert.True(sessions.RegisterActions(plane).Ok);
+        Assert.True(graph.RegisterActions(plane).Ok);
         _graph = graph;
     }
 
@@ -55,10 +60,11 @@ public sealed class ScriptToolTests : IDisposable
     }
 
     private static ScriptPackage Callable(string id, string name, string source,
-        AccessLevel level = AccessLevel.Agent, string? description = null) => new(
+        AccessLevel level = AccessLevel.Agent, string? description = null, AccessLevel? access = null) => new(
         new(id, 1, "channel", MountMode.Manual, ["channel.message.accepted"], "onEvent",
             [ScriptCapabilities.ChannelReply], TrustDomain.Trusted, Call: "onCall",
-            Tool: new(name, description ?? "Say how many characters you were given.", """{"type":"object"}""")),
+            Tool: new(name, description ?? "Say how many characters you were given.", """{"type":"object"}""",
+                access ?? AccessLevel.Agent)),
         source, Level: level);
 
     private const string Echo =
@@ -176,23 +182,72 @@ public sealed class ScriptToolTests : IDisposable
     }
 
     [Fact]
-    public async Task A_tool_is_offered_with_its_provenance_and_only_to_sessions_deep_enough()
+    public async Task A_tool_is_opened_to_whoever_its_author_opened_it_to()
     {
-        var trusted = Callable("tools.trusted", "tool.trusted", Echo, AccessLevel.Full);
+        // Two tools from one person: the basic one open to everybody, the deep one kept for callers at least as deep as
+        // its own level. Both are the author's decision — that is the knob, not the caller's level.
+        var openToAll = Callable("tools.open", "tool.open", Echo, AccessLevel.Full, access: AccessLevel.Agent);
+        var keptDeep = Callable("tools.kept", "tool.kept", Echo, AccessLevel.Full, access: AccessLevel.Full);
         var own = Callable("tools.own", "tool.own", Echo, AccessLevel.Agent);
-        Assert.True((await _graph.LoadAsync([trusted, own], default)).Ok);
+        Assert.True((await _graph.LoadAsync([openToAll, keptDeep, own], default)).Ok);
 
         var source = new ScriptCallTools(_graph);
-        var agent = (await source.ToolsAsync(new RoundContextRequest("s-1", Guid.NewGuid(), 1, Level: AccessLevel.Agent),
+        var atAgent = (await source.ToolsAsync(new RoundContextRequest("s-1", Guid.NewGuid(), 1, Level: AccessLevel.Agent),
             default)).Value!;
-        // A full-level tool runs with full reach, so an agent-level Session is not offered it — same rule as mounting.
-        Assert.Equal(["tool.own"], agent.Select(offer => offer.Definition.Name).ToArray());
-        Assert.Contains("来自", agent[0].Definition.Description);
-        Assert.Contains("L0 agent", agent[0].Definition.Description);
+        Assert.Equal(["tool.open", "tool.own"], atAgent.Select(offer => offer.Definition.Name).Order().ToArray());
 
-        var full = (await source.ToolsAsync(new RoundContextRequest("s-2", Guid.NewGuid(), 1, Level: AccessLevel.Full),
+        var atFull = (await source.ToolsAsync(new RoundContextRequest("s-2", Guid.NewGuid(), 1, Level: AccessLevel.Full),
             default)).Value!;
-        Assert.Equal(["tool.own", "tool.trusted"], full.Select(offer => offer.Definition.Name).Order().ToArray());
+        Assert.Equal(["tool.kept", "tool.open", "tool.own"],
+            atFull.Select(offer => offer.Definition.Name).Order().ToArray());
+
+        // And the definition says who is doing the work and who may ask — the two facts a caller needs.
+        var deep = atAgent.Single(offer => offer.Definition.Name == "tool.open");
+        Assert.Contains("来自", deep.Definition.Description);
+        Assert.Contains("L2 full", deep.Definition.Description);
+        Assert.Contains("不按调用它的会话", deep.Definition.Description);
+        Assert.Contains("可调用者", deep.Definition.Description);
+    }
+
+    [Fact]
+    public async Task A_maker_cannot_open_a_tool_further_than_its_own_level()
+    {
+        // Narrowing the audience is not granting anything — but the tool's own permission is capped by its maker in both
+        // directions, and a file that says otherwise is a file to fix, not a ceiling to guess at.
+        var overreaching = Callable("tools.cheeky", "tool.cheeky", Echo, AccessLevel.Agent, access: AccessLevel.Full);
+        Assert.True((await _graph.LoadAsync([overreaching], default)).Ok);
+
+        Assert.Empty(_graph.ToolScripts);
+        Assert.Contains(_graph.RejectedScripts, issue => issue.Reason.Contains("never above", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_tool_runs_at_the_level_of_whoever_made_it_and_that_level_bounds_what_it_is_made_of()
+    {
+        // sessions.setLevel is an operator's verb. A tool built by a person reaches it — the call gets past the gate and
+        // fails on its own arguments ("invalid", not "denied"). A tool built by the model cannot even be built out of
+        // that capability: the loader refuses the file, which is why "the tool's interfaces never exceed its maker's" is
+        // a property of the catalogue rather than a check at call time.
+        const string Ask = """
+            async function onEvent(event, ctx) { }
+            async function onCall(args, ctx) {
+              return await ctx.actions.call("sessions.setLevel", { id: "s-no-such-session", level: "operator" });
+            }
+            """;
+        static ScriptPackage MadeBy(string id, AccessLevel level) => new(
+            new(id, 1, "channel", MountMode.Manual, ["channel.message.accepted"], "onEvent",
+                [ScriptCapabilities.ChannelReply, Capabilities.SessionsControl], TrustDomain.Trusted, Call: "onCall",
+                Tool: new("tool." + id, "Ask for a level change.", """{"type":"object"}""")),
+            Ask, Level: level);
+
+        Assert.True((await _graph.LoadAsync([MadeBy("deep", AccessLevel.Full)], default)).Ok);
+        var deep = await _graph.InvokeToolAsync("deep", "{}", default);
+        Assert.True(deep.Ok, deep.Error?.Message);
+        Assert.Contains("invalid", deep.Value, StringComparison.OrdinalIgnoreCase);
+
+        Assert.True((await _graph.LoadAsync([MadeBy("shallow", AccessLevel.Agent)], default)).Ok);
+        Assert.DoesNotContain(_graph.ToolScripts, package => package.Manifest.Id == "shallow");
+        Assert.Contains(_graph.RejectedScripts, issue => issue.Reason.Contains("folder it came from", StringComparison.Ordinal));
     }
 
     [Fact]

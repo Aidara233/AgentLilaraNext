@@ -180,7 +180,8 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     | `timeoutMilliseconds` | 否 | 默认 1000，1–60000 |
     | `memoryLimitBytes` | 否 | 默认 16 MiB，1 MiB–256 MiB |
     | `call` | 否 | 想让它同时是一件**工具**时，写第二入口的函数名，如 `onCall` |
-    | `tool` | 否 | 工具的名字/描述/参数（`{ name, description, parametersJson }`）；不写就让脚本自己导出 `describe()` 返回同样三个字段 |
+    | `tool` | 否 | 工具的名字/描述/参数（`{ name, description, parametersJson, access }`）；不写就让脚本自己导出 `describe()` 返回同样几个字段 |
+    | `tool.access` | 否 | 谁可以调它：`agent`（默认，谁都能）/ `operator` / `full`。**不得超过你脚本自己的等级** |
 
     ## 当工具用：`call` + `tool`
 
@@ -191,8 +192,12 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     - 两个脚本同名 → **第二个被拒载**（工具名对每个会话都是全局的，重名会让每个会话每一轮都失败）；
     - 定义只解析一次：同一段对话不会看到同一个工具的两个形状。
 
-    你的 `onCall(args, ctx)` 拿到解析好的参数对象和同一个 `ctx`，返回值会变成工具结果。它按**你所在目录**的权限跑，
-    不按调用你的会话；`full` 脚本的工具不会出现在 agent 级会话的工具表里。
+    你写的那件工具**按你所在目录的等级运行**，不按调用它的会话：`full` 脚本的工具被 agent 级会话调用时，
+    做的是 full 能做的事。所以谁能造什么，等于谁能碰什么——这是设计的核心，不是限制的副产品。
+
+    `tool.access` 决定**谁能调它**：默认 `agent`（谁都能），你可以收紧到 `operator` 甚至 `full`（只给你这个等级用）。
+    它也不能超过你自己的等级——一个人可以做了工具只留给自己那个等级，但不能造一个比自己更"特权"的入口。
+    除了这个口子，工具列表是全局的：你做的工具所有会话都看得见，正是"让别人用它做它做不到的事"这条路。
 
     ```
     async function onCall(args, ctx) {

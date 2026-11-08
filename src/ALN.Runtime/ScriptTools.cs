@@ -484,25 +484,40 @@ public sealed class ScriptCallTools(IGraphRuntime graph) : ISessionToolSource
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        // Every callable script, offered to every Session it was opened to — the author decides that, not the caller's
+        // level. What matters is the level the tool <b>runs</b> at, and that is the maker's (its folder's): a person can
+        // use interfaces the model cannot reach to build a tool the model may call, and the model can build a basic one a
+        // deeper Session may call. Calling a tool never hands the caller the tool's authority, so there is nothing to be
+        // gained by hiding a deep tool from a shallow Session — and everything to lose, because that is the whole way
+        // work gets done for someone who cannot do it themselves.
         var offers = graph.ToolScripts
-            .Where(package => package.Tool is not null && package.Level <= request.Level)
+            .Where(package => package.Tool is not null && package.Tool.Access <= request.Level)
             .Select(package => new SessionToolOffer(
                 new ScriptCallTool(graph, package),
                 new ModelToolDefinition(package.Tool!.Name, Describe(package), package.Tool.ParametersJson),
                 // A script tool can act: it has the same ctx an event handler has, so a turn that only called one has
                 // not spoken to anybody just because it produced text.
                 ActsExternally: true,
-                MinLevel: package.Level))
+                MinLevel: package.Tool!.Access))
             .ToArray();
         return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(offers));
     }
 
-    /// <summary>The definition the model reads, with the provenance no other part of the tool surface gets to carry.</summary>
+    /// <summary>
+    /// The definition the model reads, with the provenance no other part of the tool surface gets to carry.
+    ///
+    /// The level in it is the <b>worker's</b>, not the reader's, and that is the sentence to get right: "this tool reaches
+    /// L2 full" tells a shallow caller it just borrowed a person's hands; "this tool is L0" tells a deep Session the
+    /// answer it gets came from a shallow author. Either way the reader knows who is acting, which is the only thing the
+    /// description is here to establish.
+    /// </summary>
     private static string Describe(ScriptPackage package) =>
         $"{package.Tool!.Description}\n\n"
         + $"（这是一个脚本，不是内建工具：id `{package.Manifest.Id}`，来自 {ScriptReload.LibraryOf(package)}，"
-        + $"等级 {AccessLevels.Describe(package.Level)}。它按自己所在目录的权限做事，不按调用它的会话。"
-        + "改它要 scripts_reload；名字和参数在定义时会确定，改名相当于换一个工具。）";
+        + $"制作者与运行时的等级都是 {AccessLevels.Describe(package.Level)}。它按自己所在目录的权限做事，不按调用它的会话——"
+        + "调用它不会给你任何权限，只是请它做件事。"
+        + $"可调用者：{AccessLevels.Describe(package.Tool.Access)} 及以上。"
+        + "改它要 scripts_reload；改名相当于换一个工具。）";
 
     private sealed class ScriptCallTool(IGraphRuntime graph, ScriptPackage package) : ISessionTool
     {
