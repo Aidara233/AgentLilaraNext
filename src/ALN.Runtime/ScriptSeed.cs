@@ -172,7 +172,7 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     | `version` | 是 | 整数，至少 1 |
     | `targetType` | 是 | `adapter` 或 `channel`：挂在哪一类实例上 |
     | `mount` | 是 | 草稿必须是 `manual`。`default` 会被拒绝——能写脚本的东西不能自己接管一类实例 |
-    | `events` | 是 | `adapter.envelope`（adapter 收到消息）或 `channel.message.accepted`（频道收到消息） |
+    | `events` | 是 | 宿主会产出的全部事件名都可以写：`adapter.envelope`、`channel.message.accepted`、`schedule.due`、`lifecycle.start`/`lifecycle.stop`/`lifecycle.started`、`session.turn.started`/`session.turn.finished`。 |
     | `entryPoint` | 是 | `main.js` 里的函数名。加载时会真的执行脚本并检查它确实是函数 |
     | `capabilities` | 是 | 你打算用的能力，见下表。越界会被拒绝加载；没声明的能力在运行时会失败 |
     | `trustDomain` | 是 | 必须是 `"trusted"`。写 `builtin` 会被拒绝：那是随程序发布、本地不可改的东西 |
@@ -216,7 +216,7 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     |---|---|---|
     | `channel.accept` | `ctx.channel.accept()` | adapter 事件：把这条消息交给认领它的频道 |
     | `channel.route` | `ctx.channel.route(options)` | adapter 事件 |
-    | `channel.bound-send` | `ctx.channel.reply(message)` | channel 事件：往这个频道回一句 |
+    | `channel.bound-send` | `ctx.channel.reply(message)` | 往这个频道回一句。回答刚收到的那条消息可以，频道开始/停止工作或一轮说完时说一句也可以（那时平台会话 id 可以省略，就是本频道那一个） |
     | `model.complete` | `ctx.model.complete(profileId, request)` | 一次模型调用，无会话、无工具 |
     | `session.run` | `ctx.session.run(spec, text)` | channel 事件：跑一轮会话并拿回结果 |
     | `session.activate` | `ctx.session.activate(spec)` | channel 事件：唤醒会话，不等结果 |
@@ -291,7 +291,7 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     - `targetType` 写了具体类型（如 `channel.conversation`）→ 拒绝：这里要的是抽象类型名。
     - `capabilities` 里有表外的东西 → 拒绝加载。
     - `entryPoint` 名字和函数名不一致 → 拒绝：加载时会检查函数是否存在。
-    - 事件名拼错 → 拒绝。只有 `adapter.envelope` 和 `channel.message.accepted` 两个。
+    - 事件名拼错 → 拒绝（回话里会列出现在能用的全部名字）。能写的不止两个：频道/适配器的启停、`schedule.due`、以及会话每轮的起止，都算事件。
     - 语法错误 → 拒绝，原因里带解释器的话。
 
     被拒不会弄坏宿主：那个脚本不会出现，其余的照常运行；原因会在 `scripts_reload` 的返回里、在 `scripts_list` 里，
