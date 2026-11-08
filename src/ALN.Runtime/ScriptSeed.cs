@@ -179,6 +179,30 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     | `maxStatements` | 否 | 默认 10000，1–1000000 |
     | `timeoutMilliseconds` | 否 | 默认 1000，1–60000 |
     | `memoryLimitBytes` | 否 | 默认 16 MiB，1 MiB–256 MiB |
+    | `call` | 否 | 想让它同时是一件**工具**时，写第二入口的函数名，如 `onCall` |
+    | `tool` | 否 | 工具的名字/描述/参数（`{ name, description, parametersJson }`）；不写就让脚本自己导出 `describe()` 返回同样三个字段 |
+
+    ## 当工具用：`call` + `tool`
+
+    加了这两个字段，模型手里就多一件工具，名字就是你写的那一个。三件事在**加载时**定（不是调用时）：
+
+    - 名字必须带点、全是小写：`^[a-z][a-z0-9]*(\.[a-z0-9][a-z0-9_-]*)+$`，例如 `tool.summarise`。这样它一眼就是"别人的
+      工具"，也碰不到 `wait` / `compact` / 模块自己的名字；
+    - 两个脚本同名 → **第二个被拒载**（工具名对每个会话都是全局的，重名会让每个会话每一轮都失败）；
+    - 定义只解析一次：同一段对话不会看到同一个工具的两个形状。
+
+    你的 `onCall(args, ctx)` 拿到解析好的参数对象和同一个 `ctx`，返回值会变成工具结果。它按**你所在目录**的权限跑，
+    不按调用你的会话；`full` 脚本的工具不会出现在 agent 级会话的工具表里。
+
+    ```
+    async function onCall(args, ctx) {
+      const text = String(args.text ?? "");
+      return { ok: true, lines: text.split("\n").length, characters: text.length };
+    }
+    ```
+
+    超时（`timeoutMilliseconds` / 语句数 / 内存）不是"什么都没发生"：模型会被告知"可能已经做了，要确认就自己核一下"。
+    所以能重试的动作要自己能被重复执行，或者先记一笔再动手。
 
     ## 能力
 
