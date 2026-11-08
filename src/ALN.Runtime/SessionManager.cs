@@ -170,22 +170,32 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     private async ValueTask AnnounceAsync(string sessionId, string? channel, LifecyclePhase phase,
         CancellationToken cancellationToken)
     {
-        if (_events is null) return;
         if (string.IsNullOrWhiteSpace(channel)) return;
         var target = ChannelAddress(channel);
         if (!target.IsInstance) return;
-        var payload = JsonSerializer.Serialize(new SessionLifecycleNotice(sessionId,
-            new LifecycleSignal(phase, DateTimeOffset.UtcNow).For(target)), JsonOptions);
         var name = phase == LifecyclePhase.Start ? EventNames.LifecycleStart : EventNames.LifecycleStop;
-        var published = await _events.PublishAsync(new RoutedEvent(name, target, Guid.NewGuid(),
-            payload, target), cancellationToken).ConfigureAwait(false);
+        await PublishAsync(target, name,
+            new SessionLifecycleNotice(sessionId, new LifecycleSignal(phase, DateTimeOffset.UtcNow).For(target)),
+            sessionId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// One event to one instance, with the two rules every announcement here follows: an address that is not an
+    /// instance is not a destination, and a failed publish is a warning about a graph problem — never a failed turn.
+    /// </summary>
+    private async ValueTask PublishAsync(Address target, string name, object payload, string sessionId,
+        CancellationToken cancellationToken)
+    {
+        if (_events is null || !target.IsInstance) return;
+        var published = await _events.PublishAsync(new(name, target, Guid.NewGuid(),
+            JsonSerializer.Serialize(payload, JsonOptions), target), cancellationToken).ConfigureAwait(false);
         if (!published.Ok)
             _signalLog.Write(new()
             {
                 Id = Guid.NewGuid(),
                 Group = "session",
                 Name = sessionId,
-                From = channel,
+                From = target.ToString(),
                 To = "session",
                 Mechanism = "session.announce",
                 Outcome = "failed",
@@ -493,6 +503,13 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                 result = await RunTurnCoreAsync(record, activationId, input, tools, cancellationToken, skipIfBusy)
                     .ConfigureAwait(false);
             RecordTurn(sessionId, spec, activationId, result, started, recordId, parentId);
+            // After the turn, not inside it: the gate is already released here, so a listener that answers this event by
+            // talking to the same Session cannot end up waiting for the turn that is announcing its own end. An ending is
+            // sent whatever happened — failed turns end too, and a listener counting beginnings must not be left odd.
+            await AnnounceTurnAsync(sessionId, input.Channel, TurnReason(input), started: false,
+                result.Ok ? result.Value!.StepNumber : 0,
+                result.Ok ? result.Value!.StopReason.ToString() : $"failed:{result.Error?.Code}",
+                cancellationToken).ConfigureAwait(false);
             return result;
         }
         catch (OperationCanceledException)
@@ -505,8 +522,30 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                 Outcome = "timeout", Level = SignalLevel.Warn,
                 DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds
             });
+            // A cancelled turn still ends. Publishing with the cancelled token would drop the ending on the floor.
+            await AnnounceTurnAsync(sessionId, input.Channel, TurnReason(input), started: false, 0, "cancelled",
+                CancellationToken.None).ConfigureAwait(false);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Why a turn happened, in one word: what a listener asks first, and what cannot be recovered from anything else.
+    /// </summary>
+    private static string TurnReason(SessionTurnInput input) =>
+        input.Messages is { Count: > 0 } ? "message"
+        : input.Schedule is not null ? "schedule"
+        : input.Relay is not null ? "relay"
+        : "wake";
+
+    /// <summary>Tells the Channel a turn is starting or has ended. A Channel that is not an instance is not a destination.</summary>
+    private async ValueTask AnnounceTurnAsync(string sessionId, Address? channel, string reason, bool started,
+        int stepNumber, string? ending, CancellationToken cancellationToken)
+    {
+        if (channel is not { IsInstance: true } target) return;
+        var name = started ? EventNames.SessionTurnStarted : EventNames.SessionTurnFinished;
+        await PublishAsync(target, name, new SessionTurnNotice(sessionId, reason, stepNumber, ending),
+            sessionId, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1141,6 +1180,9 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             Directory.CreateDirectory(directory);
             if (record.State.Locked)
                 return Result<SessionTurnResult>.Failure(new(ErrorCode.Denied, "Session is locked."));
+            // The turn has the gate: it is really beginning, not queued and not skipped as busy.
+            await AnnounceTurnAsync(sessionId, input.Channel, TurnReason(input), started: true,
+                record.State.StepNumber, null, cancellationToken).ConfigureAwait(false);
 
             var history = record.History;
             var activation = activationId.ToString("N");

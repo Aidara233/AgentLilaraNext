@@ -218,6 +218,38 @@ public sealed class SessionLifecycleTests : IDisposable
             JsonSerializer.Deserialize<SessionLifecycleNotice>(stopped.PayloadJson, Json)!.Signal.Phase);
     }
 
+    /// <summary>
+    /// A turn has a beginning and an end, and both are announced: "greet me when you start working on this, and say
+    /// something when you are done" is a thing people ask for, and before this there was no moment at which a script
+    /// could hear the second half at all.
+    ///
+    /// The order and the pairing are the contract: one started, one finished, finished always after the turn's gate is
+    /// released (a listener that answers by talking to the same Session must not wait for the turn it is answering), and
+    /// finished is sent even when the turn failed.
+    /// </summary>
+    [Fact]
+    public async Task Every_turn_announces_its_beginning_and_its_end()
+    {
+        var sink = new RecordingSink();
+        var sessions = new SessionManager(_root, new ScriptedModel(), events: sink);
+
+        var turn = await sessions.TurnAsync("s-turn", Spec, Guid.NewGuid(), Input(Chat, "hello"), null, default);
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+
+        var notices = sink.Events
+            .Where(entry => entry.Name is EventNames.SessionTurnStarted or EventNames.SessionTurnFinished)
+            .ToArray();
+        Assert.Equal([EventNames.SessionTurnStarted, EventNames.SessionTurnFinished], notices.Select(entry => entry.Name));
+        Assert.All(notices, entry => Assert.Equal("channel.conversation#chat-1", entry.Target?.ToString()));
+
+        var beginning = JsonSerializer.Deserialize<SessionTurnNotice>(notices[0].PayloadJson, Json)!;
+        var ending = JsonSerializer.Deserialize<SessionTurnNotice>(notices[1].PayloadJson, Json)!;
+        Assert.Equal("s-turn", beginning.SessionId);
+        Assert.Equal("message", beginning.Reason);
+        Assert.Equal(turn.Value!.StopReason.ToString(), ending.StopReason);
+        Assert.Equal(turn.Value!.StepNumber, ending.StepNumber);
+    }
+
     /// <summary>What "announced" looks like from outside: the events that were published, in order.</summary>
     private sealed class RecordingSink : IEventSink
     {

@@ -357,6 +357,16 @@ public interface ISessionManager
 /// </summary>
 public sealed record SessionLifecycleNotice(string SessionId, LifecycleSignal Signal);
 
+/// <summary>
+/// What one turn's beginning or end looks like from outside: which Session, why it ran, how far it got, and — when it
+/// has finished — how it stopped.
+///
+/// <paramref name="Reason"/> is the activation reason (a message, a deadline, a schedule, a relay): "why did it wake"
+/// is the question a listener asks first, and it is not recoverable from anything else in the event.
+/// </summary>
+public sealed record SessionTurnNotice(string SessionId, string Reason, int StepNumber,
+    string? StopReason = null, string? Detail = null);
+
 /// <summary>The action ids the session manager answers to. Same rule as the other modules: the id is part of the interface.</summary>
 public static class SessionActions
 {
