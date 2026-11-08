@@ -64,6 +64,9 @@ public static class AccessLevels
 
         // Changing the shape of the process: a person's decision, made on purpose, written down in the audit.
         [Capabilities.AdaptersControl] = AccessLevel.Operator,
+        // Reachable at agent level because the *verb's* depth is per-instance data (rawActions); the handler compares the
+        // caller against that. Registering it deeper would make "the model may call get_group_list" impossible to say.
+        [Capabilities.AdaptersRaw] = AccessLevel.Agent,
         [Capabilities.ChannelsControl] = AccessLevel.Operator,
         [Capabilities.ModelsControl] = AccessLevel.Operator,
         [Capabilities.ParamsWrite] = AccessLevel.Operator,
@@ -239,6 +242,12 @@ public static class Capabilities
     public const string SystemRead = "system.read";
     public const string AdaptersRead = "adapters.read";
     public const string AdaptersControl = "adapters.control";
+    /// <summary>
+    /// The platform's own operations, passed through. Agent-level on purpose: the depth of a <i>verb</i> is the
+    /// instance's own data (<c>rawActions</c>), so the handler is where that is decided — one place, per verb, written by
+    /// a person. The action itself has to be reachable or that decision could never say "the model may call this one".
+    /// </summary>
+    public const string AdaptersRaw = "adapters.raw";
     public const string ChannelsRead = "channels.read";
     public const string ChannelsControl = "channels.control";
     public const string MessagesWrite = "messages.write";

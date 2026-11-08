@@ -162,6 +162,14 @@ public static partial class OneBotProtocol
             : JsonSerializer.Serialize(new { action = "send_group_msg", @params = new { group_id = targetId, message = segments, auto_escape = false }, echo }, Json);
     }
 
+    /// <summary>
+    /// Any action at all, passed through: the verbs this host never wrapped. Nothing here decides what is allowed — that
+    /// is the caller's instance configuration (<c>rawActions</c>) — and nothing translates, which is why the answer is
+    /// handed back as the platform wrote it.
+    /// </summary>
+    public static string BuildRaw(string echo, string action, JsonElement parameters) =>
+        JsonSerializer.Serialize(new { action, @params = parameters, echo }, Json);
+
     /// <summary><c>get_login_info</c>: how the account id is learned instead of typed in by hand.</summary>
     public static string BuildLoginInfo(string echo) =>
         JsonSerializer.Serialize(new { action = "get_login_info", @params = new { }, echo }, Json);

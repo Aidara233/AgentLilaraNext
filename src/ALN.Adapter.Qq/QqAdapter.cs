@@ -14,7 +14,7 @@ namespace ALN.Adapter.Qq;
 /// v1 scope: group text in, group text out. Private chats, images, mentions and rate-limit pacing are
 /// not implemented — see docs/16.
 /// </summary>
-public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, IParameterTarget, ITargetNaming
+public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, IParameterTarget, ITargetNaming, IRawAdapter
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private const int SeenCapacity = 512;
@@ -94,6 +94,36 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
             ["endpoint"] = _endpoint.ToString()
         });
         return Result.Success();
+    }
+
+    /// <summary>
+    /// One of OneBot's own actions, passed through: the ones this host never wrapped.
+    ///
+    /// The answer is the platform's own JSON — including its <c>retcode</c>, which is where a bridge says "muted", "not a
+    /// member", "no such group". Translating that into our error codes would throw away the only part a model could act
+    /// on, so it is handed back whole, and a refusal by the platform is a successful call with a refusal inside it.
+    /// </summary>
+    public async ValueTask<Result<JsonElement>> RawAsync(string action, JsonElement parameters,
+        CancellationToken cancellationToken)
+    {
+        if (!IsRunning)
+            return Result<JsonElement>.Failure(new(ErrorCode.Unavailable, "QQ adapter is not running."));
+        if (string.IsNullOrWhiteSpace(action))
+            return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "An OneBot action name is required."));
+
+        var called = await _connection.CallAsync(echo => OneBotProtocol.BuildRaw(echo, action, parameters),
+            cancellationToken).ConfigureAwait(false);
+        if (!called.Ok)
+            return Result<JsonElement>.Failure(called.Error ?? new(ErrorCode.Unavailable, "OneBot call failed."));
+
+        var reply = called.Value;
+        return Result<JsonElement>.Success(JsonSerializer.SerializeToElement(new
+        {
+            ok = reply.Response.Ok,
+            retcode = reply.Response.RetCode,
+            message = reply.Response.Message,
+            data = reply.Data
+        }));
     }
 
     public override async ValueTask<Result> StopAsync(CancellationToken cancellationToken)

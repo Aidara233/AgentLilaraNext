@@ -1,3 +1,4 @@
+using System.Text.Json;
 namespace ALN.Contracts;
 
 public readonly record struct Address(string Module, string? Kind = null, string? Instance = null)
@@ -85,7 +86,16 @@ public sealed record AdapterSpec(Address Address, AdapterDescriptor Descriptor,
     /// address: the address is a name, and a name whose spelling decides what the thing is cannot be changed.
     /// </summary>
     string TypeId,
-    IReadOnlyDictionary<string, string>? Settings = null);
+    IReadOnlyDictionary<string, string>? Settings = null,
+    /// <summary>
+    /// Which of the platform's own operations this instance will carry, and how deep each one sits. Absent or empty means
+    /// "none": nothing raw is callable below an operator's level, and a verb that is not named here is an operator's.
+    ///
+    /// This is a person's written decision, not the adapter's opinion — it is the one place that says "the model may call
+    /// get_group_list, and nobody but me may call set_group_ban". Wrapping each platform verb would need the host to know
+    /// every bridge's feature list; this needs two words per verb and no code at all.
+    /// </summary>
+    IReadOnlyDictionary<string, AccessLevel>? RawActions = null);
 
 public sealed record RoutedEvent(string Name, Address Source, Guid EventId, string PayloadJson, Address? Target = null)
 {
@@ -120,6 +130,23 @@ public interface IChatAdapter : IInboundAdapter, IOutboundAdapter, IAddressed, I
     AdapterState State { get; }
     ValueTask<Result> StartAsync(CancellationToken cancellationToken);
     ValueTask<Result> StopAsync(CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// Optional for an Adapter whose platform has operations we do not model — OneBot has dozens, and wrapping each one would
+/// mean the host grows a verb every time a bridge gains a feature.
+///
+/// The host's counterpart is one action (<c>adapters.raw</c>) plus a per-instance allowlist that says which verbs may be
+/// called and at what level; the adapter only has to send one and hand back the answer. An adapter that cannot
+/// meaningfully do that does not implement this, and saying so is the answer.
+/// </summary>
+public interface IRawAdapter
+{
+    /// <summary>
+    /// One platform operation, verbatim: <paramref name="action"/> is the platform's own name for it, and the answer is
+    /// the platform's own data. Nothing on this path translates, which is the point and also the risk.
+    /// </summary>
+    ValueTask<Result<JsonElement>> RawAsync(string action, JsonElement parameters, CancellationToken cancellationToken);
 }
 
 /// <summary>
@@ -178,6 +205,12 @@ public static class AdapterActions
     public const string Stop = "adapters.stop";
     public const string Create = "adapters.create";
     public const string Destroy = "adapters.destroy";
+
+    /// <summary>
+    /// One of the platform's own operations, passed through verbatim. Callable only for the verbs an instance lists under
+    /// <c>rawActions</c>, at the level written there; anything unnamed is an operator's.
+    /// </summary>
+    public const string Raw = "adapters.raw";
 }
 public interface IModuleTypeCatalog
 {    bool IsKnownAbstract(string typeId);

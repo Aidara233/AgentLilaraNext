@@ -115,7 +115,7 @@ public sealed partial class AdapterManager : IAdapterManager, IModuleIndex, IMod
 
     /// <summary>One live instance and what its spec said it is. The name is the key: an address is a name, and a
     /// name says nothing about what it is, so the type travels next to the object instead of in a parallel map.</summary>
-    private sealed record LiveAdapter(IChatAdapter Adapter, string TypeId);
+    private sealed record LiveAdapter(IChatAdapter Adapter, string TypeId, AdapterSpec Spec);
 
     private readonly Dictionary<ModuleId, LiveAdapter> _adapters = new();
 
@@ -230,7 +230,7 @@ public sealed partial class AdapterManager : IAdapterManager, IModuleIndex, IMod
                 return Result<IChatAdapter>.Failure(new(ErrorCode.Invalid, "Factory output does not match its AdapterSpec."));
             lock (_gate)
             {
-                _adapters.Add(adapter.Id, new LiveAdapter(adapter, spec.TypeId));
+                _adapters.Add(adapter.Id, new LiveAdapter(adapter, spec.TypeId, spec));
             }
             if (_parameters is not null && adapter is IParameterTarget tunable) _parameters.Register(tunable);
             var attached = await _bindings.AttachAsync(spec.Address, cancellationToken).ConfigureAwait(false);
