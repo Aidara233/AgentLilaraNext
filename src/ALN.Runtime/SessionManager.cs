@@ -69,10 +69,17 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
         ?? throw new InvalidOperationException("No model manager answered, and none was handed in.");
 
     private readonly ISignalLog _signalLog;
+    /// <summary>
+    /// Where a Session's own start is announced. Optional because a test fake need not have a queue, and nothing in a
+    /// turn depends on the answer: an event nobody listens for is not a reason to refuse to load a conversation.
+    /// </summary>
+    private readonly IEventSink? _events;
     private readonly ISessionExtensionRegistry _extensions;
     private readonly IPromptLibrary? _prompts;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SessionRecord> _loaded = new(StringComparer.Ordinal);
+    /// <summary>Sessions that have already said "I am serving" in this process. A beginning is announced once.</summary>
+    private readonly ConcurrentDictionary<string, byte> _announced = new(StringComparer.Ordinal);
     /// <summary>
     /// What the provider's own counts say about this Session's estimates. In memory on purpose: it is evidence about the
     /// requests this process has sent, not a fact about the Session that should outlive it.
@@ -100,7 +107,7 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
     /// this manager out of the host's construction order.
     /// </summary>
     public SessionManager(string dataRoot, IModelManager? models = null, ISessionExtensionRegistry? extensions = null,
-        ISignalLog? signalLog = null, IPromptLibrary? prompts = null, ICatalog? catalog = null)
+        ISignalLog? signalLog = null, IPromptLibrary? prompts = null, ICatalog? catalog = null, IEventSink? events = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         if (models is null && catalog is null)
@@ -112,6 +119,82 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
         _extensions = extensions ?? new SessionExtensionRegistry();
         _signalLog = signalLog ?? NullSignalLog.Instance;
         _prompts = prompts;
+        _events = events;
+    }
+
+    /// <summary>
+    /// Every Session this process is holding right now, with the Channel each answers for.
+    ///
+    /// Loaded, not stored: a Session that has not been touched since the host started is not one that was serving
+    /// anybody, and announcing its stop would be announcing the end of something that never began. The host reads this
+    /// on shutdown, where it dispatches the stop itself — see the comment there for why that is the host's job and not
+    /// a phase of this manager.
+    /// </summary>
+    public IReadOnlyList<SessionLifecycleNotice> LoadedSessions(DateTimeOffset at) =>
+        _loaded.Values
+            .Select(record => (Id: Path.GetFileName(record.Directory), State: record.State))
+            .Where(entry => !string.IsNullOrWhiteSpace(entry.State.Channel))
+            .Select(entry => new SessionLifecycleNotice(entry.Id,
+                new LifecycleSignal(LifecyclePhase.Stop, at).For(ChannelAddress(entry.State.Channel!))))
+            .ToArray();
+
+    /// <summary>The Channel a Session answers for, when the stored text still names a usable instance address.</summary>
+    private static Address ChannelAddress(string channel) =>
+        Address.TryParse(channel, out var parsed) && parsed.IsInstance ? parsed : default;
+
+    /// <summary>
+    /// Announces that a Session has started serving. Called once per Session per process — on load, not on every turn,
+    /// because "being here" is the thing a lifecycle event is about and a turn has its own events.
+    ///
+    /// A failed publish is a warning in the signal log, never a failed load: a graph problem must not cost somebody
+    /// their conversation (the same rule the instance announcement follows).
+    /// </summary>
+    private async ValueTask AnnounceServingAsync(SessionRecord record, CancellationToken cancellationToken)
+    {
+        // Once per Session per process, keyed by id: a Session learns which Channel it serves either when it is loaded
+        // for a Channel that already names it, or the moment a brand-new one is created for a Channel. Both are "it is
+        // serving now", and neither may say it twice — the second turn of a conversation is not a second beginning.
+        var id = Path.GetFileName(record.Directory);
+        if (string.IsNullOrWhiteSpace(record.State.Channel)) return;
+        if (!_announced.TryAdd(id, 0)) return;
+        await AnnounceAsync(id, record.State.Channel, LifecyclePhase.Start, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>A Session stopped serving in this process: archived, or the host is going down.</summary>
+    private async ValueTask AnnounceStoppedAsync(string sessionId, SessionState? state, CancellationToken cancellationToken)
+    {
+        if (state is null) return;
+        await AnnounceAsync(sessionId, state.Channel, LifecyclePhase.Stop, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask AnnounceAsync(string sessionId, string? channel, LifecyclePhase phase,
+        CancellationToken cancellationToken)
+    {
+        if (_events is null) return;
+        if (string.IsNullOrWhiteSpace(channel)) return;
+        var target = ChannelAddress(channel);
+        if (!target.IsInstance) return;
+        var payload = JsonSerializer.Serialize(new SessionLifecycleNotice(sessionId,
+            new LifecycleSignal(phase, DateTimeOffset.UtcNow).For(target)), JsonOptions);
+        var name = phase == LifecyclePhase.Start ? EventNames.LifecycleStart : EventNames.LifecycleStop;
+        var published = await _events.PublishAsync(new RoutedEvent(name, target, Guid.NewGuid(),
+            payload, target), cancellationToken).ConfigureAwait(false);
+        if (!published.Ok)
+            _signalLog.Write(new()
+            {
+                Id = Guid.NewGuid(),
+                Group = "session",
+                Name = sessionId,
+                From = channel,
+                To = "session",
+                Mechanism = "session.announce",
+                Outcome = "failed",
+                Level = SignalLevel.Warn,
+                Detail = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["error"] = published.Error?.Message ?? "refused"
+                }
+            });
     }
 
     /// <summary>
@@ -166,6 +249,9 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             record.State = record.State with { Channel = channelKey };
             await WriteAtomicJsonAsync(Path.Combine(ResolveSessionDirectory(fresh), "state.json"), record.State,
                 cancellationToken).ConfigureAwait(false);
+            // A Session created for a Channel is serving the moment the Channel is on its record — which is the half a
+            // fresh Session did not have when it was loaded a few lines up.
+            await AnnounceServingAsync(record, cancellationToken).ConfigureAwait(false);
         }
         return created;
     }
@@ -252,6 +338,9 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
                         }
                     });
             }
+            // "This Session is now serving" — once per process, and only after it is genuinely usable: the record is in
+            // the loaded set and the instance has been announced. A Session that fails above never claims to have started.
+            await AnnounceServingAsync(record, cancellationToken).ConfigureAwait(false);
             return Result<SessionRecord>.Success(record);
         }
         finally { gate.Release(); }
@@ -1746,7 +1835,12 @@ public sealed partial class SessionManager : ISessionManager, IModuleIndex, IMod
             if (Directory.Exists(destinationDirectory) || File.Exists(destinationDirectory))
                 return Result.Failure(new(ErrorCode.Conflict, $"Archive destination already exists: {destinationDirectory}"));
             Directory.Move(source, destinationDirectory);
-            _loaded.TryRemove(sessionId, out _);
+            _loaded.TryRemove(sessionId, out var removed);
+            // Archived is stopped: the data is gone from its living place, so a script that answers this Channel should
+            // hear the same thing it would hear at shutdown. Read from the loaded record when there is one, and from the
+            // state file otherwise — a Session nobody touched this boot was still a Session this Channel was serving.
+            await AnnounceStoppedAsync(sessionId, removed?.State ?? TryReadState(destinationDirectory), cancellationToken)
+                .ConfigureAwait(false);
             await DetachInstanceAsync(sessionId).ConfigureAwait(false);
             return Result.Success();
         }

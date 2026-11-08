@@ -105,7 +105,7 @@ var catalog = prompts.List();
 if (catalog.Groups.Count > 0 || catalog.Warnings.Count > 0)
     restore.Note("prompts", $"{catalog.Groups.Count} group(s), {catalog.Groups.Sum(group => group.Entries.Count)} prompt(s)" +
         (catalog.Warnings.Count == 0 ? "" : $"; skipped {catalog.Warnings.Count}: {string.Join("; ", catalog.Warnings)}"));
-var sessions = new SessionManager(data.Root, extensions: sessionExtensions, signalLog: signalLog, prompts: prompts, catalog: modules);
+var sessions = new SessionManager(data.Root, extensions: sessionExtensions, signalLog: signalLog, prompts: prompts, catalog: modules, events: queue);
 var reloadState = new ModuleReloadStateStore();
 // The action table exists before anything runs, because the modules that implement actions are the ones that
 // register them: a manager is created (and readied) inside a package load, long before startup finishes, and it
@@ -652,6 +652,22 @@ catch (OperationCanceledException) when (shutdown.IsCancellationRequested) { }
 finally
 {
     if (api is not null) await api.DisposeAsync();
+    // Sessions are told they are stopping here, and dispatched inline, for one reason: ordering. Every Channel and
+    // Adapter is still up at this point, so a script that answers a Session's stop can still speak — which is the
+    // whole point of saying goodbye. Through the queue it would land behind the shutdown it is about, and through a
+    // phase of the session manager it could not run at all (a session has no phase machine; the manager is passive).
+    // Nothing is awaited per script: the dispatch is the graph's, and a script that runs long is bounded by its own
+    // timeout, like every other event.
+    foreach (var stopping in sessions.LoadedSessions(DateTimeOffset.UtcNow))
+    {
+        var target = stopping.Signal.Branch is { IsInstance: true } branch ? branch : (Address?)null;
+        if (target is not { } address) continue;
+        var beforeStop = await graph.DispatchAsync(new(EventNames.LifecycleStop, address, Guid.NewGuid(),
+            JsonSerializer.Serialize(stopping, new JsonSerializerOptions(JsonSerializerDefaults.Web)), address),
+            CancellationToken.None).ConfigureAwait(false);
+        if (!beforeStop.Ok)
+            Console.Error.WriteLine($"Warning: {stopping.SessionId} could not be told it is stopping: {beforeStop.Error?.Message}");
+    }
     await kernel.StopAsync(CancellationToken.None);
     shutdown.Cancel();
     try { await clockTask; } catch (OperationCanceledException) { }

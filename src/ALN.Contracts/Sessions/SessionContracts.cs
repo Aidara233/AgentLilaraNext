@@ -343,6 +343,20 @@ public interface ISessionManager
     ValueTask<Result> RestoreAsync(string sessionId, string sourceDirectory, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// What a Session's lifecycle event carries: the instance signal every other lifecycle event carries, plus which
+/// Session it is about.
+///
+/// The signal says <c>start</c> or <c>stop</c> and the instant; the id says which of a manager's instances it was.
+/// Both are needed: a Channel is served by one Session, so a script mounted on the Channel can tell "my conversation's
+/// Session came up" from "the Channel came up".
+///
+/// Why these events go to the Channel and not to the Session: a Session's id is its type plus a fresh suffix, and
+/// an event is addressed by an instance address — a Session has none a mount could name. The Channel is the address
+/// the Session answers for, and it is where the scripts already are.
+/// </summary>
+public sealed record SessionLifecycleNotice(string SessionId, LifecycleSignal Signal);
+
 /// <summary>The action ids the session manager answers to. Same rule as the other modules: the id is part of the interface.</summary>
 public static class SessionActions
 {

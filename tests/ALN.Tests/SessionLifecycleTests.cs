@@ -174,6 +174,62 @@ public sealed class SessionLifecycleTests : IDisposable
         Assert.Null(kernel.Find(new ModuleId("s-node")));
     }
 
+    /// <summary>
+    /// A Session is an instance with a lifecycle, and until now that was true only on paper: the manager announced it to
+    /// the graph and nothing else. Both halves are pinned here — "it has started serving" once per process, "it stopped"
+    /// when it is put away — because a script that wants to greet or say goodbye listens for exactly these two.
+    ///
+    /// The event goes to the Channel, not to the Session: an event is addressed by an instance address, and a Session's
+    /// id is a hash with no address a mount could name. The Channel is what the Session answers for.
+    /// </summary>
+    [Fact]
+    public async Task A_session_announces_its_own_start_and_stop_on_its_channel()
+    {
+        var sink = new RecordingSink();
+        var sessions = new SessionManager(_root, new ScriptedModel(), events: sink);
+
+        var opened = await sessions.OpenForChannelAsync(Chat.ToString(), Spec, default);
+        Assert.True(opened.Ok, opened.Error?.Message);
+        var first = await opened.Value!.RunTurnAsync(Guid.NewGuid(), Input(Chat, "hello"), null, default);
+        Assert.True(first.Ok, first.Error?.Detail ?? first.Error?.Message);
+        // A second turn is not a second start: the Session was already serving.
+        var second = await opened.Value!.RunTurnAsync(Guid.NewGuid(), Input(Chat, "again"), null, default);
+        Assert.True(second.Ok, second.Error?.Detail ?? second.Error?.Message);
+        var starts = sink.Events.Where(entry => entry.Name == EventNames.LifecycleStart).ToArray();
+        var start = Assert.Single(starts);
+        var sessionId = opened.Value!.Id.Value;
+        Assert.Equal("channel.conversation#chat-1", start.Target?.ToString());
+        Assert.Equal("channel.conversation#chat-1", start.Source.ToString());
+        var notice = JsonSerializer.Deserialize<SessionLifecycleNotice>(start.PayloadJson, Json)!;
+        Assert.Equal(sessionId, notice.SessionId);
+        Assert.Equal(LifecyclePhase.Start, notice.Signal.Phase);
+        Assert.DoesNotContain(sink.Events, entry => entry.Name == EventNames.LifecycleStop);
+
+        var destination = Path.Combine(_root, "bin", sessionId);
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        var moved = await sessions.ArchiveAsync(sessionId, destination, default);
+        Assert.True(moved.Ok, moved.Error?.Message);
+
+        var stopped = sink.Events.Single(entry => entry.Name == EventNames.LifecycleStop);
+        Assert.Equal("channel.conversation#chat-1", stopped.Target?.ToString());
+        Assert.Equal(sessionId,
+            JsonSerializer.Deserialize<SessionLifecycleNotice>(stopped.PayloadJson, Json)!.SessionId);
+        Assert.Equal(LifecyclePhase.Stop,
+            JsonSerializer.Deserialize<SessionLifecycleNotice>(stopped.PayloadJson, Json)!.Signal.Phase);
+    }
+
+    /// <summary>What "announced" looks like from outside: the events that were published, in order.</summary>
+    private sealed class RecordingSink : IEventSink
+    {
+        public List<RoutedEvent> Events { get; } = new();
+
+        public ValueTask<Result> PublishAsync(RoutedEvent routedEvent, CancellationToken cancellationToken)
+        {
+            Events.Add(routedEvent);
+            return ValueTask.FromResult(Result.Success());
+        }
+    }
+
     private SessionManager Sessions() => new(_root, new ScriptedModel());
 
     private ArchiveManager Bin() => new(_root);
