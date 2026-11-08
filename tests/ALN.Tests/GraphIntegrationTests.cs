@@ -1332,6 +1332,46 @@ public sealed class GraphIntegrationTests : IDisposable
                      && issue.Reason.Contains(EventNames.LifecycleStart, StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// A script's Channel has a start and a stop, and saying something at either is the whole reason somebody wants a
+    /// script to hear them: greet when the conversation comes up, say goodbye when it goes away. The message case needs
+    /// no help — the event carries the binding it is answering. A lifecycle moment carries no message, so two things had
+    /// to be true and are pinned here: the destination comes from the Channel itself, and the reply is still checked
+    /// against that Channel's binding rather than trusted because it came from a mount.
+    /// </summary>
+    [Fact]
+    public async Task A_script_can_speak_on_its_channel_when_the_channel_starts_and_stops()
+    {
+        static ScriptPackage Greeter() => new(
+            new("channel.greeter", 1, "channel", MountMode.Manual,
+                [EventNames.ChannelMessageAccepted, EventNames.LifecycleStart, EventNames.LifecycleStop], "onEvent",
+                [ScriptCapabilities.ChannelReply], TrustDomain.Trusted),
+            """
+            async function onEvent(event, ctx) {
+              if (ctx.eventName === "channel.message.accepted") return;
+              if (event.phase === "start") await ctx.channel.reply({ text: "hello" });
+              else await ctx.channel.reply({ text: "bye" });
+            }
+            """);
+
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), Greeter()], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        var channel = new Address("channel", "conversation", "chat-life");
+        await AddChannelAsync(channel, "chat-life");
+        Assert.True((await _graph.MountAsync("channel.greeter", channel, default)).Ok);
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+
+        // Dispatched the way the host does it — the Channel tells its own address it is starting, then stopping.
+        var started = await _graph.DispatchAsync(new(EventNames.LifecycleStart, channel, Guid.NewGuid(),
+            """{"phase":"start"}""", channel), default);
+        Assert.True(started.Ok, started.Error?.Detail ?? started.Error?.Message);
+        var stopped = await _graph.DispatchAsync(new(EventNames.LifecycleStop, channel, Guid.NewGuid(),
+            """{"phase":"stop"}""", channel), default);
+        Assert.True(stopped.Ok, stopped.Error?.Detail ?? stopped.Error?.Message);
+
+        Assert.Equal(["bye", "hello"], OutboxTexts("chat-life"));
+    }
+
     private static ScriptPackage ManualTagger(string id, string text) => new(
         new(id, 1, "channel", MountMode.Manual, [EventNames.ChannelMessageAccepted], "onEvent",
             [ScriptCapabilities.ChannelReply], TrustDomain.Trusted),

@@ -1663,14 +1663,52 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         private async Task<string> ReplyThroughChannelCoreAsync(string json, CancellationToken cancellationToken)
         {
             await RequireCapabilityAsync(ScriptCapabilities.ChannelReply, cancellationToken).ConfigureAwait(false);
-            if (current.Name != EventNames.ChannelMessageAccepted || current.Source != mount.Target)
+            // Two events a Channel reply belongs to, and one rule that covers both: the event came from the Channel this
+            // script is mounted on, and the destination is that Channel's own binding.
+            //
+            // The first is a message the script just received — the original and still the common case. The second is
+            // any of the Channel's own lifecycle moments: a script that greets when the conversation comes up, or says
+            // goodbye when it goes away, is doing exactly what a module does in its start and stop phases, and it has
+            // no message to hang the reply on. Written as a list of names rather than "anything from my target" so that
+            // a future event does not silently become a licence to speak.
+            if (current.Source != mount.Target)
                 await DenyAsync(ScriptCapabilities.ChannelReply, "Not the mounted Channel event.", cancellationToken).ConfigureAwait(false);
-            var routed = Parse<ChannelMessage>(current.PayloadJson);
+            if (current.Name is not (EventNames.ChannelMessageAccepted or EventNames.LifecycleStart
+                    or EventNames.LifecycleStop or EventNames.LifecycleStarted))
+                await DenyAsync(ScriptCapabilities.ChannelReply,
+                    $"A Channel reply belongs to a Channel message or to that Channel starting or stopping, not to '{current.Name}'.",
+                    cancellationToken).ConfigureAwait(false);
+
             var request = Parse<ChannelReplyRequest>(json);
-            var binding = routed.Binding;
-            if (routed.Channel != current.Source || !channels.IsBound(current.Source, binding.Adapter, binding.PlatformConversationId) ||
-                request.PlatformConversationId != binding.PlatformConversationId)
-                await DenyAsync(ScriptCapabilities.ChannelReply, "Reply destination differs from Channel binding.", cancellationToken).ConfigureAwait(false);
+            ChannelBinding binding;
+            // Where it goes. For a message the script was handed a binding and must name that conversation; for a
+            // lifecycle moment there is nothing in the event to name one with, so a Channel that serves one
+            // conversation answers for itself — the destination is still checked against its binding below.
+            var destination = request.PlatformConversationId;
+            if (current.Name == EventNames.ChannelMessageAccepted)
+            {
+                var routed = Parse<ChannelMessage>(current.PayloadJson);
+                binding = routed.Binding;
+                if (routed.Channel != current.Source ||
+                    !channels.IsBound(current.Source, binding.Adapter, binding.PlatformConversationId) ||
+                    request.PlatformConversationId != binding.PlatformConversationId)
+                    await DenyAsync(ScriptCapabilities.ChannelReply, "Reply destination differs from Channel binding.", cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                // No message to read the binding from, so it comes from the Channel itself: what it is aimed at is a
+                // fact about the instance, and the graph is allowed to read it because the script is mounted on it.
+                var addressed = channels.Get(current.Source);
+                if (!addressed.Ok || addressed.Value is null || addressed.Value.Bindings.Count == 0)
+                    await DenyAsync(ScriptCapabilities.ChannelReply,
+                        "The Channel this script is mounted on is aimed at nothing, so there is nowhere to reply.",
+                        cancellationToken).ConfigureAwait(false);
+                binding = addressed.Value!.Bindings[0];
+                if (string.IsNullOrWhiteSpace(destination)) destination = binding.PlatformConversationId;
+                if (!channels.IsBound(current.Source, binding.Adapter, binding.PlatformConversationId) ||
+                    destination != binding.PlatformConversationId)
+                    await DenyAsync(ScriptCapabilities.ChannelReply, "Reply destination differs from Channel binding.", cancellationToken).ConfigureAwait(false);
+            }
 
             // The mode decides how many messages this one reply becomes. Unknown modes are refused rather than
             // treated as the default: a script asking for "image" today would otherwise send text and look like
@@ -1678,7 +1716,7 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
             var mode = string.IsNullOrWhiteSpace(request.Mode) ? ChannelReplyModes.Default : request.Mode;
             if (!ChannelReplyModes.IsKnown(mode))
                 await DenyAsync(ScriptCapabilities.ChannelReply, $"Unknown reply mode: {mode}", cancellationToken).ConfigureAwait(false);
-            var sent = await DeliverAsync(current.EventId, routed.Channel, binding.Adapter, request.PlatformConversationId,
+            var sent = await DeliverAsync(current.EventId, current.Source, binding.Adapter, destination,
                 request.Text, mode, request.ReplyTo, cancellationToken).ConfigureAwait(false);
             return JsonSerializer.Serialize(new { mode, sent = sent.TrueForAll(part => part.Sent), parts = sent }, JsonOptions);
         }
