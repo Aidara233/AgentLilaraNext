@@ -1221,8 +1221,16 @@ public sealed class GraphIntegrationTests : IDisposable
     private async Task<Result> DispatchOneResultAsync()
     {
         await using var enumerator = _events.ReadAllAsync(default).GetAsyncEnumerator();
-        Assert.True(await enumerator.MoveNextAsync());
-        return await _graph.DispatchAsync(enumerator.Current, default);
+        // Lifecycle announcements are addressed to the Channel itself and are produced by anyone who starts or stops it —
+        // including the test arranging its fixture. They are not the traffic these tests are walking, so the queue is
+        // read past them; a script that wants them declares them and gets its own test.
+        while (await enumerator.MoveNextAsync())
+        {
+            if (enumerator.Current.Name.StartsWith("lifecycle.", StringComparison.Ordinal)) continue;
+            return await _graph.DispatchAsync(enumerator.Current, default);
+        }
+        Assert.Fail("The queue holds no event to dispatch.");
+        return Result.Success();
     }
 
     private ScriptPackage AdapterIntake() => new(

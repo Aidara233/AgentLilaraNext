@@ -571,7 +571,16 @@ public sealed class StateContinuityTests : IDisposable
         /// <summary>Dispatches exactly one queued event and settles it, the way the pump does one at a time.</summary>
         public async Task<bool> StepAsync()
         {
-            if (!Events.TryRead(out var queued)) return false;
+            // Lifecycle announcements are the Channel talking to itself, and starting a Channel now produces one. They are
+            // not the traffic these tests walk, so they are stepped over, not stepped through.
+            RoutedEvent? queued = null;
+            while (Events.TryRead(out var next))
+            {
+                if (next.Name.StartsWith("lifecycle.", StringComparison.Ordinal)) continue;
+                queued = next;
+                break;
+            }
+            if (queued is null) return false;
             var dispatched = await Graph.DispatchAsync(queued, default);
             Assert.True(dispatched.Ok, dispatched.Error?.Detail ?? dispatched.Error?.Message);
             var settled = await Settlers.SettleAsync(queued, default);

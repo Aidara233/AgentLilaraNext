@@ -231,8 +231,16 @@ public sealed class PersistenceTests : IDisposable
         Assert.False(delivered.Ok);
         Assert.Equal(ErrorCode.Unavailable, delivered.Error?.Code);
         Assert.Contains("later-1", delivered.Error?.Message, StringComparison.Ordinal);
-        // Nothing was queued for a delivery that never happened.
-        Assert.False(events.TryRead(out _));
+        // Nothing was queued for a delivery that never happened. Starting the Channel announced itself (lifecycle.start),
+        // so the queue is read past those announcements and then has to be empty.
+        RoutedEvent? leftover = null;
+        while (events.TryRead(out var candidate))
+        {
+            if (candidate.Name.StartsWith("lifecycle.", StringComparison.Ordinal)) continue;
+            leftover = candidate;
+            break;
+        }
+        Assert.Null(leftover);
     }
 
     [Fact]

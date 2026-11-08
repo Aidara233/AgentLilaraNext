@@ -222,11 +222,16 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
             // Running is a wish as much as a fact, so it is written down: a Channel stopped on purpose must
             // not come back to life just because the process restarted.
             var stored = await PersistDesiredAsync(address, running: true, cancellationToken).ConfigureAwait(false);
-            return stored.Ok
-                ? Result.Success()
-                : Result.Failure(new(ErrorCode.Unavailable,
+            if (!stored.Ok)
+                return Result.Failure(new(ErrorCode.Unavailable,
                     $"{address} is running but that could not be persisted; it will start anyway on the next boot.",
                     stored.Error?.Message));
+            // A person starting a Channel and the host reviving one are the same event to anything listening: "this one
+            // is working now". Leaving it to the boot path made `channels.start` silent, so a script that greets when a
+            // conversation comes up greeted once per process and never again.
+            await AnnounceAsync(address, EventNames.LifecycleStart, LifecyclePhase.Start, cancellationToken)
+                .ConfigureAwait(false);
+            return Result.Success();
         }
         finally { _lifecycle.Release(); }
     }
@@ -239,14 +244,29 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
             var set = SetRunning(address, running: false);
             if (!set.Ok) return set;
             var stored = await PersistDesiredAsync(address, running: false, cancellationToken).ConfigureAwait(false);
-            return stored.Ok
-                ? Result.Success()
-                : Result.Failure(new(ErrorCode.Unavailable,
+            if (!stored.Ok)
+                return Result.Failure(new(ErrorCode.Unavailable,
                     $"{address} is stopped but that could not be persisted; it will be running again after a restart.",
                     stored.Error?.Message));
+            // Stopping by hand is a stop like any other: whatever is mounted here should hear it now, not at the next
+            // shutdown.
+            await AnnounceAsync(address, EventNames.LifecycleStop, LifecyclePhase.Stop, cancellationToken)
+                .ConfigureAwait(false);
+            return Result.Success();
         }
         finally { _lifecycle.Release(); }
     }
+
+    /// <summary>
+    /// One lifecycle event to one Channel — the same shape the manager sends at boot, reused by the verbs that change a
+    /// Channel's running state. A failed publish is not turned into a failed start: the Channel's own state is the fact,
+    /// and an event nobody could be told about is not a reason to refuse to do what was asked.
+    /// </summary>
+    private async ValueTask AnnounceAsync(Address address, string name, LifecyclePhase phase,
+        CancellationToken cancellationToken) =>
+        await _events.PublishAsync(new(name, address, Guid.NewGuid(),
+            JsonSerializer.Serialize(new LifecycleSignal(phase, DateTimeOffset.UtcNow).For(address), LifecycleJson.Options),
+            address), cancellationToken).ConfigureAwait(false);
 
     /// <summary>In-memory only: shutdown uses this, because stopping everything is not a change of wish.</summary>
     private Result SetRunning(Address address, bool running)
@@ -626,8 +646,11 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
                 await DestroyAsync(spec.Address, CancellationToken.None).ConfigureAwait(false);
                 return set;
             }
-            await _events.PublishAsync(new(EventNames.LifecycleStart, spec.Address, Guid.NewGuid(),
-                JsonSerializer.Serialize(signal.For(spec.Address), LifecycleJson.Options), spec.Address), cancellationToken).ConfigureAwait(false);
+            // Only the ones that are actually working: a Channel somebody left stopped is not starting, and telling its
+            // scripts otherwise is the kind of small lie that makes "lifecycle.start" mean nothing.
+            if (desired.Value is not false)
+                await _events.PublishAsync(new(EventNames.LifecycleStart, spec.Address, Guid.NewGuid(),
+                    JsonSerializer.Serialize(signal.For(spec.Address), LifecycleJson.Options), spec.Address), cancellationToken).ConfigureAwait(false);
         }
         if (revived + keptStopped > 0)
             _report.Note("channels", $"{revived} revived running, {keptStopped} kept stopped as they were left");
