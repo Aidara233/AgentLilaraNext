@@ -269,7 +269,8 @@ public sealed class ScriptToolTests : IDisposable
               "capabilities": [],
               "trustDomain": "trusted",
               "call": "onCall",
-              "tool": { "name": "tool.fromfile", "description": "From a file.", "parametersJson": "{\"type\":\"object\"}" }
+              "tool": { "name": "tool.fromfile", "description": "From a file.", "parametersJson": "{\"type\":\"object\"}",
+                        "access": "operator" }
             }
             """);
         await File.WriteAllTextAsync(Path.Combine(directory, "main.js"),
@@ -280,6 +281,8 @@ public sealed class ScriptToolTests : IDisposable
         var package = Assert.Single(read.Value!, entry => entry.Manifest.Id == "tools.fromfile");
         Assert.Equal("onCall", package.Manifest.Call);
         Assert.Equal("tool.fromfile", package.Manifest.Tool!.Name);
+        // The access level comes out of the JSON as a level, not as a string: "operator" in a file a person edits.
+        Assert.Equal(AccessLevel.Operator, package.Manifest.Tool.Access);
 
         // And the graph takes it the rest of the way: resolved, offered, callable.
         Assert.True((await _graph.LoadAsync([package], default)).Ok);
