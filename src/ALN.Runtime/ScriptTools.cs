@@ -465,13 +465,87 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
 }
 
 /// <summary>
+/// Scripts that offer themselves as tools, offered to Sessions.
+///
+/// Visible everywhere, deliberately: a tool is part of what a Session can do, and the model's own tool should not need a
+/// per-session opt-in to be usable. What keeps that honest is on every line of the description — the script it comes from,
+/// the folder, the level — because a tool definition has no "（转交）" position to carry a sender, unlike a message.
+///
+/// The offer's level is the script's own, so a Session cannot borrow a tool deeper than itself: same rule as mounting, and
+/// the reason is the same — a tool runs with the code's reach, not the caller's.
+/// </summary>
+public sealed class ScriptCallTools(IGraphRuntime graph) : ISessionToolSource
+{
+    public const string SourceId = "system.script-call-tools";
+
+    public string Id => SourceId;
+
+    public ValueTask<Result<IReadOnlyList<SessionToolOffer>>> ToolsAsync(RoundContextRequest request,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var offers = graph.ToolScripts
+            .Where(package => package.Tool is not null && package.Level <= request.Level)
+            .Select(package => new SessionToolOffer(
+                new ScriptCallTool(graph, package),
+                new ModelToolDefinition(package.Tool!.Name, Describe(package), package.Tool.ParametersJson),
+                // A script tool can act: it has the same ctx an event handler has, so a turn that only called one has
+                // not spoken to anybody just because it produced text.
+                ActsExternally: true,
+                MinLevel: package.Level))
+            .ToArray();
+        return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(offers));
+    }
+
+    /// <summary>The definition the model reads, with the provenance no other part of the tool surface gets to carry.</summary>
+    private static string Describe(ScriptPackage package) =>
+        $"{package.Tool!.Description}\n\n"
+        + $"（这是一个脚本，不是内建工具：id `{package.Manifest.Id}`，来自 {ScriptReload.LibraryOf(package)}，"
+        + $"等级 {AccessLevels.Describe(package.Level)}。它按自己所在目录的权限做事，不按调用它的会话。"
+        + "改它要 scripts_reload；名字和参数在定义时会确定，改名相当于换一个工具。）";
+
+    private sealed class ScriptCallTool(IGraphRuntime graph, ScriptPackage package) : ISessionTool
+    {
+        public string Name => package.Tool!.Name;
+
+        public bool EndsTurn => false;
+
+        public async ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call,
+            CancellationToken cancellationToken)
+        {
+            var result = await graph.InvokeToolAsync(package.Manifest.Id, call.ArgumentsJson, cancellationToken)
+                .ConfigureAwait(false);
+            if (result.Ok)
+                return Result<SessionToolResult>.Success(new SessionToolResult(result.Value ?? "", null));
+
+            // A timeout is not "nothing happened": the call may have reached the host and taken effect before the
+            // interpreter stopped. Saying so is the whole difference between a model that checks and one that retries
+            // something that already happened — and it is the shape async tools will need anyway.
+            var text = result.Error!.Code == ErrorCode.Timeout
+                ? $"调用 {Name} 没有等到回音（超时）。它**可能已经做了**，也可能没有：这一路没有留下“完成”的记录，"
+                  + "要确认就自己核一下（读一遍状态、看一遍日志），别直接重试。"
+                : $"调用 {Name} 失败：{result.Error.Message}"
+                  + (string.IsNullOrWhiteSpace(result.Error.Detail) ? "" : $"（{result.Error.Detail}）")
+                  + "。这次没有完成，可以改参数再试，或者换一条路。";
+            return Result<SessionToolResult>.Success(new SessionToolResult(text, null));
+        }
+    }
+}
+
+
+/// <summary>
 /// The module that offers the script control tools: one instance, one tool source, no configuration of its own.
 ///
 /// It is a module because a model's tools are a module's business everywhere else in this host, and because "who may
 /// reload scripts" should be answerable by looking at the graph rather than at the host's source.
 /// </summary>
 [Module(TypeId, Category = "scripts")]
-public sealed class ScriptToolsModule(ModuleId id, ScriptTools tools, ISessionExtensionRegistry extensions) : IKernelModule
+/// <summary>
+/// The script module's two surfaces: the control tools (what is loaded, reload it) and every callable script offered as
+/// a tool in its own right. One module owns both because they read the same catalogue and must not disagree about it.
+/// </summary>
+public sealed class ScriptToolsModule(ModuleId id, ScriptTools tools, ScriptCallTools callTools,
+    ISessionExtensionRegistry extensions) : IKernelModule
 {
     public const string TypeId = "scripts.control";
 
@@ -487,7 +561,8 @@ public sealed class ScriptToolsModule(ModuleId id, ScriptTools tools, ISessionEx
         if (!string.Equals(manifest.Type, TypeId, StringComparison.Ordinal))
             return Result<IKernelModule>.Failure(new(ErrorCode.Invalid, $"This factory builds {TypeId}, not {manifest.Type}."));
         return Result<IKernelModule>.Success(
-            new ScriptToolsModule(manifest.Id, new ScriptTools(graph, catalog, scripts, modules, plane), extensions));
+            new ScriptToolsModule(manifest.Id, new ScriptTools(graph, catalog, scripts, modules, plane),
+                new ScriptCallTools(graph), extensions));
     }
 
     public ValueTask<Result> InitializeAsync(CancellationToken cancellationToken)
@@ -495,6 +570,12 @@ public sealed class ScriptToolsModule(ModuleId id, ScriptTools tools, ISessionEx
         cancellationToken.ThrowIfCancellationRequested();
         var registered = extensions.Register(tools);
         if (!registered.Ok) return ValueTask.FromResult(registered);
+        var callRegistered = extensions.Register(callTools);
+        if (!callRegistered.Ok)
+        {
+            extensions.Unregister(tools.Id);
+            return ValueTask.FromResult(callRegistered);
+        }
         _registered = true;
         return ValueTask.FromResult(Result.Success());
     }
@@ -506,6 +587,7 @@ public sealed class ScriptToolsModule(ModuleId id, ScriptTools tools, ISessionEx
     {
         if (_registered)
         {
+            extensions.Unregister(callTools.Id);
             extensions.Unregister(tools.Id);
             _registered = false;
         }

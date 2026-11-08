@@ -17,7 +17,27 @@ public sealed record ScriptManifest(
     TrustDomain TrustDomain = TrustDomain.Trusted,
     int MaxStatements = 10_000,
     int TimeoutMilliseconds = 1_000,
-    long MemoryLimitBytes = 16 * 1024 * 1024);
+    long MemoryLimitBytes = 16 * 1024 * 1024,
+    /// <summary>
+    /// The function a Session calls when it uses this script as a tool. Absent means "this script only answers events":
+    /// being callable is a decision made in the file, not a property of every script.
+    /// </summary>
+    string? Call = null,
+    /// <summary>
+    /// What the tool is called and what it takes. Optional even when <see cref="Call"/> is set: a script may instead
+    /// export <c>describe()</c> and keep the definition next to the code. The manifest wins when both are present,
+    /// because it is the one a person can read without running anything.
+    /// </summary>
+    ScriptToolSpec? Tool = null);
+
+/// <summary>
+/// One tool a script offers: what a Session sees in its tool list, and what the model has to fill in to call it.
+///
+/// The name is namespaced on purpose and the loader enforces it. A tool name is global to every Session's tool list, and
+/// the safest thing to say about that is nothing at all: two sources offering one name is a failed turn in every
+/// conversation, so a name that could collide is refused when the script is loaded, not discovered at 3am.
+/// </summary>
+public sealed record ScriptToolSpec(string Name, string Description, string ParametersJson);
 
 public sealed record ScriptPackage(ScriptManifest Manifest, string Source, string Fingerprint = "",
     /// <summary>Where it came from when that is not the operator's own script tree: "plugin:&lt;id&gt;".</summary>
@@ -30,7 +50,13 @@ public sealed record ScriptPackage(ScriptManifest Manifest, string Source, strin
     /// The loader always sets this. The default is <see cref="AccessLevel.Full"/> because a package built in code is
     /// code, and the folders are the only place the question has a second answer.
     /// </summary>
-    AccessLevel Level = AccessLevel.Full);
+    AccessLevel Level = AccessLevel.Full,
+    /// <summary>
+    /// The tool definition, resolved once when this package was loaded: from the manifest, or from the script's own
+    /// <c>describe()</c>. Null means "not callable". Resolved at load rather than per round because a definition that
+    /// changed shape between two rounds would make the same conversation see two different tools.
+    /// </summary>
+    ScriptToolSpec? Tool = null);
 
 /// <summary>
 /// A rule resolved onto one instance. <paramref name="RuleId"/> is null for bundle mounts, which are not
@@ -45,6 +71,18 @@ public interface IGraphRuntime : IInstanceBindings
     /// <summary>Mount a manual script on one instance. Equivalent to adding an instance-scoped rule.</summary>
     ValueTask<Result> MountAsync(string scriptId, Address target, CancellationToken cancellationToken,
         AccessLevel callerLevel = AccessLevel.Full);
+
+    /// <summary>
+    /// Every script that is loaded and says it can be called as a tool, with the definition resolved at load.
+    /// Per round, like every other tool source: a reload changes this list, and the next round sees the change.
+    /// </summary>
+    IReadOnlyList<ScriptPackage> ToolScripts { get; }
+
+    /// <summary>
+    /// Call one of those scripts as a tool. The code runs with the <b>script's</b> authority, never the calling Session's:
+    /// a tool written by a shallow component must not become a way for a deep Session to run it with deep reach.
+    /// </summary>
+    ValueTask<Result<string>> InvokeToolAsync(string scriptId, string argumentsJson, CancellationToken cancellationToken);
 
     /// <summary>Drop every mount of one script on one instance; an instance-scoped rule that produced them goes with it.</summary>
     ValueTask<Result> UnmountAsync(string scriptId, Address target, CancellationToken cancellationToken);
@@ -85,6 +123,24 @@ public interface IScriptExecutor
 {
     ValueTask<Result> ValidateAsync(ScriptPackage package, CancellationToken cancellationToken);
     ValueTask<Result> ExecuteAsync(ScriptPackage package, Address target, RoutedEvent routedEvent,
+        IScriptApi api, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The tool definition a script describes for itself, as JSON text. Only called for a package that says it is
+    /// callable and does not spell the definition out in its manifest; a script with no <c>describe()</c> answers
+    /// <c>null</c> rather than failing, and the loader decides what that means.
+    /// </summary>
+    ValueTask<Result<string>> DescribeAsync(ScriptPackage package, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Call a script as a tool: one entry point, one argument object, one answer.
+    ///
+    /// A timeout here is <b>not</b> "nothing happened" — the call may already have reached the host and taken effect —
+    /// so it comes back as <see cref="ErrorCode.Timeout"/> rather than as a plain failure, and the caller is expected to
+    /// say so in words. That distinction is the groundwork for async tools: the day a call can outlive its turn, "did it
+    /// happen" is the only question left, and it will be asked of exactly this shape.
+    /// </summary>
+    ValueTask<Result<string>> InvokeAsync(ScriptPackage package, Address target, string argumentsJson,
         IScriptApi api, CancellationToken cancellationToken);
 }
 
@@ -168,7 +224,11 @@ public interface IGraphScriptCatalog
 public sealed record ScriptFileManifest(
     string Id, int Version, string TargetType, MountMode Mount, string[] Events,
     string EntryPoint, string[] Capabilities, TrustDomain TrustDomain,
-    int MaxStatements = 10_000, int TimeoutMilliseconds = 1_000, long MemoryLimitBytes = 16 * 1024 * 1024);
+    int MaxStatements = 10_000, int TimeoutMilliseconds = 1_000, long MemoryLimitBytes = 16 * 1024 * 1024,
+    /// <summary>The function a Session calls when this script is used as a tool. Absent: events only.</summary>
+    string? Call = null,
+    /// <summary>What that tool is. Absent: ask the script's own <c>describe()</c>.</summary>
+    ScriptToolSpec? Tool = null);
 public static class ScriptEvents
 {
     public const string AdapterEnvelope = "adapter.envelope";

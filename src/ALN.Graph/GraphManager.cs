@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -101,6 +102,7 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         var incoming = packages.ToArray();
         var candidate = new Dictionary<string, ScriptPackage>(StringComparer.Ordinal);
         var rejected = new List<ScriptIssue>();
+        var toolNames = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var package in incoming)
         {
             // One script at a time, and a refusal that costs only that script. The alternative — refusing the whole
@@ -120,6 +122,37 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
             if (!validated.Ok)
             {
                 rejected.Add(new(package.Manifest.Id!, validated.Error?.Message ?? "The script's source is invalid."));
+                continue;
+            }
+            // A script that says it can be called is a tool, and the definition is settled here — once, at load. Two
+            // reasons it cannot be settled later: the same conversation must not see two shapes for one tool, and a name
+            // that collides is a failed turn in every Session (the resolver refuses duplicates), so a collision has to
+            // be a refused script rather than an outage nobody connects to the file they just wrote.
+            if (package.Manifest.Call is { Length: > 0 } entry)
+            {
+                var described = await ResolveToolAsync(package, entry, cancellationToken).ConfigureAwait(false);
+                if (described.Error is { } toolError)
+                {
+                    rejected.Add(new(package.Manifest.Id!, toolError.Message));
+                    continue;
+                }
+                var spec = described.Value!;
+                if (WhyNotAName(spec.Name) is { } nameError)
+                {
+                    rejected.Add(new(package.Manifest.Id!, nameError));
+                    continue;
+                }
+                if (toolNames.TryGetValue(spec.Name, out var owner))
+                {
+                    rejected.Add(new(package.Manifest.Id!,
+                        $"Tool name \"{spec.Name}\" is already offered by {owner}. A tool name is global: two of them is "
+                        + "a failed turn in every conversation."));
+                    continue;
+                }
+                toolNames[spec.Name] = package.Manifest.Id!;
+                // `package` is the loop variable, so the resolved definition is what goes into the candidate: the script
+                // that runs and the tool it offers are the same decision, taken once.
+                candidate[package.Manifest.Id!] = package with { Tool = spec };
                 continue;
             }
             candidate[package.Manifest.Id!] = package;
@@ -332,6 +365,121 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
 
     /// <summary>What the last load refused: not in <see cref="_packages"/>, and named so the caller can say why.</summary>
     private IReadOnlyList<ScriptIssue> _rejected = [];
+
+    /// <summary>
+    /// The tool definition a callable script offers: its manifest when it says, its own <c>describe()</c> when it does
+    /// not. A script that claims to be callable and describes nothing is refused here rather than loaded and never
+    /// offered — "I am a tool" with no definition is a file that needs fixing, and load time is when somebody is looking.
+    /// </summary>
+    private async ValueTask<Result<ScriptToolSpec>> ResolveToolAsync(ScriptPackage package, string entry,
+        CancellationToken cancellationToken)
+    {
+        if (package.Manifest.Tool is { } declared)
+            return Result<ScriptToolSpec>.Success(declared);
+
+        var described = await _executor.DescribeAsync(package, cancellationToken).ConfigureAwait(false);
+        if (!described.Ok)
+            return Result<ScriptToolSpec>.Failure(described.Error
+                ?? new(ErrorCode.Invalid, $"{package.Manifest.Id}: describe() failed."));
+        if (string.IsNullOrWhiteSpace(described.Value) || described.Value.Trim() == "null")
+            return Result<ScriptToolSpec>.Failure(new(ErrorCode.Invalid,
+                $"{package.Manifest.Id} has \"call\": \"{entry}\" but no \"tool\" in its manifest and no describe()."));
+
+        try
+        {
+            var spec = JsonSerializer.Deserialize<ScriptToolSpec>(described.Value, JsonOptions);
+            return spec is null
+                ? Result<ScriptToolSpec>.Failure(new(ErrorCode.Invalid, $"{package.Manifest.Id}: describe() returned null."))
+                : Result<ScriptToolSpec>.Success(spec);
+        }
+        catch (JsonException ex)
+        {
+            return Result<ScriptToolSpec>.Failure(new(ErrorCode.Invalid,
+                $"{package.Manifest.Id}: describe() did not return a tool definition.", ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// Why this tool name cannot be used, or null. Dotted and lowercase, so a tool reads as somebody else's rather than as
+    /// one of the Session's own — and so `wait`, `compact` and every module's names are out of reach by construction.
+    /// </summary>
+    private static string? WhyNotAName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return "A tool needs a name.";
+        if (name.Length > 64) return $"Tool name is longer than 64 characters: {name}";
+        return Regex.IsMatch(name, "^[a-z][a-z0-9]*(\\.[a-z0-9][a-z0-9_-]*)+$", RegexOptions.CultureInvariant)
+            ? null
+            : $"Tool name \"{name}\" must be lowercase and namespaced, like \"tool.summarise\": the dot is what says it "
+              + "is somebody else's tool, and what keeps it away from wait, compact and the modules' own names.";
+    }
+
+    /// <summary>Every loaded script that can be called, with the definition the loader settled on.</summary>
+    public IReadOnlyList<ScriptPackage> ToolScripts
+    {
+        get
+        {
+            _gate.Wait();
+            try { return _packages.Values.Where(package => package.Tool is not null && IsEnabled(package)).ToArray(); }
+            finally { _gate.Release(); }
+        }
+    }
+
+    /// <summary>
+    /// Calls one script as a tool.
+    ///
+    /// It runs as itself: capabilities and level come from the folder the script came from, never from the Session that
+    /// called it. Same rule as mounting, same reason — a tool written by the model must not become a way for a deeper
+    /// Session to run it with deeper reach.
+    /// </summary>
+    public async ValueTask<Result<string>> InvokeToolAsync(string scriptId, string argumentsJson,
+        CancellationToken cancellationToken)
+    {
+        ScriptPackage? package;
+        _gate.Wait();
+        try { package = _packages.TryGetValue(scriptId, out var found) ? found : null; }
+        finally { _gate.Release(); }
+        if (package is null || package.Tool is null)
+            return Result<string>.Failure(new(ErrorCode.Invalid, $"No callable script is called {scriptId}."));
+        if (!IsEnabled(package))
+            return Result<string>.Failure(new(ErrorCode.Denied, $"Script {scriptId} is switched off."));
+
+        var target = new Address("script", "tool", package.Manifest.Id);
+        var invocationId = Guid.NewGuid();
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        Result<string> result;
+        using (SignalScope.Enter(invocationId, invocationId))
+        {
+            var api = new ScriptApi(Adapters, Channels, _audit, _signalLog, Models, Sessions,
+                new MountedScript(package, target), new RoutedEvent(ToolCallEvent, target, invocationId, argumentsJson),
+                $"script.tool:{package.Manifest.Id}", _state, _plane, cancellationToken);
+            result = await _executor.InvokeAsync(package, target, argumentsJson, api, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        var outcome = result.Ok ? "allowed" : result.Error!.Code == ErrorCode.Timeout ? "timeout" : "failed";
+        await _audit.AppendAsync(new(DateTimeOffset.UtcNow, invocationId, package.Manifest.Id, target, ToolCallEvent,
+            outcome, result.Error?.Message), CancellationToken.None).ConfigureAwait(false);
+        _signalLog.Write(new()
+        {
+            Id = invocationId,
+            Group = "script",
+            Name = package.Manifest.Id,
+            From = "session",
+            To = $"tool:{package.Tool.Name}",
+            Mechanism = ToolCallEvent,
+            Outcome = result.Ok ? "ok" : outcome,
+            Level = result.Ok ? SignalLevel.Info : SignalLevel.Warn,
+            DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+            Detail = new Dictionary<string, string>
+            {
+                ["arguments"] = argumentsJson.Length.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            }
+        });
+        return result;
+    }
+
+    /// <summary>The name a tool call carries in the audit and the signal log. Not an event: nothing is dispatched.</summary>
+    public const string ToolCallEvent = "script.tool.call";
 
     /// <summary>
     /// Why one script cannot be used, or null when it can. Checked per script because the answer is per script: a
