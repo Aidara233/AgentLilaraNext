@@ -193,6 +193,69 @@ public sealed class PersistenceTests : IDisposable
         Assert.DoesNotContain("settings", text, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// A Channel announces itself only once the Adapter it serves can actually carry a message. The first live run found
+    /// the gap the hard way: the greeting a script posted at "lifecycle.start" died with "the connection is not open",
+    /// because the Channel had announced itself while the WebSocket was still coming up.
+    ///
+    /// A socket is the case that needs this; a mailbox is ready the moment it exists, and an Adapter that cannot answer
+    /// is treated as ready — "absent means ready when started" is true of the file adapter and a lie about the platform
+    /// one would be a lie about its own health.
+    /// </summary>
+    [Fact]
+    public async Task A_channel_waits_for_its_adapter_to_connect_before_it_announces_itself()
+    {
+        var types = new AdapterTypeCatalog();
+        var bindings = new StubBindings();
+        var events = new EventQueue(8);
+        var catalog = new ModuleCatalog();
+        var adapter = new SlowAdapter(new Address("adapter", "slow", "one"));
+        catalog.Attach(adapter);
+        var channels = new ALN.Channel.ChannelManager(events, bindings, catalog);
+        var address = new Address("channel", "conversation", "chat-slow");
+        var spec = new ChannelSpec(address, "chat-slow", [new ChannelBinding(adapter.Address, "chat-slow")],
+            "channel.conversation");
+        Assert.True((await channels.CreateAsync(spec, default)).Ok);
+
+        Assert.True((await channels.StartAsync(address, default)).Ok);
+        // Not connected yet: nothing is claimed.
+        await Task.Delay(100);
+        Assert.False(events.TryRead(out var early), $"nothing should be announced yet, got {early?.Name}");
+
+        adapter.Connect();
+        // The wait polls at 200ms; a generous window keeps this about the behaviour, not about timing.
+        var announced = false;
+        for (var attempt = 0; attempt < 25 && !announced; attempt++)
+        {
+            await Task.Delay(100);
+            if (events.TryRead(out var queued))
+            {
+                Assert.Equal(EventNames.LifecycleStart, queued.Name);
+                Assert.Equal(address.ToString(), queued.Target?.ToString());
+                announced = true;
+            }
+        }
+        Assert.True(announced, "a Channel whose adapter connected must announce itself");
+    }
+
+    /// <summary>An Adapter that says it is not up until somebody says it is — a socket, in the shape that matters here.</summary>
+    [Module("adapter.slow", Category = "adapter", Role = ModuleRole.Instance)]
+    private sealed class SlowAdapter(Address address) : IChatAdapter, IAdapterHealth
+    {
+        private volatile bool _connected;
+        public Address Address { get; } = address;
+        public ModuleId Id => new(Address.ToString());
+        public AdapterDescriptor Descriptor { get; } = new("slow", "one", AdapterDirection.Both);
+        public AdapterState State => AdapterState.Running;
+        public bool Connected => _connected;
+        public string? HealthDetail => _connected ? "connected" : "not connected";
+        public void Connect() => _connected = true;
+        public ValueTask<Result> StartAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result> StopAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public ValueTask<Result<SendResult>> SendAsync(OutboundMessage message, CancellationToken cancellationToken) =>
+            ValueTask.FromResult(Result<SendResult>.Success(new(true, null)));
+    }
+
     [Fact]
     public async Task Channel_specs_survive_a_round_trip_including_bindings()
     {

@@ -229,8 +229,7 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
             // A person starting a Channel and the host reviving one are the same event to anything listening: "this one
             // is working now". Leaving it to the boot path made `channels.start` silent, so a script that greets when a
             // conversation comes up greeted once per process and never again.
-            await AnnounceAsync(address, EventNames.LifecycleStart, LifecyclePhase.Start, cancellationToken)
-                .ConfigureAwait(false);
+            AnnounceStartedWhenUsable(address);
             return Result.Success();
         }
         finally { _lifecycle.Release(); }
@@ -256,6 +255,52 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
         }
         finally { _lifecycle.Release(); }
     }
+
+    /// <summary>
+    /// Announces that a Channel is working — once the Adapter it serves can actually carry a message.
+    ///
+    /// "Started" and "usable" are two moments and the gap between them is where the first real bug lived: a Channel
+    /// announced itself the instant it was told to run, a script mounted on it greeted the conversation, and the greeting
+    /// died with "the connection is not open" because the WebSocket was still coming up. So the announcement waits for
+    /// the Adapter to say it is connected, and if it never does the announcement is not sent at all: a Channel that
+    /// cannot send is not working, and saying otherwise is the lie that made the greeting fail.
+    ///
+    /// The wait does not hold up the caller. Startup would otherwise take as long as the slowest platform, and a start
+    /// verb has nothing useful to do with the answer.
+    /// </summary>
+    private void AnnounceStartedWhenUsable(Address address)
+    {
+        Address? adapterAddress = null;
+        lock (_gate) if (_channels.TryGetValue(IdOf(address), out var channel) && channel.Binding is { } bound)
+            adapterAddress = bound.Adapter;
+        if (adapterAddress is not { } adapter)
+        {
+            _ = AnnounceAsync(address, EventNames.LifecycleStart, LifecyclePhase.Start, CancellationToken.None);
+            return;
+        }
+        // A file mailbox is ready the moment it exists; a socket is not, and only one of them can say so.
+        if (_catalog.Find(adapter.ToModuleId()) is not IAdapterHealth health || health.Connected)
+        {
+            _ = AnnounceAsync(address, EventNames.LifecycleStart, LifecyclePhase.Start, CancellationToken.None);
+            return;
+        }
+        _ = Task.Run(async () =>
+        {
+            var ready = await health.WaitUntilConnectedAsync(AdapterWaitForConnection, CancellationToken.None)
+                .ConfigureAwait(false);
+            if (!ready)
+            {
+                _report.Note("channels", $"{address} did not announce its start: {adapter} never connected "
+                    + $"({health.HealthDetail ?? "no detail"})");
+                return;
+            }
+            await AnnounceAsync(address, EventNames.LifecycleStart, LifecyclePhase.Start, CancellationToken.None)
+                .ConfigureAwait(false);
+        });
+    }
+
+    /// <summary>How long a Channel waits for the platform before it stops claiming to be working.</summary>
+    private static readonly TimeSpan AdapterWaitForConnection = TimeSpan.FromMinutes(2);
 
     /// <summary>
     /// One lifecycle event to one Channel — the same shape the manager sends at boot, reused by the verbs that change a
@@ -648,9 +693,7 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
             }
             // Only the ones that are actually working: a Channel somebody left stopped is not starting, and telling its
             // scripts otherwise is the kind of small lie that makes "lifecycle.start" mean nothing.
-            if (desired.Value is not false)
-                await _events.PublishAsync(new(EventNames.LifecycleStart, spec.Address, Guid.NewGuid(),
-                    JsonSerializer.Serialize(signal.For(spec.Address), LifecycleJson.Options), spec.Address), cancellationToken).ConfigureAwait(false);
+            if (desired.Value is not false) AnnounceStartedWhenUsable(spec.Address);
         }
         if (revived + keptStopped > 0)
             _report.Note("channels", $"{revived} revived running, {keptStopped} kept stopped as they were left");

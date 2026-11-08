@@ -170,6 +170,26 @@ public interface IAdapterHealth
 
     /// <summary>Human readable last condition: last error, endpoint, next retry. Never contains secrets.</summary>
     string? HealthDetail { get; }
+
+    /// <summary>
+    /// Waits until <see cref="Connected"/>, or until <paramref name="timeout"/> runs out; false means it did not, which
+    /// is a fact about the platform rather than an error to retry forever.
+    ///
+    /// A default implementation, because every adapter that can answer <see cref="Connected"/> can answer this the same
+    /// way and none of them should have to write it: the connection state is not push-notified anywhere, and inventing a
+    /// notification for one caller would be a second mechanism for a fact this one property already states.
+    /// </summary>
+    async ValueTask<bool> WaitUntilConnectedAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (Connected) return true;
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(200), cancellationToken).ConfigureAwait(false);
+            if (Connected) return true;
+        }
+        return Connected;
+    }
 }
 
 /// <summary>
