@@ -291,6 +291,31 @@ public sealed class ScriptToolTests : IDisposable
         Assert.True(called.Ok, called.Error?.Message);
     }
 
+    [Fact]
+    public async Task The_author_can_always_call_its_own_tool()
+    {
+        // The cap's other half, and the reason the cap cannot be relaxed in either direction: `access <= maker` means the
+        // maker is always at or above its own tool's door, so the author can always run what it built. A tool its author
+        // never called is a tool nobody should use — and if a shallow author could set a deep door, its only testers
+        // would be the Sessions that know least about what it is meant to do.
+        foreach (var maker in new[] { AccessLevel.Agent, AccessLevel.Operator, AccessLevel.Full })
+        {
+            foreach (var access in new[] { AccessLevel.Agent, AccessLevel.Operator, AccessLevel.Full }.Where(door => door <= maker))
+            {
+                var name = $"tool.{maker}.{access}".ToLowerInvariant();
+                var package = Callable($"tools.{name}", name, Echo, maker, access: access);
+                Assert.True((await _graph.LoadAsync([package], default)).Ok);
+
+                // Offered to the maker, and callable by it, every time.
+                var offers = (await new ScriptCallTools(_graph).ToolsAsync(
+                    new RoundContextRequest("s-1", Guid.NewGuid(), 1, Level: maker), default)).Value!;
+                Assert.Contains(offers, offer => offer.Definition.Name == name);
+                var called = await _graph.InvokeToolAsync(package.Manifest.Id, """{"text":"hi"}""", default);
+                Assert.True(called.Ok, called.Error?.Message);
+            }
+        }
+    }
+
     private sealed class Proxy : IInstanceBindings
     {
         private IInstanceBindings? _inner;
