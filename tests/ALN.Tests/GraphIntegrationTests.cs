@@ -1352,13 +1352,15 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         static ScriptPackage Greeter() => new(
             new("channel.greeter", 1, "channel", MountMode.Manual,
-                [EventNames.ChannelMessageAccepted, EventNames.LifecycleStart, EventNames.LifecycleStop], "onEvent",
+                [EventNames.ChannelMessageAccepted, EventNames.LifecycleStart, EventNames.LifecycleStop,
+                    EventNames.SessionTurnFinished], "onEvent",
                 [ScriptCapabilities.ChannelReply], TrustDomain.Trusted),
             """
             async function onEvent(event, ctx) {
               if (ctx.eventName === "channel.message.accepted") return;
               if (event.phase === "start") await ctx.channel.reply({ text: "hello" });
-              else await ctx.channel.reply({ text: "bye" });
+              else if (event.phase === "stop") await ctx.channel.reply({ text: "bye" });
+              else await ctx.channel.reply({ text: "turn done: " + event.stopReason });
             }
             """);
 
@@ -1376,8 +1378,13 @@ public sealed class GraphIntegrationTests : IDisposable
         var stopped = await _graph.DispatchAsync(new(EventNames.LifecycleStop, channel, Guid.NewGuid(),
             """{"phase":"stop"}""", channel), default);
         Assert.True(stopped.Ok, stopped.Error?.Detail ?? stopped.Error?.Message);
+        // And a turn on that Channel's Session: the moment somebody wants a script to say "done". It carries no
+        // binding either — the Channel is still the destination, for the same reason.
+        var turnEnded = await _graph.DispatchAsync(new(EventNames.SessionTurnFinished, channel, Guid.NewGuid(),
+            """{"sessionId":"s-1","reason":"message","stepNumber":3,"stopReason":"endTurn"}""", channel), default);
+        Assert.True(turnEnded.Ok, turnEnded.Error?.Detail ?? turnEnded.Error?.Message);
 
-        Assert.Equal(["bye", "hello"], OutboxTexts("chat-life"));
+        Assert.Equal(["bye", "hello", "turn done: endTurn"], OutboxTexts("chat-life"));
     }
 
     private static ScriptPackage ManualTagger(string id, string text) => new(

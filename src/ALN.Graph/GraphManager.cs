@@ -1666,15 +1666,16 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
             // Two events a Channel reply belongs to, and one rule that covers both: the event came from the Channel this
             // script is mounted on, and the destination is that Channel's own binding.
             //
-            // The first is a message the script just received — the original and still the common case. The second is
-            // any of the Channel's own lifecycle moments: a script that greets when the conversation comes up, or says
-            // goodbye when it goes away, is doing exactly what a module does in its start and stop phases, and it has
-            // no message to hang the reply on. Written as a list of names rather than "anything from my target" so that
-            // a future event does not silently become a licence to speak.
+            // The first is a message the script just received — the original and still the common case. The second is any
+            // moment the Channel itself is about: it starts, it stops, or a turn on its Session begins and ends. A script
+            // that greets when the conversation comes up, or says something when a turn is done, is doing what a module
+            // does in its phases, and it has no message to hang the reply on. Written as a list of names rather than
+            // "anything from my target" so that a future event does not silently become a licence to speak.
             if (current.Source != mount.Target)
                 await DenyAsync(ScriptCapabilities.ChannelReply, "Not the mounted Channel event.", cancellationToken).ConfigureAwait(false);
             if (current.Name is not (EventNames.ChannelMessageAccepted or EventNames.LifecycleStart
-                    or EventNames.LifecycleStop or EventNames.LifecycleStarted))
+                    or EventNames.LifecycleStop or EventNames.LifecycleStarted
+                    or EventNames.SessionTurnStarted or EventNames.SessionTurnFinished))
                 await DenyAsync(ScriptCapabilities.ChannelReply,
                     $"A Channel reply belongs to a Channel message or to that Channel starting or stopping, not to '{current.Name}'.",
                     cancellationToken).ConfigureAwait(false);
