@@ -138,7 +138,13 @@ public sealed record ChannelMessage(Guid MessageId, Address Channel, ChannelBind
     /// <summary>The name the platform uses for the sender (group card, then nickname), when one was found. Kept apart
     /// from <see cref="Sender"/>, which is the platform's identifier: a name changes and an id does not, and only one
     /// of them is safe to answer somebody by.</summary>
-    string? SenderName = null)
+    string? SenderName = null,
+    /// <summary>
+    /// What arrived with the message that was not words: a picture, a voice note, a file — by reference, because the
+    /// bytes live once in the media area and a Channel row that inlined them would be a second copy written on every
+    /// message (docs/28 §3). The receipt line in <see cref="Text"/> is what a model reads when it is not shown one.
+    /// </summary>
+    IReadOnlyList<MediaRef>? Media = null)
 {
     /// <summary>
     /// How to address the sender in text: the name that was found (group card, nickname or the account id, in that

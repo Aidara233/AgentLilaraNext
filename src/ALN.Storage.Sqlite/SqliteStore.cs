@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json;
 using ALN.Contracts;
 using ALN.Contracts.Memory;
 using Microsoft.Data.Sqlite;
@@ -19,7 +20,7 @@ namespace ALN.Storage.Sqlite;
 /// </summary>
 public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomicWork, IQueuedMessageStore, IDisposable
 {
-    private const int SchemaVersion = 6;
+    private const int SchemaVersion = 7;
     private const int SqliteConstraint = 19;
     private const int SqliteBusy = 5;
     private const int SqliteLocked = 6;
@@ -111,8 +112,8 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                 return Result.Failure(new(ErrorCode.Invalid, $"Message owner is not a valid instance address: {message.Owner}"));
             using var command = Command(
                 "INSERT INTO message(id, owner, conversation, platform_message_id, sender, sender_name, sender_remark, " +
-                "text, at, direction, reply_to) " +
-                "VALUES($id, $owner, $conversation, $platform, $sender, $senderName, $senderRemark, $text, $at, $direction, $replyTo);");
+                "text, at, direction, reply_to, media) " +
+                "VALUES($id, $owner, $conversation, $platform, $sender, $senderName, $senderRemark, $text, $at, $direction, $replyTo, $media);");
             command.Parameters.AddWithValue("$id", message.Id);
             command.Parameters.AddWithValue("$owner", message.Owner.ToString());
             command.Parameters.AddWithValue("$conversation", message.PlatformConversationId);
@@ -124,6 +125,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             command.Parameters.AddWithValue("$at", Timestamp(message.At));
             command.Parameters.AddWithValue("$direction", (int)message.Direction);
             command.Parameters.AddWithValue("$replyTo", (object?)message.ReplyTo ?? DBNull.Value);
+            command.Parameters.AddWithValue("$media", MediaJson(message.Media));
             try
             {
                 command.ExecuteNonQuery();
@@ -145,7 +147,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             if (!owner.IsInstance)
                 return Result<IReadOnlyList<StoredMessage>>.Failure(new(ErrorCode.Invalid, $"Not an instance address: {owner}"));
             using var command = Command(
-                "SELECT id, conversation, platform_message_id, sender, sender_name, sender_remark, text, at, direction, reply_to FROM message " +
+                "SELECT id, conversation, platform_message_id, sender, sender_name, sender_remark, text, at, direction, reply_to, media FROM message " +
                 "WHERE owner=$owner ORDER BY at, id;");
             command.Parameters.AddWithValue("$owner", owner.ToString());
             var messages = new List<StoredMessage>();
@@ -162,7 +164,8 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                     DateTimeOffset.Parse(reader.GetString(7), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
                     (MessageDirection)reader.GetInt32(8), reader.IsDBNull(9) ? null : reader.GetString(9),
                     reader.IsDBNull(4) ? null : reader.GetString(4),
-                    reader.IsDBNull(5) ? null : reader.GetString(5)));
+                    reader.IsDBNull(5) ? null : reader.GetString(5),
+                    MediaOf(reader.IsDBNull(10) ? null : reader.GetString(10))));
             }
             return Result<IReadOnlyList<StoredMessage>>.Success(messages);
         });
@@ -219,7 +222,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
         RunAsync(cancellationToken, Result<IReadOnlyList<StoredMessage>>.Failure, "Message history could not be read.", () =>
         {
             using var command = Command(
-                "SELECT id, conversation, platform_message_id, sender, sender_name, sender_remark, text, at, direction, reply_to FROM message " +
+                "SELECT id, conversation, platform_message_id, sender, sender_name, sender_remark, text, at, direction, reply_to, media FROM message " +
                 "WHERE owner=$owner ORDER BY at DESC, id DESC LIMIT $limit;");
             command.Parameters.AddWithValue("$owner", owner.ToString());
             command.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 5000));
@@ -235,7 +238,8 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                     DateTimeOffset.Parse(reader.GetString(7), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
                     (MessageDirection)reader.GetInt32(8), reader.IsDBNull(9) ? null : reader.GetString(9),
                     reader.IsDBNull(4) ? null : reader.GetString(4),
-                    reader.IsDBNull(5) ? null : reader.GetString(5)));
+                    reader.IsDBNull(5) ? null : reader.GetString(5),
+                    MediaOf(reader.IsDBNull(10) ? null : reader.GetString(10))));
             }
             messages.Reverse();
             return Result<IReadOnlyList<StoredMessage>>.Success(messages);
@@ -504,11 +508,37 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             if (!HasColumn("message", "sender_name")) Execute("ALTER TABLE message ADD COLUMN sender_name TEXT NULL;");
             if (!HasColumn("message", "sender_remark")) Execute("ALTER TABLE message ADD COLUMN sender_remark TEXT NULL;");
         }
+        if (current < 7 && !HasColumn("message", "media"))
+        {
+            // A message may now arrive with something that is not words. What the row keeps is a pointer (a JSON array
+            // of MediaRef), not the bytes: the picture is stored once, by hash, and the same column in every later row
+            // would be a second copy per message (docs/28 §3). Older rows have none, which is what they had.
+            Execute("ALTER TABLE message ADD COLUMN media TEXT NULL;");
+        }
         Execute($"PRAGMA user_version = {SchemaVersion};");
     }
 
-    private bool HasColumn(string table, string column)
+    /// <summary>
+    /// Media references as the column holds them: a JSON array, or null when there were none.
+    ///
+    /// A pointer per message, never the bytes — the same rule the session timeline follows, for the same reason: this
+    /// table is read whole on a claim, and a picture inlined here would be paid for by every read for as long as the
+    /// row exists (docs/28 §3).
+    /// </summary>
+    private static object MediaJson(IReadOnlyList<MediaRef>? media) =>
+        media is { Count: > 0 } ? JsonSerializer.Serialize(media, MediaJsonOptions) : DBNull.Value;
+
+    /// <summary>A row written by an older build, or a column this build does not understand, is "no media" — never a failure to read the message.</summary>
+    private static IReadOnlyList<MediaRef>? MediaOf(string? json)
     {
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        try { return JsonSerializer.Deserialize<List<MediaRef>>(json, MediaJsonOptions); }
+        catch (JsonException) { return null; }
+    }
+
+    private static readonly JsonSerializerOptions MediaJsonOptions = new(JsonSerializerDefaults.Web);
+
+    private bool HasColumn(string table, string column)    {
         using var command = Command($"PRAGMA table_info({table});");
         using var reader = command.ExecuteReader();
         while (reader.Read())
@@ -553,7 +583,8 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                 text TEXT NOT NULL,
                 at TEXT NOT NULL,
                 direction INTEGER NOT NULL DEFAULT 0,
-                reply_to TEXT NULL);
+                reply_to TEXT NULL,
+                media TEXT NULL);
 
             CREATE INDEX IF NOT EXISTS message_owner_at ON message(owner, at);
             -- One platform message is one row per owner: the transport handing it over twice is not news.

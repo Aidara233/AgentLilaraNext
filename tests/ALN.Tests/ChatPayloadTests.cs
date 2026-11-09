@@ -49,4 +49,65 @@ public sealed class ChatPayloadTests
         Assert.Equal("call-1", items[3].GetProperty("tool_call_id").GetString());
         Assert.Equal("remember", items[3].GetProperty("name").GetString());
     }
+
+    [Fact]
+    public void A_message_without_parts_still_sends_a_plain_string()
+    {
+        // The regression that matters: pictures must not change the shape of an ordinary request. A proxy in front of a
+        // provider may understand only the string form, and "it worked before" is the cheapest compatibility there is.
+        var payload = ChatPayload.Message(new ModelMessage("user", "看图", Parts: null));
+        Assert.IsType<string>(payload["content"]);
+        Assert.Equal("看图", payload["content"]);
+
+        // An empty Parts list is the same fact as no parts — nothing to say beyond the text.
+        var empty = ChatPayload.Message(new ModelMessage("user", "看图", Parts: []));
+        Assert.Equal("看图", empty["content"]);
+    }
+
+    [Fact]
+    public void A_message_with_parts_sends_a_content_array_in_order()
+    {
+        var png = new byte[] { 0x89, 0x50, 0x4E, 0x47 };
+        var message = new ModelMessage("user", null, Parts:
+        [
+            new TextPart("这张图里写了什么？"),
+            new ImagePart("image/png", png, 1920, 1080, "截图")
+        ]);
+
+        var payload = ChatPayload.Message(message);
+        var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        using var document = JsonDocument.Parse(json);
+        var parts = document.RootElement.GetProperty("content").EnumerateArray().ToList();
+
+        Assert.Equal(2, parts.Count);
+        Assert.Equal("text", parts[0].GetProperty("type").GetString());
+        Assert.Equal("这张图里写了什么？", parts[0].GetProperty("text").GetString());
+        Assert.Equal("image_url", parts[1].GetProperty("type").GetString());
+        // A data URL, so the bytes are in the request and the provider needs nothing from this machine.
+        var url = parts[1].GetProperty("image_url").GetProperty("url").GetString()!;
+        Assert.StartsWith("data:image/png;base64,", url, StringComparison.Ordinal);
+        Assert.Equal(png, Convert.FromBase64String(url["data:image/png;base64,".Length..]));
+    }
+
+    [Fact]
+    public void A_part_survives_a_round_trip_through_json_because_scripts_hand_requests_over_that_way()
+    {
+        // Graph scripts can build a request as JSON; if the polymorphic shape did not round-trip, pictures would be a
+        // feature only the host could use.
+        var original = new ModelMessage("user", null, Parts:
+        [
+            new TextPart("看"),
+            new ImagePart("image/jpeg", new byte[] { 0xFF, 0xD8 }, 10, 20)
+        ]);
+
+        var json = JsonSerializer.Serialize(original, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        var restored = JsonSerializer.Deserialize<ModelMessage>(json, new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
+
+        var parts = restored.Parts!;
+        Assert.Equal("看", Assert.IsType<TextPart>(parts[0]).Text);
+        var image = Assert.IsType<ImagePart>(parts[1]);
+        Assert.Equal("image/jpeg", image.MediaType);
+        Assert.Equal(new byte[] { 0xFF, 0xD8 }, image.Bytes.ToArray());
+        Assert.Equal((10, 20), (image.Width, image.Height));
+    }
 }

@@ -320,6 +320,37 @@ public sealed partial class ModelManager(IArtifactStore? artifacts = null, ISign
     /// Model calls are large — full messages, tool schemas, responses — so they go to the storage
     /// module, not the signal log. Failure to store must never fail the call it describes.
     /// </summary>
+    /// <summary>
+    /// The request as it is worth keeping: everything except the pixels.
+    ///
+    /// A stored model call is a copy of a request that has already been answered, kept so a person can see what was
+    /// actually sent. For a picture, "what was actually sent" is a media type, a size and a byte count — the pixels
+    /// themselves are four thirds of their size in base64, per call, forever, in a store that exists to be pruned. So
+    /// an image becomes a sentence in its place and the record stays readable instead of becoming unopenable.
+    /// </summary>
+    private static ModelRequest Redact(ModelRequest request)
+    {
+        if (request.Messages.All(message => !message.HasImage)) return request;
+        var messages = new List<ModelMessage>(request.Messages.Count);
+        foreach (var message in request.Messages)
+        {
+            if (!message.HasImage || message.Parts is not { } parts)
+            {
+                messages.Add(message);
+                continue;
+            }
+            var redacted = new List<ModelContentPart>(parts.Count);
+            foreach (var part in parts)
+                redacted.Add(part is ImagePart image
+                    ? new TextPart($"[图片 {image.MediaType}"
+                                   + (image.Width is > 0 && image.Height is > 0 ? $" {image.Width}×{image.Height}" : "")
+                                   + $" {image.Bytes.Length} 字节；内容未存进调用记录]")
+                    : part);
+            messages.Add(message with { Parts = redacted });
+        }
+        return request with { Messages = messages };
+    }
+
     private async ValueTask PersistCallAsync(string callId, DateTimeOffset at, string profileId, Address provider,
         string modelId, ModelRequest request, string? responseText, IReadOnlyList<ModelToolCall> toolCalls,
         StopReason? stopReason, ModelUsage? usage, double durationMs, int eventCount, Error? failure,
@@ -328,7 +359,7 @@ public sealed partial class ModelManager(IArtifactStore? artifacts = null, ISign
         if (artifacts is null) return;
         try
         {
-            var record = new ModelCallRecord(callId, at, profileId, provider, modelId, request, responseText, toolCalls,
+            var record = new ModelCallRecord(callId, at, profileId, provider, modelId, Redact(request), responseText, toolCalls,
                 stopReason, usage, durationMs, eventCount, failure?.Message);
             var json = JsonSerializer.SerializeToUtf8Bytes(record, new JsonSerializerOptions(JsonSerializerDefaults.Web)
             { WriteIndented = false, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });

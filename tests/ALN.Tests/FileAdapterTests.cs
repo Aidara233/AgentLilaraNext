@@ -177,6 +177,37 @@ public sealed class FileAdapterTests : IDisposable
     }
 
     [Fact]
+    public async Task A_picture_travels_through_a_mailbox_as_the_reference_it_is()
+    {
+        // This is the adapter that settled the design question: it writes whole OutboundMessages to disk, so a picture is
+        // deliverable — the reference *is* the delivery and the bytes stay where they are. It used to declare "text only"
+        // and be refused its own pictures by a check in front of SendAsync. Now nothing is asked in advance, and the file
+        // says what arrived (IOutboundAdapter.SendAsync).
+        var mailbox = new FileMailbox(Path.Combine(_directory, "pictures"));
+        var adapter = NewAdapter(mailbox, new RecordingSink(Result.Success()));
+        Assert.True((await adapter.StartAsync(default)).Ok);
+        var picture = new MediaRef(FileScopes.Media, "image/ab/ab12.png", MediaKind.Image, "image/png", 33, 4, 3, "ab12");
+        var layout = new MessageBlock[] { new TextBlock("看这个"), new ImageBlock(picture) };
+
+        var sent = await adapter.SendAsync(new("c", MessageBlock.Flatten(layout), Blocks: layout), default);
+
+        Assert.True(sent.Ok, sent.Error?.Message);
+        var path = Path.Combine(mailbox.Root, "outbox", "c", sent.Value!.AttemptId + ".json");
+        using var output = JsonDocument.Parse(await File.ReadAllTextAsync(path));
+        var blocks = output.RootElement.GetProperty("Blocks");
+        Assert.Equal(2, blocks.GetArrayLength());
+        var image = blocks[1];
+        Assert.Equal("image", image.GetProperty("type").GetString());
+        var stored = image.GetProperty("Picture");
+        Assert.Equal(FileScopes.Media, stored.GetProperty("Scope").GetString());
+        Assert.Equal("image/ab/ab12.png", stored.GetProperty("Path").GetString());
+        // And the text view, which is what an operator reads first, still says what it is.
+        Assert.Contains("[图片：media/image/ab/ab12.png]", output.RootElement.GetProperty("Text").GetString()!,
+            StringComparison.Ordinal);
+        await adapter.StopAsync(default);
+    }
+
+    [Fact]
     public async Task Mailbox_rejects_path_tokens_and_limits_pending_batch()
     {
         var mailbox = new FileMailbox(Path.Combine(_directory, "instance"));

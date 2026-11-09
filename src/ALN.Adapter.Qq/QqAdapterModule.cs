@@ -39,8 +39,14 @@ public sealed class QqAdapterModule : IModulePlugin
         // arrived will survive a crash, and nothing acknowledges on its behalf.
         var acks = context.HostServices.GetService(typeof(IInboundAcks)) as IInboundAcks;
         var queue = context.HostServices.GetService(typeof(IQueuedMessageStore)) as IQueuedMessageStore;
+        // Optional: it is how a picture the model wants to send becomes bytes on the wire. Without it the adapter still
+        // sends every message, and a picture part arrives as the sentence that named it (docs/28 §6).
+        var files = context.HostServices.GetService(typeof(IBinaryFileAccess)) as IBinaryFileAccess;
+        // And, when the host opened one, a URL a bridge can fetch instead of base64 in a frame: the difference between
+        // "works for a small picture on this machine" and "works for a photo from a container over there".
+        var urls = context.HostServices.GetService(typeof(IMediaUrlSource)) as IMediaUrlSource;
 
-        var registered = _factories.Register(PackageId, new QqAdapterFactory(events, logger, acks, queue));
+        var registered = _factories.Register(PackageId, new QqAdapterFactory(events, logger, acks, queue, files, urls));
         if (!registered.Ok) return ValueTask.FromResult(registered);
         _started = true;
         return ValueTask.FromResult(Result.Success());
@@ -81,7 +87,8 @@ public sealed class QqAdapterModule : IModulePlugin
         return service as T ?? throw new InvalidOperationException($"Required host service is missing: {typeof(T).FullName}");
     }
 
-    private sealed class QqAdapterFactory(IEventSink events, IModuleLogger logger, IInboundAcks? acks, IQueuedMessageStore? queue) : IAdapterFactory
+    private sealed class QqAdapterFactory(IEventSink events, IModuleLogger logger, IInboundAcks? acks,
+        IQueuedMessageStore? queue, IBinaryFileAccess? files, IMediaUrlSource? urls) : IAdapterFactory
     {
         public string TypeId => "adapter.qq";
 
@@ -89,5 +96,5 @@ public sealed class QqAdapterModule : IModulePlugin
         /// Creation reads the instance settings, so a spec with a missing or malformed endpoint fails
         /// here — at startup, with a message naming the file — instead of at first send.
         /// </summary>
-        public IChatAdapter Create(AdapterSpec spec) => new QqAdapter(spec, events, logger, acks, queue);
+        public IChatAdapter Create(AdapterSpec spec) => new QqAdapter(spec, events, logger, acks, queue, files, urls);
     }}

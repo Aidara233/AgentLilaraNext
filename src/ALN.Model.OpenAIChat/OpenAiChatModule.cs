@@ -89,12 +89,33 @@ public static class ChatPayload
 {
     public static Dictionary<string, object?> Message(ModelMessage message)
     {
-        var item = new Dictionary<string, object?> { ["role"] = message.Role, ["content"] = message.Content ?? "" };
+        var item = new Dictionary<string, object?> { ["role"] = message.Role, ["content"] = Content(message) };
         if (message.Name is not null) item["name"] = message.Name;
         if (message.ToolCallId is not null) item["tool_call_id"] = message.ToolCallId;
         if (message.ToolCalls is { Count: > 0 }) item["tool_calls"] = message.ToolCalls.Select(call => new
         { id = call.Id, type = "function", function = new { name = call.Name, arguments = call.ArgumentsJson } }).ToArray();
         return item;
+    }
+
+    /// <summary>
+    /// The <c>content</c> field: a string when the message is text, an array of parts when it is not.
+    ///
+    /// The two shapes are not interchangeable — a provider accepts both, but only the array form can carry a picture —
+    /// and a text-only message keeps sending a plain string, so nothing about an ordinary request changed shape when
+    /// pictures arrived. That matters beyond aesthetics: the string form is what every provider in the wild has been
+    /// accepting for years, and a proxy in front of one of them may not understand the array at all.
+    /// </summary>
+    private static object Content(ModelMessage message)
+    {
+        if (message.Parts is not { Count: > 0 } parts) return message.Content ?? "";
+        return parts.Select(part => part switch
+        {
+            TextPart text => (object)new { type = "text", text = text.Text },
+            ImagePart image => new { type = "image_url", image_url = new { url = image.ToDataUrl() } },
+            // Unreachable for the two types that exist; kept so a future part cannot be dropped silently into an empty
+            // message, which a provider reads as "the user said nothing".
+            _ => new { type = "text", text = "" }
+        }).ToArray();
     }
 }
 

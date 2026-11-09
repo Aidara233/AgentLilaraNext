@@ -19,7 +19,8 @@ namespace ALN.Runtime;
 /// What these are <b>not</b>: a semantic layer. Nothing here knows what a memory group is; that knowledge lives in
 /// the memory module, which is why tidying memory is "move the file" and writing a fragment is "append a line".
 /// </summary>
-public sealed class FileSystemTools(IFileSystemAccess access, IReadOnlyList<string> scopes) : ISessionToolSource
+public sealed class FileSystemTools(IFileSystemAccess access, IReadOnlyList<string> scopes, IMediaStore? media = null)
+    : ISessionToolSource
 {
     public const string SourceId = "system.filesystem-tools";
 
@@ -36,6 +37,12 @@ public sealed class FileSystemTools(IFileSystemAccess access, IReadOnlyList<stri
     private const int MaxReadChars = 32_000;
 
     private readonly IFileSystemAccess _access = access;
+
+    /// <summary>
+    /// How a non-text file is identified. Null when the host has no media store, and then "not UTF-8" stays the answer —
+    /// which is honest: without a store there is nothing that can say whether the bytes are a picture.
+    /// </summary>
+    private readonly IMediaStore? _media = media;
 
     /// <summary>The scopes the model may see. A subset of what the process registered, and the reason a tool call
     /// can be refused before it reaches the disk.</summary>
@@ -212,7 +219,24 @@ public sealed class FileSystemTools(IFileSystemAccess access, IReadOnlyList<stri
 
             var read = await owner._access.ReadAsync(scope!, path, cancellationToken).ConfigureAwait(false);
             // Absence is not a failure: Result<T>.Ok is false for a null value, so the two are told apart by Error.
-            if (read.Error is { } error) return Result<SessionToolResult>.Failure(error);
+            if (read.Error is { } error)
+            {
+                // A picture is not a mistake. Before saying "not UTF-8 text", ask what the bytes actually are: refusing
+                // to open the one kind of file this build can show a model would be the wrong answer to the wrong
+                // question, and the model would have no way to tell it apart from a broken file.
+                if (owner._media is { } mediaStore)
+                {
+                    var described = await mediaStore.DescribeAsync(scope!, path, cancellationToken).ConfigureAwait(false);
+                    if (described.Ok && described.Value is { IsViewable: true } picture)
+                        return ToolArguments.Ok(
+                            $"这是图片：{MediaImages.Describe(picture)}。",
+                            attachments: [picture]);
+                    if (described.Ok && described.Value is { } other && other.Kind != MediaKind.File)
+                        return ToolArguments.Ok(
+                            $"这个文件不是文本，是 {other.MediaType}（{MediaPolicy.Describe(other.Bytes)}）；本框架读不出它的内容。");
+                }
+                return Result<SessionToolResult>.Failure(error);
+            }
             if (read.Value is null)
                 return ToolArguments.Ok($"没有 {scope}/{path} 这个文件。（不存在，不是空文件。）");
 
@@ -363,8 +387,8 @@ internal static class ToolArguments
         return null;
     }
 
-    public static Result<SessionToolResult> Ok(string content) =>
-        Result<SessionToolResult>.Success(new SessionToolResult(content));
+    public static Result<SessionToolResult> Ok(string content, IReadOnlyList<MediaRef>? attachments = null) =>
+        Result<SessionToolResult>.Success(new SessionToolResult(content, Attachments: attachments));
 
     public static Result<SessionToolResult> BadJson(string tool) =>
         Result<SessionToolResult>.Failure(new(ErrorCode.Invalid, $"{tool} arguments must be a JSON object."));

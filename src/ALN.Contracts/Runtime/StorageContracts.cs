@@ -27,7 +27,13 @@ public sealed record StoredMessage(
     /// </summary>
     string? SenderName = null,
     /// <summary>The remark this account had given the sender, when it had one. An extra, never a substitute.</summary>
-    string? SenderRemark = null);
+    string? SenderRemark = null,
+    /// <summary>
+    /// What the message carried that is not words, by reference (docs/28 §3). Stored so that a delta handed to a
+    /// Session a minute later still knows a picture came with the sentence — the bytes are on disk, and this is the
+    /// pointer the row keeps instead of a copy of them.
+    /// </summary>
+    IReadOnlyList<MediaRef>? Media = null);
 
 /// <summary>Per-owner message history, append-only.</summary>
 public interface IMessageStore

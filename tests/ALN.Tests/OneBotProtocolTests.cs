@@ -1,4 +1,5 @@
 using System.Text.Json;
+using ALN.Contracts;
 using ALN.Adapter.Qq;
 
 namespace ALN.Tests;
@@ -364,5 +365,172 @@ public sealed class OneBotProtocolTests
             root.TryGetProperty("message_id", out var id) ? id.ToString() : null,
             root.GetProperty("retcode").GetInt32(),
             root.TryGetProperty("message", out var message) ? message.GetString() : null);
+    }
+
+    [Fact]
+    public void A_layout_becomes_segments_in_order_with_the_quote_first()
+    {
+        var picture = new MediaRef(FileScopes.Media, "image/ab/x.png", MediaKind.Image, "image/png", 33, 4, 3, "ab");
+        var segments = OneBotProtocol.BuildOutboundSegments(
+            [new TextBlock("看 "), new MentionBlock("20000"), new TextBlock("："), new FaceBlock("1"), new ImageBlock(picture)],
+            replyTo: "4242", imageUri: _ => "base64://QUJD");
+
+        var root = JsonDocument.Parse(JsonSerializer.Serialize(segments)).RootElement;
+        var kinds = root.EnumerateArray().Select(segment => segment.GetProperty("type").GetString()).ToArray();
+        // The quote is outermost, then the layout exactly as it was written.
+        Assert.Equal(new[] { "reply", "text", "at", "text", "face", "image" }, kinds);
+        Assert.Equal("4242", root[0].GetProperty("data").GetProperty("id").GetString());
+        Assert.Equal("看 ", root[1].GetProperty("data").GetProperty("text").GetString());
+        Assert.Equal("20000", root[2].GetProperty("data").GetProperty("qq").GetString());
+        Assert.Equal("：", root[3].GetProperty("data").GetProperty("text").GetString());
+        Assert.Equal("1", root[4].GetProperty("data").GetProperty("id").GetString());
+        // A picture is bytes on the wire, not a path a bridge on another machine could not open.
+        Assert.Equal("base64://QUJD", root[5].GetProperty("data").GetProperty("file").GetString());
+    }
+
+    [Fact]
+    public void A_picture_that_could_not_be_read_still_takes_its_place_as_a_sentence()
+    {
+        // The caller resolves the bytes (it holds the file port). Null means "I could not read it", and the message must
+        // still arrive with the part visible — a silently missing picture is one the model believes it sent.
+        var picture = new MediaRef(FileScopes.Media, "image/ab/x.png", MediaKind.Image, "image/png", 33, 4, 3, "ab");
+        var segments = OneBotProtocol.BuildOutboundSegments([new TextBlock("看"), new ImageBlock(picture)], null,
+            imageUri: _ => null);
+
+        var root = JsonDocument.Parse(JsonSerializer.Serialize(segments)).RootElement;
+        Assert.Equal(2, root.GetArrayLength());
+        Assert.All(root.EnumerateArray(), segment => Assert.Equal("text", segment.GetProperty("type").GetString()));
+        Assert.Equal("[图片：media/image/ab/x.png]", root[1].GetProperty("data").GetProperty("text").GetString());
+    }
+
+    [Fact]
+    public void A_message_that_is_only_a_reply_still_sends_the_text_view()
+    {
+        // OneBot rejects an empty message array, and an empty bubble is not what anybody meant: the flattening goes
+        // rather than a refusal nobody can act on.
+        var segments = OneBotProtocol.BuildOutboundSegments([new TextBlock("")], replyTo: "4242");
+
+        var root = JsonDocument.Parse(JsonSerializer.Serialize(segments)).RootElement;
+        Assert.Equal(2, root.GetArrayLength());
+        Assert.Equal("text", root[1].GetProperty("type").GetString());
+    }
+
+    // ---- pictures ----------------------------------------------------------------------------------------------
+
+    [Fact]
+    public void An_image_segment_says_where_the_picture_is_without_fetching_it()
+    {
+        // The protocol layer's whole job here: read where it is. Fetching is the Adapter's, storing is the Channel's.
+        var images = OneBotProtocol.ReadImages(Parse("""
+            {"post_type":"message","message":[
+              {"type":"image","data":{"file":"abc.image","url":"https://gchat.qpic.cn/x?term=2","sub_type":1}},
+              {"type":"text","data":{"text":"看"}},
+              {"type":"image","data":{"file":"no-url.png"}}]}
+            """));
+
+        Assert.Equal(2, images.Count);
+        Assert.Equal("https://gchat.qpic.cn/x?term=2", images[0].Url);
+        Assert.Equal("abc.image", images[0].File);
+        // A segment with no url is still reported: the Adapter says it could not be fetched rather than pretending the
+        // message had one picture when it had two.
+        Assert.Null(images[1].Url);
+        Assert.Equal("no-url.png", images[1].File);
+    }
+
+    [Fact]
+    public void The_cq_code_form_is_read_too_because_the_format_is_configuration()
+    {
+        // message_format=string is a deployment setting; the same bridge can switch it. The url arrives HTML-escaped
+        // ("&amp;" for "&"), and left escaped it is not a url at all.
+        var images = OneBotProtocol.ReadImages(Parse("""
+            {"post_type":"message","message":"[CQ:image,file=b.jpg,url=https://gchat.qpic.cn/y?a=1&amp;b=2] 看图"}
+            """));
+
+        var image = Assert.Single(images);
+        Assert.Equal("https://gchat.qpic.cn/y?a=1&b=2", image.Url);
+        Assert.Equal("b.jpg", image.File);
+    }
+
+    [Fact]
+    public void A_message_without_pictures_reports_none()
+    {
+        Assert.Empty(OneBotProtocol.ReadImages(Parse(GroupMessage.Replace(
+            """{ "type": "image", "data": { "file": "a.png" } },""", ""))));
+        // And the text still carries "[图片]" when there is one, so a model that gets no bytes still learns something
+        // was there (see ReadMessage → Narrate).
+        Assert.Equal("[图片]", OneBotProtocol.ReadMessage(Parse("""
+            {"post_type":"message","message_type":"group","self_id":10000,"group_id":1,"user_id":20000,
+             "message_id":1,"time":1730000000,"message":[{"type":"image","data":{"file":"a.png"}}]}
+            """), selfId: 10000)!.Text);
+    }
+
+    // ---- files: a pointer, not bytes ---------------------------------------------------------------
+
+    [Fact]
+    public void A_file_segment_carries_the_handle_that_fetches_it()
+    {
+        // The bytes are not in the message and are not fetched here: what a model needs is the name, the size, and the
+        // handle `files_get` takes — a bare "[文件]" would leave it with something it cannot name (docs/28 §6.8).
+        var inbound = OneBotProtocol.ReadMessage(Parse("""
+            {"post_type":"message","message_type":"group","self_id":10000,"group_id":616565017,"user_id":20000,
+             "message_id":7,"time":1730000000,
+             "message":[{"type":"text","data":{"text":"看看这个 "}},
+                        {"type":"file","data":{"file":"周报.zip","file_id":"abc123","file_size":2411724,"busid":0}}]}
+            """), selfId: 10000);
+
+        Assert.NotNull(inbound);
+        Assert.Contains("看看这个", inbound!.Text, StringComparison.Ordinal);
+        Assert.Contains("周报.zip", inbound.Text, StringComparison.Ordinal);
+        Assert.Contains("2.3 MB", inbound.Text, StringComparison.Ordinal);
+        Assert.Contains("f:0|abc123", inbound.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_group_file_upload_arrives_as_a_notice_with_no_message_id()
+    {
+        // On this platform a file in the group's file area is a notice, not a message: nothing appears in the chat, and
+        // there is no message_id to dedupe on. The envelope still has to say what arrived and how to get it.
+        var inbound = OneBotProtocol.ReadMessage(Parse("""
+            {"post_type":"notice","notice_type":"group_upload","self_id":10000,"group_id":616565017,
+             "user_id":20000,"time":1730000000,
+             "file":{"id":"xyz789","name":"成片.mp4","size":104857600,"busid":0}}
+            """), selfId: 10000);
+
+        Assert.NotNull(inbound);
+        Assert.Null(inbound!.MessageId);
+        Assert.Equal("group-616565017", inbound.ConversationId);
+        Assert.Equal("20000", inbound.SenderId);
+        Assert.Contains("上传了文件", inbound.Text, StringComparison.Ordinal);
+        Assert.Contains("成片.mp4", inbound.Text, StringComparison.Ordinal);
+        Assert.Contains("100 MB", inbound.Text, StringComparison.Ordinal);
+        Assert.Contains("f:0|xyz789", inbound.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_file_the_bridge_only_named_says_so_instead_of_inventing_a_handle()
+    {
+        var inbound = OneBotProtocol.ReadMessage(Parse("""
+            {"post_type":"message","message_type":"group","self_id":10000,"group_id":1,"user_id":20000,
+             "message_id":8,"time":1730000000,
+             "message":[{"type":"file","data":{"name":"旧.zip"}}]}
+            """), selfId: 10000);
+
+        Assert.Contains("旧.zip", inbound!.Text, StringComparison.Ordinal);
+        Assert.Contains("取不到", inbound.Text, StringComparison.Ordinal);
+        // No handle at all: a made-up one would be a call that can only fail.
+        Assert.DoesNotContain("f:", inbound.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Other_notices_are_still_ignored()
+    {
+        // A poke, a recall, somebody joining: none of them is something to say, and turning them into messages would make
+        // the conversation noisier than the chat it mirrors.
+        Assert.Null(OneBotProtocol.ReadMessage(Parse("""
+            {"post_type":"notice","notice_type":"group_increase","self_id":10000,"group_id":1,"user_id":20000}
+            """), selfId: 10000));
+        Assert.Null(OneBotProtocol.ReadMessage(Parse("""
+            {"post_type":"notice","notice_type":"group_upload","self_id":10000,"group_id":1,"user_id":20000}
+            """), selfId: 10000));
     }
 }

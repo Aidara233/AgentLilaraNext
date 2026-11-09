@@ -23,10 +23,16 @@ public sealed class FileSystemModule(ModuleId id, FileSystemTools tools, ISessio
 
     /// <summary>
     /// Default configuration written by the host when no <c>module.json</c> exists yet: the memory library, the folder a
-    /// script is drafted in, and a workspace to do chores in. Granting more is an edit, not a default — these three are
-    /// the areas whose contents are already the model's responsibility, and none of them is read by the host itself.
+    /// script is drafted in, a workspace to do chores in, and the media area to read (docs/28).
+    ///
+    /// Media is here in the read direction only — the port refuses writes to it whatever this file says, so offering it
+    /// to the tools is safe and is what makes "look at the picture I did not show you" possible. Granting more is an
+    /// edit, not a default.
+    ///
+    /// A data root created before media existed keeps its old file (C-03): the host says so at startup and the operator
+    /// adds the name. That is the intended cost of never rewriting a person's configuration.
     /// </summary>
-    public const string DefaultConfig = """{"scopes":["memory","workspace","scripts/draft"]}""";
+    public const string DefaultConfig = """{"scopes":["memory","workspace","scripts/draft","media"]}""";
 
     private bool _registered;
 
@@ -40,7 +46,12 @@ public sealed class FileSystemModule(ModuleId id, FileSystemTools tools, ISessio
     /// a config that is not JSON, and a scope that is not registered with the port.
     /// </summary>
     public static Result<IKernelModule> FromManifest(ModuleManifest manifest, IFileSystemAccess access,
-        ISessionExtensionRegistry extensions)
+        ISessionExtensionRegistry extensions,
+        /// <summary>
+        /// How <c>fs_read</c> recognises a picture instead of reporting "not UTF-8 text". Optional: without it the tools
+        /// still read and write every text file, and opening a picture is an ordinary failure rather than a receipt.
+        /// </summary>
+        IMediaStore? media = null)
     {
         ArgumentNullException.ThrowIfNull(manifest);
         if (!string.Equals(manifest.Type, TypeId, StringComparison.Ordinal))
@@ -81,7 +92,8 @@ public sealed class FileSystemModule(ModuleId id, FileSystemTools tools, ISessio
             }
         }
 
-        return Result<IKernelModule>.Success(new FileSystemModule(manifest.Id, new FileSystemTools(access, scopes.AsReadOnly()), extensions));
+        return Result<IKernelModule>.Success(new FileSystemModule(manifest.Id,
+            new FileSystemTools(access, scopes.AsReadOnly(), media), extensions));
     }
 
     public ValueTask<Result> InitializeAsync(CancellationToken cancellationToken)

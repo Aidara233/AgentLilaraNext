@@ -146,8 +146,11 @@ public sealed partial class ChannelManager
         var adapter = adapters.Get(binding.Adapter);
         if (!adapter.Ok || adapter.Value is null) return Result<JsonElement>.Failure(adapter.Error!);
 
-        var sent = await adapter.Value.SendAsync(new OutboundMessage(binding.PlatformConversationId, text, replyTo), ct)
-            .ConfigureAwait(false);
+        // The Adapter is handed the message and decides what it can send. There is no question asked before this
+        // call: channels.send is the verb a script uses to say something, and "can this Adapter do it?" is answered by
+        // the Adapter, on the one call it takes to find out (IOutboundAdapter.SendAsync).
+        var message = new OutboundMessage(binding.PlatformConversationId, text, replyTo);
+        var sent = await adapter.Value.SendAsync(message, ct).ConfigureAwait(false);
         if (!sent.Ok || sent.Value is null) return Result<JsonElement>.Failure(sent.Error!);
         return Result<JsonElement>.Success(Json(new
         {

@@ -12,7 +12,16 @@ namespace ALN.Contracts.Sessions;
 /// reply sent through a tool would vanish from the model's view of its own side of the conversation. Null for
 /// tools that only look things up.
 /// </param>
-public sealed record SessionToolResult(string Content, string? SpokenText = null);
+/// <param name="Attachments">
+/// Pictures this result brought back, as references — not bytes. The tool reports what it found; whether a model may
+/// be shown it is the Session's decision, because only the Session knows which model is being talked to (docs/28 §5).
+///
+/// The bytes are read once, at the moment the message is built, and they are not stored on the tool result: a result
+/// lives in the timeline, and a timeline full of pictures is a history that cannot be re-read cheaply (see
+/// <see cref="ALN.Contracts.MediaRef"/>).
+/// </param>
+public sealed record SessionToolResult(string Content, string? SpokenText = null,
+    IReadOnlyList<MediaRef>? Attachments = null);
 
 /// <summary>
 /// One tool a Session may call.

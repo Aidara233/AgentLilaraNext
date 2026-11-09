@@ -463,6 +463,27 @@ public sealed class SessionToolTests : IDisposable
     }
 
     [Fact]
+    public async Task A_job_wake_says_a_job_ended_rather_than_a_wait_coming_due()
+    {
+        // Three ways to be awake with nobody speaking, and they are not the same promise: my own wait came due, a rule
+        // I stored fired, or work I started has ended. Saying the wrong one is worse than saying none — the model would
+        // go looking for a reason it does not have.
+        var model = new ScriptedModel([new TextDelta("ok"), new ModelCompleted(StopReason.EndTurn, new ModelUsage(1, 1))]);
+        var sessions = new SessionManager(Path.Combine(_root, "job-wake"), model);
+        Assert.True((await sessions.OpenAsync("s-job", Spec(), default)).Ok);
+
+        var woken = await ((ISessionWaker)sessions).WakeAsync("s-job", default);
+
+        Assert.True(woken.Ok, woken.Error?.Detail ?? woken.Error?.Message);
+        var note = Assert.Single(model.Requests[^1].Messages, message => message.Content?.Contains("没有任何人说话") == true);
+        Assert.Equal("user", note.Role);
+        Assert.Contains("后台任务结束了", note.Content!, StringComparison.Ordinal);
+        Assert.Contains("任务账本", note.Content!, StringComparison.Ordinal);
+        Assert.DoesNotContain("等待到期", note.Content!);
+        Assert.DoesNotContain("定时规则", note.Content!);
+    }
+
+    [Fact]
     public async Task A_schedule_wake_carries_what_the_rule_was_written_to_do()
     {
         // A row's id is not a reason. The note carries the words whoever wrote the rule used, and says they are a note

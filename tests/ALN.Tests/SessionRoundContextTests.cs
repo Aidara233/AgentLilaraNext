@@ -81,6 +81,69 @@ public sealed class SessionRoundContextTests : IDisposable
         Assert.Contains("当前时间：", block.Content ?? string.Empty, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task Self_says_which_session_it_is_how_deep_it_is_trusted_and_what_policy_narrowed_it()
+    {
+        var policy = new SessionToolPolicy(Only: ["actions_call"], Deny: ["read_file", "write_file"]);
+        var spec = new SessionSpec("default", "Answer briefly.", "1", ToolPolicy: policy);
+        var first = await _sessions.TurnAsync("s-self", spec, Guid.NewGuid(),
+            new SessionTurnInput([new("m-1", "user", "alice", "hello", DateTimeOffset.UtcNow)], Channel, Binding),
+            null, default);
+        Assert.True(first.Ok, first.Error?.Detail ?? first.Error?.Message);
+
+        var block = Assert.Single(_model.Requests[0].Messages, m => m.Role == "user" &&
+            m.Content?.Contains("<channel_context>", StringComparison.Ordinal) == true).Content ?? string.Empty;
+        Assert.Contains("<section name=\"self\"", block, StringComparison.Ordinal);
+        Assert.Contains("会话：s-self。", block, StringComparison.Ordinal);
+        Assert.Contains($"你答的是频道 {Channel}", block, StringComparison.Ordinal);
+        Assert.Contains("等级：L0 agent", block, StringComparison.Ordinal);
+        // The sentence that keeps "depth" from being read as "rank".
+        Assert.Contains("不是谁有资格命令你", block, StringComparison.Ordinal);
+        Assert.Contains("只要 actions_call", block, StringComparison.Ordinal);
+        Assert.Contains("另有 2 个永远不给", block, StringComparison.Ordinal);
+
+        // The level is one of the few things an operator can change mid-flight: the very next round has to know.
+        Assert.True((await _sessions.SetLevelAsync("s-self", AccessLevel.Operator, default)).Ok);
+        var second = await _sessions.TurnAsync("s-self", spec, Guid.NewGuid(),
+            new SessionTurnInput([new("m-2", "user", "alice", "again", DateTimeOffset.UtcNow)], Channel, Binding),
+            null, default);
+        Assert.True(second.Ok, second.Error?.Detail ?? second.Error?.Message);
+
+        var after = Assert.Single(_model.Requests[1].Messages, m => m.Role == "user" &&
+            m.Content?.Contains("<channel_context>", StringComparison.Ordinal) == true).Content ?? string.Empty;
+        Assert.Contains("等级：L1 operator", after, StringComparison.Ordinal);
+        Assert.DoesNotContain("等级：L0 agent", after, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Self_still_says_which_channel_after_the_opening_line_falls_out_of_the_window()
+    {
+        // The opening channel-info line is one message among the last N that get re-rendered, so a conversation longer
+        // than that window drops the one entry that said where this Session lives. Nothing else in the request replaced
+        // it — which is why the self section carries the same identity every round.
+        var spec = new SessionSpec("default", "Answer briefly.", "1");
+        var opening = await _sessions.TurnAsync("s-long", spec, Guid.NewGuid(),
+            new SessionTurnInput([new("m-open", "user", "alice", "hello", DateTimeOffset.UtcNow)], Channel, Binding),
+            null, default);
+        Assert.True(opening.Ok, opening.Error?.Detail ?? opening.Error?.Message);
+
+        var burst = Enumerable.Range(0, SessionManager.RecentChannelMessages)
+            .Select(index => new SessionChannelMessage($"m-{index:D3}", "channel.delta", "alice", $"第 {index} 句",
+                DateTimeOffset.UtcNow.AddSeconds(index)))
+            .ToArray();
+        var later = await _sessions.TurnAsync("s-long", spec, Guid.NewGuid(),
+            new SessionTurnInput(burst, Channel, Binding), null, default);
+        Assert.True(later.Ok, later.Error?.Detail ?? later.Error?.Message);
+
+        var block = Assert.Single(_model.Requests[1].Messages, m => m.Role == "user" &&
+            m.Content?.Contains("<channel_context>", StringComparison.Ordinal) == true).Content ?? string.Empty;
+        // The opening note is gone from the request…
+        Assert.DoesNotContain("频道地址：", block, StringComparison.Ordinal);
+        Assert.Contains("<omitted count=", block, StringComparison.Ordinal);
+        // …but the identity is not.
+        Assert.Contains($"你答的是频道 {Channel}", block, StringComparison.Ordinal);
+    }
+
     private sealed class ThrowingSource(string id) : IFloatingContextSource
     {
         public string Id => id;

@@ -1,4 +1,6 @@
 using System.Globalization;
+using ALN.Contracts;
+using ALN.Contracts.Adapters;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -10,6 +12,15 @@ public sealed record OneBotInbound(string ConversationId, string Platform, strin
 
 /// <summary>The part of an action response that matters: did it work, and what id did the platform assign.</summary>
 public sealed record OneBotResponse(bool Ok, string? MessageId, long RetCode, string? Message);
+
+/// <summary>
+/// One picture an inbound message carried: where to get it, and what the platform called the file.
+///
+/// The bytes are not here. A bridge sends a url (or a bare file name that only <c>get_image</c> can resolve), and
+/// fetching it is the Adapter's next step — which is why a message whose picture cannot be fetched still arrives, as
+/// the words around it plus <c>[图片]</c> (docs/28 §1).
+/// </summary>
+public sealed record OneBotImage(string? Url, string? File);
 
 /// <summary>Who the listener is logged in as, learned from the platform rather than configured.</summary>
 public sealed record OneBotLogin(long UserId, string? Nickname);
@@ -78,6 +89,8 @@ public static partial class OneBotProtocol
         // The bot's own sends come back as message_sent. Feeding them in would make every reply of ours
         // look like user input and start a self-feeding loop.
         if (postType == "message_sent") return null;
+        // A file somebody put in the group's file area arrives as a notice, not as a message (docs/16 §12.6).
+        if (postType == "notice") return ReadNotice(root);
         if (postType != "message") return null;
         if (!TryString(root, "message_type", out var messageType)) return null;
 
@@ -109,6 +122,70 @@ public static partial class OneBotProtocol
 
         return new OneBotInbound(conversationId, messageType, messageId, Number(senderId.Value),
             ReadSenderName(root), text, at, Mentions(root, selfId));
+    }
+
+    /// <summary>
+    /// A notice worth a turn: today only <c>group_upload</c>, somebody putting a file in the group's file area.
+    ///
+    /// It is a notice and not a message on this platform — no <c>message_id</c>, nothing in the chat stream, the chat
+    /// shows no trace of it. So the envelope it becomes carries <b>no platform message id</b> (which is why
+    /// <see cref="OneBotInbound.MessageId"/> is nullable), and its text is ours: what arrived, how big, and the handle
+    /// that fetches it. A model that only ever sees "a file appeared" without a name to point at would go looking for it
+    /// with the one tool that cannot find it (docs/28 §6.8).
+    /// </summary>
+    public static OneBotInbound? ReadNotice(JsonElement root)
+    {
+        if (!TryString(root, "notice_type", out var notice) || notice != "group_upload") return null;
+        if (!TryLong(root, "group_id", out var groupId)) return null;
+        if (!TryLong(root, "user_id", out var userId)) return null;
+        if (!root.TryGetProperty("file", out var file) || file.ValueKind != JsonValueKind.Object) return null;
+        var note = FileNote(file);
+        if (note is null) return null;
+        var at = TryLong(root, "time", out var unix) && unix > 0
+            ? DateTimeOffset.FromUnixTimeSeconds(unix)
+            : DateTimeOffset.UtcNow;
+        return new OneBotInbound(GroupConversation(groupId), GroupPlatform, null, Number(userId), null,
+            $"（群里有人上传了文件）{note}", at);
+    }
+
+    /// <summary>
+    /// A file, as the text a model reads: the name, the size, and the handle that fetches it.
+    ///
+    /// <b>No bytes and no fetch here.</b> On this platform a file in a message is a pointer, and pulling it is a decision
+    /// with a destination attached — which belongs to whoever wants the file, not to the adapter (docs/28 §6.7). What
+    /// the adapter owes is the handle, spelled the way <c>files_get</c> takes it.
+    ///
+    /// Null only when there is nothing to point at or to call it: a segment with neither id nor name is `[文件]` and
+    /// stays that way.
+    /// </summary>
+    public static string? FileNote(JsonElement data)
+    {
+        if (data.ValueKind != JsonValueKind.Object) return null;
+        TryString(data, "file_id", out var id);
+        // Older shapes put the id in "id", and some put the whole thing in "file" (a path or a name).
+        if (string.IsNullOrWhiteSpace(id)) TryString(data, "id", out id);
+        TryString(data, "name", out var name);
+        if (string.IsNullOrWhiteSpace(name)) TryString(data, "file", out name);
+
+        // Two spellings for the same thing: a message segment says `file_size`, a group_upload notice says `size`.
+        long? bytes = TryLong(data, "file_size", out var fileSize) && fileSize > 0 ? fileSize
+            : TryLong(data, "size", out var declaredSize) && declaredSize > 0 ? declaredSize
+            : null;
+        var size = bytes is { } known ? $"（{Measure(known)}）" : string.Empty;
+        var label = string.IsNullOrWhiteSpace(name) ? "文件" : name;
+        if (string.IsNullOrWhiteSpace(id))
+            return name is null ? "[文件]" : $"[文件：{label}{size}；桥接只给了名字，取不到它]";
+
+        var busid = TryLong(data, "busid", out var bus) ? bus.ToString(CultureInfo.InvariantCulture) : "0";
+        return $"[文件：{label}{size}，files_get 取它：{FileHandles.Wrap($"{busid}|{id}")}]";
+
+        static string Measure(long value) => value switch
+        {
+            >= 1024L * 1024 * 1024 => $"{value / (1024.0 * 1024 * 1024):0.#} GB",
+            >= 1024 * 1024 => $"{value / (1024.0 * 1024):0.#} MB",
+            >= 1024 => $"{value / 1024.0:0.#} KB",
+            _ => $"{value} B"
+        };
     }
 
     /// <summary>
@@ -145,6 +222,58 @@ public static partial class OneBotProtocol
         text.Length > 0 && CqCode().Matches(text).Any(match =>
             match.Groups["type"].Value == "at" && CqArgument(match.Groups["args"].Value, "qq") == selfId);
 
+    /// <summary>
+    /// The pictures in an inbound message, in the order they appeared.
+    ///
+    /// Both message formats are read, because which one a bridge sends is configuration and the same deployment can
+    /// switch: the array form has a segment per picture with <c>data.url</c>/<c>data.file</c>, and the string form carries
+    /// <c>[CQ:image,file=…,url=…]</c> with the url percent- or HTML-escaped. Nothing here fetches anything: a text block
+    /// is what a model reads when the picture cannot be had, and <c>[图片]</c> is already in the text by the time this
+    /// is asked (see <see cref="Narrate"/>).
+    /// </summary>
+    public static IReadOnlyList<OneBotImage> ReadImages(JsonElement root)
+    {
+        var images = new List<OneBotImage>();
+        if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("message", out var message))
+        {
+            if (message.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var segment in message.EnumerateArray())
+                {
+                    if (segment.ValueKind != JsonValueKind.Object) continue;
+                    if (!TryString(segment, "type", out var type) || type != "image") continue;
+                    if (!segment.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) continue;
+                    images.Add(new OneBotImage(
+                        TryString(data, "url", out var url) ? Blank(url) : null,
+                        TryString(data, "file", out var file) ? Blank(file) : null));
+                }
+                return images;
+            }
+            if (message.ValueKind == JsonValueKind.String)
+            {
+                AppendCqImages(HtmlDecode(message.GetString() ?? string.Empty), images);
+                return images;
+            }
+        }
+        // The fallback some bridges use when message_format is string but "message" was empty.
+        if (root.ValueKind == JsonValueKind.Object && TryString(root, "raw_message", out var raw))
+            AppendCqImages(HtmlDecode(raw), images);
+        return images;
+    }
+
+    private static void AppendCqImages(string text, List<OneBotImage> images)
+    {
+        if (text.Length == 0) return;
+        foreach (Match match in CqCode().Matches(text))
+        {
+            if (match.Groups["type"].Value != "image") continue;
+            var args = match.Groups["args"].Value;
+            // CQ arguments escape "&#44;" for a comma and "&#91;" for brackets: left as-is, the url is not a url.
+            images.Add(new OneBotImage(Blank(HtmlDecode(CqArgument(args, "url") ?? "")),
+                Blank(HtmlDecode(CqArgument(args, "file") ?? ""))));
+        }
+    }
+
     /// <summary>The account the listener is logged in as, from a heartbeat or lifecycle meta event.</summary>
     public static long? ReadSelfId(JsonElement root) =>
         TryLong(root, "self_id", out var selfId) ? selfId : null;
@@ -157,6 +286,25 @@ public static partial class OneBotProtocol
     public static string BuildSend(string echo, long targetId, string platform, string text, string? replyTo = null)
     {
         var segments = BuildOutboundSegments(text, replyTo);
+        return BuildSend(echo, targetId, platform, segments);
+    }
+
+    /// <summary>
+    /// The layout form: one message made of segments, in the order the blocks were. The reply quote is added by
+    /// <see cref="BuildOutboundSegments(IReadOnlyList{MessageBlock}, string?, Func{ImageBlock, string?})"/>, and pictures
+    /// are looked up in <paramref name="pictures"/> by what they point at — null there means "could not be read", which
+    /// travels as its own one-line text.
+    /// </summary>
+    public static string BuildSend(string echo, long targetId, string platform, OutboundMessage message,
+        IReadOnlyDictionary<string, string?> pictures)
+    {
+        var segments = BuildOutboundSegments(message.Blocks!, message.ReplyTo,
+            picture => pictures.GetValueOrDefault(picture.Picture.Locator));
+        return BuildSend(echo, targetId, platform, segments);
+    }
+
+    private static string BuildSend(string echo, long targetId, string platform, object[] segments)
+    {
         return platform == PrivatePlatform
             ? JsonSerializer.Serialize(new { action = "send_private_msg", @params = new { user_id = targetId, message = segments, auto_escape = false }, echo }, Json)
             : JsonSerializer.Serialize(new { action = "send_group_msg", @params = new { group_id = targetId, message = segments, auto_escape = false }, echo }, Json);
@@ -257,14 +405,221 @@ public static partial class OneBotProtocol
     /// A reply segment needs a numeric id; anything else is dropped rather than sent as a broken
     /// segment, because a rejected send is worse than a send without quoting.
     /// </summary>
-    public static object[] BuildOutboundSegments(string text, string? replyTo)
+    public static object[] BuildOutboundSegments(string text, string? replyTo) =>
+        BuildOutboundSegments([new TextBlock(text)], replyTo);
+
+    /// <summary>
+    /// A laid-out message as OneBot segments, in order. The reply quote goes first when there is one, because it is the
+    /// outermost thing the message says ("this answers that"), and a quote in the middle would be a quote of nothing.
+    ///
+    /// Pictures go as <c>base64://</c> rather than as a file path: a locale on the same machine is not something a
+    /// deployment may assume, and a base64 segment needs no shared filesystem at all. A face is sent as the platform's own
+    /// id, untouched — it is already dialect.
+    /// </summary>
+    public static object[] BuildOutboundSegments(IReadOnlyList<MessageBlock> blocks, string? replyTo,
+        Func<ImageBlock, string?>? imageUri = null)
     {
-        var segments = new List<object>(2);
+        var segments = new List<object>(blocks.Count + 2);
         if (replyTo is { Length: > 0 } id && id.All(char.IsAsciiDigit))
             segments.Add(new { type = "reply", data = new { id } });
-        segments.Add(new { type = "text", data = new { text } });
+        var body = 0;
+        foreach (var block in blocks)
+        {
+            switch (block)
+            {
+                case TextBlock text when text.Text.Length > 0:
+                    segments.Add(new { type = "text", data = new { text = text.Text } });
+                    break;
+                case MentionBlock mention:
+                    segments.Add(new { type = "at", data = new { qq = mention.Id } });
+                    break;
+                case FaceBlock face:
+                    segments.Add(new { type = "face", data = new { id = face.Id } });
+                    break;
+                case ImageBlock picture:
+                {
+                    // The bytes are resolved by the caller (it is the one holding the file port). A picture that could not
+                    // be read still becomes a segment — as the sentence the text view already had — so a message never
+                    // silently loses a part.
+                    var uri = imageUri?.Invoke(picture);
+                    segments.Add(uri is null
+                        ? new { type = "text", data = new { text = picture.AsText } }
+                        : new { type = "image", data = new { file = uri, sub_type = 0 } });
+                    break;
+                }
+                case FileBlock:
+                    // Deliberately not a segment. OneBot has no "here is a file" message part: `upload_group_file` is an
+                    // action of its own and the chat never mentions what it delivered (docs/28 §6.6). The adapter delivers
+                    // file blocks itself, one action each — one arriving here was put into a segment list by mistake, and
+                    // skipping it is better than inventing a part the bridge does not have.
+                    continue;
+                default:
+                    continue;
+            }
+            body++;
+        }
+        // Only a quote (or nothing at all): OneBot rejects an empty message array, and an empty bubble is not what any
+        // caller meant, so the flattening is sent rather than a refusal nobody can act on.
+        if (body == 0) segments.Add(new { type = "text", data = new { text = MessageBlock.Flatten(blocks) } });
         return segments.ToArray();
     }
+
+    /// <summary>
+    /// <c>upload_group_file</c> or <c>upload_private_file</c>: how a file gets there when it is not part of the message.
+    ///
+    /// <paramref name="file"/> is whatever the bridge accepts as a resource — a URL it can fetch, a path on its own disk,
+    /// or <c>base64://</c> — and which one it accepts is the one real difference between OneBot implementations: NapCat
+    /// documents http(s) URLs and recommends an HTTP port for exactly this (docs/16 §12.5), while the go-cqhttp API says
+    /// local path only. That is why the choice is configuration, not a guess: <c>fileDelivery</c>.
+    ///
+    /// <c>folder</c> is omitted rather than sent as null when there is none: a group's root directory is the default, and
+    /// "folder: null" is a value somebody has to interpret.
+    /// </summary>
+    public static string BuildUploadFile(string echo, long targetId, string platform, string file, string name,
+        string? folder = null)
+    {
+        var parameters = new Dictionary<string, object?> { ["file"] = file, ["name"] = name };
+        if (platform == PrivatePlatform) parameters["user_id"] = targetId;
+        else
+        {
+            parameters["group_id"] = targetId;
+            if (string.IsNullOrWhiteSpace(folder) is false) parameters["folder"] = folder;
+        }
+        return JsonSerializer.Serialize(new
+        {
+            action = platform == PrivatePlatform ? "upload_private_file" : "upload_group_file",
+            @params = parameters,
+            echo
+        }, Json);
+    }
+
+    /// <summary>
+    /// <c>download_file</c>: the bridge fetches a URL onto its own disk and answers with the path. The second half of the
+    /// two-step upload, and the only way to use a URL on an implementation whose <c>upload_*</c> takes paths only.
+    ///
+    /// <paramref name="threads"/> is a request, not a promise: it is what makes the bridge ask for byte ranges instead of
+    /// one long body (docs/28 §6.6), which is why the door we hand it has to answer ranges.
+    /// </summary>
+    public static string BuildDownloadFile(string echo, string url, int threads) =>
+        JsonSerializer.Serialize(new
+        {
+            action = "download_file",
+            @params = new Dictionary<string, object?> { ["url"] = url, ["thread_count"] = threads },
+            echo
+        }, Json);
+
+    /// <summary>Where <c>download_file</c> put it. Implementations differ on the key, so both spellings are read.</summary>
+    public static string? ReadDownloadedPath(JsonElement data)
+    {
+        if (data.ValueKind != JsonValueKind.Object) return null;
+        foreach (var key in new[] { "file", "file_path", "path" })
+            if (TryString(data, key, out var value) && !string.IsNullOrWhiteSpace(value)) return value;
+        return null;
+    }
+
+    /// <summary>
+    /// <c>get_group_root_files</c>: the group's own file area, which is a place of its own rather than the chat.
+    ///
+    /// Only the root is listed because only the root is one call. A group with folders answers with them as well, and
+    /// saying "there are three folders here, this build does not open them" is the honest version of a partial listing
+    /// (docs/28 §6.7) — <see cref="ReadGroupFiles"/> keeps both lists.
+    /// </summary>
+    public static string BuildListGroupFiles(string echo, long groupId) =>
+        JsonSerializer.Serialize(new
+        {
+            action = "get_group_root_files",
+            @params = new Dictionary<string, object?> { ["group_id"] = groupId },
+            echo
+        }, Json);
+
+    /// <summary>
+    /// <c>get_file</c>: the bytes behind one id, or where they are. The handle carries what the call needs —
+    /// <c>{busid}|{file_id}</c> for a group file, <c>{file_id}</c> alone for a private one — because a group file's id
+    /// is not enough on its own: <c>busid</c> says which of QQ's file systems it lives in, and the bridge wants both.
+    /// </summary>
+    public static string BuildGetFile(string echo, string busid, string fileId)
+    {
+        var parameters = new Dictionary<string, object?> { ["file_id"] = fileId };
+        // A number when it is one: a bridge on either side of the v11 dialect reads `busid` as an integer, and sending it
+        // as a string is the kind of thing that works until it does not.
+        if (long.TryParse(busid, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var numeric))
+            parameters["busid"] = numeric;
+        else if (!string.IsNullOrWhiteSpace(busid)) parameters["busid"] = busid;
+        return JsonSerializer.Serialize(new { action = "get_file", @params = parameters, echo }, Json);
+    }
+
+    /// <summary>
+    /// One entry in a group's file area, as the bridge described it. Kept as its own record rather than parsed straight
+    /// into a <c>PlatformFile</c> because the handle is the adapter's business: the protocol knows a file id and a busid,
+    /// and how those two become a name nobody else parses is decided one layer up.
+    /// </summary>
+    public sealed record OneBotFile(string Id, string Name, long? Bytes, DateTimeOffset? At, string? From, string BusId);
+
+    /// <summary>
+    /// The two lists <c>get_group_root_files</c> answers with. Either may be missing, and a file without an id is not a
+    /// file we can point at later — dropping it is better than handing out a handle nobody can use.
+    /// </summary>
+
+    public static (IReadOnlyList<OneBotFile> Files, IReadOnlyList<string> Folders) ReadGroupFiles(JsonElement data)
+    {
+        if (data.ValueKind != JsonValueKind.Object) return ([], []);
+
+        var files = new List<OneBotFile>();
+        if (data.TryGetProperty("files", out var list) && list.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var entry in list.EnumerateArray())
+            {
+                if (entry.ValueKind != JsonValueKind.Object) continue;
+                if (!TryString(entry, "file_id", out var id) || string.IsNullOrWhiteSpace(id)) continue;
+                TryString(entry, "file_name", out var name);
+                var bytes = TryLong(entry, "file_size", out var size) ? size : (long?)null;
+                // upload_time is a unix second on every implementation that sends it; modify_time is the fallback, and
+                // either is more useful than "no date" when the model is asked "is this today's".
+                var at = TryLong(entry, "upload_time", out var uploaded) && uploaded > 0 ? Seconds(uploaded)
+                    : TryLong(entry, "modify_time", out var modified) && modified > 0 ? Seconds(modified)
+                    : (DateTimeOffset?)null;
+                TryString(entry, "uploader_name", out var from);
+                var busid = TryLong(entry, "busid", out var bus) ? bus.ToString(System.Globalization.CultureInfo.InvariantCulture) : "0";
+                files.Add(new OneBotFile(id, string.IsNullOrWhiteSpace(name) ? id : name, bytes, at,
+                    string.IsNullOrWhiteSpace(from) ? null : from, busid));
+            }
+        }
+
+        var folders = new List<string>();
+        if (data.TryGetProperty("folders", out var children) && children.ValueKind == JsonValueKind.Array)
+            foreach (var entry in children.EnumerateArray())
+                if (entry.ValueKind == JsonValueKind.Object && TryString(entry, "folder_name", out var folder) &&
+                    !string.IsNullOrWhiteSpace(folder))
+                    folders.Add(folder);
+
+        return (files, folders);
+
+        static DateTimeOffset Seconds(long unix) => DateTimeOffset.FromUnixTimeSeconds(unix);
+    }
+
+    /// <summary>
+    /// Where <c>get_file</c> says the bytes are: a url, <c>base64://</c>, a data url, or a path on the bridge's own disk.
+    /// Implementations really do answer differently, and NapCat answers with a path (docs/16 §12.5) — so the caller gets
+    /// the raw string and decides, instead of this method guessing that a string with slashes is a path.
+    /// </summary>
+    public static string? ReadFileBody(JsonElement data)
+    {
+        if (data.ValueKind != JsonValueKind.Object) return null;
+        foreach (var key in new[] { "file", "url", "base64", "file_path", "path" })
+            if (TryString(data, key, out var value) && !string.IsNullOrWhiteSpace(value)) return value;
+        return null;
+    }
+
+    /// <summary>The name <c>get_file</c> felt like including, when it did. Often it does not — the caller has a fallback.</summary>
+    public static string? ReadFileName(JsonElement data) =>
+        data.ValueKind == JsonValueKind.Object && TryString(data, "file_name", out var name) &&
+        !string.IsNullOrWhiteSpace(name) ? name : null;
+
+    /// <summary>What the bridge claims the bytes are. A claim: whoever stores them probes them (docs/28 §5).</summary>
+    public static string? ReadFileMediaType(JsonElement data) =>
+        data.ValueKind == JsonValueKind.Object && TryString(data, "content_type", out var type) &&
+        !string.IsNullOrWhiteSpace(type) ? type : null;
 
     public static OneBotResponse? ReadResponse(JsonElement root)
     {
@@ -383,7 +738,7 @@ public static partial class OneBotProtocol
             case "mface": return "[表情]";
             case "record": return "[语音]";
             case "video": return "[视频]";
-            case "file": return "[文件]";
+            case "file": return FileNote(data) ?? "[文件]";
             case "json":
             case "xml":
             case "markdown": return "[卡片]";

@@ -71,11 +71,20 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
     /// what keeps "who is allowed to talk to whom" a question about names rather than about constructor graphs.
     /// </summary>
     public GraphManager(ICatalog catalog, IModuleTypeCatalog types, IScriptExecutor executor, IAuditSink audit,
-        ISignalLog signalLog, IStateStore? state = null, IRestoreReporter? report = null)
+        ISignalLog signalLog, IStateStore? state = null, IRestoreReporter? report = null,
+        /// <summary>
+        /// How a picture the model wants to send is named. Optional: a graph without it can still send text, and
+        /// <c>speak</c> with an image block then says so instead of sending a placeholder (docs/28 §6).
+        /// </summary>
+        IMediaStore? media = null)
     {
         _catalog = catalog; _types = types; _executor = executor; _audit = audit; _signalLog = signalLog;
         _state = state; _report = report ?? NullRestoreReporter.Instance;
+        _media = media;
     }
+
+    /// <summary>Where a picture named by a tool becomes a reference the media area can resolve.</summary>
+    private readonly IMediaStore? _media;
 
     private static ModuleId IdOf(Address address) => address.ToModuleId();
 
@@ -461,7 +470,7 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         {
             var api = new ScriptApi(Adapters, Channels, _audit, _signalLog, Models, Sessions,
                 new MountedScript(package, target), new RoutedEvent(ToolCallEvent, target, invocationId, argumentsJson),
-                $"script.tool:{package.Manifest.Id}", _state, _plane, cancellationToken);
+                $"script.tool:{package.Manifest.Id}", _state, _plane, cancellationToken, _media);
             result = await _executor.InvokeAsync(package, target, argumentsJson, api, cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -931,7 +940,7 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
                 using (SignalScope.Enter(invocationId, routedEvent.EventId))
                 {
                     var api = new ScriptApi(Adapters, Channels, _audit, _signalLog, Models, Sessions, mount, routedEvent,
-                        stateScopes[handlerIndex], _state, _plane, deadline.Token);
+                        stateScopes[handlerIndex], _state, _plane, deadline.Token, _media);
                     result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
                 }
                 // The record settles after the handler returns, but its id existed during it, so
@@ -1005,9 +1014,22 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
     }
 
 
+    /// <summary>
+    /// A send the Adapter itself refused, carried out of <c>SendAsync</c> as an exception because that path is called
+    /// from scripts, which have no <see cref="Result"/> to hand back.
+    ///
+    /// It exists so the reason survives: <c>speak</c>'s generic catch turns anything unexpected into "speak failed.",
+    /// which is right for a null reference and wrong for "这个适配器发不出图片" — the model can act on the second and
+    /// cannot act on the first. When an Adapter says why, its own wording is what the model reads.
+    /// </summary>
+    private sealed class AdapterSendException(Error error) : Exception(error.Message)
+    {
+        public Error Error { get; } = error;
+    }
+
     private sealed class ScriptApi(IAdapterManager adapters, IChannelManager channels, IAuditSink audit,
         ISignalLog signalLog, IModelManager? models, ISessionManager? sessions, MountedScript mount, RoutedEvent current,
-        string? stateScope, IStateStore? state, IControlPlane? plane, CancellationToken ct) : IScriptApi
+        string? stateScope, IStateStore? state, IControlPlane? plane, CancellationToken ct, IMediaStore? media = null) : IScriptApi
     {
         /// <summary>
         /// The action table, as this script: its own id, the capabilities its manifest declared, and the level its folder
@@ -1411,7 +1433,8 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
                 opened.Ok && opened.Value is not null ? opened.Value.Id.Value : channelMessage.Channel.ToString()),
                 cancellationToken).ConfigureAwait(false);
             var input = new SessionTurnInput([new SessionChannelMessage(channelMessage.MessageId.ToString("N"), "user",
-                channelMessage.DisplaySender, channelMessage.Text, channelMessage.At)], channelMessage.Channel, channelMessage.Binding);
+                channelMessage.DisplaySender, channelMessage.Text, channelMessage.At, channelMessage.Media)],
+                channelMessage.Channel, channelMessage.Binding);
             var result = opened.Ok && opened.Value is not null
                 ? await opened.Value.RunTurnAsync(current.EventId, input,
                     new TurnToolbox(new SpeakTool(this, current, mount, channels, audit)), cancellationToken).ConfigureAwait(false)
@@ -1479,10 +1502,48 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
 
                 var binding = channelMessage.Binding;
                 if (channelMessage.Channel != current.Source || channelMessage.MessageId != current.EventId ||
-                    !channels.IsBound(current.Source, binding.Adapter, binding.PlatformConversationId) ||
-                    string.IsNullOrWhiteSpace(arguments.Text))
+                    !channels.IsBound(current.Source, binding.Adapter, binding.PlatformConversationId))
                     return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid,
-                        "speak needs non-empty text for the bound Channel."));
+                        "speak needs the bound Channel's message for this event."));
+
+                // Two shapes, one tool: {text} is the old thing and stays exactly as it was, {blocks} is a layout —
+                // words, a mention, a picture, a face, in one message. Both may not be given: a caller that supplies
+                // text and blocks has not decided which one is the message.
+                var hasBlocks = arguments.Blocks is { Count: > 0 };
+                if (hasBlocks && !string.IsNullOrWhiteSpace(arguments.Text))
+                    return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid,
+                        "speak takes {text} or {blocks}, not both."));
+                if (!hasBlocks && string.IsNullOrWhiteSpace(arguments.Text))
+                    return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid,
+                        "speak needs non-empty text, or blocks to lay out."));
+
+                if (hasBlocks)
+                {
+                    var built = await api.BuildBlocksAsync(arguments.Blocks!, channelMessage, cancellationToken).ConfigureAwait(false);
+                    if (!built.Ok || built.Value is null) return Result<SessionToolResult>.Failure(built.Error!);
+                    var layout = built.Value;
+                    // No up-front question about what the Adapter can render: it is asked by *sending*, and its answer
+                    // is the answer. A sender that checked a capability list first would be a sender that has a model of
+                    // every Adapter in it — and a second place for that model to be wrong (IOutboundAdapter.SendAsync).
+                    await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
+                        mount.Target, "session.tool.speak", "allowed", call.Id), cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        var sent = await api.DeliverAsync(current.EventId, channelMessage.Channel, binding.Adapter,
+                            binding.PlatformConversationId, MessageBlock.Flatten(layout), ChannelReplyModes.Default,
+                            channelMessage.PlatformMessageId, cancellationToken, layout).ConfigureAwait(false);
+                        // The Session's own view of what it said is the plain-text flattening: the transcript is text,
+                        // and what actually appeared as a mention or a picture is the platform's business.
+                        return Result<SessionToolResult>.Success(new SessionToolResult(
+                            JsonSerializer.Serialize(sent, JsonOptions), MessageBlock.Flatten(layout)));
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                    // The Adapter's own refusal, in its own words: this is the answer the model needs (see
+                    // AdapterSendException). Only genuinely unexpected failures become "speak failed."
+                    catch (AdapterSendException ex) { return Result<SessionToolResult>.Failure(ex.Error); }
+                    catch (Exception ex)
+                    { return Result<SessionToolResult>.Failure(new(ErrorCode.Unavailable, "speak failed.", ex.Message)); }
+                }
 
                 var mode = string.IsNullOrWhiteSpace(arguments.Mode) ? ChannelReplyModes.Default : arguments.Mode;
                 if (!ChannelReplyModes.IsKnown(mode))
@@ -1492,15 +1553,19 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
                     mount.Target, "session.tool.speak", "allowed", call.Id), cancellationToken).ConfigureAwait(false);
                 try
                 {
+                    // Past the guard above, so this is a sentence: `arguments.Text` may only be null when blocks were
+                    // given, and that case returned earlier.
+                    var said = arguments.Text!;
                     var parts = await api.DeliverAsync(current.EventId, channelMessage.Channel, binding.Adapter,
-                        binding.PlatformConversationId, arguments.Text, mode, channelMessage.PlatformMessageId, cancellationToken)
+                        binding.PlatformConversationId, said, mode, channelMessage.PlatformMessageId, cancellationToken)
                         .ConfigureAwait(false);
                     // SpokenText is how the Session learns what the conversation now has from its own side; without
                     // it a reply sent through a tool would vanish from the model's view of its own words.
                     return Result<SessionToolResult>.Success(new SessionToolResult(
-                        JsonSerializer.Serialize(parts, JsonOptions), arguments.Text));
+                        JsonSerializer.Serialize(parts, JsonOptions), said));
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                catch (AdapterSendException ex) { return Result<SessionToolResult>.Failure(ex.Error); }
                 catch (Exception ex)
                 { return Result<SessionToolResult>.Failure(new(ErrorCode.Unavailable, "speak failed.", ex.Message)); }
             }
@@ -1723,22 +1788,169 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         }
 
         /// <summary>
+        /// <c>speak</c>'s <c>{blocks}</c> argument, turned into a layout the Adapter can render — or into the sentence
+        /// saying which block could not be built and why.
+        ///
+        /// Everything is checked here rather than at the platform, because a refusal the model can read is a correction
+        /// it can make, and a message that arrives half-rendered is one nobody can fix. In particular: a mention may name
+        /// <b>the sender</b> or a platform id, never "@everyone" — a model that could ping a whole group by writing one
+        /// word is a model that will, and the cost of being wrong is everybody's phone.
+        /// </summary>
+        private async ValueTask<Result<IReadOnlyList<MessageBlock>>> BuildBlocksAsync(
+            IReadOnlyList<SessionSpeakBlock> blocks, ChannelMessage message, CancellationToken cancellationToken)
+        {
+            if (blocks.Count > MaxSpeakBlocks)
+                return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                    $"一条消息最多 {MaxSpeakBlocks} 个块，这里给了 {blocks.Count} 个。"));
+            var layout = new List<MessageBlock>(blocks.Count);
+            var text = new System.Text.StringBuilder();
+            foreach (var block in blocks)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var type = block.Type?.Trim().ToLowerInvariant();
+                switch (type)
+                {
+                    case "text":
+                        if (string.IsNullOrEmpty(block.Text))
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                                "有一个 text 块没有 text。空块删掉就行。"));
+                        text.Append(block.Text);
+                        layout.Add(new TextBlock(block.Text));
+                        break;
+                    case "at" or "mention":
+                        var who = block.Who?.Trim();
+                        if (string.IsNullOrWhiteSpace(who))
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                                "at 块需要 who：\"sender\" 表示回这条消息的人，或者直接写平台号。"));
+                        if (who is "all" or "everyone" or "全体" or "全体成员")
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Denied,
+                                "不能 @全体成员：那会响每个人的手机，而这不是一条消息该有的分量。"));
+                        if (string.Equals(who, "sender", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (string.IsNullOrWhiteSpace(message.Sender))
+                                return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                                    "这条消息没有发送者 id，写不出 at sender；用平台号或者直接称呼对方。"));
+                            layout.Add(new MentionBlock(message.Sender));
+                            text.Append('@').Append(message.Sender);
+                            break;
+                        }
+                        if (who.Length is 0 or > 20 || !who.All(char.IsAsciiDigit))
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                                $"at 只认 \"sender\" 或纯数字的平台号，收到的是：{who}。"));
+                        layout.Add(new MentionBlock(who));
+                        text.Append('@').Append(who);
+                        break;
+                    case "image":
+                    {
+                        if (media is null)
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Unavailable,
+                                "这个宿主没有接上媒体存储，发不了图。"));
+                        var (scope, path) = SplitMediaPath(block.Scope, block.Path);
+                        if (scope is null || string.IsNullOrWhiteSpace(path))
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                                "image 块需要 path：\"media/<文件>\" 或 \"workspace/<文件>\"，也可以用 scope + path 分开写。"));
+                        var described = await media.DescribeAsync(scope, path, cancellationToken).ConfigureAwait(false);
+                        if (described.Error is { } error)
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                                $"那个位置没有能发的图片：{scope}/{path}", error.Message));
+                        var picture = described.Value!;
+                        if (!picture.IsViewable)
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                                $"{scope}/{path} 不是图片（{picture.MediaType}），发不出去。"));
+                        layout.Add(new ImageBlock(picture));
+                        text.Append(MessageBlock.Flatten([new ImageBlock(picture)]));
+                        break;
+                    }
+                    case "file":
+                    {
+                        if (media is null)
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Unavailable,
+                                "这个宿主没有接上媒体存储，发不了文件。"));
+                        var (scope, path) = SplitMediaPath(block.Scope, block.Path);
+                        if (scope is null || string.IsNullOrWhiteSpace(path))
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                                "file 块需要 path：\"media/<文件>\" 或 \"workspace/<文件>\"，也可以用 scope + path 分开写。"));
+                        var described = await media.DescribeAsync(scope, path, cancellationToken).ConfigureAwait(false);
+                        if (described.Error is { } fileError)
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                                $"那个位置没有能发的文件：{scope}/{path}", fileError.Message));
+                        var stored = described.Value!;
+                        // What it is, asked of the bytes rather than of the name. Nothing here refuses on the answer —
+                        // where a file may come from is the byte surface's rule, and it already said yes by producing
+                        // this reference (docs/28 §6.6). The description is for the receipt and the adapter's `name`.
+                        var name = block.Name?.Trim();
+                        if (name is { Length: > 120 })
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                                $"file 块的 name 太长（最多 120 字）：{name[..40]}…"));
+                        var file = stored;
+                        layout.Add(new FileBlock(file, string.IsNullOrWhiteSpace(name) ? null : name));
+                        text.Append(MessageBlock.Flatten([new FileBlock(file, name)]));
+                        break;
+                    }
+                    case "face":
+                        var id = block.Id?.Trim();
+                        if (string.IsNullOrWhiteSpace(id) || id.Length > 10 || !id.All(char.IsAsciiDigit))
+                            return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                                "face 块需要平台自己的表情编号（纯数字），例如 {\"type\":\"face\",\"id\":\"1\"}。"));
+                        layout.Add(new FaceBlock(id));
+                        text.Append("[表情]");
+                        break;
+                    default:
+                        return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                            $"没有这种块：{block.Type}。能用的有 text / at / image / face / file。"));
+                }
+                if (text.Length > MaxSpeakChars)
+                    return Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid,
+                        $"这条消息太长（超过 {MaxSpeakChars} 字）。分成几条说，或者先说重要的。"));
+            }
+            return layout.Count == 0
+                ? Result<IReadOnlyList<MessageBlock>>.Failure(new(ErrorCode.Invalid, "blocks 是空的。"))
+                : Result<IReadOnlyList<MessageBlock>>.Success(layout);
+        }
+
+        /// <summary>
+        /// Where a file is: <c>scope</c> + <c>path</c>, or one string whose head is the scope.
+        ///
+        /// Nothing here lists which scopes exist. The head of <c>media/x</c> is taken as a scope name and the store
+        /// answers whether that room exists and whether its bytes may be read at all — one place decides, and the
+        /// question "may a model send this" is answered there rather than insisted on twice (docs/24, docs/28 §6.6).
+        /// </summary>
+        private static (string? Scope, string Path) SplitMediaPath(string? scope, string? path)
+        {
+            if (!string.IsNullOrWhiteSpace(path))
+            {
+                var trimmed = path.Trim().Replace('\\', '/');
+                if (!string.IsNullOrWhiteSpace(scope)) return (scope.Trim(), trimmed);
+                var slash = trimmed.IndexOf('/');
+                return slash > 0 ? (trimmed[..slash], trimmed[(slash + 1)..]) : (null, trimmed);
+            }
+            return (scope, string.Empty);
+        }
+
+        /// <summary>
         /// Turns one reply into the messages it should arrive as, and sends each of them the way an Adapter
         /// expects: one call, one message. Everything above this line may grow more modes (a rendered picture
         /// for a long answer, a file); nothing below it has to know.
+        ///
+        /// <paramref name="blocks"/> is the layout case, and it is exactly one message: a layout is what one message
+        /// looks like, so "split into segments" and "lay it out" cannot both be asked for.
         /// </summary>
-        private async Task<List<SendResult>> DeliverAsync(Guid eventId, Address? channel, Address adapter,
-            string platformConversationId, string text, string mode, string? replyTo, CancellationToken cancellationToken)
+        public async Task<List<SendResult>> DeliverAsync(Guid eventId, Address? channel, Address adapter,
+            string platformConversationId, string text, string mode, string? replyTo, CancellationToken cancellationToken,
+            IReadOnlyList<MessageBlock>? blocks = null)
         {
-            var parts = string.Equals(mode, ChannelReplyModes.Segments, StringComparison.Ordinal)
-                ? SplitOnBlankLines(text)
-                : [text.Trim()];
+            var parts = blocks is not null
+                ? [text]
+                : string.Equals(mode, ChannelReplyModes.Segments, StringComparison.Ordinal)
+                    ? SplitOnBlankLines(text)
+                    : [text.Trim()];
             var sent = new List<SendResult>(parts.Count);
             for (var index = 0; index < parts.Count; index++)
             {
                 // The quoted reply belongs on the first message: the rest are the same answer continuing, and a
                 // quote on each of them buries the conversation in arrows.
-                var piece = new OutboundMessage(platformConversationId, parts[index], index == 0 ? replyTo : null);
+                var piece = new OutboundMessage(platformConversationId, parts[index], index == 0 ? replyTo : null,
+                    index == 0 ? blocks : null);
                 sent.Add(await SendAsync(eventId, channel, adapter, piece, cancellationToken).ConfigureAwait(false));
             }
             return sent;
@@ -1943,8 +2155,12 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
             ct.ThrowIfCancellationRequested();
             var found = adapters.Get(adapter);
             if (!found.Ok || found.Value is null) throw new InvalidOperationException("Bound Adapter is unavailable.");
+            // No capability check here either: this is the one place every block-carrying send passes through, and it
+            // passes the message to the Adapter unchanged. If a part cannot go out, the Adapter says so on this call —
+            // and if it goes out as its text form instead, SendResult.Detail carries that back to the caller.
             var result = await found.Value.SendAsync(message, cancellationToken).ConfigureAwait(false);
-            if (!result.Ok || result.Value is null) throw new InvalidOperationException(result.Error?.Message ?? "Adapter send failed.");
+            if (!result.Ok || result.Value is null)
+                throw new AdapterSendException(result.Error ?? new(ErrorCode.Unavailable, "Adapter send failed."));
             if (channel is { } answeredChannel)
             {
                 // Written down after the send, never before: the reply is already out, so a failed row costs at
@@ -1967,7 +2183,31 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         }
 
         private static T Parse<T>(string json) => JsonSerializer.Deserialize<T>(json, JsonOptions) ?? throw new ArgumentException("Script API received invalid JSON.");
-        private sealed record SessionSpeakArguments(string Text, string? Mode = null);
+
+        /// <summary>
+        /// <c>speak</c>'s arguments. <see cref="Text"/> and <see cref="Blocks"/> are alternatives: one is a sentence, the
+        /// other is a layout, and a caller that sends both has not decided which one is the message.
+        /// </summary>
+        private sealed record SessionSpeakArguments(string? Text = null, string? Mode = null,
+            IReadOnlyList<SessionSpeakBlock>? Blocks = null);
+
+        /// <summary>
+        /// One block as the model writes it: <c>{"type":"text","text":…}</c>, <c>{"type":"at","who":"sender"}</c>,
+        /// <c>{"type":"image","path":"media/…"}</c>, <c>{"type":"face","id":"1"}</c>.
+        ///
+        /// Deliberately not the <see cref="MessageBlock"/> hierarchy: the model names where a picture <b>is</b>, and the
+        /// core turns that into the reference a picture travels as. Letting a model write a MediaRef would let it invent
+        /// one — a scope, a size, a hash — and the first thing it got wrong would be sent.
+        /// </summary>
+        private sealed record SessionSpeakBlock(string? Type = null, string? Text = null, string? Who = null,
+            string? Path = null, string? Scope = null, string? Id = null, string? Name = null);
+
+        /// <summary>
+        /// How much one laid-out message may hold. Not a platform limit — it is the point past which "one message" stops
+        /// being what was meant, and the refusal says so rather than truncating.
+        /// </summary>
+        private const int MaxSpeakBlocks = 32;
+        private const int MaxSpeakChars = 8000;
         private sealed record RouteOptions(string? ChannelId, string? Name);
         private const int MaxLogRecords = 200;
         private const int MaxLogMessageLength = 2_000;

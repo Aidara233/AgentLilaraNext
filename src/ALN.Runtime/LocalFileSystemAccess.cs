@@ -20,13 +20,15 @@ namespace ALN.Runtime;
 /// Text only: a file with NUL bytes or invalid UTF-8 is refused rather than guessed at, because a model that reads
 /// mojibake will confidently reason about it.
 /// </summary>
-public sealed class LocalFileSystemAccess : IFileSystemAccess
+public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
 {
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
     private static readonly char[] Separators = ['/', '\\'];
 
     private readonly string _root;
     private readonly IReadOnlyList<string> _scopes;
+    private readonly IReadOnlyList<string> _binaryScopes;
+    private readonly IReadOnlyList<string> _readOnlyScopes;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _appendLocks = new(StringComparer.Ordinal);
 
     /// <param name="dataRoot">Where the host keeps its data; scopes are directories directly under it.</param>
@@ -34,7 +36,20 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess
     /// The scopes this instance may touch. A scope's name is one path segment (it becomes a directory name), and it is
     /// registered here rather than derived: "which directories exist" is the host's decision (C-20).
     /// </param>
-    public LocalFileSystemAccess(string dataRoot, IReadOnlyList<string> scopes)
+    /// <param name="binaryScopes">
+    /// The subset of <paramref name="scopes"/> that accept bytes as well as text. Empty by default: a directory is a
+    /// text room until somebody says otherwise, because "the model can park a tarball here" is a different grant from
+    /// "the model can keep notes here" (docs/24 §5).
+    /// </param>
+    /// <param name="readOnlyScopes">
+    /// The subset of <paramref name="scopes"/> that a caller may read but never write: today that is
+    /// <c>media</c>, the area the host fills (docs/28). Its purpose is not tidiness — a session's record names the
+    /// files it looked at, so a caller that could rewrite one could change what it is recorded as having seen.
+    /// Enforced here rather than in the tools because there is more than one way in (text and bytes), and two entry
+    /// points with two rules is how one of them ends up forgetting.
+    /// </param>
+    public LocalFileSystemAccess(string dataRoot, IReadOnlyList<string> scopes,
+        IReadOnlyList<string>? binaryScopes = null, IReadOnlyList<string>? readOnlyScopes = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         ArgumentNullException.ThrowIfNull(scopes);
@@ -58,6 +73,33 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess
         }
         _scopes = registered.AsReadOnly();
 
+        var binary = new List<string>();
+        foreach (var scope in binaryScopes ?? [])
+        {
+            var canonical = FilePaths.Split(scope) is { Ok: true } split && split.Value!.Count > 0
+                ? string.Join("/", split.Value)
+                : scope;
+            // Refused rather than dropped: a binary scope that does not exist reads exactly like "transfers are broken".
+            if (!registered.Contains(canonical, StringComparer.Ordinal))
+                throw new ArgumentException($"'{scope}' is not a registered scope, so it cannot allow binary.", nameof(binaryScopes));
+            binary.Add(canonical);
+        }
+        _binaryScopes = binary.AsReadOnly();
+
+        var readOnly = new List<string>();
+        foreach (var scope in readOnlyScopes ?? [])
+        {
+            var canonical = FilePaths.Split(scope) is { Ok: true } split && split.Value!.Count > 0
+                ? string.Join("/", split.Value)
+                : scope;
+            // Same rule as the binary ones: an unregistered read-only scope is a configuration mistake that would
+            // otherwise behave exactly like "the model is allowed to write there".
+            if (!registered.Contains(canonical, StringComparer.Ordinal))
+                throw new ArgumentException($"'{scope}' is not a registered scope, so it cannot be read-only.", nameof(readOnlyScopes));
+            readOnly.Add(canonical);
+        }
+        _readOnlyScopes = readOnly.AsReadOnly();
+
         // Created once, like the mailbox's folders: a caller may ask what is in an empty scope, and "the directory
         // has not been made yet" is not that answer.
         foreach (var scope in _scopes)
@@ -68,6 +110,121 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess
     }
 
     public IReadOnlyList<string> Scopes => _scopes;
+
+    public IReadOnlyList<string> BinaryScopes => _binaryScopes;
+
+    /// <summary>The scopes that may be read but never written. Empty unless the host said otherwise.</summary>
+    public IReadOnlyList<string> ReadOnlyScopes => _readOnlyScopes;
+
+    /// <summary>
+    /// The refusal every write path shares. A read-only scope is not "a scope with a permission bit missing": the
+    /// caller is told which area it is and where its own files belong, because "denied" with no alternative is how a
+    /// model retries the same thing three times.
+    /// </summary>
+    private Error? RefuseWrite(string scope)
+    {
+        if (!_readOnlyScopes.Contains(scope, StringComparer.Ordinal)) return null;
+        var writable = _scopes.Where(s => !_readOnlyScopes.Contains(s, StringComparer.Ordinal)).ToArray();
+        return new(ErrorCode.Denied,
+            $"Scope '{scope}' is read-only: the host writes it, and a session only reads it. "
+            + (writable.Length == 0 ? "No scope accepts writes." : $"Writable scopes: {string.Join(", ", writable)}."));
+    }
+
+    /// <summary>
+    /// Opens a file as bytes. Same containment as every other operation, plus one more refusal: the scope has to be one
+    /// that accepts binary at all. Reads are streamed, not slurped, so a 64 MiB transfer costs a buffer rather than 64 MiB
+    /// of managed heap per retry.
+    /// </summary>
+    public ValueTask<Result<Stream>> OpenReadAsync(string scope, string path, CancellationToken cancellationToken) =>
+        OpenReadStreamAsync(scope, path, IBinaryFileAccess.MaxTransferBytes, cancellationToken);
+
+    /// <inheritdoc />
+    public ValueTask<Result<Stream>> OpenReadStreamAsync(string scope, string path, long ceiling,
+        CancellationToken cancellationToken) =>
+        Run(cancellationToken, () =>
+        {
+            if (!_binaryScopes.Contains(scope, StringComparer.Ordinal))
+                return Result<Stream>.Failure(new(ErrorCode.Denied,
+                    $"Scope '{scope}' does not allow binary transfers. Scopes that do: "
+                    + (_binaryScopes.Count == 0 ? "(none)" : string.Join(", ", _binaryScopes)) + "."));
+            if (Resolve(scope, path, out var absolute, out var denied) is false) return Result<Stream>.Failure(denied!);
+            if (Directory.Exists(absolute))
+                return Result<Stream>.Failure(new(ErrorCode.Invalid, $"'{Canonical(scope, path)}' is a directory."));
+            if (!File.Exists(absolute))
+                return Result<Stream>.Failure(new(ErrorCode.Invalid, $"'{Canonical(scope, path)}' does not exist."));
+            var length = new FileInfo(absolute).Length;
+            if (length > ceiling)
+                return Result<Stream>.Failure(new(ErrorCode.Invalid,
+                    $"'{Canonical(scope, path)}' is {length} bytes, more than the {ceiling} allowed."));
+            // FileShare.Read: two readers are fine, a writer is not — an upload reading a half-written file would send
+            // half a file and call it done.
+            return Result<Stream>.Success(new FileStream(absolute, FileMode.Open, FileAccess.Read, FileShare.Read));
+        });
+
+    /// <summary>
+    /// Streams bytes into a file: temporary file beside the target, then rename. Never buffers the whole thing, and a
+    /// caller that dies mid-way leaves the old file untouched.
+    /// </summary>
+    public ValueTask<Result> SaveAsync(string scope, string path, Stream content, CancellationToken cancellationToken) =>
+        SaveCoreAsync(scope, path, content, asHost: false, cancellationToken);
+
+    /// <summary>
+    /// The host's own write path: the one way into a read-only scope.
+    ///
+    /// <c>internal</c> on purpose — it is on no interface a module can hold, so "the host fills media, a model only
+    /// reads it" is a fact about the assembly rather than a rule somebody has to remember to check. Everything else is
+    /// the same code as <see cref="SaveAsync"/>: same scope check, same containment, same rename-into-place.
+    /// </summary>
+    internal ValueTask<Result> SaveAsHostAsync(string scope, string path, Stream content, CancellationToken cancellationToken) =>
+        SaveCoreAsync(scope, path, content, asHost: true, cancellationToken);
+
+    private ValueTask<Result> SaveCoreAsync(string scope, string path, Stream content, bool asHost,
+        CancellationToken cancellationToken) =>
+        Run(cancellationToken, () =>
+        {
+            ArgumentNullException.ThrowIfNull(content);
+            if (!asHost && RefuseWrite(scope) is { } readOnly) return Result.Failure(readOnly);
+            if (!_binaryScopes.Contains(scope, StringComparer.Ordinal))
+                return Result.Failure(new(ErrorCode.Denied,
+                    $"Scope '{scope}' does not allow binary transfers. Scopes that do: "
+                    + (_binaryScopes.Count == 0 ? "(none)" : string.Join(", ", _binaryScopes)) + "."));
+            if (Resolve(scope, path, out var absolute, out var denied) is false) return Result.Failure(denied!);
+            if (Directory.Exists(absolute))
+                return Result.Failure(new(ErrorCode.Invalid, $"'{Canonical(scope, path)}' is a directory."));
+
+            var scopeRoot = Path.Combine(_root, scope);
+            var parent = Path.GetDirectoryName(absolute)!;
+            SafeFileSystem.EnsureDirectory(parent);
+            SafeFileSystem.VerifyNewOrRegularFile(absolute, scopeRoot);
+
+            var temporary = Path.Combine(parent, $".{Path.GetFileName(absolute)}.{Guid.NewGuid():N}.tmp");
+            SafeFileSystem.VerifyNewOrRegularFile(temporary, scopeRoot);
+            try
+            {
+                long written = 0;
+                using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    var buffer = new byte[81_920];
+                    int read;
+                    while ((read = content.ReadAsync(buffer, cancellationToken).AsTask().GetAwaiter().GetResult()) > 0)
+                    {
+                        written += read;
+                        // Checked as it goes: refusing after the disk is full is not a refusal, it is a mess.
+                        if (written > IBinaryFileAccess.MaxTransferBytes)
+                            return Result.Failure(new(ErrorCode.Invalid,
+                                $"The content is larger than the {IBinaryFileAccess.MaxTransferBytes} allowed for one transfer."));
+                        stream.Write(buffer, 0, read);
+                    }
+                    stream.Flush(flushToDisk: true);
+                }
+                File.Move(temporary, absolute, overwrite: true);
+                return Result.Success();
+            }
+            finally
+            {
+                if (File.Exists(temporary)) try { File.Delete(temporary); } catch (IOException) { }
+            }
+        });
 
     public ValueTask<Result<IReadOnlyList<FileEntry>>> ListAsync(string scope, string path, CancellationToken cancellationToken) =>
         Run(cancellationToken, () =>
@@ -156,6 +313,7 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess
         Run(cancellationToken, () =>
         {
             ArgumentNullException.ThrowIfNull(text);
+            if (RefuseWrite(scope) is { } readOnly) return Result<FileText>.Failure(readOnly);
             if (Encoding.UTF8.GetByteCount(text) > IFileSystemAccess.MaxFileBytes)
                 return Result<FileText>.Failure(new(ErrorCode.Invalid, $"Text is larger than {IFileSystemAccess.MaxFileBytes} bytes."));
             if (Resolve(scope, path, out var absolute, out var denied) is false) return Result<FileText>.Failure(denied!);
@@ -194,6 +352,7 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess
         Run(cancellationToken, () =>
         {
             ArgumentNullException.ThrowIfNull(text);
+            if (RefuseWrite(scope) is { } readOnly) return Result<long>.Failure(readOnly);
             if (Resolve(scope, path, out var absolute, out var denied) is false) return Result<long>.Failure(denied!);
             if (Directory.Exists(absolute))
                 return Result<long>.Failure(new(ErrorCode.Invalid, $"'{Canonical(scope, path)}' is a directory."));
@@ -222,14 +381,27 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess
         });
 
     public ValueTask<Result> MoveAsync(string scope, string from, string to, CancellationToken cancellationToken) =>
+        MoveCoreAsync(scope, from, to, asHost: false, cancellationToken);
+
+    /// <summary>The host's own rename, for filling a read-only scope. See <see cref="SaveAsHostAsync"/> for why this is internal.</summary>
+    internal ValueTask<Result> MoveAsHostAsync(string scope, string from, string to, CancellationToken cancellationToken) =>
+        MoveCoreAsync(scope, from, to, asHost: true, cancellationToken);
+
+    private ValueTask<Result> MoveCoreAsync(string scope, string from, string to, bool asHost,
+        CancellationToken cancellationToken) =>
         Run(cancellationToken, () =>
         {
+            if (!asHost && RefuseWrite(scope) is { } readOnly) return Result.Failure(readOnly);
             if (Resolve(scope, from, out var source, out var fromDenied) is false) return Result.Failure(fromDenied!);
             if (Resolve(scope, to, out var destination, out var toDenied) is false) return Result.Failure(toDenied!);
             var scopeRoot = Path.Combine(_root, scope);
             if (!File.Exists(source) && !Directory.Exists(source))
                 return Result.Failure(new(ErrorCode.Invalid, $"Nothing to move: {Canonical(scope, from)}"));
             var parent = Path.GetDirectoryName(destination)!;
+            // The host's own moves name their destination after its content, which means the shard folder may not exist
+            // yet. A caller's move still has to say where it is going — that rule is about not inventing a directory a
+            // person did not ask for, and the host inventing one is the whole point of content addressing.
+            if (asHost) SafeFileSystem.EnsureDirectory(parent);
             if (!Directory.Exists(parent))
                 return Result.Failure(new(ErrorCode.Invalid, $"Destination directory does not exist: {Canonical(scope, to)}"));
             if (File.Exists(destination) || Directory.Exists(destination))
@@ -241,8 +413,17 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess
         });
 
     public ValueTask<Result> DeleteAsync(string scope, string path, bool recursive, CancellationToken cancellationToken) =>
+        DeleteCoreAsync(scope, path, recursive, asHost: false, cancellationToken);
+
+    /// <summary>The host's own delete, for tidying up after a failed ingest in a read-only scope.</summary>
+    internal ValueTask<Result> DeleteAsHostAsync(string scope, string path, CancellationToken cancellationToken) =>
+        DeleteCoreAsync(scope, path, recursive: false, asHost: true, cancellationToken);
+
+    private ValueTask<Result> DeleteCoreAsync(string scope, string path, bool recursive, bool asHost,
+        CancellationToken cancellationToken) =>
         Run(cancellationToken, () =>
         {
+            if (!asHost && RefuseWrite(scope) is { } readOnly) return Result.Failure(readOnly);
             if (Resolve(scope, path, out var absolute, out var denied) is false) return Result.Failure(denied!);
             if (File.Exists(absolute))
             {

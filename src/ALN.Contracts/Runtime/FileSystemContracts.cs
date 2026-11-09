@@ -123,6 +123,21 @@ public static class FileScopes
     /// everything is not a loss.
     /// </summary>
     public const string Workspace = "workspace";
+
+    /// <summary>
+    /// Everything that is not text and was not written by the model: <c>&lt;dataRoot&gt;/media</c>, split by kind
+    /// (<c>image/</c>, <c>voice/</c>, …) and then by day (docs/28).
+    ///
+    /// It is a storage area beside the other three, not a module's private folder, for the same reason memory and the
+    /// workspace are: "which directories exist" is the host's decision, and a module that owned a directory would be a
+    /// second file system with slightly different rules.
+    ///
+    /// <b>Read-only to the model.</b> It may look at what is here — that is the whole point, a picture it can see —
+    /// but it may not write, move or delete any of it. The bytes here are what somebody else sent, and a session's
+    /// record points at them by name: a model that could rewrite the file could change what it is recorded as having
+    /// looked at. Its own产出 belongs in <see cref="Workspace"/>.
+    /// </summary>
+    public const string Media = "media";
 }
 
 /// <summary>

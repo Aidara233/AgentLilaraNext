@@ -122,15 +122,52 @@ public sealed class FileSystemModuleTests : IDisposable
         var scan = await store.ScanAsync(types: null, default);
         var manifest = Assert.Single(scan.Manifests);
         var built = FileSystemModule.FromManifest(manifest,
-            Access(FileScopes.Memory, FileScopes.Workspace, FileScopes.ScriptsDraft), new SessionExtensionRegistry());
+            Access(FileScopes.Memory, FileScopes.Workspace, FileScopes.ScriptsDraft, FileScopes.Media),
+            new SessionExtensionRegistry());
 
         Assert.True(built.Ok, built.Error?.Message);
-        // The default configuration is what the host writes: the memory library, a workspace for chores, plus the folder
-        // a script is drafted in.
-        Assert.Equal([FileScopes.Memory, FileScopes.Workspace, FileScopes.ScriptsDraft], ((FileSystemModule)built.Value!).Scopes);
+        // The default configuration is what the host writes: the memory library, a workspace for chores, the folder a
+        // script is drafted in, and the media area the host fills and the model only reads (docs/28).
+        Assert.Equal([FileScopes.Memory, FileScopes.Workspace, FileScopes.ScriptsDraft, FileScopes.Media],
+            ((FileSystemModule)built.Value!).Scopes);
     }
 
     // ---- what the model experiences -------------------------------------------------------------
+
+    [Fact]
+    public async Task The_media_area_is_offered_to_the_tools_and_refuses_every_write()
+    {
+        // Media is a normal scope for reading — the tools find it, list it, and a text file in it reads back — and a
+        // closed door for writing. The refusal is the port's, so it holds for every tool at once instead of for the
+        // seven handlers somebody remembered to change (docs/28 §2).
+        var access = new LocalFileSystemAccess(_root, [FileScopes.Media, FileScopes.Workspace],
+            binaryScopes: [FileScopes.Media, FileScopes.Workspace], readOnlyScopes: [FileScopes.Media]);
+        Directory.CreateDirectory(Path.Combine(_root, "media", "image"));
+        await File.WriteAllTextAsync(Path.Combine(_root, "media", "image", "note.md"), "记一笔");
+        var source = new FileSystemTools(access, [FileScopes.Media, FileScopes.Workspace]);
+
+        var listed = await CallAsync(source, "fs_list", """{"scope":"media","path":"image"}""");
+        Assert.True(listed.Ok, listed.Error?.Message);
+        Assert.Contains("note.md", listed.Value!.Content, StringComparison.Ordinal);
+        var read = await CallAsync(source, "fs_read", """{"scope":"media","path":"image/note.md"}""");
+        Assert.Equal("记一笔", read.Value!.Content);
+
+        foreach (var (tool, arguments) in new[]
+                 {
+                     ("fs_write", """{"scope":"media","path":"image/x.md","text":"写"}"""),
+                     ("fs_append", """{"scope":"media","path":"image/note.md","text":"补"}"""),
+                     ("fs_remove", """{"scope":"media","path":"image/note.md"}"""),
+                     ("fs_move", """{"scope":"media","from":"image/note.md","to":"image/y.md"}""")
+                 })
+        {
+            var refused = await CallAsync(source, tool, arguments);
+            Assert.False(refused.Ok, tool);
+            Assert.Equal(ErrorCode.Denied, refused.Error!.Code);
+            Assert.Contains("read-only", refused.Error.Message, StringComparison.OrdinalIgnoreCase);
+        }
+
+        Assert.Equal("记一笔", await File.ReadAllTextAsync(Path.Combine(_root, "media", "image", "note.md")));
+    }
 
     private static async Task<Result<SessionToolResult>> CallAsync(ISessionToolSource source, string tool, string arguments)
     {

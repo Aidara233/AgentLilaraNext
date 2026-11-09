@@ -161,8 +161,11 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter, ITriggerSink
             // The file's text is the message: nothing to parse, nothing to validate. The sender is the conversation,
             // because one folder is one person here — a private mailbox has no roster — and the message id was assigned
             // when the input was claimed, so the file name is not an identity and does not have to be well-formed.
+            //
+            // A file that was not text arrives as an attachment instead: dropping a picture into the folder is how a
+            // person exercises the whole media path without a chat platform in the way (docs/28 §1).
             var text = input.Content.Trim();
-            if (text.Length == 0)
+            if (text.Length == 0 && input.Attachments is not { Count: > 0 })
             {
                 try
                 {
@@ -176,7 +179,7 @@ public sealed class FileAdapter : AdapterBase, IPollingAdapter, ITriggerSink
             }
 
             var envelope = new AdapterEnvelope(Address, Descriptor.PlatformId, input.ConversationId, input.Token, text,
-                DateTimeOffset.UtcNow, input.ConversationId);
+                DateTimeOffset.UtcNow, input.ConversationId, Attachments: input.Attachments);
 
             Result published;
             try

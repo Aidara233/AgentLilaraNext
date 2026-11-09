@@ -63,7 +63,10 @@ public sealed class DefaultModulesPlugin : IModulePlugin
             var channelActions = channels.RegisterActions(HostService<IControlPlane>(context));
             if (!channelActions.Ok) return ValueTask.FromResult(channelActions);
             var executor = new JintScriptExecutor();
-            var graph = new GraphManager(catalog, types, executor, audit, journal, state, report);
+            // Media is optional for the graph: without it, speak's image blocks say so. The ChannelManager above gets the
+            // same store through host services, which is where both of them ask for it by contract name.
+            var media = context.HostServices.GetService(typeof(IMediaStore)) as IMediaStore;
+            var graph = new GraphManager(catalog, types, executor, audit, journal, state, report, media);
             if (bindings is IInstanceBindingsProxy proxy) proxy.Bind(graph);
             // The mount verbs are the graph's: it owns the rules, and it owns what a scope may name.
             var graphActions = graph.RegisterActions(HostService<IControlPlane>(context));

@@ -34,6 +34,23 @@ public interface ISessionDeadlineHandler
 }
 
 /// <summary>
+/// Telling a Session that work it started has ended while it was not looking.
+///
+/// <b>One method, and it takes no description of what ended.</b> Not out of laziness: a caller that could pass its own
+/// account would eventually disagree with the table, and the model would read two stories about one job. So the caller
+/// says "this session has news", and the news itself is read from the table when the turn assembles its note
+/// (<c>docs/28 §9.4</c>).
+///
+/// An implementation is <b>not</b> obliged to run a turn. A Session already inside one is skipped — and that is not a
+/// lost wake-up: the row it would have been told about stays unannounced, so the next turn carries it. Late, not gone.
+/// </summary>
+public interface ISessionWaker
+{
+    /// <summary>Runs a turn now, or skips it when the Session is already in one.</summary>
+    ValueTask<Result> WakeAsync(string sessionId, CancellationToken cancellationToken);
+}
+
+/// <summary>
 /// What one pass of the deadline sweep did. Reported rather than logged so that "the sweep ran and found
 /// nothing" and "the sweep never ran" cannot look the same from outside.
 /// </summary>

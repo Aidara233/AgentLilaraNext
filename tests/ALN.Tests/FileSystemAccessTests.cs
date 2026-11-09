@@ -327,4 +327,85 @@ public sealed class FileSystemAccessTests : IDisposable
         Assert.Equal(ErrorCode.Invalid, listing.Error!.Code);
         Assert.Contains("link", listing.Error.Message, StringComparison.OrdinalIgnoreCase);
     }
+
+    // ---- read-only scopes ----------------------------------------------------------------------
+
+    private LocalFileSystemAccess WithMedia() =>
+        new(_root, ["memory", "workspace", "media"], binaryScopes: ["workspace", "media"], readOnlyScopes: ["media"]);
+
+    [Fact]
+    public async Task A_read_only_scope_can_be_read_and_listed_but_not_written()
+    {
+        var access = WithMedia();
+        // The host is the one that fills it, so the test plays the host: the file is put there directly.
+        Directory.CreateDirectory(Path.Combine(_root, "media", "image"));
+        await File.WriteAllTextAsync(Path.Combine(_root, "media", "image", "note.md"), "别人发来的东西");
+
+        var read = await access.ReadAsync("media", "image/note.md", default);
+        Assert.True(read.Ok, read.Error?.Message);
+        Assert.Equal("别人发来的东西", read.Value!.Text);
+
+        var listed = await access.ListAsync("media", "image", default);
+        Assert.True(listed.Ok, listed.Error?.Message);
+        Assert.Equal("note.md", Assert.Single(listed.Value!).Name);
+
+        var written = await access.WriteAsync("media", "image/note.md", "改掉它", default);
+        Assert.False(written.Ok);
+        Assert.Equal(ErrorCode.Denied, written.Error!.Code);
+        // Denied with no alternative is how a model retries the same call three times: the message says where its own
+        // files belong, and does not name the scope it is standing in.
+        Assert.Contains("read-only", written.Error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(FileScopes.Workspace, written.Error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("Writable scopes: media", written.Error.Message, StringComparison.Ordinal);
+
+        // Nothing was replaced on the way to that refusal.
+        Assert.Equal("别人发来的东西", await File.ReadAllTextAsync(Path.Combine(_root, "media", "image", "note.md")));
+    }
+
+    [Fact]
+    public async Task Every_way_of_writing_to_a_read_only_scope_is_refused()
+    {
+        var access = WithMedia();
+        Directory.CreateDirectory(Path.Combine(_root, "media"));
+        Directory.CreateDirectory(Path.Combine(_root, "workspace"));
+        await File.WriteAllTextAsync(Path.Combine(_root, "media", "a.txt"), "x");
+
+        Assert.Equal(ErrorCode.Denied, (await access.AppendAsync("media", "a.txt", "y", default)).Error!.Code);
+        Assert.Equal(ErrorCode.Denied, (await access.DeleteAsync("media", "a.txt", false, default)).Error!.Code);
+        Assert.Equal(ErrorCode.Denied, (await access.MoveAsync("media", "a.txt", "b.txt", default)).Error!.Code);
+        Assert.Equal(ErrorCode.Denied,
+            (await access.SaveAsync("media", "b.bin", new MemoryStream([1, 2, 3]), default)).Error!.Code);
+
+        // The workspace is still the place to put things, which is what the refusal above points at.
+        Assert.True((await access.WriteAsync("workspace", "mine.txt", "我的", default)).Ok);
+        Assert.True(File.Exists(Path.Combine(_root, "media", "a.txt")));
+        Assert.False(File.Exists(Path.Combine(_root, "media", "b.txt")));
+        Assert.False(File.Exists(Path.Combine(_root, "media", "b.bin")));
+    }
+
+    [Fact]
+    public async Task A_read_only_scope_that_accepts_bytes_can_be_opened_for_reading()
+    {
+        var access = WithMedia();
+        Directory.CreateDirectory(Path.Combine(_root, "media", "image"));
+        await File.WriteAllBytesAsync(Path.Combine(_root, "media", "image", "x.png"), [0x89, 0x50, 0x4E, 0x47]);
+
+        await using var stream = (await access.OpenReadAsync("media", "image/x.png", default)).Value!;
+        var buffer = new byte[4];
+        Assert.Equal(4, await stream.ReadAsync(buffer, default));
+        Assert.Equal([0x89, 0x50, 0x4E, 0x47], buffer);
+
+        // The read-only refusal is the reason given, not "this scope does not allow binary": both are true here, and
+        // the useful one is the one the caller can act on.
+        var saved = await access.SaveAsync("media", "image/y.png", new MemoryStream([1]), default);
+        Assert.Equal(ErrorCode.Denied, saved.Error!.Code);
+        Assert.Contains("read-only", saved.Error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void A_read_only_scope_that_was_never_registered_is_refused_at_construction()
+    {
+        var bad = Assert.Throws<ArgumentException>(() => new LocalFileSystemAccess(_root, ["workspace"], readOnlyScopes: ["media"]));
+        Assert.Contains("media", bad.Message, StringComparison.Ordinal);
+    }
 }

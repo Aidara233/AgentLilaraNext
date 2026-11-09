@@ -10,5 +10,8 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\ALN.Contracts\ALN.Contracts.csproj" />
+    <!-- The media endpoint reads a file's header to decide whether it is a picture at all: that probe is the same one
+         the store uses, and a second opinion about "is this an image" is how the two disagree later. -->
+    <ProjectReference Include="..\ALN.Runtime\ALN.Runtime.csproj" />
   </ItemGroup>
 </Project>

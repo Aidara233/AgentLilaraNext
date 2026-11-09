@@ -9,7 +9,8 @@ namespace ALN.Channel;
 public sealed partial class ChannelManager(IEventSink events, IInstanceBindings bindings, ICatalog catalog,
     IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
     IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IQueuedMessageStore? queue = null,
-    IArchiveRegistry? archive = null, IInstanceHost? instances = null, IModuleTypeCatalog? types = null)
+    IArchiveRegistry? archive = null, IInstanceHost? instances = null, IModuleTypeCatalog? types = null,
+    IMediaStore? media = null)
     : IChannelManager, IModuleIndex, IModuleWiring, IInstanceSink, ILifecycleParticipant, IModule, IRequireModules
 {
     /// <inheritdoc />
@@ -59,6 +60,9 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
     private readonly IQueuedMessageStore? _queue = queue;
     private readonly IArchiveRegistry? _archive = archive;
     private readonly IModuleTypeCatalog? _types = types;
+    /// <summary>Where a picture that arrived with a message goes. Null means "this host stores nothing", and then the
+    /// attachment is dropped with a note rather than taking the message down with it.</summary>
+    private readonly IMediaStore? _media = media;
     private IInstanceHost? _instances = instances;
     /// <summary>Instances by name. The address lives on the instance; the name is the key, so nothing has to take one
     /// apart to look something up.</summary>
@@ -475,7 +479,8 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
                 }
             }
             var message = new ChannelMessage(envelope.EventId, channel.Address, binding, envelope.PlatformMessageId,
-                envelope.Text, envelope.At, envelope.Sender, envelope.MentionsSelf, senderRemark, senderName);
+                envelope.Text, envelope.At, envelope.Sender, envelope.MentionsSelf, senderRemark, senderName,
+                await IngestAsync(envelope, cancellationToken).ConfigureAwait(false));
             // One fact, one transaction: the history row and the "accepted but unfinished" marker are written
             // together. Half of them is either a message nobody will look at or a marker naming nothing.
             var duplicate = false;
@@ -486,7 +491,10 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
                     // The channel keeps its own history; the mailbox folder is transport, not storage.
                     var recorded = await _messages.AppendAsync(new StoredMessage(envelope.EventId.ToString("D"),
                         channel.Address, envelope.PlatformConversationId, envelope.PlatformMessageId,
-                        envelope.Sender, envelope.Text, envelope.At, SenderName: senderName, SenderRemark: senderRemark),
+                        envelope.Sender, envelope.Text, envelope.At, SenderName: senderName, SenderRemark: senderRemark,
+                        // The delta that reaches a Session an hour later reads this row, so the pointers travel with it:
+                        // a message that is half a picture would otherwise look like somebody who said nothing.
+                        Media: message.Media),
                         token).ConfigureAwait(false);
                     if (recorded.Error?.Code == ErrorCode.Conflict)
                     {
@@ -499,7 +507,7 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
                 }
                 return await AddPendingAsync(channel.Address, new PendingAccept(envelope.EventId.ToString("D"),
                     envelope.PlatformMessageId, binding.Adapter.ToString(), binding.PlatformConversationId,
-                    envelope.Text, envelope.At, envelope.Sender), token).ConfigureAwait(false);
+                    envelope.Text, envelope.At, envelope.Sender, message.Media), token).ConfigureAwait(false);
             }, cancellationToken).ConfigureAwait(false);
             if (!written.Ok) return Result<int>.Failure(written.Error!);
             if (duplicate) continue;
@@ -569,7 +577,7 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
                     }
                 }
                 var message = new ChannelMessage(eventId, channel.Address, binding, entry.PlatformMessageId,
-                    entry.Text, entry.At, entry.Sender);
+                    entry.Text, entry.At, entry.Sender, Media: entry.Media);
                 // The same event id, so the original round and this one are the same round as far as any
                 // downstream bookkeeping (and the acknowledgement) is concerned.
                 var published = await _events.PublishAsync(new("channel.message.accepted", channel.Address, eventId,
@@ -611,6 +619,36 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
         return Result<IReadOnlyList<PendingAccept>>.Success(pending);
     }
 
+    /// <summary>
+    /// Stores what came with the message and hands back the pointers a record may keep.
+    ///
+    /// Two rules, both about not letting a non-word take the words down with it. <b>Nothing here fails the message:</b> a
+    /// picture that could not be stored is a note and a message that still gets delivered, because the alternative is
+    /// dropping what somebody actually said over a broken attachment. <b>Nothing here is trusted:</b> the kind the
+    /// Adapter claimed is not what decides anything — the bytes are probed by the store, and a "picture" that is not one
+    /// is stored as a plain file and never shown to a model (docs/28 §5).
+    /// </summary>
+    private async ValueTask<IReadOnlyList<MediaRef>?> IngestAsync(AdapterEnvelope envelope, CancellationToken cancellationToken)
+    {
+        if (envelope.Attachments is not { Count: > 0 } attachments) return null;
+        if (_media is null)
+        {
+            _report.Note("channels", $"a message arrived with {attachments.Count} attachment(s) and this host has no media store; they were dropped");
+            return null;
+        }
+        var stored = new List<MediaRef>(attachments.Count);
+        foreach (var attachment in attachments)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var ingested = await _media.IngestAsync(attachment.Kind, new MemoryStream(attachment.Bytes, writable: false),
+                cancellationToken).ConfigureAwait(false);
+            if (ingested.Ok && ingested.Value is not null) { stored.Add(ingested.Value); continue; }
+            _report.Note("channels", $"an attachment ({attachment.MediaType}, {attachment.Bytes.Length} bytes) could not be " +
+                $"stored and the message went on without it: {ingested.Error?.Message}");
+        }
+        return stored.Count == 0 ? null : stored;
+    }
+
     private async ValueTask<Result> AddPendingAsync(Address channel, PendingAccept entry, CancellationToken cancellationToken)
     {
         if (_queue is null) return Result.Success();
@@ -621,8 +659,12 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
     }
 
     /// <summary>An accepted message whose round never finished. Enough to rebuild the wake-up without the history.</summary>
+    /// <param name="Media">
+    /// What came with it, by reference. The marker is written after the ingest, so a replay publishes the same pointers
+    /// rather than storing the picture a second time.
+    /// </param>
     private sealed record PendingAccept(string MessageId, string? PlatformMessageId, string Adapter, string Conversation,
-        string Text, DateTimeOffset At, string? Sender);
+        string Text, DateTimeOffset At, string? Sender, IReadOnlyList<MediaRef>? Media = null);
 
     private static bool IsValidConversationId(string value) =>
         value is { Length: > 0 and <= 128 } && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_');

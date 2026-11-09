@@ -25,6 +25,12 @@ public sealed class DataDirectory
 /// <summary>Host-owned file mailbox rooted at one adapter instance directory.</summary>
 public sealed class FileMailbox : IFileMailbox
 {    private const int MaxInputBytes = 64 * 1024;
+    /// <summary>
+    /// How big a file may be when it is not text. A picture a person pasted or dropped is at most a few megabytes; the
+    /// store refuses anything past its own ceiling, and this is the same order of magnitude, so the mailbox cannot be
+    /// used to make the host read a disk image into memory before saying no.
+    /// </summary>
+    private const int MaxMediaInputBytes = (int)IMediaStore.MaxIngestBytes;
     private const int BatchSize = 64;
     private const string ReadySuffix = ".ready.json";
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
@@ -116,23 +122,38 @@ public sealed class FileMailbox : IFileMailbox
                 cancellationToken.ThrowIfCancellationRequested();
                 SafeFileSystem.VerifyFile(item.Path, item.Directory);
                 byte[] bytes;
-                try { bytes = await ReadAtMostAsync(item.Path, MaxInputBytes + 1, cancellationToken).ConfigureAwait(false); }
+                try { bytes = await ReadAtMostAsync(item.Path, MaxMediaInputBytes + 1, cancellationToken).ConfigureAwait(false); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
 
-                if (bytes.Length > MaxInputBytes)
+                // Text first, always: a message is what somebody typed, and the mailbox's oldest rule ("the file's text
+                // is the message") does not change because pictures are allowed now. Only bytes that refuse to be text
+                // get the second question asked — and then what answers it is the header, never the file name.
+                string? text = null;
+                if (bytes.Length <= MaxInputBytes)
                 {
-                    Reject(item.ConversationId, item.Path, $"Input exceeds {MaxInputBytes} bytes.");
-                    continue;
+                    try { text = StrictUtf8.GetString(bytes); }
+                    catch (DecoderFallbackException) { /* not text: ask what it is */ }
                 }
-                string text;
-                try { text = StrictUtf8.GetString(bytes); }
-                catch (DecoderFallbackException)
+                IReadOnlyList<InboundAttachment>? attachments = null;
+                if (text is null)
                 {
-                    Reject(item.ConversationId, item.Path, "Input is not valid UTF-8.");
-                    continue;
+                    var info = MediaProbe.Detect(bytes.AsSpan(0, Math.Min(bytes.Length, MediaProbe.HeaderBytes)));
+                    if (info.Kind == MediaKind.File)
+                    {
+                        // Unidentifiable bytes are still refused, and still said so: the alternative is a mailbox that
+                        // quietly turns a half-written binary into a message the model reads as code.
+                        Reject(item.ConversationId, item.Path, bytes.Length > MaxInputBytes
+                            ? $"Input exceeds {MaxInputBytes} bytes and is not a recognised medium."
+                            : "Input is not valid UTF-8.");
+                        continue;
+                    }
+                    // A picture, a voice note, a file — it goes on to be stored and referenced, and the model is told
+                    // what it was even when it cannot look at it (docs/28 §4).
+                    attachments = [new InboundAttachment(info.Kind, info.MediaType, bytes)];
+                    text = "";
                 }
                 // Still being written, or deliberately empty: either way it is not a message yet.
-                if (string.IsNullOrWhiteSpace(text)) continue;
+                if (attachments is null && string.IsNullOrWhiteSpace(text)) continue;
 
                 var messageId = Guid.NewGuid().ToString("N");
                 var claimedDirectory = Path.Combine(_inflight, item.ConversationId);
@@ -143,7 +164,7 @@ public sealed class FileMailbox : IFileMailbox
                 // leaves it recoverable if this process dies mid-round (ReclaimAsync puts it back).
                 try { System.IO.File.Move(item.Path, claimed); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
-                inputs.Add(new(item.ConversationId, messageId, text));
+                inputs.Add(new(item.ConversationId, messageId, text, attachments));
             }
             return inputs;
         }

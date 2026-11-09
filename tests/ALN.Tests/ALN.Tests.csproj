@@ -24,6 +24,7 @@
     <ProjectReference Include="..\..\src\ALN.Storage.Sqlite\ALN.Storage.Sqlite.csproj" />
     <ProjectReference Include="..\..\src\ALN.Graph.Contracts\ALN.Graph.Contracts.csproj" />
     <ProjectReference Include="..\..\src\ALN.Graph\ALN.Graph.csproj" />
+    <ProjectReference Include="..\..\src\ALN.Ssh\ALN.Ssh.csproj" />
     <ProjectReference Include="..\..\src\ALN.Scripting.Jint\ALN.Scripting.Jint.csproj" />
     <ProjectReference Include="..\..\src\ALN.Adapter.File\ALN.Adapter.File.csproj" />
     <ProjectReference Include="..\..\src\ALN.Adapter.Qq\ALN.Adapter.Qq.csproj" />

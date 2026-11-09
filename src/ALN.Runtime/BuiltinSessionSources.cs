@@ -70,7 +70,7 @@ public sealed class ChannelDeltaSource(IChannelDeltaSource source, IChannelManag
                 // The name recorded with the message, then the id. Outbound rows have neither name nor sender, and
                 // the composer already answers that case with an empty string.
                 ChannelMessage.Compose(message.SenderName, message.Sender, message.SenderRemark),
-                message.Text, message.At));
+                message.Text, message.At, message.Media));
 
         // The cursor moves when this turn has been written down, not now: a turn that dies still owes these
         // messages to the next one.

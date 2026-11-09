@@ -119,7 +119,15 @@ public sealed record SessionHistoryEntry(
     /// over. Kept as fields rather than only in the text, because "who sent this, and how deep were they" is the question
     /// a person asks afterwards, and a sentence in the middle of a paragraph is not an answer you can query.
     /// </summary>
-    SessionRelay? Relay = null);
+    SessionRelay? Relay = null,
+    /// <summary>
+    /// Pictures this record brought with it, as references. The bytes stay where they are; this is the pointer, and it
+    /// is small enough that a timeline can hold thousands of them.
+    ///
+    /// Old files do not have it and do not need it: an absent field on a history line reads back as null, so a timeline
+    /// written before pictures existed keeps loading.
+    /// </summary>
+    IReadOnlyList<MediaRef>? Attachments = null);
 
 /// <summary>
 /// A message one component handed to a Session: the sender as the host spells it (<c>script:&lt;id&gt;@&lt;target&gt;</c>,
@@ -137,7 +145,13 @@ public sealed record SessionChannelMessage(
     string Source,
     string? Sender,
     string Content,
-    DateTimeOffset At);
+    DateTimeOffset At,
+    /// <summary>
+    /// What came with it that is not words, by reference. Kept on the message rather than in the text because the
+    /// text is what everything downstream reads when it cannot look: the rendering puts a receipt in the text and the
+    /// parts beside it (docs/28 §1, §4).
+    /// </summary>
+    IReadOnlyList<MediaRef>? Media = null);
 
 /// <summary>Durable channel messages accepted for one Session activation, plus the Channel they came from.</summary>
 public sealed record SessionTurnInput(
@@ -168,7 +182,13 @@ public sealed record SessionTurnInput(
     /// level, and when. The note this turn carries says the message was handed over rather than spoken, because that is
     /// the difference between a request and an instruction.
     /// </summary>
-    SessionRelay? Relay = null);
+    SessionRelay? Relay = null,
+    /// <summary>
+    /// Set when the turn exists because work this Session started has ended. The note then says a job is over instead
+    /// of "your own wait expired" — the session asked for neither, and being told the wrong reason is worse than being
+    /// told none. <b>What</b> ended is deliberately absent: the job table has it, and the turn reads it from there.
+    /// </summary>
+    bool JobEnded = false);
 
 /// <summary>
 /// Why a Session is being run without anybody writing to it. Named rather than passed as text: the reason decides
@@ -189,7 +209,15 @@ public enum ActivationReason
     /// Another component handed this Session a message and asked for it to be looked at now. The message is already in
     /// the timeline; the turn exists so that "somebody sent me something" is not mistaken for "the user just asked".
     /// </summary>
-    Relayed
+    Relayed,
+
+    /// <summary>
+    /// Something this Session started and then stopped waiting for is over: a background command, a download. Unlike
+    /// the other reasons, this one is not about a promise to wake up — it is about work that outlived the turn which
+    /// started it. The details are not carried here because the job table holds them, and the turn reads them there;
+    /// a second account of the same ending would be one too many (<c>docs/28 §9.4</c>).
+    /// </summary>
+    JobFinished
 }
 
 public sealed record RoundContextRequest(
@@ -208,7 +236,9 @@ public sealed record RoundContextRequest(
 /// <summary>Ephemeral context to render into this model request; it is never persisted in Session history.</summary>
 public sealed record RoundContextContribution(string Id, string Section, string Content, int Order = 0);
 
-public sealed record SessionTimelineContribution(string Id, string? Sender, string Content, DateTimeOffset At);
+public sealed record SessionTimelineContribution(string Id, string? Sender, string Content, DateTimeOffset At,
+    /// <summary>What arrived with it that is not words, by reference (docs/28 §1) — a pointer, never the bytes.</summary>
+    IReadOnlyList<MediaRef>? Media = null);
 
 public interface ISessionTimelineWriter
 {

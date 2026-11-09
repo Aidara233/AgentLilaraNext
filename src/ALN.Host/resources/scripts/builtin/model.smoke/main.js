@@ -50,16 +50,35 @@ async function onEvent(event, ctx) {
         parametersJson: JSON.stringify({
           type: "object",
           properties: {
-            text: { type: "string", description: "Message text to send." },
+            text: { type: "string", description: "Message text to send. Use this OR blocks, not both." },
             // The mode is a request, not a transport detail: "segments" sends each blank-line separated
             // paragraph as its own message (what a chat window wants), "text" keeps the whole block in one.
             mode: {
               type: "string",
               enum: ["segments", "text"],
               description: "segments: one message per blank-line separated paragraph (default). text: the whole text as one message."
+            },
+            // A layout for one message: what a chat window shows as one bubble. Blocks are the only way to
+            // mention somebody or send a picture; plain text stays plain text.
+            blocks: {
+              type: "array",
+              description: "One message laid out in order: words, mentions, pictures, faces. Use this OR text, not both.",
+              items: {
+                type: "object",
+                properties: {
+                  type: { type: "string", enum: ["text", "at", "image", "face"] },
+                  text: { type: "string", description: "for text" },
+                  who: { type: "string", description: "for at: \"sender\" (the person being answered) or a numeric platform id. \"all\" is refused." },
+                  path: { type: "string", description: "for image: media/<file> or workspace/<file> — a picture that is already stored." },
+                  scope: { type: "string", description: "for image, when given separately from path" },
+                  id: { type: "string", description: "for face: this platform's own emoji id, e.g. \"1\"" }
+                },
+                required: ["type"],
+                additionalProperties: false
+              }
             }
           },
-          required: ["text"],
+          anyOf: [{ required: ["text"] }, { required: ["blocks"] }],
           additionalProperties: false
         })
       }]

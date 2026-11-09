@@ -48,6 +48,21 @@ public static class TokenEstimator
     /// <summary>What one tool definition costs before its schema: its name, its "type":"function" wrapper.</summary>
     private const int PerToolOverhead = 8;
 
+    /// <summary>What one picture costs before any tile: the role, the wrapper, the media type in the data URL.</summary>
+    private const int ImageBaseTokens = 85;
+
+    /// <summary>What one 512-pixel tile of a picture costs.</summary>
+    private const int ImageTileTokens = 170;
+
+    /// <summary>The tile a vision provider actually charges by. Coarse, and the same number everywhere it matters.</summary>
+    private const int ImageTilePixels = 512;
+
+    /// <summary>
+    /// What a picture costs when its size is not known: four tiles, which is a screenshot nobody measured. Charged
+    /// rather than skipped, because "unknown" must never be cheaper than "small".
+    /// </summary>
+    private const int AssumedImageTokens = 1600;
+
     /// <summary>Roughly how many tokens this text will be charged as. Null and empty both cost nothing.</summary>
     public static int Estimate(string? text)
     {
@@ -64,10 +79,42 @@ public static class TokenEstimator
     {
         ArgumentNullException.ThrowIfNull(message);
         var tokens = PerMessageOverhead + Estimate(message.Content) + Estimate(message.Name);
+        // Parts, when present, are the content: a message built with parts leaves Content null rather than duplicating
+        // its text, so there is nothing to subtract.
+        foreach (var part in message.Parts ?? [])
+            tokens += Estimate(part);
         foreach (var call in message.ToolCalls ?? [])
             tokens += Estimate(call.ArgumentsJson) + Estimate(call.Name) + PerMessageOverhead;
         return tokens;
     }
+
+    /// <summary>One piece of a message.</summary>
+    public static int Estimate(ModelContentPart part)
+    {
+        ArgumentNullException.ThrowIfNull(part);
+        return part switch
+        {
+            TextPart text => Estimate(text.Text),
+            ImagePart image => EstimateImage(image.Width, image.Height),
+            _ => 0
+        };
+    }
+
+    /// <summary>
+    /// A picture is charged by area, not by characters: base64 makes the file bigger without making it cost more.
+    ///
+    /// The rule is the coarse one every vision provider uses in some form — 512-pixel tiles plus a fixed overhead — and
+    /// it leans high on purpose. 1920×1080 comes out at about 2.1k tokens, a sticker at about 0.3k, and a size nobody
+    /// declared is charged the assumed maximum: a request priced too low is refused by the provider, and because the
+    /// history that made it too big is still there, every request after it is refused too.
+    /// </summary>
+    public static int EstimateImage(int? width, int? height) =>
+        width is > 0 && height is > 0
+            ? ImageBaseTokens
+              + ImageTileTokens
+              * ((width.Value + ImageTilePixels - 1) / ImageTilePixels)
+              * ((height.Value + ImageTilePixels - 1) / ImageTilePixels)
+            : AssumedImageTokens;
 
     /// <summary>A whole request body, less the tool schemas.</summary>
     public static int Estimate(IEnumerable<ModelMessage> messages)

@@ -55,6 +55,21 @@ public readonly record struct Result<T>(T? Value, Error? Error)
 public enum AdapterDirection { Inbound, Outbound, Both }
 public enum AdapterState { Created, Running, Stopped, Faulted, Destroyed }
 public sealed record AdapterDescriptor(string PlatformId, string AccountId, AdapterDirection Direction);
+
+/// <summary>
+/// Something that came in with a message and is not words: the bytes, and what the Adapter thinks they are.
+///
+/// It carries <b>bytes</b> rather than a reference because the Adapter has no business knowing where media is stored:
+/// it asked the platform for a picture and got one, and naming it is the core's job (one hash, one limit, one place
+/// that decides what a run of bytes is — <see cref="IMediaStore"/>). The bytes cross exactly one boundary, from the
+/// Adapter to whoever takes the message in, and never reach a durable record.
+/// </summary>
+/// <param name="Kind">
+/// What the Adapter says it is. A claim, not the answer: the bytes are probed on the way in, and a "picture" that is
+/// not one is stored as a file and never shown to a model.
+/// </param>
+public sealed record InboundAttachment(MediaKind Kind, string MediaType, byte[] Bytes);
+
 public sealed record AdapterEnvelope(Address Adapter, string PlatformId, string PlatformConversationId,
     string? PlatformMessageId, string Text, DateTimeOffset At,
     /// <summary>The platform's identifier for the sender. Not a name: it does not change when somebody renames.</summary>
@@ -62,11 +77,118 @@ public sealed record AdapterEnvelope(Address Adapter, string PlatformId, string 
     /// <summary>What the platform calls the sender, when the event carried it (a group card, then a nickname).</summary>
     string? SenderName = null,
     /// <summary>What you call the sender — a remark that belongs to the account rather than to the platform.</summary>
-    string? SenderRemark = null)
+    string? SenderRemark = null,
+    /// <summary>
+    /// Non-text content the message arrived with. <see cref="Text"/> may then be empty — a picture with no caption is
+    /// a message, and a Channel that dropped it as "empty" would be dropping exactly what somebody sent (docs/28 §1).
+    /// </summary>
+    IReadOnlyList<InboundAttachment>? Attachments = null)
 {
     public Guid EventId { get; init; } = Guid.NewGuid();
 }
-public sealed record OutboundMessage(string PlatformConversationId, string Text, string? ReplyTo = null);
+/// <summary>
+/// One piece of an outgoing message, in the order it should appear. <b>Blocks are layout, not boundaries:</b> two text
+/// blocks separated by a mention are one message that reads "…@someone…", which is why this exists at all — the
+/// alternative was three messages, and a platform shows three messages as three.
+///
+/// A block names what should appear, not how the platform spells it. <c>at</c> is "mention this person", <c>face</c> is
+/// "this platform's own emoji id" — the one block that is deliberately dialect, because there is no portable name for
+/// "the 微笑 emoji" and a mapping table between platforms is a second thing to maintain and get wrong (docs/28 §6).
+///
+/// <see cref="OutboundMessage.Text"/> stays the plain-text view of the same thing: what a platform that can only send
+/// text would send, what the transcript records, and what an adapter's日志 shows. A message is never block-only.
+/// </summary>
+[JsonPolymorphic(TypeDiscriminatorPropertyName = "type")]
+[JsonDerivedType(typeof(TextBlock), "text")]
+[JsonDerivedType(typeof(MentionBlock), "mention")]
+[JsonDerivedType(typeof(ImageBlock), "image")]
+[JsonDerivedType(typeof(FaceBlock), "face")]
+[JsonDerivedType(typeof(FileBlock), "file")]
+public abstract record MessageBlock
+{
+    /// <summary>What this block is, in the one spelling the plain-text view uses.</summary>
+    public abstract string AsText { get; }
+
+    /// <summary>
+    /// The whole message as text: blocks concatenated, with no separator invented between them. A producer that wants a
+    /// line break writes a text block containing one — guessing insertions here would make the text view differ from
+    /// what the platform shows.
+    /// </summary>
+    public static string Flatten(IEnumerable<MessageBlock>? blocks) =>
+        blocks is null ? string.Empty : string.Concat(blocks.Select(block => block.AsText));
+}
+
+/// <summary>Words, including punctuation and line breaks. An empty block is refused by the senders, not here.</summary>
+public sealed record TextBlock(string Text) : MessageBlock
+{
+    public override string AsText => Text;
+}
+
+/// <summary>
+/// "Say this person's name out loud." The id is the platform's own, resolved by whoever knew it — the tool that answers
+/// a message knows who sent it, and a model that could name anybody by typing a number would be a model that can ping
+/// strangers (docs/28 §6).
+/// </summary>
+public sealed record MentionBlock(string Id) : MessageBlock
+{
+    public override string AsText => $"@{Id}";
+}
+
+/// <summary>
+/// A picture, by reference: the bytes are already in the media area (the model's own output, or something that arrived).
+/// Never the bytes themselves — an <see cref="OutboundMessage"/> is written to a mailbox file by some adapters, and a
+/// picture inlined there would be a second copy on disk for every send (docs/28 §3).
+/// </summary>
+public sealed record ImageBlock(MediaRef Picture) : MessageBlock
+{
+    public override string AsText => $"[图片：{Picture.Locator}]";
+}
+
+/// <summary>
+/// The platform's own face/emoji id, passed through untouched: <c>1</c> is 微笑 on QQ and meaningless anywhere else.
+/// Kept because inventing a portable emoji vocabulary is a project of its own, and refusing faces would mean refusing
+/// the one thing people actually type in a group chat.
+/// </summary>
+public sealed record FaceBlock(string Id) : MessageBlock
+{
+    public override string AsText => "[表情]";
+}
+
+/// <summary>
+/// A file, by reference. <b>Not a picture:</b> nothing shows it inline, and on some platforms it does not even travel as
+/// part of the message — QQ delivers it as an upload of its own and the chat never mentions it (<c>docs/28 §6.6</c>).
+///
+/// The block says <i>what</i> to deliver. How many calls that takes, and whether the bytes go as a URL, a path, base64
+/// or a request for the bridge to fetch them itself, is the Adapter's business like every other part — which is the
+/// whole reason this is a block and not a second send verb (<c>I-33</c>): a sender that had to know which platforms
+/// attach a file to a message and which upload it separately would be a sender holding a model of every Adapter.
+/// </summary>
+/// <param name="Name">
+/// What the platform should store it as. Null means "the file's own name", which is what a receiver expects to see. It
+/// is separate from the path because a name is a thing people read and a path is a thing the file rules decide.
+/// </param>
+public sealed record FileBlock(MediaRef File, string? Name = null) : MessageBlock
+{
+    public override string AsText => $"[文件：{File.Locator}]";
+
+    /// <summary>What to call it on the far side: the name that was given, or the last piece of the path.</summary>
+    public string SuggestedName
+    {
+        get
+        {
+            if (string.IsNullOrWhiteSpace(Name) is false) return Name!;
+            var slash = File.Path.LastIndexOf('/');
+            return slash < 0 ? File.Path : File.Path[(slash + 1)..];
+        }
+    }
+}
+
+public sealed record OutboundMessage(string PlatformConversationId, string Text, string? ReplyTo = null,
+    /// <summary>
+    /// The layout, when the sender has one. Null means "this is one run of text", which is what every caller that has
+    /// nothing richer to say produces — and what an adapter falls back to when it cannot render blocks.
+    /// </summary>
+    IReadOnlyList<MessageBlock>? Blocks = null);
 public sealed record SendResult(bool Sent, string AttemptId, string? Detail = null,
     /// <summary>The platform's own id for what was just sent, when the transport has one.</summary>
     string? PlatformMessageId = null);
@@ -125,10 +247,37 @@ public interface IEventSink
     ValueTask<Result> PublishAsync(RoutedEvent routedEvent, CancellationToken cancellationToken);
 }
 public interface IInboundAdapter { }
+
+/// <summary>
+/// The one way a message leaves this process. <b>There is no other, and nothing in front of it decides anything.</b>
+///
+/// That is deliberate, and it is the whole design: a sender — a Session's <c>speak</c>, a script, a Channel — hands over
+/// what it wants to say and this method is where it stops being its business. <b>What can actually be sent is the
+/// Adapter's question to answer, not the sender's to guess:</b> whether a picture becomes a segment, a URL, base64, a
+/// file beside a mailbox entry, or nothing at all, is a fact about one platform's protocol and belongs in the one class
+/// that speaks it.
+///
+/// What that rules out, because it was tried and it was worse: an <b>up-front capability declaration</b> that a sender
+/// consults before calling. Two costs, both real. It made every send a question and then an answer — two calls to learn
+/// something one call would have said. And the declaration was a second place that had to agree with the code, so it
+/// could be wrong in the dishonest direction: a mailbox that writes whole <see cref="OutboundMessage"/>s to disk was
+/// declaring "text only" and being refused pictures it could deliver perfectly well. A sender that is expected not to
+/// think about Adapters is a sender that must not be handed a model of them.
+///
+/// So a part that cannot go out is answered on this path, by the Adapter that knows why, in one of two ways:
+/// <list type="bullet">
+///   <item><b>Refuse</b> — <see cref="Result{T}"/> failure when the message would be a lie: nothing arrives, and the
+///   reason says which part and why. A model that reads it can rewrite what it said.</item>
+///   <item><b>Degrade and say so</b> — success with <see cref="SendResult.Detail"/> naming what fell back to its text
+///   form. Losing a whole message because one picture was too big is worse than arriving with a sentence where the
+///   picture was; arriving <i>quietly</i> is worse than both.</item>
+/// </list>
+/// </summary>
 public interface IOutboundAdapter
 {
     ValueTask<Result<SendResult>> SendAsync(OutboundMessage message, CancellationToken cancellationToken);
 }
+
 /// <summary>
 /// What an Adapter can do. It is also a module: an instance is a thing with a name, and the name is how the
 /// catalog and the graph reach it. The behavior lives here; "it exists under a name" comes from
@@ -138,6 +287,7 @@ public interface IChatAdapter : IInboundAdapter, IOutboundAdapter, IAddressed, I
 {
     AdapterDescriptor Descriptor { get; }
     AdapterState State { get; }
+
     ValueTask<Result> StartAsync(CancellationToken cancellationToken);
     ValueTask<Result> StopAsync(CancellationToken cancellationToken);
 }
@@ -296,7 +446,12 @@ public interface IInstanceBindingsProxy : IForceInstanceBindings
 /// drop something in, not an identity, and taking it as one made two folders with the same file name a collision.
 /// <paramref name="Content"/> is the file's text as it was written — no envelope, no JSON to parse.
 /// </summary>
-public sealed record MailboxInput(string ConversationId, string Token, string Content);
+public sealed record MailboxInput(string ConversationId, string Token, string Content,
+    /// <summary>
+    /// What the file turned out to be when it was not text. Empty for an ordinary message, and <see cref="Content"/>
+    /// is then allowed to be empty — a picture with no caption is still something somebody sent (docs/28 §1).
+    /// </summary>
+    IReadOnlyList<InboundAttachment>? Attachments = null);
 
 /// <summary>
 /// Hands out the mailbox for one account. The host owns where mailboxes live; the adapter package only asks for one

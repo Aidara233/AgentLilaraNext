@@ -21,6 +21,28 @@ if (dataArg + 1 >= args.Length || string.IsNullOrWhiteSpace(args[dataArg + 1]))
     return 2;
 }
 var data = DataDirectory.Open(args[dataArg + 1]);
+// The media endpoint: where a picture already on this disk becomes a URL a bridge can fetch — the normal way to send a
+// picture to a bridge, because base64 in one WebSocket frame is both slow and, past a few megabytes, something bridges
+// have been seen to die on (docs/16 §12.3).
+//
+// On by default: "works out of the box" is worth more than "off unless configured", given the door is read-only, serves
+// only pictures the probe recognises, only from `media` and `workspace`, and only with a per-process random token in the
+// URL. What is *not* guessed is the address — `--media-endpoint http://<host>:<port>` overrides it, `--media-endpoint off`
+// switches it off, and with nothing said it listens on 5310 and advertises this machine's LAN address, which is the shape
+// of a bridge on the same network and the only case where a default can be right.
+var mediaEndpointArg = Array.FindIndex(args, a => a == "--media-endpoint");
+var mediaEndpointValue = mediaEndpointArg >= 0 && mediaEndpointArg + 1 < args.Length ? args[mediaEndpointArg + 1] : null;
+if (mediaEndpointArg >= 0 && string.IsNullOrWhiteSpace(mediaEndpointValue))
+{
+    Console.Error.WriteLine("--media-endpoint requires a base url (http://<host>:<port>) or 'off'.");
+    return 2;
+}
+var mediaEndpointDisabled = mediaEndpointValue is { } chosen &&
+    (string.Equals(chosen, "off", StringComparison.OrdinalIgnoreCase) ||
+     string.Equals(chosen, "none", StringComparison.OrdinalIgnoreCase));
+var mediaEndpointUrl = mediaEndpointDisabled
+    ? null
+    : mediaEndpointValue ?? $"http://{LanAddress()}:5310";
 // Transport state, not configuration: a file Adapter's mailbox is IO and lives under io/file/<account>/, which the
 // adapter package derives from the spec it is handed. The host no longer hands out one mailbox for everybody — that
 // made the second file Adapter read the first one's inbox.
@@ -74,12 +96,56 @@ if (!channelInfoSource.Ok) { Console.Error.WriteLine(channelInfoSource.Error?.Me
 // Everything a model may reach on disk goes through this one port, and the scopes it knows are registered here and
 // nowhere else. The memory library is the first; another is added by registering it here and naming it in that
 // module's own module.json — never by a module inventing a path.
-var fileAccess = new LocalFileSystemAccess(data.Root, [FileScopes.Memory, FileScopes.ScriptsDraft, FileScopes.Workspace]);
+var fileAccess = new LocalFileSystemAccess(data.Root,
+    [FileScopes.Memory, FileScopes.ScriptsDraft, FileScopes.Workspace, FileScopes.Media],
+    // Only the workspace accepts bytes: it is the room whose contents nobody reads back, so a tarball there is a
+    // tarball and not a memory block somebody's summariser has to make sense of (docs/24 §5).
+    //
+    // Media is the exception in the other direction: it holds what the model cannot read as text but must be able to
+    // look at (a picture) or move (a transfer), and it is written by the host alone — an inbound message, an ingest —
+    // never by the model (docs/28 §2).
+    binaryScopes: [FileScopes.Workspace, FileScopes.Media],
+    // Read-only is the whole point of media: a session's record names the files it looked at, so a caller that could
+    // rewrite one could change what it is recorded as having seen. Its own产出 goes to the workspace.
+    readOnlyScopes: [FileScopes.Media]);
+// Media: the one place bytes that are not text are named and kept. It writes through the port above, into the scope
+// nobody but the host may write, and every caller — a message that arrived, a file the model opened — gets back a
+// pointer rather than a copy (docs/28 §2, §3).
+var mediaStore = new FileMediaStore(fileAccess);
+// The door a bridge fetches media through, when the operator said where it can be reached. It starts here because
+// this is where the data root and the file port are: a bridge that keeps hanging up on base64 needs a URL, and only the
+// host knows how to hand one out (docs/16 §12.4). The file ceiling is a deployment number, so it is a flag rather than
+// a constant in the code: what one bridge will swallow in one upload is a fact about that deployment (docs/28 §6.6).
+var mediaMaxFileArg = Array.FindIndex(args, a => a == "--media-max-file");
+var mediaMaxFileValue = mediaMaxFileArg >= 0 && mediaMaxFileArg + 1 < args.Length ? args[mediaMaxFileArg + 1] : null;
+var mediaMaxFile = ALN.Api.MediaEndpoint.DefaultMaxFileBytes;
+if (mediaMaxFileValue is { } declaredMaxFile &&
+    (!long.TryParse(declaredMaxFile, out mediaMaxFile) || mediaMaxFile <= 0))
+{
+    Console.Error.WriteLine("--media-max-file must be a positive number of bytes (e.g. 2147483648).");
+    return 2;
+}
+ALN.Api.MediaEndpoint? mediaEndpoint = null;
+if (!string.IsNullOrWhiteSpace(mediaEndpointUrl))
+{
+    var startedEndpoint = await ALN.Api.MediaEndpoint.StartAsync(mediaEndpointUrl, fileAccess, CancellationToken.None,
+        maxFileBytes: mediaMaxFile);
+    if (startedEndpoint.Ok) mediaEndpoint = startedEndpoint.Value;
+    else Console.Error.WriteLine($"note: {startedEndpoint.Error?.Message} {startedEndpoint.Error?.Detail}");
+}
+// And the policy that decides what may be shown: filled in by the media module when it starts, because that is where
+// the decision is written down. Until then it answers with the shipped defaults, never with "no ceiling".
+var mediaPolicy = new MediaPolicyBridge();
 // Memory is a module of its own: it registers its own line and its own tools, and nothing else knows it exists. It
 // reads and writes through the port above, so "the model may tidy memory with file tools" needs no special case:
 // they reach the same files by the same rules.
 var memoryLibrary = new FileMemoryLibrary(fileAccess);
 var memoryModule = new MemoryModule(memoryLibrary, sessionExtensions);
+// SSH has its own port for the same reason the file system does: one place that opens a socket, and a module that
+// only says which device a Session asked for. Live keys stay in memory, so replacing a device or dropping it after two
+// idle hours leaves nothing on disk.
+var sshAccess = new ALN.Ssh.SshNetAccess();
+var sshLiveKeys = new ALN.Ssh.MemorySecretStore();
 // The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.
@@ -105,7 +171,17 @@ var catalog = prompts.List();
 if (catalog.Groups.Count > 0 || catalog.Warnings.Count > 0)
     restore.Note("prompts", $"{catalog.Groups.Count} group(s), {catalog.Groups.Sum(group => group.Entries.Count)} prompt(s)" +
         (catalog.Warnings.Count == 0 ? "" : $"; skipped {catalog.Warnings.Count}: {string.Join("; ", catalog.Warnings)}"));
-var sessions = new SessionManager(data.Root, extensions: sessionExtensions, signalLog: signalLog, prompts: prompts, catalog: modules, events: queue);
+// Background work, written down. A job cannot be resumed after a restart — its socket and its reading thread are gone —
+// but the row is how the next turn finds out that it is gone instead of waiting on it (docs/28 §9).
+var jobs = new FileJobRegistry(storage);
+var sessions = new SessionManager(data.Root, extensions: sessionExtensions, signalLog: signalLog, prompts: prompts, catalog: modules, events: queue,
+    // A picture in a request is read here, from the store, for that one request: the timeline keeps the reference.
+    media: mediaPolicy, files: fileAccess, jobs: jobs);
+// Attached here rather than in the constructor because it is the one edge that points the other way: a Session is built
+// with the ledger, so the ledger cannot be built with the Session. From this line on, a row that first says "over" wakes
+// the session that started it (docs/28 §9.4). Before it — and never, in a host without sessions — the row is still
+// written, and the session reads it at its next turn.
+jobs.Waker = sessions;
 var reloadState = new ModuleReloadStateStore();
 // The action table exists before anything runs, because the modules that implement actions are the ones that
 // register them: a manager is created (and readied) inside a package load, long before startup finishes, and it
@@ -148,6 +224,16 @@ var hostServices = new HostServiceProvider(
     (typeof(IAuditSink), auditSink),
     (typeof(ICatalog), modules),
     (typeof(IModuleReloadStateStore), reloadState),
+    // How a Channel stores what came with a message: brackets first, bytes once, pointer in the row (docs/28 §2).
+    (typeof(IMediaStore), mediaStore),
+    // The one byte surface, for an Adapter that has to read a picture the model asked it to send. The SSH module is
+    // given the same port by constructor; this is it registered under the name a plugin looks up.
+    (typeof(IBinaryFileAccess), fileAccess),
+    // The table of background work, for anything that starts something long: SSH today, file downloads next.
+    (typeof(IJobRegistry), jobs),
+    // And the door a bridge fetches a picture through, when one was configured: the adapter asks for it by contract name
+    // and gets null when the operator did not open one — which is exactly "keep using base64".
+    (typeof(IMediaUrlSource), (object)mediaEndpoint!),
     (typeof(ModuleHostPaths), new ModuleHostPaths(AppContext.BaseDirectory, data.Root)));
 var moduleServices = new ModuleServiceRegistry(hostServices);
 var moduleUnloads = new ModuleUnloadCoordinator();
@@ -340,7 +426,19 @@ var factories = new ModuleFactoryRegistry();
 // The file system module is built from its own file, like every other module that a person configures: the factory
 // gets the manifest and decides what its config means. The whitelist is therefore an edit, not a recompile.
 factories.Register(FileSystemModule.TypeId,
-    manifest => FileSystemModule.FromManifest(manifest, fileAccess, sessionExtensions));
+    manifest => FileSystemModule.FromManifest(manifest, fileAccess, sessionExtensions, mediaStore));
+// SSH: same shape, one file to decide the timings, and no device list — a device is something a user hands over in a
+// conversation, not something a default file invents.
+factories.Register(SshModule.TypeId,
+    manifest => SshModule.FromManifest(manifest, sshAccess, sshLiveKeys, sessionExtensions,
+        audit: auditSink, signals: signalLog, binaryFiles: fileAccess,
+        // The ledger, so that a build still running when the host stops is a fact the next turn reads (docs/28 §9).
+        jobs: jobs,
+        savedStore: stateStore, savedKeys: new ALN.Ssh.FileSecretStore(Path.Combine(data.Root, "ssh", "keys"))));
+// Media: one file decides which formats may be shown to a model, how big, how many, and whether an arriving picture is
+// shown unasked. It has no tools — looking at one is fs_read and the file is under a scope the model can read — so what
+// is left for a module to own is the policy, which is exactly the kind of decision a module.json is for (docs/28 §4).
+factories.Register(MediaModule.TypeId, manifest => MediaModule.FromManifest(manifest, parameters, mediaPolicy));
 // The script control tools are a module too: "who may reload scripts" is answerable by looking at the graph instead of
 // at the host's source, and the two tools it offers read whatever the graph holds at the moment they are called.
 factories.Register(ScriptToolsModule.TypeId,
@@ -353,6 +451,15 @@ factories.Register(ActionToolsModule.TypeId,
 // The read-only half of the schedules, offered as a module for the same reason the other tool modules are.
 factories.Register(ScheduleTools.TypeId,
     manifest => ScheduleToolsModule.FromManifest(manifest, scheduleStore, sessionExtensions));
+// And the table of background work, read-only: "what is this conversation still waiting on" is a question the model
+// should be able to answer from the record, including after a restart. Two verbs and no third — stopping work belongs
+// to the tool that started it, not to the table that remembers it (docs/28 §9.3).
+factories.Register(JobTools.TypeId,
+    manifest => JobToolsModule.FromManifest(manifest, jobs, sessionExtensions));
+// Files that are on the platform rather than in this process: listed, searched and fetched through the adapter. Where
+// they land is the model's answer and the byte port's rule, so this module needs both ends and neither policy.
+factories.Register(FilesGetTools.TypeId,
+    manifest => FilesToolsModule.FromManifest(manifest, channels, adapters, fileAccess, sessionExtensions, jobs));
 foreach (var type in adapterTypes.ListTypes().Where(type => adapterTypes.IsConcrete(type.TypeId)))
     factories.RegisterOwned(type.TypeId);
 foreach (var type in modelManager.ListTypes())
@@ -484,6 +591,30 @@ if (!scheduleToolsFile.Ok)
     queue.Complete();
     return 1;
 }
+// The job table, readable the same way and for the same reason. It reads through to the row as it stands when a tool is
+// called, so a module file written today cannot go stale about what is running.
+var jobToolsFile = await new ModuleManifestStore(data.Root).WriteIfMissingAsync(
+    new ModuleManifest(new ModuleId(JobTools.TypeId), JobTools.TypeId, Enabled: true),
+    CancellationToken.None);
+if (!jobToolsFile.Ok)
+{
+    Console.Error.WriteLine(jobToolsFile.Error?.Message ?? "Job tool module declaration failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
+// And the file tool, which reads the platform's own file area. A module like the others: whether a Session may pull files
+// off a platform is answered by the graph, not by a setting inside the tool.
+var filesToolsFile = await new ModuleManifestStore(data.Root).WriteIfMissingAsync(
+    new ModuleManifest(new ModuleId(FilesGetTools.TypeId), FilesGetTools.TypeId, Enabled: true),
+    CancellationToken.None);
+if (!filesToolsFile.Ok)
+{
+    Console.Error.WriteLine(filesToolsFile.Error?.Message ?? "File tool module declaration failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
 // What the file system module will actually offer, said out loud. The scopes this host registers and the scopes that
 // module's own file declares are two different lists, and only their intersection is reachable — and the file is never
 // rewritten (C-03), so a module.json written before a scope existed keeps the old list forever. Without this line,
@@ -505,6 +636,28 @@ if (undeclaredScopes.Length > 0)
         + "tools will not offer it. Add it to that file's config.scopes to grant it — the host will not rewrite the file.");
 }
 
+// SSH reads its timings from its own file, written once and never rewritten for the same reason: from then on the
+// numbers are whatever a person left there. It carries no device list — a device arrives from a conversation.
+var mediaFile = await new ModuleManifestStore(data.Root).WriteIfMissingAsync(
+    new ModuleManifest(new ModuleId(MediaModule.TypeId), MediaModule.TypeId, Enabled: true,
+        ConfigJson: MediaModule.DefaultConfig), CancellationToken.None);
+if (!mediaFile.Ok)
+{
+    Console.Error.WriteLine(mediaFile.Error?.Message ?? "Media module declaration failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
+var sshFile = await new ModuleManifestStore(data.Root).WriteIfMissingAsync(
+    new ModuleManifest(new ModuleId(SshModule.TypeId), SshModule.TypeId, Enabled: true,
+        ConfigJson: SshModule.DefaultConfig), CancellationToken.None);
+if (!sshFile.Ok)
+{
+    Console.Error.WriteLine(sshFile.Error?.Message ?? "SSH module file could not be written.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
 var started = await kernel.StartAsync(shutdown.Token);
 if (!started.Ok || started.Value is null)
 {
@@ -652,6 +805,7 @@ catch (OperationCanceledException) when (shutdown.IsCancellationRequested) { }
 finally
 {
     if (api is not null) await api.DisposeAsync();
+    if (mediaEndpoint is not null) await mediaEndpoint.DisposeAsync();
     // Sessions are told they are stopping here, and dispatched inline, for one reason: ordering. Every Channel and
     // Adapter is still up at this point, so a script that answers a Session's stop can still speak — which is the
     // whole point of saying goodbye. Through the queue it would land behind the shutdown it is about, and through a
@@ -684,6 +838,37 @@ finally
     await modulePackages.UnloadAsync(adapterPackage.Value.Id, TimeSpan.FromSeconds(10), force: true, CancellationToken.None);
 }
 return 0;
+
+/// <summary>
+/// This machine's address on the local network: the one a bridge on the same network can dial.
+///
+/// Chosen by shape rather than by name — a private IPv4 that is up and not loopback, preferring the RFC 1918 ranges — because
+/// there is no configuration to consult at this point and "127.0.0.1" is exactly the address a container cannot reach. A
+/// machine with several adapters may well pick the wrong one; that is what <c>--media-endpoint</c> is for, and the receipt
+/// prints the address it chose so a wrong pick is visible instead of mysterious.
+/// </summary>
+static string LanAddress()
+{
+    var candidates = new List<System.Net.IPAddress>();
+    foreach (var network in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+    {
+        if (network.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+        if (network.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback) continue;
+        foreach (var address in network.GetIPProperties().UnicastAddresses)
+        {
+            if (address.Address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) continue;
+            candidates.Add(address.Address);
+        }
+    }
+    var priv = candidates.FirstOrDefault(address =>
+    {
+        var bytes = address.GetAddressBytes();
+        return bytes[0] == 192 && bytes[1] == 168
+            || bytes[0] == 10
+            || (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31);
+    });
+    return (priv ?? candidates.FirstOrDefault() ?? System.Net.IPAddress.Loopback).ToString();
+}
 
 /// <summary>
 /// Deletes derived artifacts older than the retention window, now and every few hours.
