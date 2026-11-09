@@ -336,6 +336,16 @@ public interface ISessionManager
     ValueTask<Result<SessionTurnResult>> DeliverAsync(string sessionId, string text, string from,
         AccessLevel fromLevel, bool wake, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Points one Session at another model profile, at a turn boundary.
+    ///
+    /// The spec is stored-wins by design — addressing a Session cannot rewrite what it is — but "this conversation
+    /// should keep going somewhere else" is a deliberate operator decision, not an accident of who addressed it. It
+    /// takes effect on the next model step (the profile is looked up by id every step), and it is refused while a turn
+    /// is running, because that turn was assembled against the profile it started with.
+    /// </summary>
+    ValueTask<Result<SessionRebind>> RebindAsync(string sessionId, string profileId, CancellationToken cancellationToken);
+
     Result<SessionState> GetState(string sessionId);
 
     /// <summary>
@@ -388,6 +398,12 @@ public interface ISessionManager
 public sealed record SessionLifecycleNotice(string SessionId, LifecycleSignal Signal);
 
 /// <summary>
+/// The answer to "move this Session to that model": where it was, where it is, and whether anything moved. Unchanged is
+/// a success, not an error — a caller retrying after a timeout should not be told it did something wrong.
+/// </summary>
+public sealed record SessionRebind(string? PreviousProfile, string Profile, bool Changed);
+
+/// <summary>
 /// What one turn's beginning or end looks like from outside: which Session, why it ran, how far it got, and — when it
 /// has finished — how it stopped.
 ///
@@ -401,11 +417,19 @@ public sealed record SessionTurnNotice(string SessionId, string Reason, int Step
 public static class SessionActions
 {
     public const string List = "sessions.list";
+
     /// <summary>
     /// Raise or lower what one Session may reach. The only level anyone can change at runtime: an interface's level is
     /// a fact about the code, so it takes a rebuild (and per script a re-mount, where the interface surface is settled).
     /// </summary>
     public const string SetLevel = "sessions.setLevel";
+
+    /// <summary>
+    /// Point one Session at another model profile: <c>id</c> and <c>profile</c>. Takes effect at a turn boundary — a
+    /// Session in the middle of a turn is refused rather than silently moved under itself, because the half-finished
+    /// turn was assembled against the profile it started with.
+    /// </summary>
+    public const string Rebind = "sessions.rebind";
 
     /// <summary>
     /// Hand one Session a message: <c>id</c> (or <c>channel</c>), <c>text</c>, and <c>wake</c> for "and look now".

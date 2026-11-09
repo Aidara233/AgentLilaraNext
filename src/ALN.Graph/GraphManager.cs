@@ -2261,17 +2261,29 @@ public sealed class JsonScriptCatalog(string programRoot, string dataRoot) : IGr
             // Scripts shipped inside a plugin: dropping the plugin in is the trust decision, so they must declare
             // "trusted" — a shipped script cannot claim to be builtin. They are not written by the operator, so
             // they are read from the plugin folder and never written to.
-            var pluginsRoot = Path.Combine(dataRoot, "plugins");
-            if (Directory.Exists(pluginsRoot))
+            //
+            // Only the version that is in force is read. A package folder may hold several versions side by side, and
+            // scanning all of them would put two copies of one script id in the catalogue — the older one might even
+            // win on directory order, which is the shape of a hot replacement that swapped the module and kept
+            // running the old script. The layout decides, once, for both this and the loader.
+            foreach (var packageRoot in ModulePackageLayout.PackageRoots(Path.Combine(dataRoot, "plugins")))
             {
-                foreach (var plugin in Directory.GetDirectories(pluginsRoot).Order(StringComparer.Ordinal))
+                cancellationToken.ThrowIfCancellationRequested();
+                var resolved = ModulePackageLayout.Resolve(packageRoot);
+                if (!resolved.Ok || resolved.Value is null || !resolved.Value.Resolved)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var scriptsRoot = Path.Combine(plugin, "scripts");
-                    if (!Directory.Exists(scriptsRoot)) continue;
-                    await LoadRootAsync(scriptsRoot, TrustDomain.Trusted, AccessLevel.Full, "plugin:" + Path.GetFileName(plugin),
-                        packages, seen, issues, cancellationToken).ConfigureAwait(false);
+                    // Named as a package problem, not a script one: the person who put the folder there is the one who
+                    // can fix it, and this is where a package's own scripts go missing without any other trace.
+                    issues.Add(new(packageRoot, "package layout: " +
+                        (resolved.Error?.Message ?? "the package layout could not be resolved.")));
+                    continue;
                 }
+                var scriptsRoot = Path.Combine(resolved.Value.ActiveDirectory, "scripts");
+                if (!Directory.Exists(scriptsRoot)) continue;
+                // plugin:<id>, and the id is the package's own: a version directory is not a package, so stamping
+                // scripts with the folder they happen to sit in would have renamed the library on every replacement.
+                await LoadRootAsync(scriptsRoot, TrustDomain.Trusted, AccessLevel.Full, "plugin:" + resolved.Value.Id,
+                    packages, seen, issues, cancellationToken).ConfigureAwait(false);
             }
             _issues = issues;
             return Result<IReadOnlyList<ScriptPackage>>.Success(packages);

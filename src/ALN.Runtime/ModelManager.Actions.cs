@@ -65,8 +65,17 @@ public sealed partial class ModelManager
                 """, Subject: "address"), (arguments, ct) => SaveProviderAsync(arguments, store, ct)),
 
             (new(ModelActions.ProviderDestroy, "Destroy a provider instance and delete its configuration file. Refused "
-                    + "while a profile still points at it: a profile with no provider fails at the next turn instead.",
-                Capabilities.ModelsControl, true, ParamsJson: ProviderArgs(), Subject: "address"),
+                    + "while a profile still points at it: a profile with no provider fails at the next turn instead. "
+                    + "drainSeconds waits for in-flight calls before giving up, instead of refusing immediately.",
+                Capabilities.ModelsControl, true,
+                ParamsJson: """
+                {"type":"object","properties":{
+                  "address":{"type":"string","description":"provider instance, e.g. model.openai-chat#main"},
+                  "category":{"type":"string","description":"Alternative: the provider's category."},
+                  "instance":{"type":"string","description":"Alternative: the instance name."},
+                  "drainSeconds":{"type":"integer","minimum":1,"maximum":600,"description":"Wait this long for calls in flight to finish."}},
+                 "additionalProperties":false}
+                """, Subject: "address"),
                 (arguments, ct) => DestroyProviderAsync(arguments, store, ct)),
 
             (new(ModelActions.ProfileCreate, "Register one model profile and write it into its provider's file.",
@@ -84,7 +93,22 @@ public sealed partial class ModelManager
             (new(ModelActions.ProfileRemove, "Remove one model profile from the registry and from its provider's file.",
                 Capabilities.ModelsControl, true,
                 ParamsJson: """{"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}""",
-                Subject: "id"), (arguments, ct) => RemoveProfileAsync(arguments, store, ct))
+                Subject: "id"), (arguments, ct) => RemoveProfileAsync(arguments, store, ct)),
+
+            (new(ModelActions.ProfileSet, "Change a profile in place: model, provider, sampling, context window. Anything "
+                    + "not named keeps what it had, and the change is what the very next model step uses — a Session in "
+                    + "the middle of a turn reads its profile again every step, so this is how a conversation moves to a "
+                    + "different model without being restarted or rebuilt.",
+                Capabilities.ModelsControl, true,
+                ParamsJson: """
+                {"type":"object","properties":{
+                  "id":{"type":"string"},
+                  "model":{"type":"string","description":"The provider's own model id."},
+                  "provider":{"type":"string","description":"Another provider instance, already running."},
+                  "defaultSampling":{"type":"object"},
+                  "contextWindow":{"type":"integer","minimum":1}},
+                 "required":["id"],"additionalProperties":false}
+                """, Subject: "id"), (arguments, ct) => SetProfileAsync(arguments, store, ct))
         };
 
         foreach (var (descriptor, handler) in registrations)
@@ -256,11 +280,40 @@ public sealed partial class ModelManager
         var saved = await store.SaveAsync(named.Value.Address, spec, ct).ConfigureAwait(false);
         if (!saved.Ok) return Result<JsonElement>.Failure(saved.Error!);
 
-        // A provider that is not running yet can be built right now, so a freshly added key is usable without a restart.
-        // One that is running holds its configuration; saying "restart" is honest, applying silently is not possible
-        // without pulling it out from under calls that are in flight.
+        var address = new Address("model", named.Value.Kind, named.Value.Instance);
         var running = List().Any(provider => provider.Address.ToString() == named.Value.Address);
-        if (!running && enabled)
+        if (running)
+        {
+            if (!enabled)
+                // Disabling a provider that is already built would mean taking it out from under whatever is using it;
+                // the file says disabled, the process keeps serving until a restart. Saying so is the difference between
+                // a setting and a silent no-op.
+                return Result<JsonElement>.Success(ActionArgs.JsonOf(new
+                {
+                    address = named.Value.Address, saved = true, applied = "restart",
+                    reason = "the instance is still running; 'enabled: false' takes effect when the host restarts"
+                }));
+
+            // A provider that is already built takes the new settings where it can, and says "restart" where it cannot.
+            // This is the path a session in the middle of a turn cares about: the next step goes to the new endpoint,
+            // and the turn that was already in flight finishes where it started.
+            var applied = ReconfigureProvider(address, merged.GetRawText());
+            if (!applied.Ok)
+                return Result<JsonElement>.Success(ActionArgs.JsonOf(new
+                {
+                    address = named.Value.Address, saved = true, applied = "restart", reason = applied.Error?.Message
+                }));
+            var profilesApplied = ApplyProfiles(address, profiles ?? []);
+            return Result<JsonElement>.Success(ActionArgs.JsonOf(new
+            {
+                address = named.Value.Address,
+                saved = true,
+                applied = profilesApplied.Ok ? "now" : "profiles-not-applied",
+                reason = profilesApplied.Error?.Message
+            }));
+        }
+
+        if (enabled)
         {
             var created = await CreateAsync(named.Value.Category, named.Value.Instance, merged.GetRawText(), ct).ConfigureAwait(false);
             if (!created.Ok || created.Value is null)
@@ -268,15 +321,30 @@ public sealed partial class ModelManager
             // A profile read out of the provider's own file carries no provider: the file it lives in *is* the provider,
             // so repeating the address there would be a second place for it to be wrong. Registering it needs the
             // address all the same — this is the one moment the two spellings meet.
-            var provider = new Address("model", named.Value.Kind, named.Value.Instance);
-            foreach (var profile in profiles ?? [])
-                RegisterProfile(profile.Provider.IsInstance ? profile : profile with { Provider = provider });
+            var registered = ApplyProfiles(address, profiles ?? []);
+            if (!registered.Ok) return Result<JsonElement>.Failure(registered.Error!);
             return Result<JsonElement>.Success(ActionArgs.JsonOf(new { address = named.Value.Address, saved = true, applied = "now" }));
         }
         return Result<JsonElement>.Success(ActionArgs.JsonOf(new
         {
-            address = named.Value.Address, saved = true, applied = running ? "restart" : "disabled"
+            address = named.Value.Address, saved = true, applied = "disabled"
         }));
+    }
+
+    /// <summary>
+    /// Registers or updates each profile the caller wrote. In place when the id already exists: a profile is read by id
+    /// on every step, so remove-then-create would turn a save into a window where a live session cannot find its model.
+    /// </summary>
+    private Result ApplyProfiles(Address address, IReadOnlyList<ModelProfile> profiles)
+    {
+        var known = ListProfiles().Select(profile => profile.Id).ToHashSet(StringComparer.Ordinal);
+        foreach (var profile in profiles)
+        {
+            var resolved = profile.Provider.IsInstance ? profile : profile with { Provider = address };
+            var applied = known.Contains(resolved.Id) ? UpdateProfile(resolved) : RegisterProfile(resolved);
+            if (!applied.Ok) return applied;
+        }
+        return Result.Success();
     }
 
     private async ValueTask<Result<JsonElement>> DestroyProviderAsync(JsonElement arguments, IModelInstanceStore? store,
@@ -288,9 +356,14 @@ public sealed partial class ModelManager
         var running = List().Any(provider => provider.Address.ToString() == named.Value.Address);
         if (running)
         {
-            // Destroy refuses while a profile still points at it, and that refusal is the useful answer: a profile with
-            // no provider is a session that fails at its next turn with a stranger error.
-            var destroyed = await DestroyAsync(new Address("model", named.Value.Kind, named.Value.Instance), ct).ConfigureAwait(false);
+            // A profile pointing here is a refusal, and that refusal is the useful answer: a profile with no provider is
+            // a session that fails at its next turn with a stranger error. Calls still in flight are the other refusal —
+            // and the one a caller can wait out, which is what drainSeconds is for.
+            var drain = arguments.TryGetProperty("drainSeconds", out var drainItem) && drainItem.TryGetInt32(out var seconds) && seconds > 0
+                ? TimeSpan.FromSeconds(seconds)
+                : TimeSpan.Zero;
+            var destroyed = await DestroyAsync(new Address("model", named.Value.Kind, named.Value.Instance), drain, ct)
+                .ConfigureAwait(false);
             if (!destroyed.Ok) return Result<JsonElement>.Failure(destroyed.Error!);
         }
         var deleted = await store.DeleteAsync(named.Value.Address, ct).ConfigureAwait(false);
@@ -341,6 +414,69 @@ public sealed partial class ModelManager
         return Result<JsonElement>.Success(ActionArgs.JsonOf(new
         {
             id = id.Trim(), provider = provider.Value.ToString(), model = model.Trim()
+        }));
+    }
+
+    private async ValueTask<Result<JsonElement>> SetProfileAsync(JsonElement arguments, IModelInstanceStore? store,
+        CancellationToken ct)
+    {
+        if (!arguments.TryReadText("id", out var id) || id.Trim().Length == 0)
+            return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "models.profile.set requires 'id'."));
+        var existing = ListProfiles().FirstOrDefault(candidate => candidate.Id == id.Trim());
+        if (existing is null)
+            return Result<JsonElement>.Failure(new(ErrorCode.Invalid,
+                $"Model profile not found: {id.Trim()}. models.profile.create is how one comes into being."));
+
+        // Anything not named keeps what it had. A verb that reset a field the caller did not mention would turn "point
+        // this at another model" into "and also forget the context window".
+        var provider = existing.Provider;
+        if (arguments.TryGetProperty("provider", out _))
+        {
+            var read = arguments.ReadAddress("provider");
+            if (!read.Ok) return Result<JsonElement>.Failure(read.Error!);
+            provider = read.Value;
+        }
+        var model = arguments.TryReadText("model", out var named) && named.Trim().Length > 0 ? named.Trim() : existing.ModelId;
+
+        var sampling = existing.DefaultSampling;
+        if (arguments.TryGetProperty("defaultSampling", out var samplingItem))
+        {
+            if (samplingItem.ValueKind != JsonValueKind.Object)
+                return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "'defaultSampling' must be an object."));
+            try { sampling = samplingItem.Deserialize<SamplingSettings>(ActionJson); }
+            catch (JsonException ex) { return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "defaultSampling is malformed.", ex.Message)); }
+        }
+
+        var window = existing.ContextWindow;
+        if (arguments.TryGetProperty("contextWindow", out _))
+        {
+            window = ReadContextWindow(arguments, out var windowError);
+            if (windowError is { } error) return Result<JsonElement>.Failure(error);
+        }
+
+        var updated = existing with { Provider = provider, ModelId = model, DefaultSampling = sampling, ContextWindow = window };
+        var applied = UpdateProfile(updated);
+        if (!applied.Ok) return Result<JsonElement>.Failure(applied.Error!);
+
+        if (store is not null && provider.IsInstance)
+        {
+            var stored = await store.ReadAsync(provider.ToString(), ct).ConfigureAwait(false);
+            if (stored.Error is null && stored.Value is { } instanceSpec)
+            {
+                var profiles = (instanceSpec.Profiles ?? []).Where(profile => profile.Id != id.Trim())
+                    .Append(new ModelProfile(id.Trim(), default, model, sampling, window)).ToArray();
+                var saved = await store.SaveAsync(provider.ToString(), instanceSpec with { Profiles = profiles }, ct)
+                    .ConfigureAwait(false);
+                if (!saved.Ok) return Result<JsonElement>.Failure(saved.Error!);
+            }
+        }
+        return Result<JsonElement>.Success(ActionArgs.JsonOf(new
+        {
+            id = id.Trim(),
+            provider = provider.ToString(),
+            model,
+            contextWindow = window,
+            applies = "next step"
         }));
     }
 

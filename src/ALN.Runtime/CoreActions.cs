@@ -48,7 +48,8 @@ public static class CoreActions
         IModelManager models, ISignalLog signals, IGraphRuntime graph, IParameterRegistry parameters,
         IModuleCatalog? modules = null, ISessionManager? sessions = null, IArchiveRegistry? archive = null,
         IPromptLibrary? prompts = null, IModuleTypeCatalog? moduleTypes = null, IModelInstanceStore? modelInstances = null,
-        Func<ModuleGraphStatus>? graphStatus = null, Kernel? kernel = null, IGraphScriptCatalog? scriptCatalog = null)
+        Func<ModuleGraphStatus>? graphStatus = null, Kernel? kernel = null, IGraphScriptCatalog? scriptCatalog = null,
+        IModulePackageMaintenance? packages = null)
     {
         var registrations = new (ActionDescriptor Descriptor, ActionHandler Handler)[]
         {
@@ -133,20 +134,43 @@ public static class CoreActions
                         @abstract = type.IsAbstract
                     })
                 })))),
-            (new(PackagesList, "Module packages loaded into this process, with what each provides.", Capabilities.SystemRead, false),
-                (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
+            (new(PackagesList, "Module packages loaded into this process: what each provides, the version, and the "
+                    + "directory its code was read from. Also the package folders on disk and which of their versions "
+                    + "is in force, so a folder that did not load is visible rather than merely absent.",
+                Capabilities.SystemRead, false),
+                (_, _) =>
                 {
-                    modules = modules?.Loaded.Select(manifest => new
+                    var loaded = packages?.LoadedPackages;
+                    return ValueTask.FromResult(Result<JsonElement>.Success(ToJson(new
                     {
-                        id = manifest.Id,
-                        version = manifest.Version,
-                        kind = JsonNamingPolicy.CamelCase.ConvertName(manifest.PackageKind.ToString()),
-                        reload = JsonNamingPolicy.CamelCase.ConvertName(manifest.ReloadPolicy.ToString()),
-                        provides = manifest.Provides.Select(type => type.TypeId),
-                        dependencies = manifest.Dependencies.Select(dependency => dependency.Id)
-                    }) ?? [],
-                    contracts = ModuleContracts.Version
-                })))),
+                        modules = loaded is not null
+                            ? loaded.Select(info => new
+                            {
+                                id = info.Id,
+                                version = info.Version,
+                                kind = JsonNamingPolicy.CamelCase.ConvertName(info.PackageKind.ToString()),
+                                reload = JsonNamingPolicy.CamelCase.ConvertName(info.ReloadPolicy.ToString()),
+                                provides = info.Provides.Select(type => type.TypeId),
+                                dependencies = info.Dependencies.Select(dependency => dependency.Id),
+                                directory = (string?)info.Directory
+                            })
+                            : modules?.Loaded.Select(manifest => new
+                            {
+                                id = manifest.Id,
+                                version = manifest.Version,
+                                kind = JsonNamingPolicy.CamelCase.ConvertName(manifest.PackageKind.ToString()),
+                                reload = JsonNamingPolicy.CamelCase.ConvertName(manifest.ReloadPolicy.ToString()),
+                                provides = manifest.Provides.Select(type => type.TypeId),
+                                dependencies = manifest.Dependencies.Select(dependency => dependency.Id),
+                                directory = (string?)null
+                            }) ?? [],
+                        // What is on disk, as opposed to what is running: a version folder nobody selected, a pointer
+                        // naming a version that is not there, two layouts in one folder. All of those look identical
+                        // from the "modules" list above — they are simply absent from it.
+                        plugins = PluginFolders(packages),
+                        contracts = ModuleContracts.Version
+                    })));
+                }),
             // The graph, not the packages: which instances exist right now, where each one got to, and what was added or
             // removed since startup. A module is a instance here (docs/22 §3), and the package it came from is a different
             // question with a different answer (packages.list).
@@ -234,7 +258,6 @@ public static class CoreActions
             detail = edge.Detail
         };
         static Result<JsonElement> Unavailable(string message) => Result<JsonElement>.Failure(new(ErrorCode.Unavailable, message));
-
         ValueTask<Result<JsonElement>> RecentSignals(JsonElement arguments, CancellationToken ct)
         {
             var limit = 200;
@@ -292,5 +315,31 @@ public static class CoreActions
             !address.IsInstance)
             return Result<Address>.Failure(new(ErrorCode.Invalid, $"Argument '{property}' must be an instance address."));
         return Result<Address>.Success(address);
+    }
+
+    /// <summary>
+    /// The package folders on disk, whether or not they loaded. A folder that could not be resolved is the one thing a
+    /// log line says once and nobody reads again: it is listed here with the reason, next to the folders that worked.
+    /// </summary>
+    private static object[] PluginFolders(IModulePackageMaintenance? packages)
+    {
+        if (packages?.PluginsRoot is not { } root) return [];
+        var running = packages.LoadedPackages.ToDictionary(info => info.Id, StringComparer.Ordinal);
+        return ModulePackageLayout.PackageRoots(root).Select(folder =>
+        {
+            var name = System.IO.Path.GetFileName(folder);
+            var resolved = ModulePackageLayout.Resolve(folder);
+            var value = resolved.Ok ? resolved.Value : null;
+            running.TryGetValue(name, out var loaded);
+            return (object)new
+            {
+                folder = name,
+                layout = value is null ? (string?)null : (value.Legacy ? "flat" : "versions"),
+                active = value?.Version,
+                versions = value?.Versions ?? ModulePackageLayout.ListVersions(folder),
+                running = loaded?.Version,
+                problem = value is null ? resolved.Error?.Message : null
+            };
+        }).ToArray();
     }
 }

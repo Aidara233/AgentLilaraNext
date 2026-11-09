@@ -37,10 +37,19 @@ public sealed class OpenAiChatModule : IModulePlugin
         cancellationToken.ThrowIfCancellationRequested();
         var manager = _manager;
         if (manager is null) return ValueTask.FromResult(Result<ModuleUnloadReadiness>.Success(new(false, "Model manager is unavailable.")));
-        var providerAddresses = manager.List().Where(p => p.Descriptor.TypeId == ProviderDescriptor.TypeId).Select(p => p.Address).ToHashSet();
-        if (providerAddresses.Count > 0)
-            return ValueTask.FromResult(Result<ModuleUnloadReadiness>.Success(new(false, "Destroy OpenAI Chat model profiles and instances before unloading the provider package.")));
-        return ValueTask.FromResult(Result<ModuleUnloadReadiness>.Success(new(true)));
+        // What blocks an unload is a call in flight, not an instance that happens to exist. An idle instance keeps the
+        // old assembly alive (and therefore keeps working) until it is destroyed, which is exactly the state a hot
+        // replacement wants: the new version registers a new factory, and the old instances finish their lives on the
+        // old code. Requiring every profile to be destroyed first made this package impossible to replace without a
+        // restart the moment anybody had ever configured one.
+        var busy = manager.List()
+            .Where(provider => provider.Descriptor.TypeId == ProviderDescriptor.TypeId && provider.InFlight > 0)
+            .Select(provider => provider.Address.ToString())
+            .ToArray();
+        return ValueTask.FromResult(busy.Length > 0
+            ? Result<ModuleUnloadReadiness>.Success(new(false,
+                $"OpenAI Chat still has calls in flight: {string.Join(", ", busy)}. A switch waits for the turn boundary."))
+            : Result<ModuleUnloadReadiness>.Success(new(true)));
     }
 
     public ValueTask<Result> DisconnectAsync(bool forced, CancellationToken cancellationToken) =>
@@ -49,7 +58,6 @@ public sealed class OpenAiChatModule : IModulePlugin
 
 public sealed class OpenAiChatProviderFactory(ModelProviderDescriptor descriptor) : IModelProviderFactory
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     public string TypeId => descriptor.TypeId;
     public ModelProviderDescriptor Describe => descriptor;
 
@@ -58,21 +66,21 @@ public sealed class OpenAiChatProviderFactory(ModelProviderDescriptor descriptor
         cancellationToken.ThrowIfCancellationRequested();
         if (spec.TypeId != TypeId || !spec.Address.IsInstance)
             return ValueTask.FromResult(Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "OpenAI Chat provider requires a model.openai-chat instance address.")));
-        OpenAiChatProviderOptions? options;
-        try { options = JsonSerializer.Deserialize<OpenAiChatProviderOptions>(spec.ConfigurationJson, JsonOptions); }
-        catch (JsonException ex) { return ValueTask.FromResult(Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "OpenAI Chat configuration is invalid JSON.", ex.Message))); }
-        if (options is null || string.IsNullOrWhiteSpace(options.ApiKey))
-            return ValueTask.FromResult(Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "OpenAI Chat configuration requires apiKey.")));
-        // The operator fills in the host (or pastes a full method URL); the protocol completes the path.
-        var endpoint = ChatEndpoint.Normalize(options.Endpoint);
-        if (!endpoint.Ok || endpoint.Value is null)
-            return ValueTask.FromResult(Result<IModelProvider>.Failure(endpoint.Error!));
+        var options = OpenAiChatProvider.ReadOptions(spec.ConfigurationJson);
+        if (!options.Ok || options.Value is null)
+            return ValueTask.FromResult(Result<IModelProvider>.Failure(options.Error!));
         return ValueTask.FromResult(Result<IModelProvider>.Success(
-            new OpenAiChatProvider(spec.Address, descriptor, endpoint.Value, options.ApiKey)));
+            new OpenAiChatProvider(spec.Address, descriptor, options.Value)));
     }
 }
 
 public sealed record OpenAiChatProviderOptions(string ApiKey, string? Endpoint = null);
+
+/// <summary>
+/// The settings one request is sent with. Held as a whole and replaced as a whole: a provider whose endpoint changed
+/// and whose key did not is not a state anybody asked for.
+/// </summary>
+public sealed record OpenAiChatRuntimeOptions(Uri Endpoint, string ApiKey);
 
 /// <summary>
 /// The wire shape of one chat message.
@@ -119,19 +127,48 @@ public static class ChatPayload
     }
 }
 
-internal sealed class OpenAiChatProvider : IModelProvider
+internal sealed class OpenAiChatProvider : IModelProvider, IModelProviderReconfigurable
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly HttpClient _http = new();
-    private readonly Uri _endpoint;
-    private readonly string _apiKey;
+    /// <summary>Replaced whole, read whole. A request that already started keeps the settings it began with.</summary>
+    private OpenAiChatRuntimeOptions _options;
 
-    public OpenAiChatProvider(Address address, ModelProviderDescriptor descriptor, Uri endpoint, string apiKey)
-    { Address = address; Describe = descriptor; _endpoint = endpoint; _apiKey = apiKey; }
+    public OpenAiChatProvider(Address address, ModelProviderDescriptor descriptor, OpenAiChatRuntimeOptions options)
+    { Address = address; Describe = descriptor; _options = options; }
 
     public Address Address { get; }
     public ModuleId Id => new(Address.ToString());
     public ModelProviderDescriptor Describe { get; }
+
+    /// <summary>
+    /// Reads one configuration into the settings a request uses. Public because the factory and the running provider
+    /// have to agree on what a configuration means — two parsers would eventually disagree about which fields matter.
+    /// </summary>
+    public static Result<OpenAiChatRuntimeOptions> ReadOptions(string configurationJson)
+    {
+        OpenAiChatProviderOptions? options;
+        try { options = JsonSerializer.Deserialize<OpenAiChatProviderOptions>(configurationJson, JsonOptions); }
+        catch (JsonException ex) { return Result<OpenAiChatRuntimeOptions>.Failure(new(ErrorCode.Invalid, "OpenAI Chat configuration is invalid JSON.", ex.Message)); }
+        if (options is null || string.IsNullOrWhiteSpace(options.ApiKey))
+            return Result<OpenAiChatRuntimeOptions>.Failure(new(ErrorCode.Invalid, "OpenAI Chat configuration requires apiKey."));
+        // The operator fills in the host (or pastes a full method URL); the protocol completes the path.
+        var endpoint = ChatEndpoint.Normalize(options.Endpoint);
+        if (!endpoint.Ok || endpoint.Value is null)
+            return Result<OpenAiChatRuntimeOptions>.Failure(endpoint.Error!);
+        return Result<OpenAiChatRuntimeOptions>.Success(new(endpoint.Value, options.ApiKey));
+    }
+
+    /// <inheritdoc />
+    public Result ApplyConfiguration(string configurationJson)
+    {
+        var options = ReadOptions(configurationJson);
+        if (!options.Ok || options.Value is null) return Result.Failure(options.Error!);
+        // One write, one whole set of settings: a request in flight read the previous value and is unaffected, and the
+        // next request cannot see half of this one.
+        Volatile.Write(ref _options, options.Value);
+        return Result.Success();
+    }
 
     public async IAsyncEnumerable<ModelEvent> CompleteAsync(ModelRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
@@ -142,9 +179,12 @@ internal sealed class OpenAiChatProvider : IModelProvider
             yield break;
         }
 
+        // One read for the whole request. Two reads could straddle a configuration change and send a request to the new
+        // endpoint with the old key — which fails in a way that looks like the key is wrong.
+        var settings = Volatile.Read(ref _options);
         HttpRequestMessage? httpRequest = null;
         Error? requestError = null;
-        try { httpRequest = BuildRequest(request); }
+        try { httpRequest = BuildRequest(request, settings); }
         catch (Exception ex) when (ex is JsonException or ArgumentException or InvalidOperationException)
         { requestError = new(ErrorCode.Invalid, "Model request could not be mapped to OpenAI Chat.", ex.Message); }
         if (requestError is not null)
@@ -152,7 +192,7 @@ internal sealed class OpenAiChatProvider : IModelProvider
             yield return new ModelFailed(requestError);
             yield break;
         }
-        httpRequest!.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+        httpRequest!.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.ApiKey);
 
         var enumerator = StreamAsync(httpRequest, cancellationToken).GetAsyncEnumerator(cancellationToken);
         var terminalCount = 0;
@@ -286,7 +326,7 @@ internal sealed class OpenAiChatProvider : IModelProvider
         { return Result<ParsedChunk>.Failure(new(ErrorCode.Invalid, "OpenAI Chat returned malformed streaming JSON.", ex.Message)); }
     }
 
-    private HttpRequestMessage BuildRequest(ModelRequest request)
+    private HttpRequestMessage BuildRequest(ModelRequest request, OpenAiChatRuntimeOptions settings)
     {
         var messages = request.Messages.Select(ChatPayload.Message).ToArray();
         var body = new Dictionary<string, object?>
@@ -304,7 +344,7 @@ internal sealed class OpenAiChatProvider : IModelProvider
             }).ToArray();
             body["tool_choice"] = "auto";
         }
-        return new HttpRequestMessage(HttpMethod.Post, _endpoint) { Content = JsonContent.Create(body, options: JsonOptions) };
+        return new HttpRequestMessage(HttpMethod.Post, settings.Endpoint) { Content = JsonContent.Create(body, options: JsonOptions) };
     }
 
     private static Error MapTransportError(Exception exception) => exception switch

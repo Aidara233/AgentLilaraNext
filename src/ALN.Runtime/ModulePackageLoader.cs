@@ -11,7 +11,7 @@ namespace ALN.Runtime;
 /// entry assembly. Contract assemblies already loaded by the host are shared;
 /// package-private dependencies are resolved beside the entry assembly.
 /// </summary>
-public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IModulePackageLoader
+public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IModulePackageLoader, IModulePackageMaintenance
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     { Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) } };
@@ -22,6 +22,11 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
     private readonly IReadOnlyList<IModulePackageResourceRegistry> _resourceRegistries;
     private readonly IAdapterManager? _adapters;
     private readonly IForceInstanceBindings? _forceBindings;
+    /// <summary>Where dropped-in packages live. Optional: a loader wired without it can still load directories it is handed.</summary>
+    private readonly string? _pluginsRoot;
+    /// <summary>Who owns which verb, so a package that registered actions can give them back. Optional: without it a
+    /// replaced package would leave its verbs pointing into an assembly nothing can release.</summary>
+    private readonly IActionTableOwner? _actions;
     private readonly Dictionary<string, LoadedPackage> _loaded = new(StringComparer.Ordinal);
     private readonly HashSet<string> _reserved = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -31,7 +36,9 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
         IModuleReloadStateStore? reloadState = null,
         IEnumerable<IModulePackageResourceRegistry>? resourceRegistries = null,
         IAdapterManager? adapters = null,
-        IForceInstanceBindings? forceBindings = null)
+        IForceInstanceBindings? forceBindings = null,
+        string? pluginsRoot = null,
+        IActionTableOwner? actionTable = null)
     {
         _unloads = unloads;
         _services = services;
@@ -40,6 +47,8 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
         _resourceRegistries = resourceRegistries?.ToArray() ?? [];
         _adapters = adapters;
         _forceBindings = forceBindings;
+        _pluginsRoot = string.IsNullOrWhiteSpace(pluginsRoot) ? null : Path.GetFullPath(pluginsRoot);
+        _actions = actionTable;
     }
 
     public IReadOnlyList<ModulePackageManifest> Loaded
@@ -48,6 +57,26 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
         {
             _gate.Wait();
             try { return _loaded.Values.Select(p => p.Manifest).ToArray(); }
+            finally { _gate.Release(); }
+        }
+    }
+
+    public string? PluginsRoot => _pluginsRoot;
+
+    /// <inheritdoc />
+    public IReadOnlyList<LoadedPackageInfo> LoadedPackages
+    {
+        get
+        {
+            _gate.Wait();
+            try
+            {
+                return _loaded.Values.Select(package => new LoadedPackageInfo(package.Manifest.Id, package.Manifest.Version,
+                        package.Manifest.PackageKind, package.Manifest.ReloadPolicy, package.Manifest.Provides,
+                        package.Manifest.Dependencies, package.PackageDirectory))
+                    .OrderBy(info => info.Id, StringComparer.Ordinal)
+                    .ToArray();
+            }
             finally { _gate.Release(); }
         }
     }
@@ -126,7 +155,12 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
 
                 var context = new PackageContext(file.Id, _services);
                 pluginStarted = true;
+                // What the table held before this package spoke. Anything new after StartAsync is its verb, which is
+                // enough to take them back later: action ids are unique across the process, so a verb that appeared
+                // while this package was starting appeared because of it.
+                var actionsBefore = _actions?.ActionIds;
                 var started = await plugin.StartAsync(context, cancellationToken).ConfigureAwait(false);
+                AdoptActions(file.Id, actionsBefore);
                 if (!started.Ok) return Result<ModulePackageManifest>.Failure(started.Error!);
                 _loaded.Add(file.Id, new LoadedPackage(manifest, Path.GetFullPath(packageDirectory), plugin, loadContext, context));
                 loadSucceeded = true;
@@ -143,6 +177,7 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
                         catch { }
                     }
                     _services.RemovePackageServices(file.Id);
+                    _actions?.RemovePackage(file.Id);
                     if (participantRegistered && plugin is not null) _unloads.UnregisterParticipant(plugin.ParticipantId);
                     if (typeProvisionsRegistered) _types.RemovePackageTypes(file.Id);
                     if (packageRegistered) _unloads.UnregisterPackage(file.Id);
@@ -194,6 +229,7 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
                     return Result<ModuleUnloadReport>.Failure(typesRemoved.Error!);
                 }
                 _services.RemovePackageServices(affectedPackage);
+                _actions?.RemovePackage(affectedPackage);
                 affectedHandle.Release();
             }
             if (!replacing)
@@ -247,7 +283,12 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
     /// of the type id: a package may call its adapter type anything it likes (C-04, C-06).</summary>
     private bool IsAdapterType(string typeId) => _types.IsAssignableTo(typeId, "adapter");
 
-    public async ValueTask<Result<ModuleReloadReport>> ReplaceAsync(
+    /// <summary>
+    /// Replaces a running package with the one in another directory, and rolls back to the original set if anything
+    /// about the new one fails. The candidate must be a separate, immutable directory: a package whose files are
+    /// overwritten in place cannot be unloaded and reloaded on Windows, where a mapped assembly is a locked file.
+    /// </summary>
+    public async ValueTask<Result<ModuleReloadReport>> ReplaceFromDirectoryAsync(
         string packageId,
         string candidateDirectory,
         TimeSpan timeout,
@@ -257,6 +298,13 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
         await _replaceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         List<LoadedSnapshot> originals = [];
         string previousVersion = "";
+        // What was loaded before this attempt. A replacement that fails half way must not leave a package behind that
+        // this attempt loaded: the report would say "failed" while the new code answered requests, which is worse
+        // than either outcome on its own.
+        HashSet<string> loadedBefore;
+        await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try { loadedBefore = _loaded.Keys.ToHashSet(StringComparer.Ordinal); }
+        finally { _gate.Release(); }
         var reservedIds = new List<string>();
         try
         {
@@ -308,10 +356,15 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
                         allowReserved: true, cancellationToken).ConfigureAwait(false);
                     if (!restoredDependent.Ok)
                     {
+                        // The candidate loaded but a dependent did not come back: the new code is running and the old
+                        // set is broken. Take the new one out first, then put the originals back, so that a failure
+                        // report and the process state agree with each other.
+                        var cleaned = await DropPackagesLoadedByThisAttemptAsync(loadedBefore, timeout).ConfigureAwait(false);
                         var rollbackError = await RestoreOriginalsAsync(packageId, originals, timeout).ConfigureAwait(false);
                         return Result<ModuleReloadReport>.Failure(new(ErrorCode.Unavailable,
                             "Replacement could not reactivate a dependent; the prior package set was restored when possible.",
-                            $"Dependent {original.Manifest.Id}: {restoredDependent.Error?.Message}; rollback: {rollbackError ?? "succeeded"}"));
+                            $"Dependent {original.Manifest.Id}: {restoredDependent.Error?.Message}; "
+                            + $"new packages removed: {cleaned ?? "succeeded"}; rollback: {rollbackError ?? "succeeded"}"));
                     }
                     reactivated.Add(original.Manifest.Id);
                 }
@@ -320,13 +373,16 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
                     replacement.Value!.Version, reactivated));
             }
 
+            var cleanedUp = await DropPackagesLoadedByThisAttemptAsync(loadedBefore, timeout).ConfigureAwait(false);
             var restoreError = await RestoreOriginalsAsync(packageId, originals, timeout).ConfigureAwait(false);
             return Result<ModuleReloadReport>.Failure(new(ErrorCode.Unavailable,
                 "Replacement failed; the prior package set was restored when possible.",
-                $"Candidate: {replacement.Error?.Message}; rollback: {restoreError ?? "succeeded"}"));
+                $"Candidate: {replacement.Error?.Message}; new packages removed: {cleanedUp ?? "succeeded"}; "
+                + $"rollback: {restoreError ?? "succeeded"}"));
         }
         catch (OperationCanceledException)
         {
+            await DropPackagesLoadedByThisAttemptAsync(loadedBefore, TimeSpan.FromSeconds(10)).ConfigureAwait(false);
             if (originals.Count > 0)
                 await RestoreOriginalsAsync(packageId, originals, TimeSpan.FromSeconds(10)).ConfigureAwait(false);
             throw;
@@ -341,6 +397,101 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
             }
             _replaceGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Switches a package to one of the versions sitting in its folder, and writes down which one is in force.
+    ///
+    /// The order is the whole point: the switch happens first, the pointer second. A failure in between leaves the
+    /// pointer on the version that was already servicing requests, so the next start boots something that worked.
+    /// Writing it first would make a rolled-back replacement come back as the new version after a restart.
+    /// </summary>
+    public async ValueTask<Result<ModuleReloadReport>> ReplaceAsync(string packageId, string version, TimeSpan timeout,
+        bool force, CancellationToken cancellationToken)
+    {
+        if (_pluginsRoot is null)
+            return Result<ModuleReloadReport>.Failure(new(ErrorCode.Unavailable,
+                "No plugin folder is configured, so there are no versions to switch between."));
+        if (!IsPackageName(packageId))
+            return Result<ModuleReloadReport>.Failure(new(ErrorCode.Invalid, $"Not a package id: \"{packageId}\"."));
+        if (!IsPackageName(version))
+            return Result<ModuleReloadReport>.Failure(new(ErrorCode.Invalid, $"Not a version: \"{version}\"."));
+
+        var packageRoot = Path.Combine(_pluginsRoot, packageId);
+        var resolved = ModulePackageLayout.Resolve(packageRoot);
+        if (!resolved.Ok || resolved.Value is null)
+            return Result<ModuleReloadReport>.Failure(resolved.Error!);
+        if (resolved.Value.Legacy)
+            return Result<ModuleReloadReport>.Failure(new(ErrorCode.Invalid,
+                $"Package {packageId} is a single flat folder, not a set of versions: {ModulePackageLayout.ManifestFileName} "
+                + $"sits in {packageId}/ itself. Move it into a version directory to be able to switch."));
+
+        var candidate = Path.Combine(packageRoot, version);
+        if (!File.Exists(Path.Combine(candidate, ModulePackageLayout.ManifestFileName)))
+            return Result<ModuleReloadReport>.Failure(new(ErrorCode.Invalid,
+                $"Package {packageId} has no version \"{version}\". Available: {DescribeVersions(resolved.Value.Versions)}."));
+
+        var replaced = await ReplaceFromDirectoryAsync(packageId, candidate, timeout, force, cancellationToken).ConfigureAwait(false);
+        if (!replaced.Ok || replaced.Value is null) return replaced;
+
+        // The switch worked. What is left is the pointer, and a pointer that could not be written is worth saying out
+        // loud: reporting a clean success the next restart contradicts is how somebody spends an afternoon on it.
+        var written = ModulePackageLayout.WriteActive(packageRoot, version);
+        return Result<ModuleReloadReport>.Success(written.Ok
+            ? replaced.Value
+            : replaced.Value with
+            {
+                Note = $"Running {version}, but {ModulePackageLayout.ActiveFileName} could not be written "
+                    + $"({written.Error?.Message}). The next start will run the previous version."
+            });
+    }
+
+    /// <summary>
+    /// Takes note of the verbs the package just put in the table, so unloading it can take them back.
+    ///
+    /// Called even when <c>StartAsync</c> failed: a package can register a verb and then fail, and the rollback has to
+    /// undo that too — a leftover verb is a handler captured over an assembly load context that can then never be
+    /// released, which is the whole reason a hot replacement stays pinned.
+    /// </summary>
+    private void AdoptActions(string packageId, IReadOnlySet<string>? before)
+    {
+        if (_actions is null || before is null) return;
+        var added = _actions.ActionIds.Where(id => !before.Contains(id)).Order(StringComparer.Ordinal).ToArray();
+        if (added.Length > 0) _actions.TrackPackage(packageId, added);
+    }
+
+    /// <summary>A package id and a version are both one directory name. Anything with a separator is a path, not a name.</summary>
+    private static bool IsPackageName(string value) =>
+        !string.IsNullOrWhiteSpace(value) && value != "." && value != ".." &&
+        value.IndexOfAny(['/', '\\', ':']) < 0 && value.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
+
+    private static string DescribeVersions(IReadOnlyList<string> versions) =>
+        versions.Count == 0 ? "none" : string.Join(", ", versions);
+
+    /// <summary>
+    /// Unloads every package this replacement attempt added and had not been there before — the candidate, and any
+    /// dependent that came back with it. Returns null when there was nothing to do or everything went, and a sentence
+    /// when something could not be taken out (which the caller reports, because a half-cleaned rollback is not silent).
+    /// </summary>
+    private async Task<string?> DropPackagesLoadedByThisAttemptAsync(HashSet<string> loadedBefore, TimeSpan timeout)
+    {
+        string[] added;
+        await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try { added = _loaded.Keys.Where(id => !loadedBefore.Contains(id)).ToArray(); }
+        finally { _gate.Release(); }
+        if (added.Length == 0) return null;
+
+        var errors = new List<string>();
+        foreach (var packageId in added)
+        {
+            // Reserved is on for exactly the ids this attempt is working on; going through the reserved check would
+            // refuse to clean up the very package it just loaded.
+            var unloaded = await UnloadInternalAsync(packageId, timeout, force: true, allowReserved: true,
+                CancellationToken.None, replacing: true).ConfigureAwait(false);
+            if (!unloaded.Ok || unloaded.Value is not { Completed: true })
+                errors.Add($"{packageId}: {unloaded.Error?.Message ?? "unload did not complete"}");
+        }
+        return errors.Count == 0 ? null : string.Join("; ", errors);
     }
 
     private async Task<string?> RestoreOriginalsAsync(string packageId, IReadOnlyList<LoadedSnapshot> originals, TimeSpan timeout)
@@ -418,6 +569,7 @@ public sealed class ModulePackageLoader : IAsyncDisposable, IModuleCatalog, IMod
                     _unloads.UnregisterParticipant(plugin.ParticipantId);
                 }
                 _services.RemovePackageServices(packageId);
+                _actions?.RemovePackage(packageId);
                 _types.RemovePackageTypes(packageId);
                 _unloads.UnregisterPackage(packageId);
                 package.Release();

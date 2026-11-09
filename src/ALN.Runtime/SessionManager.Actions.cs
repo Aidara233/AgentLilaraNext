@@ -80,7 +80,7 @@ public sealed partial class SessionManager
             });
         if (!delivered.Ok) return delivered;
 
-        return plane.Register(
+        var setLevel = plane.Register(
             new(SessionActions.SetLevel,
                 "Raise or lower what one Session may reach: agent, operator or full. Takes effect on the next turn — no "
                 + "restart, no reload — because the level is read when a turn is assembled. A level above your own is "
@@ -110,6 +110,42 @@ public sealed partial class SessionManager
                     id = id.Trim(),
                     previous = JsonNamingPolicy.CamelCase.ConvertName(changed.Value.ToString()),
                     level = JsonNamingPolicy.CamelCase.ConvertName(level.ToString())
+                }));
+            });
+
+        if (!setLevel.Ok) return setLevel;
+
+        // Moving a conversation to a different model while it runs. Operator-level, because it decides where a
+        // Session's words go — and, like handing over a level, it is a decision about somebody else's conversation.
+        return plane.Register(
+            new(SessionActions.Rebind,
+                "Point one Session at another model profile. Takes effect on the next model step, and is refused while "
+                + "the Session is in the middle of a turn — that turn was assembled against the profile it started with. "
+                + "This is how a live conversation moves to a different model or endpoint without being restarted: the "
+                + "history stays, the next request goes somewhere else.",
+                Capabilities.SessionsControl, true,
+                ParamsJson: """
+                {"type":"object","properties":{
+                  "id":{"type":"string","description":"The Session id, as sessions.list shows it."},
+                  "profile":{"type":"string","description":"A model profile id, as models.list shows it."}},
+                 "required":["id","profile"],"additionalProperties":false}
+                """,
+                Subject: "id"),
+            async (arguments, ct) =>
+            {
+                if (!arguments.TryReadText("id", out var id) || id.Trim().Length == 0)
+                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "sessions.rebind requires 'id'."));
+                if (!arguments.TryReadText("profile", out var profile) || profile.Trim().Length == 0)
+                    return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "sessions.rebind requires 'profile'."));
+
+                var rebound = await RebindAsync(id.Trim(), profile.Trim(), ct).ConfigureAwait(false);
+                if (!rebound.Ok || rebound.Value is null) return Result<JsonElement>.Failure(rebound.Error!);
+                return Result<JsonElement>.Success(ActionArgs.JsonOf(new
+                {
+                    id = id.Trim(),
+                    previous = rebound.Value.PreviousProfile,
+                    profile = rebound.Value.Profile,
+                    changed = rebound.Value.Changed
                 }));
             });
     }

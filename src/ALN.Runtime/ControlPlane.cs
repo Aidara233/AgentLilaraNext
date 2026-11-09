@@ -4,18 +4,70 @@ using ALN.Contracts;
 namespace ALN.Runtime;
 
 /// <summary>
+/// Actions a package registered while it started, so unloading that package can take them back.
+///
+/// The plane has no idea who owns a verb — every <see cref="IControlPlane.Register"/> call looks the same. The owner
+/// is therefore recorded by the thing that knows: the loader, which watches the table across one package's start. That
+/// is enough because action ids are unique across the process: whatever appeared while a package was starting
+/// appeared because of it.
+///
+/// Not part of <see cref="IControlPlane"/>: a plugin may add a verb, and a plugin must not be able to take one away.
+/// </summary>
+public interface IActionTableOwner
+{
+    /// <summary>Every action id the table holds right now — a snapshot, for taking a difference across a package start.</summary>
+    IReadOnlySet<string> ActionIds { get; }
+
+    /// <summary>Records that these verbs belong to this package.</summary>
+    Result TrackPackage(string packageId, IReadOnlyList<string> actionIds);
+
+    /// <summary>Takes back every verb the package registered. Says success when there was nothing to take back.</summary>
+    Result RemovePackage(string packageId);
+}
+
+/// <summary>
 /// The single execution point. Every front-end — script bindings and the HTTP API alike — reaches
 /// actions through here, so authorization, audit and signals cannot be skipped by adding a new
 /// transport. It holds no feature logic: handlers are registered by the composition root.
 /// </summary>
-public sealed class ControlPlane(IAuditSink audit, ISignalLog signalLog) : IControlPlane
+public sealed class ControlPlane(IAuditSink audit, ISignalLog signalLog) : IControlPlane, IActionTableOwner
 {
     private readonly Dictionary<string, Entry> _actions = new(StringComparer.Ordinal);
+    /// <summary>Which package put each verb there. Absent means the host itself did, and the host does not go away.</summary>
+    private readonly Dictionary<string, HashSet<string>> _owned = new(StringComparer.Ordinal);
     private readonly object _gate = new();
 
     public IReadOnlyList<ActionDescriptor> Catalog
     {
         get { lock (_gate) return _actions.Values.Select(e => e.Descriptor).OrderBy(d => d.Id, StringComparer.Ordinal).ToArray(); }
+    }
+
+    public IReadOnlySet<string> ActionIds
+    {
+        get { lock (_gate) return _actions.Keys.ToHashSet(StringComparer.Ordinal); }
+    }
+
+    public Result TrackPackage(string packageId, IReadOnlyList<string> actionIds)
+    {
+        if (string.IsNullOrWhiteSpace(packageId))
+            return Result.Failure(new(ErrorCode.Invalid, "A package id is required."));
+        lock (_gate)
+        {
+            if (!_owned.TryGetValue(packageId, out var owned))
+                _owned[packageId] = owned = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var actionId in actionIds ?? []) owned.Add(actionId);
+        }
+        return Result.Success();
+    }
+
+    public Result RemovePackage(string packageId)
+    {
+        lock (_gate)
+        {
+            if (!_owned.Remove(packageId, out var owned)) return Result.Success();
+            foreach (var actionId in owned) _actions.Remove(actionId);
+        }
+        return Result.Success();
     }
 
     public Result Register(ActionDescriptor descriptor, ActionHandler handler)

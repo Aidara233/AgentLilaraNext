@@ -138,6 +138,9 @@ public sealed class ScriptSeedTests : IDisposable
     public async Task A_plugin_cannot_take_a_name_a_shipped_script_already_uses()
     {
         Ship("adapter.channel-intake", IntakeManifest, "shipped();");
+        // A plugin folder is a package, so it says what it is: without a manifest the catalogue does not read its
+        // scripts at all — a folder the loader refused must not get to run code through the script door.
+        WritePluginManifest("someone.plugin");
         WriteUserScript(Path.Combine(DataRoot, "plugins", "someone.plugin", "scripts", "adapter.channel-intake"),
             "adapter.channel-intake", "plugin();");
 
@@ -151,6 +154,35 @@ public sealed class ScriptSeedTests : IDisposable
         var intake = Assert.Single(catalogue.Value!, package => package.Manifest.Id == "adapter.channel-intake");
         Assert.Equal("bundled", intake.Origin);
         Assert.Contains(catalog.LastIssues, issue => issue.Reason.Contains("Duplicate", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_plugin_folder_without_a_manifest_gets_no_scripts_into_the_catalogue()
+    {
+        WriteUserScript(Path.Combine(DataRoot, "plugins", "someone.plugin", "scripts", "chat"), "chat", "plugin();");
+
+        var catalog = new JsonScriptCatalog(ProgramRoot, DataRoot);
+        var catalogue = await catalog.LoadAsync(default);
+
+        // Not a failure and not a silent skip either: the folder is reported as a package problem, and its scripts stay
+        // out. Trust follows the package, and a folder that is not a package is not one the host agreed to load.
+        Assert.True(catalogue.Ok, catalogue.Error?.Message);
+        Assert.DoesNotContain(catalogue.Value!, package => package.Manifest.Id == "chat");
+        Assert.Contains(catalog.LastIssues, issue => issue.Reason.Contains("package layout", StringComparison.Ordinal));
+    }
+
+    /// <summary>A flat package: the manifest sits in the package folder, which is what one version looks like.</summary>
+    private void WritePluginManifest(string id)
+    {
+        var folder = Path.Combine(DataRoot, "plugins", id);
+        Directory.CreateDirectory(folder);
+        File.WriteAllText(Path.Combine(folder, "plugin.json"), $$"""
+        {
+          "id": "{{id}}", "version": "1.0.0", "contracts": "2",
+          "entryAssembly": "Someone.dll", "entryType": "Someone.Plugin",
+          "provides": [], "dependencies": [], "reloadPolicy": "replace"
+        }
+        """);
     }
 
     [Fact]

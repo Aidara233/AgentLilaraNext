@@ -866,7 +866,16 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
             Level = level,
             Detail = result.Ok
                 ? new Dictionary<string, string> { ["step"] = result.Value!.StepNumber.ToString() }
-                : new Dictionary<string, string> { ["message"] = result.Error?.Message ?? "" }
+                : new Dictionary<string, string>
+                {
+                    ["message"] = result.Error?.Message ?? "",
+                    // The code and the detail are what makes a failed turn diagnosable from signals.recent: "the request
+                    // failed" and "the request failed because no profile is called x" are the same sentence otherwise,
+                    // and only one of them tells you what to change.
+                    ["code"] = result.Error?.Code.ToString() ?? "",
+                    ["detail"] = result.Error?.Detail ?? "",
+                    ["retryable"] = (result.Error?.Retryable ?? false).ToString()
+                }
         });
     }
 
@@ -1997,6 +2006,85 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
             }
         });
         return Result<AccessLevel>.Success(spec.Level);
+    }
+
+    /// <summary>
+    /// Points one Session at another model profile, at a turn boundary.
+    ///
+    /// Why this exists: the spec is stored-wins and the held record is what a turn reads, so neither "edit the file" nor
+    /// "send it a spec" moves a live Session — the first is not re-read until a restart, the second is recorded as drift
+    /// and ignored. But "this conversation should keep going somewhere else" is a real thing to want, and the model is
+    /// looked up per step by profile id, so all it takes is adopting the new spec.
+    ///
+    /// A turn in progress is refused rather than raced: a gate that cannot be taken now means the turn that is running
+    /// was assembled against the profile it started with, and moving it mid-flight would produce a turn whose requests
+    /// went to two different models. That is a thing to do deliberately, not by accident.
+    /// </summary>
+    public async ValueTask<Result<SessionRebind>> RebindAsync(string sessionId, string profileId,
+        CancellationToken cancellationToken)
+    {
+        if (!IsValidSessionId(sessionId))
+            return Result<SessionRebind>.Failure(new(ErrorCode.Invalid, "Session id is invalid."));
+        if (string.IsNullOrWhiteSpace(profileId))
+            return Result<SessionRebind>.Failure(new(ErrorCode.Invalid, "sessions.rebind requires 'profile'."));
+        if (!Models.ListProfiles().Any(profile => profile.Id == profileId.Trim()))
+            return Result<SessionRebind>.Failure(new(ErrorCode.Invalid,
+                $"No model profile is called {profileId.Trim()}. models.list shows the ones that exist."));
+
+        string directory;
+        try { directory = ResolveSessionDirectory(sessionId); }
+        catch (IOException ex)
+        {
+            return Result<SessionRebind>.Failure(
+                new(ErrorCode.Conflict, "Session data exists in both old and new locations.", ex.Message));
+        }
+        var stored = TryReadSpec(directory);
+        if (stored is null)
+            return Result<SessionRebind>.Failure(new(ErrorCode.Invalid, $"No Session is called {sessionId}."));
+
+        // The held record is the newer truth when there is one: a level changed a minute ago lives there and on disk,
+        // but a pending commit may not have reached the file yet.
+        var current = _loaded.TryGetValue(sessionId, out var held) ? held.Spec : stored;
+        var previous = current.ModelProfileId;
+        if (string.Equals(previous, profileId.Trim(), StringComparison.Ordinal))
+            return Result<SessionRebind>.Success(new(previous, profileId.Trim(), Changed: false));
+
+        var gate = _sessionGates.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
+        if (!await gate.WaitAsync(TimeSpan.Zero, cancellationToken).ConfigureAwait(false))
+            return Result<SessionRebind>.Failure(new(ErrorCode.Conflict,
+                $"{sessionId} is in the middle of a turn; sessions.rebind applies at a turn boundary."));
+        try
+        {
+            var rebound = current with { ModelProfileId = profileId.Trim() };
+            await WriteAtomicJsonAsync(Path.Combine(directory, ManifestFile), new
+            {
+                id = sessionId,
+                type = SessionTypeId,
+                config = rebound
+            }, cancellationToken).ConfigureAwait(false);
+
+            // Both halves, the same way SetLevelAsync does it: the file so a restart agrees, the held record so the next
+            // step already uses it. Writing one and not the other is a change that takes effect at the next restart,
+            // which is the opposite of what this verb promises.
+            if (held is not null) held.AdoptSpec(rebound);
+
+            _signalLog.Write(new()
+            {
+                Group = "session",
+                Name = sessionId,
+                From = "operator",
+                Mechanism = "session.rebind",
+                Outcome = "changed",
+                Level = SignalLevel.Info,
+                Detail = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["from"] = previous ?? "",
+                    ["to"] = profileId.Trim()
+                }
+            });
+            return Result<SessionRebind>.Success(new(previous, profileId.Trim(), Changed: true));
+        }
+        finally { gate.Release(); }
     }
 
     public Result<SessionState> GetState(string sessionId)
@@ -3329,6 +3417,13 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
         /// restart, which is the opposite of what the verb promises.
         /// </summary>
         public void AdoptLevel(AccessLevel level) => Spec = Spec with { Level = level };
+
+        /// <summary>
+        /// Takes a new spec while the process runs. Only the fields a live verb may change are meant to move — the level
+        /// and the model profile — but the whole spec is adopted rather than merged: a spec assembled from two reads is
+        /// a third spec nobody wrote.
+        /// </summary>
+        public void AdoptSpec(SessionSpec spec) => Spec = spec;
         public SessionState State { get; set; } = null!;
         public IReadOnlyList<SessionHistoryEntry> History => _history;
 

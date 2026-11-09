@@ -66,11 +66,16 @@ public sealed partial class ModelManager(IArtifactStore? artifacts = null, ISign
         lock (_gate)
         {
             var ownedTypes = _factories.Where(x => x.Value.PackageId == packageId).Select(x => x.Key).ToHashSet(StringComparer.Ordinal);
-            var activeInstances = _providers.Values
-                .Where(x => ownedTypes.Contains(x.Provider.Describe.TypeId))
+            // Instances that are calling right now are the only thing worth refusing for: a call that started under this
+            // factory is a request in progress, and pulling the package out from under it is the case nobody can reason
+            // about afterwards. Idle instances are not a reason — they hold the old assembly open and keep working until
+            // they are destroyed, which is what makes a version switch possible at all.
+            var busy = _providers.Values
+                .Where(x => ownedTypes.Contains(x.Provider.Describe.TypeId) && x.InFlight > 0)
                 .Select(x => x.Provider.Address).ToArray();
-            if (activeInstances.Length > 0)
-                return Result.Failure(new(ErrorCode.Conflict, $"Model provider instances must be destroyed before unloading their package: {string.Join(", ", activeInstances)}"));
+            if (busy.Length > 0)
+                return Result.Failure(new(ErrorCode.Conflict,
+                    $"Model provider instances have calls in flight before unloading their package: {string.Join(", ", busy)}"));
             foreach (var type in ownedTypes) _factories.Remove(type);
             return Result.Success();
         }
@@ -88,6 +93,27 @@ public sealed partial class ModelManager(IArtifactStore? artifacts = null, ISign
     public string? TypeOf(Address address)
     {
         lock (_gate) return _providers.TryGetValue(IdOf(address), out var row) ? row.Provider.Describe.TypeId : null;
+    }
+
+    /// <summary>
+    /// Hands new settings to a provider that is already running. Refused when the provider cannot take them, which is
+    /// the honest answer for a provider that reads its configuration once: applying half of it silently is how a
+    /// deployment ends up with a key from one file and an endpoint from another.
+    /// </summary>
+    public Result ReconfigureProvider(Address address, string configurationJson)
+    {
+        IModelProvider provider;
+        lock (_gate)
+        {
+            if (!_providers.TryGetValue(IdOf(address), out var registration))
+                return Result.Failure(new(ErrorCode.Invalid, $"Model provider instance not found: {address}"));
+            provider = registration.Provider;
+        }
+        if (provider is not IModelProviderReconfigurable reconfigurable)
+            return Result.Failure(new(ErrorCode.Unavailable,
+                $"{address} keeps the configuration it was built with; a restart applies the new one."));
+        // Outside the lock: applying settings is the provider's business and must not hold the registry while it does.
+        return reconfigurable.ApplyConfiguration(configurationJson);
     }
 
     public async ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken)
@@ -170,8 +196,35 @@ public sealed partial class ModelManager(IArtifactStore? artifacts = null, ISign
         return CreateAsync(new ModelProviderSpec(new Address("model", kind, instance), configurationJson, typeId), cancellationToken);
     }
 
-    public async ValueTask<Result> DestroyAsync(Address provider, CancellationToken cancellationToken)
+    public ValueTask<Result> DestroyAsync(Address provider, CancellationToken cancellationToken) =>
+        DestroyAsync(provider, TimeSpan.Zero, cancellationToken);
+
+    /// <summary>
+    /// Destroys one provider instance, optionally waiting for its in-flight calls to finish first.
+    ///
+    /// Refusing outright is right when the caller cannot wait, and useless when it can: a turn that is one request away
+    /// from ending would otherwise block a switch for as long as somebody keeps talking to it. Waiting turns "not now"
+    /// into "in a moment", which is the answer an operator who just changed a key actually wants.
+    /// </summary>
+    public async ValueTask<Result> DestroyAsync(Address provider, TimeSpan drain, CancellationToken cancellationToken)
     {
+        if (drain > TimeSpan.Zero)
+        {
+            var deadline = DateTime.UtcNow + drain;
+            while (true)
+            {
+                int inFlight;
+                lock (_gate)
+                    inFlight = _providers.TryGetValue(IdOf(provider), out var row) ? row.InFlight : 0;
+                if (inFlight == 0) break;
+                if (DateTime.UtcNow >= deadline)
+                    return Result.Failure(new(ErrorCode.Conflict,
+                        $"{provider} still has {inFlight} call(s) in flight after {drain.TotalSeconds:0.#}s.",
+                        Retryable: true));
+                await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
         IModelProvider instance;
         lock (_gate)
         {
@@ -237,6 +290,27 @@ public sealed partial class ModelManager(IArtifactStore? artifacts = null, ISign
                 return Result.Failure(new(ErrorCode.Invalid, $"Model profile provider is not instantiated: {profile.Provider}"));
             if (!_profiles.TryAdd(profile.Id, profile))
                 return Result.Failure(new(ErrorCode.Conflict, $"Model profile already exists: {profile.Id}"));
+            return Result.Success();
+        }
+    }
+
+    /// <summary>
+    /// Replaces a profile in place. The difference from remove-then-create is the window between the two: every model
+    /// step looks its profile up by id, so a session that was mid-turn during the gap failed with "profile not found" —
+    /// an error about the host's bookkeeping, arriving as if the conversation had broken.
+    /// </summary>
+    public Result UpdateProfile(ModelProfile profile)
+    {
+        if (profile is null || string.IsNullOrWhiteSpace(profile.Id) || string.IsNullOrWhiteSpace(profile.ModelId) || !profile.Provider.IsInstance)
+            return Result.Failure(new(ErrorCode.Invalid, "Model profile is incomplete."));
+        lock (_gate)
+        {
+            if (!_profiles.ContainsKey(profile.Id))
+                return Result.Failure(new(ErrorCode.Invalid, $"Model profile not found: {profile.Id}"));
+            if (!_providers.ContainsKey(IdOf(profile.Provider)))
+                return Result.Failure(new(ErrorCode.Invalid, $"Model profile provider is not instantiated: {profile.Provider}"));
+            // One write of one whole profile: a step either reads the old one or the new one, never half of each.
+            _profiles[profile.Id] = profile;
             return Result.Success();
         }
     }

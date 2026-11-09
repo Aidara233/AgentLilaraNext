@@ -237,8 +237,12 @@ var hostServices = new HostServiceProvider(
     (typeof(ModuleHostPaths), new ModuleHostPaths(AppContext.BaseDirectory, data.Root)));
 var moduleServices = new ModuleServiceRegistry(hostServices);
 var moduleUnloads = new ModuleUnloadCoordinator();
+// The plugin folder is handed to the loader so a version can be resolved by name; the action table is handed to it
+// so a package that registered a verb can give it back. Without the second, replacing a package that added an action
+// leaves the handler pointing into an assembly nothing can release, and the next version's registration conflicts.
 await using var modulePackages = new ModulePackageLoader(moduleUnloads, moduleServices, adapterTypes, reloadState,
-    [adapterFactories, modelManager], adapters, bindings);
+    [adapterFactories, modelManager], adapters, bindings,
+    pluginsRoot: Path.Combine(data.Root, "plugins"), actionTable: controlPlane);
 // The bin comes up first: the bundled runtime registers what it has to offer into it, and anything else that
 // piles up (model-call artifacts next, most likely) registers the same way, without knowing this package.
 var archivePackage = await modulePackages.LoadAsync(
@@ -335,8 +339,11 @@ if (!qqPackage.Ok || qqPackage.Value is null)
 // third-party package must not be able to stop the host from starting.
 foreach (var dropped in await DroppedModules.LoadAsync(modulePackages, Path.Combine(data.Root, "plugins"), CancellationToken.None))
 {
-    if (dropped.Loaded) restore.Note("modules", $"plugin {dropped.Manifest!.Id} {dropped.Manifest.Version} from {Path.GetFileName(dropped.Directory)}");
-    else Console.Error.WriteLine($"plugin skipped: {Path.GetFileName(dropped.Directory)} — {dropped.Failure?.Message} {dropped.Failure?.Detail}".TrimEnd());
+    // The folder the operator wrote, not the version directory: a receipt that says "from 1.1.0" reads like the
+    // package is called 1.1.0.
+    var folder = Path.GetFileName(dropped.RootDirectory ?? dropped.Directory);
+    if (dropped.Loaded) restore.Note("modules", $"plugin {dropped.Manifest!.Id} {dropped.Manifest.Version} from {folder}");
+    else Console.Error.WriteLine($"plugin skipped: {folder} — {dropped.Failure?.Message} {dropped.Failure?.Detail}".TrimEnd());
 }
 
 // Before the catalogue is read, and only once per script: the shipped scripts get a copy in the operator's tree,
@@ -766,13 +773,22 @@ if (!scriptActions.Ok)
     Console.Error.WriteLine(scriptActions.Error?.Message ?? "Script action registration failed.");
     return 1;
 }
+// Package management: switching a dropped-in package to another of its versions. Registered here rather than inside a
+// package because it is the host's own machinery — a package that could replace other packages would be able to
+// replace the thing watching it.
+var packageActions = PackageActions.Register(controlPlane, modulePackages, graph, scriptCatalog.Value);
+if (!packageActions.Ok)
+{
+    Console.Error.WriteLine(packageActions.Error?.Message ?? "Package action registration failed.");
+    return 1;
+}
 var promptActions = PromptActions.Register(controlPlane, prompts);
 if (!promptActions.Ok)
 {
     Console.Error.WriteLine(promptActions.Error?.Message ?? "Prompt action registration failed.");
     return 1;
 }
-var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes, graphStatus: () => kernel.Status, kernel: kernel, scriptCatalog: scriptCatalog.Value);
+var actionsRegistered = CoreActions.RegisterAll(controlPlane, adapters, channels, modelManager, signalLog, graph, parameters, modulePackages, sessions, archive, prompts, adapterTypes, graphStatus: () => kernel.Status, kernel: kernel, scriptCatalog: scriptCatalog.Value, packages: modulePackages);
 if (!actionsRegistered.Ok)
 {
     Console.Error.WriteLine(actionsRegistered.Error?.Message ?? "Action registration failed.");

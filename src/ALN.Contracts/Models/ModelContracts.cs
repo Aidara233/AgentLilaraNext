@@ -338,6 +338,23 @@ public interface IModelProviderFactory
     ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// A provider that can take new configuration while it is running.
+///
+/// Without it, changing an endpoint or a key means destroying the instance — which refuses while a call is in flight or
+/// a profile points at it, so in practice it means restarting the host and losing the conversation that was in the
+/// middle of a turn. A provider that implements this says "the next request uses the new settings", which is the only
+/// claim worth making: a request already on the wire keeps the settings it was sent with.
+///
+/// The contract is deliberately narrow — one whole configuration in, applied or refused — so an implementation cannot
+/// half-apply one and leave a provider whose endpoint is new and whose key is old.
+/// </summary>
+public interface IModelProviderReconfigurable
+{
+    /// <summary>Applies a whole provider configuration. Refused, not partially applied, when it cannot be read.</summary>
+    Result ApplyConfiguration(string configurationJson);
+}
+
 public sealed record ModelProviderTypeInfo(string TypeId, string Category, string DisplayName, ModelCapabilities Capabilities);
 
 public interface IModelManager
@@ -372,5 +389,6 @@ public static class ModelActions
     public const string ProviderSave = "models.provider.save";
     public const string ProviderDestroy = "models.provider.destroy";
     public const string ProfileCreate = "models.profile.create";
+    public const string ProfileSet = "models.profile.set";
     public const string ProfileRemove = "models.profile.remove";
 }

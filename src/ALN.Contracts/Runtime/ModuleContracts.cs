@@ -100,10 +100,17 @@ public interface IModulePackageLoader
         CancellationToken cancellationToken);
 }
 
-/// <summary>The outcome of one dropped-in package, so the host can report it without parsing error strings.</summary>
-public sealed record DroppedModule(string Directory, ModulePackageManifest? Manifest, Error? Failure)
+/// <summary>
+/// The outcome of one dropped-in package, so the host can report it without parsing error strings.
+/// <para>
+/// <see cref="Directory"/> is where the code was read from — for a versioned package that is the version directory,
+/// which is the truth about what is running. <see cref="RootDirectory"/> is the folder the operator wrote, which is
+/// what a report about a package nobody can find should name.
+/// </para>
+/// </summary>
+public sealed record DroppedModule(string Directory, ModulePackageManifest? Manifest, Error? Failure, string? RootDirectory = null)
 {
-    public string Name => Manifest?.Id ?? System.IO.Path.GetFileName(Directory) ?? Directory;
+    public string Name => Manifest?.Id ?? System.IO.Path.GetFileName(RootDirectory ?? Directory) ?? Directory;
     public bool Loaded => Failure is null;
 }
 
@@ -150,7 +157,11 @@ public sealed record ModuleReloadReport(
     string PackageId,
     string PreviousVersion,
     string CurrentVersion,
-    IReadOnlyList<string> ReactivatedDependents);
+    IReadOnlyList<string> ReactivatedDependents,
+    /// <summary>Something worth saying that is not a failure: a pointer that could not be written, say. The
+    /// replacement itself succeeded, and a report that hid this would leave the next restart running the old
+    /// version for no visible reason.</summary>
+    string? Note = null);
 
 public sealed record ModuleUnloadReport(
     string PackageId,
@@ -161,3 +172,37 @@ public sealed record ModuleUnloadReport(
     IReadOnlyList<string> DisconnectedParticipants,
     IReadOnlyList<string> UnreadyParticipants,
     IReadOnlyList<string> Errors);
+
+/// <summary>One package that is loaded right now, and the directory its code came from.</summary>
+public sealed record LoadedPackageInfo(
+    string Id,
+    string Version,
+    ModulePackageKind PackageKind,
+    ModuleReloadPolicy ReloadPolicy,
+    IReadOnlyList<ModuleTypeProvision> Provides,
+    IReadOnlyList<ModuleDependency> Dependencies,
+    string Directory);
+
+/// <summary>
+/// What a caller who is allowed to manage packages can ask for.
+///
+/// Separate from <see cref="IModulePackageLoader"/> on purpose: dropping a package in is one decision, and taking a
+/// running one out from under the host is another. The host hands this one to its own actions, not to plugins.
+/// </summary>
+public interface IModulePackageMaintenance
+{
+    IReadOnlyList<LoadedPackageInfo> LoadedPackages { get; }
+
+    /// <summary>Where dropped-in packages live, so a caller can resolve versions without being handed a path.</summary>
+    string? PluginsRoot { get; }
+
+    /// <summary>
+    /// Switches a package to one of its versions, which must already be on disk as <c>&lt;pluginsRoot&gt;/&lt;id&gt;/&lt;version&gt;/</c>.
+    /// The version that is in force is written down only after the switch has succeeded.
+    /// </summary>
+    ValueTask<Result<ModuleReloadReport>> ReplaceAsync(string packageId, string version, TimeSpan timeout, bool force,
+        CancellationToken cancellationToken);
+
+    ValueTask<Result<ModuleUnloadReport>> UnloadAsync(string packageId, TimeSpan timeout, bool force,
+        CancellationToken cancellationToken);
+}
