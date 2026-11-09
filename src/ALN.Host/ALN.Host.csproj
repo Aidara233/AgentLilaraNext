@@ -10,6 +10,7 @@
     <ProjectReference Include="..\ALN.BundledModules\ALN.BundledModules.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\ALN.Model.OpenAIChat\ALN.Model.OpenAIChat.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\ALN.Ssh\ALN.Ssh.csproj" />
+    <ProjectReference Include="..\ALN.Net\ALN.Net.csproj" />
   </ItemGroup>
   <PropertyGroup>
     <OutputType>Exe</OutputType>

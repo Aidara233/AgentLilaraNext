@@ -146,11 +146,30 @@ var memoryModule = new MemoryModule(memoryLibrary, sessionExtensions);
 // idle hours leaves nothing on disk.
 var sshAccess = new ALN.Ssh.SshNetAccess();
 var sshLiveKeys = new ALN.Ssh.MemorySecretStore();
+// The network door (docs/29), in the same shape as SSH and the file system: the host decides where this process may
+// reach, and everything above it can only ask for a target by name. The file is the whole allowlist, so a data root
+// that has no target file can reach nowhere — which is what a fresh one gets.
+var netTargets = ALN.Net.NetTargetFile.Read(ALN.Net.NetTargetFile.PathIn(data.Root));
+foreach (var issue in netTargets.Issues)
+    Console.Error.WriteLine($"net: {issue.Entry}: {issue.Problem}");
+// A target's credential lives beside its file, readable only by the account running this process — the same plain store
+// SSH uses, for the same reason (docs/27 §7): the disk is the last line of defence, and a half-encrypted format whose
+// key sits on the same disk buys the feeling of safety rather than the thing.
+var netSecrets = new ALN.Ssh.FileSecretStore(Path.Combine(data.Root, "net", "secrets"));
+var netAccess = new ALN.Net.HttpNetAccess(netTargets.Targets, auditSink, signalLog, netSecrets);
+// The model's one tool for this: net_fetch, which takes a target's name and a path. Registered here rather than in a
+// module because the allowlist above is a host decision — and it offers nothing when there is nothing to reach.
+var netToolsSource = sessionExtensions.Register(new NetTools(netAccess));
+if (!netToolsSource.Ok) { Console.Error.WriteLine(netToolsSource.Error?.Message); return 1; }
 // The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.
 // The startup receipt: whoever restores something says what it restored, and the host prints it once.
 var restore = new RestoreReport();
+restore.Note("net", netTargets.Targets.Count == 0
+    ? "none — this process may reach nothing (net/targets.json is absent or empty)"
+    : $"{netTargets.Targets.Count} target(s): {string.Join(", ", netTargets.Targets.Select(t => t.Name))}" +
+      (netTargets.Issues.Count == 0 ? "" : $", {netTargets.Issues.Count} refused entry(ies)"));
 // Memory is not in the database any more, so its number is a directory listing rather than a count of rows. A
 // library that cannot be read at startup is not worth stopping for: the receipt says so and the host carries on.
 var memoryGroups = await memoryLibrary.GroupsAsync(CancellationToken.None);
@@ -777,6 +796,18 @@ if (!scriptActions.Ok)
 // package because it is the host's own machinery — a package that could replace other packages would be able to
 // replace the thing watching it.
 var packageActions = PackageActions.Register(controlPlane, modulePackages, graph, scriptCatalog.Value);
+// The allowlist as verbs. Reading it is agent-level — a model asked "can you read that page" should be able to answer
+// with a name instead of guessing a hostname — and changing it is an operator's. Both write here, so the file and the
+// running process cannot disagree about where this process may reach.
+var netActions = ALN.Net.NetActions.Register(controlPlane, netAccess, netAccess, netSecrets,
+    ALN.Net.NetTargetFile.PathIn(data.Root));
+if (!netActions.Ok)
+{
+    // A verb that failed to register is a door that is not there while everything else runs, which is exactly the
+    // state that reads as "the feature is broken" three days later. Stop instead.
+    Console.Error.WriteLine(netActions.Error?.Message ?? "The network verbs could not be registered.");
+    return 1;
+}
 if (!packageActions.Ok)
 {
     Console.Error.WriteLine(packageActions.Error?.Message ?? "Package action registration failed.");

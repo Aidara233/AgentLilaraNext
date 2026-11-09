@@ -29,7 +29,11 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         Capabilities.ModulesRead, Capabilities.ModulesControl, Capabilities.ParamsRead, Capabilities.ParamsWrite,
         Capabilities.ModelsRead, Capabilities.ModelsControl, Capabilities.SignalsRead, Capabilities.SessionsRead,
         Capabilities.SessionsControl, Capabilities.ArchiveRead, Capabilities.ArchiveControl, Capabilities.PromptsRead,
-        Capabilities.PromptsWrite
+        Capabilities.PromptsWrite,
+        // A script reaches the network only by declaring this and then calling the net.fetch action. The names it may
+        // ask for are the host's allowlist, not its own — a narrower, per-script list is a manifest change that has
+        // not been made yet (docs/29 §7).
+        Capabilities.NetRead
     };
     private readonly ICatalog _catalog;
     private readonly IModuleTypeCatalog _types;

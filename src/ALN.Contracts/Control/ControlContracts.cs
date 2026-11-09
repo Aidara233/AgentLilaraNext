@@ -61,6 +61,10 @@ public static class AccessLevels
         // Reading the schedules is answering "when does this wake up"; writing one decides when the host acts alone.
         [Capabilities.SchedulesRead] = AccessLevel.Agent,
         [Capabilities.SchedulesControl] = AccessLevel.Operator,
+        // Where this process may reach: reading the list is answering a question the model is asked; changing it — or
+        // the credential behind one target — is a deployment decision.
+        [Capabilities.NetRead] = AccessLevel.Agent,
+        [Capabilities.NetControl] = AccessLevel.Operator,
 
         // Changing the shape of the process: a person's decision, made on purpose, written down in the audit.
         [Capabilities.AdaptersControl] = AccessLevel.Operator,
@@ -297,4 +301,17 @@ public static class Capabilities
     /// which is a decision about the deployment rather than about one conversation.
     /// </summary>
     public const string SchedulesControl = "schedules.control";
+
+    /// <summary>
+    /// Seeing where this process may reach. A read, because "can you read that page" is a question an assistant should
+    /// be able to answer rather than guess — and the names it answers with are the ones it is allowed to use.
+    /// </summary>
+    public const string NetRead = "net.read";
+
+    /// <summary>
+    /// Changing the list of places this process may reach, or the credential one of them uses. Deeper than reading it,
+    /// for the reason every control is: an allowlist somebody can extend from a conversation is not an allowlist, and
+    /// what travels through these targets leaves this machine.
+    /// </summary>
+    public const string NetControl = "net.control";
 }
