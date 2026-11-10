@@ -388,6 +388,44 @@ public sealed class ChannelDeltaTests : IDisposable
         public ValueTask<Result<int>> ReplayPendingAsync(CancellationToken cancellationToken) => ValueTask.FromResult(Result<int>.Success(0));
     }
 
+    [Fact]
+    public async Task A_refused_round_costs_nothing_and_the_Session_still_runs_afterwards()
+    {
+        var admission = new RefuseRounds("白饭用完了。");
+        var contributors = new SessionExtensionRegistry();
+        Assert.True(contributors.Register(admission).Ok);
+        var model = new ScriptedModel();
+        var sessions = new SessionManager(_root, model, contributors);
+        var binding = new ChannelBinding(new("adapter", "qq", "qq-1"), "group-123456");
+        var spec = new SessionSpec("default", "Answer briefly.", "1");
+
+        var refused = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(),
+            new SessionTurnInput([], Channel, binding), null, default);
+
+        Assert.True(refused.Ok, refused.Error?.Detail ?? refused.Error?.Message);
+        Assert.Empty(model.Requests);                       // nothing was spent: the round never started
+        Assert.Equal("白饭用完了。", refused.Value!.Text);     // and the person is told why, in the Session's own words
+
+        // Starving is not the end of the conversation: one message later it runs, with no state to unwind.
+        admission.Refuse = false;
+        var ran = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding),
+            null, default);
+        Assert.True(ran.Ok, ran.Error?.Detail ?? ran.Error?.Message);
+        Assert.Single(model.Requests);
+    }
+
+    private sealed class RefuseRounds(string note) : IRoundAdmission
+    {
+        public bool Refuse { get; set; } = true;
+
+        public string Id => "test.admission";
+
+        public ValueTask<Result<RoundAdmission>> AdmitAsync(RoundAdmissionRequest request,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(Result<RoundAdmission>.Success(
+                Refuse ? RoundAdmission.No(note) : RoundAdmission.Yes));
+    }
+
     private sealed class ScriptedModel : IModelManager
     {
         public List<ModelRequest> Requests { get; } = [];

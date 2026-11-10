@@ -1644,6 +1644,17 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
             var refusedRounds = 0;
             while (true)
             {
+                // One question before anything is spent: may this round run? A refusal costs no tokens, and it is
+                // not the end of the Session — the turn closes normally with the note as the last thing said, and
+                // the next message wakes it exactly as before. Starving a conversation of its wallet is not a
+                // reason to break the conversation.
+                var admitted = await AdmitRoundAsync(sessionId, state, record.Spec.Level, cancellationToken).ConfigureAwait(false);
+                if (!admitted.Admitted)
+                {
+                    finalText = admitted.Note ?? "";
+                    finalStopReason = StopReason.EndTurn;
+                    break;
+                }
                 // Every round, because a tool result can add a picture and a turn must not get bigger permission the
                 // longer it runs. The newest pictures win; what is left out says so in words.
                 var trimmed = ImageBudget.Apply(messages, _media);
@@ -1881,6 +1892,27 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
         { return Result<SessionTurnResult>.Failure(new(ErrorCode.Unavailable, "Session turn failed.", ex.Message)); }
         finally { gate.Release(); }
+    }
+
+    /// <summary>
+    /// Asks every admission source, in id order, and stops at the first refusal.
+    ///
+    /// A source that fails to answer <b>admits</b>: a plugin with a bug must not be able to starve every Session in the
+    /// deployment. A source that says no is taken at its word — that is the whole point of having asked.
+    /// </summary>
+    private async ValueTask<RoundAdmission> AdmitRoundAsync(string sessionId, SessionState state,
+        AccessLevel level, CancellationToken cancellationToken)
+    {
+        var sources = _extensions.Admissions;
+        if (sources.Count == 0) return RoundAdmission.Yes;
+        var request = new RoundAdmissionRequest(sessionId, state.StepNumber + 1, level);
+        foreach (var source in sources)
+        {
+            var verdict = await source.AdmitAsync(request, cancellationToken).ConfigureAwait(false);
+            if (!verdict.Ok) continue;
+            if (verdict.Value is { Admitted: false } refused) return refused;
+        }
+        return RoundAdmission.Yes;
     }
 
     /// <summary>

@@ -90,10 +90,47 @@ public interface ISessionExtensionRegistry
     Result Register(ITimelineSource source);
     Result Register(ISessionToolSource source);
 
+    /// <summary>Asked once per round; see <see cref="IRoundAdmission"/>./</summary>
+    Result Register(IRoundAdmission admission);
+
     /// <summary>Removes the module's sources of every kind. A module that goes away should not keep feeding rounds.</summary>
     Result Unregister(string id);
 
     IReadOnlyList<IFloatingContextSource> Floating { get; }
     IReadOnlyList<ITimelineSource> Timeline { get; }
     IReadOnlyList<ISessionToolSource> Tools { get; }
+    IReadOnlyList<IRoundAdmission> Admissions { get; }
+}
+
+/// <summary>
+/// One question asked before every round: <i>may this round run?</i>
+///
+/// It exists because a limit that cannot refuse a round is not a limit — the session loop is <c>while (true)</c> and
+/// will keep calling the model until the model stops calling tools. Everything else (a floating block that says
+/// "0 left", a tool that returns an error) can only describe the shortage; this is the one place that can act on it.
+///
+/// A refusal is <b>not</b> the end of the Session. The turn closes normally, the note becomes what the model last
+/// said, and the next message wakes it exactly as before: starving a conversation of its wallet is not a reason to
+/// break the conversation.
+/// </summary>
+public interface IRoundAdmission
+{
+    /// Stable id for registration and removal, like every other session extension.
+    string Id { get; }
+
+    ValueTask<Result<RoundAdmission>> AdmitAsync(RoundAdmissionRequest request, CancellationToken cancellationToken);
+}
+
+/// <param name="StepNumber">The round about to run: <c>state.StepNumber + 1</c>.</param>
+public sealed record RoundAdmissionRequest(string SessionId, int StepNumber, AccessLevel Level);
+
+/// <summary>
+/// The answer. <paramref name="Note"/> is shown as the model's closing words when the round is refused, so write it
+/// for the person in the chat, not for the log: it is the only thing they will see when nothing happens.
+/// </summary>
+public sealed record RoundAdmission(bool Admitted, string? Note)
+{
+    public static readonly RoundAdmission Yes = new(true, null);
+
+    public static RoundAdmission No(string note) => new(false, note);
 }

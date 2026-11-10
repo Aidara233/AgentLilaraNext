@@ -16,6 +16,7 @@ public sealed class SessionExtensionRegistry : ISessionExtensionRegistry
     private readonly Dictionary<string, IFloatingContextSource> _floating = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ITimelineSource> _timeline = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ISessionToolSource> _tools = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, IRoundAdmission> _admissions = new(StringComparer.Ordinal);
 
     public Result Register(IFloatingContextSource source) =>
         Add(_floating, source?.Id, source, "Floating context source");
@@ -26,12 +27,15 @@ public sealed class SessionExtensionRegistry : ISessionExtensionRegistry
     public Result Register(ISessionToolSource source) =>
         Add(_tools, source?.Id, source, "Session tool source");
 
+    public Result Register(IRoundAdmission admission) =>
+        Add(_admissions, admission?.Id, admission, "Round admission");
+
     public Result Unregister(string id)
     {
         if (!IsValidId(id)) return Result.Failure(new(ErrorCode.Invalid, "Session extension id is invalid."));
         lock (_gate)
         {
-            var removed = _floating.Remove(id) | _timeline.Remove(id) | _tools.Remove(id);
+            var removed = _floating.Remove(id) | _timeline.Remove(id) | _tools.Remove(id) | _admissions.Remove(id);
             return removed ? Result.Success() : Result.Failure(new(ErrorCode.Invalid, $"No session extension answers to \"{id}\"."));
         }
     }
@@ -44,6 +48,11 @@ public sealed class SessionExtensionRegistry : ISessionExtensionRegistry
     public IReadOnlyList<ITimelineSource> Timeline
     {
         get { lock (_gate) return _timeline.Values.OrderBy(source => source.Id, StringComparer.Ordinal).ToArray(); }
+    }
+
+    public IReadOnlyList<IRoundAdmission> Admissions
+    {
+        get { lock (_gate) return _admissions.Values.OrderBy(source => source.Id, StringComparer.Ordinal).ToArray(); }
     }
 
     public IReadOnlyList<ISessionToolSource> Tools
