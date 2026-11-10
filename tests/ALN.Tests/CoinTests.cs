@@ -33,6 +33,8 @@ public sealed class CoinTests
 
     private sealed class Scripts(IReadOnlyDictionary<string, string> answers) : ICoinScripts
     {
+        public IReadOnlyList<string> Loaded => answers.Keys.Order(StringComparer.Ordinal).ToArray();
+
         public bool CanRun(string script) => answers.ContainsKey(script);
 
         public ValueTask<Result<string>> InvokeAsync(string script, string argumentsJson,

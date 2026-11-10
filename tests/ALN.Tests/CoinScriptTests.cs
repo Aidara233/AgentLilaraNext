@@ -76,6 +76,8 @@ public sealed class CoinScriptTests
                 TrustDomain.Trusted, Call: "box", Tool: new ScriptToolSpec("shop.box", "盲盒", "{}")),
             source);
 
+        public IReadOnlyList<string> Loaded => ["shop.box"];
+
         public bool CanRun(string script) => string.Equals(script, "shop.box", StringComparison.Ordinal);
 
         public ValueTask<Result<string>> InvokeAsync(string script, string argumentsJson,

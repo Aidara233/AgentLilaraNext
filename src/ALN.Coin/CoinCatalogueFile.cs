@@ -32,7 +32,7 @@ public static class CoinCatalogueFile
             if (good.Price < 0) { issues.Add($"{good.Id}: 价格是负数，不上架。"); continue; }
             if (!scripts.CanRun(good.Script))
             {
-                issues.Add($"{good.Id}: 脚本 {good.Script} 不存在或不可当工具调用，不上架。");
+                issues.Add($"{good.Id}: 脚本 {good.Script} 不可调用，不上架（图里已加载：{string.Join(", ", scripts.Loaded)}）。");
                 continue;
             }
             shelf.Add(good);
@@ -43,7 +43,7 @@ public static class CoinCatalogueFile
         {
             if (!scripts.CanRun(item.Use))
             {
-                issues.Add($"{item.Id}: 脚本 {item.Use} 不存在或不可当工具调用，这件东西不会进背包。");
+                issues.Add($"{item.Id}: 脚本 {item.Use} 不可调用，这件东西不会进背包（图里已加载：{string.Join(", ", scripts.Loaded)}）。");
                 continue;
             }
             bag.Add(item);

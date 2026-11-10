@@ -13,6 +13,10 @@ public interface ICoinScripts
 {
     bool CanRun(string script);
 
+    /// <summary>Every script the graph actually loaded. When a good cannot be sold, this is what the issue prints:
+    /// the difference between "no such script" and "loaded but not callable" is one line of log away from the answer.</summary>
+    IReadOnlyList<string> Loaded { get; }
+
     /// <summary>Runs the script as itself, with its own depth, and returns whatever it said.</summary>
     ValueTask<Result<string>> InvokeAsync(string script, string argumentsJson, CancellationToken cancellationToken);
 }
@@ -26,6 +30,9 @@ public sealed class GraphCoinScripts(IGraphRuntime graph) : ICoinScripts
     /// over the manifest's <c>tool</c> block — so a settlement script that has a <c>call</c> but no <c>describe()</c>
     /// has no definition and is still perfectly callable. Gating the shelf on that would hide every such script.
     /// </summary>
+    public IReadOnlyList<string> Loaded =>
+        graph.Scripts.Select(entry => entry.Package.Manifest.Id).Order(StringComparer.Ordinal).ToArray();
+
     public bool CanRun(string script) =>
         graph.Scripts.Any(entry =>
             entry.Enabled &&
