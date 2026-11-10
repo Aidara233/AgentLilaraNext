@@ -24,13 +24,9 @@ public sealed class RiceAdmission(RiceLedger ledger) : IRoundAdmission
         var charged = await ledger.ChargeRoundAsync(request.SessionId, request.StepNumber, cancellationToken)
             .ConfigureAwait(false);
 
-        // Refused means empty, and the person is told what to do about it. Any other failure — the store is down, the
-        // larder is unreadable — admits: a plugin with a bug must not be able to starve every Session at once.
-        if (!charged.Ok)
-            return Result<RoundAdmission>.Success(charged.Error?.Code == ErrorCode.Denied
-                ? RoundAdmission.No($"这一轮没有跑：白饭用完了（0 口）。{BuyHint}")
-                : RoundAdmission.Yes);
-
+        // The larder is a meter, not a gate: running dry must not stop a conversation. An empty larder goes
+        // negative and the next purchase pays the debt back.
+        _ = charged;
         return Result<RoundAdmission>.Success(RoundAdmission.Yes);
     }
 }

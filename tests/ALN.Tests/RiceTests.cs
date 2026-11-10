@@ -34,7 +34,7 @@ public sealed class RiceTests
     }
 
     [Fact]
-    public async Task Two_sessions_cannot_both_eat_the_last_bowl()
+    public async Task The_larder_goes_negative_rather_than_stopping_a_round()
     {
         var ledger = Ledger();
         Assert.True((await ledger.AddAsync(1, "topup", "test", default)).Ok);
@@ -43,22 +43,19 @@ public sealed class RiceTests
         var two = await ledger.ChargeRoundAsync("s-2", 1, default);
 
         Assert.True(one.Ok, one.Error?.Message);
-        Assert.False(two.Ok);
-        Assert.Equal(ErrorCode.Denied, two.Error!.Code);
-        Assert.Equal(0, (await ledger.ReadAsync(default)).Value!.Bites);
+        Assert.True(two.Ok, two.Error?.Message);
+        Assert.Equal(-1, (await ledger.ReadAsync(default)).Value!.Bites);
     }
 
     [Fact]
-    public async Task An_empty_larder_refuses_the_round_with_words_a_person_can_act_on()
+    public async Task An_empty_larder_never_refuses_a_round()
     {
         var admission = new RiceAdmission(Ledger());
 
         var verdict = await admission.AdmitAsync(new RoundAdmissionRequest("s-1", 1, AccessLevel.Agent), default);
 
         Assert.True(verdict.Ok);
-        Assert.False(verdict.Value!.Admitted);
-        Assert.Contains("白饭用完了", verdict.Value.Note);
-        Assert.Contains("rice-100", verdict.Value.Note);   // it says what to buy, not just that it is over
+        Assert.True(verdict.Value!.Admitted);
     }
 
     [Fact]

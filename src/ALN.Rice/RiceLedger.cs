@@ -62,7 +62,6 @@ public sealed class RiceLedger(IStateStore store, IAtomicWork atomic, ISignalLog
         ChangeAsync($"eat:{sessionId}", $"session:{sessionId}", state =>
         {
             if (state.ChargedUpTo(sessionId) >= step) return Result<RiceState>.Success(state);
-            if (state.Bites <= 0) return Result<RiceState>.Failure(new(ErrorCode.Denied, "白饭用完了。"));
             var charged = new Dictionary<string, int>(state.Charged, StringComparer.Ordinal) { [sessionId] = step };
             return Result<RiceState>.Success(state with
             {
