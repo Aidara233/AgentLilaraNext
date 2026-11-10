@@ -1267,6 +1267,13 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
     /// round, and quietly dropping it would run a Session with a different toolset than its spec names — the
     /// assembly mistake would then only ever show up as the model behaving oddly.
     /// </summary>
+    /// <summary>
+    /// The one tool a turn builds for itself instead of a module registering it. Named here because the check for
+    /// "declared but absent" has to know which absence is normal: this one exists only when there is a Channel message
+    /// to answer (<c>GraphManager.TurnToolbox</c> builds it), and everything else that is declared but absent is a bug.
+    /// </summary>
+    private const string PerTurnTool = "speak";
+
     private static Result<ResolvedTools> ResolveTools(SessionSpec spec, ISessionToolbox? toolbox, IReadOnlyList<SessionToolOffer> offered)
     {
         var visible = new List<ModelToolDefinition> { WaitTool.Definition, CompactTool.Definition };
@@ -1298,6 +1305,12 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
                 acting++;
                 continue;
             }
+            // "speak" is the one tool built per turn rather than registered: it answers a specific Channel message, so
+            // it exists only in a turn that has one (GraphManager.TurnToolbox). A Session woken some other way — by a
+            // script, by a schedule — still carries it in its spec, because the spec was written for the Channel.
+            // Failing the whole round over that would make "wake up and do something else" impossible, which is not
+            // an assembly mistake but a different kind of turn. Everything else declared-but-absent is still a bug.
+            if (string.Equals(declared.Name, PerTurnTool, StringComparison.Ordinal)) continue;
             missing.Add(declared.Name);
         }
         if (missing.Count == 0) return Result<ResolvedTools>.Success(new(visible, byName, acting));

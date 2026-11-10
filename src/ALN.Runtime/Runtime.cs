@@ -494,83 +494,170 @@ public sealed class EventQueue : IEventSink
 /// </param>
 public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationToken, ValueTask<Result>> dispatch, ISignalLog signalLog, IEventSettler? settler = null, IEnvelopeInterceptor? interceptor = null)
 {
+    /// <summary>
+    /// How many events may be in flight at once, across every lane.
+    ///
+    /// Not a throughput knob: it is what keeps a burst of events from becoming a burst of tasks. The pump used to run
+    /// one event at a time, which is why a forty-second compaction inside one conversation stopped every other
+    /// conversation, every instruction and the lifecycle events queued behind it.
+    /// </summary>
+    private const int MaxInFlight = 64;
+
+    /// <summary>The last event queued for each lane; the next one waits on it, which is what keeps a lane in order.</summary>
+    private readonly Dictionary<string, Task> _tails = new(StringComparer.Ordinal);
+
     public async Task RunAsync(CancellationToken cancellationToken)
     {
-        await foreach (var routedEvent in queue.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+        var inFlight = new HashSet<Task>();
+        try
         {
-            var now = DateTimeOffset.UtcNow;
-            var intakeId = Guid.NewGuid();
+            await foreach (var routedEvent in queue.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                inFlight.RemoveWhere(static task => task.IsCompleted);
+                inFlight.Add(Enqueue(LaneOf(routedEvent), routedEvent, cancellationToken));
+                if (inFlight.Count >= MaxInFlight) await Task.WhenAny(inFlight).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            // Whatever was already taken off the queue finishes: half a round leaves a Channel row nobody answers and a
+            // mailbox file nobody acknowledges, and both of those are replayed on the next boot.
+            if (inFlight.Count > 0) await Task.WhenAll(inFlight).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// The address an event belongs to: its target when it has one, its source otherwise.
+    ///
+    /// This is the thing a person would call "the conversation it is about", and it is the right key because the two
+    /// halves of the answer differ. Events about one conversation have to stay in order — two turns of one Session
+    /// interleaved would each read half a conversation and answer it. Events about different conversations have
+    /// nothing to say to each other, and making them wait is what turned one slow turn into a silent host.
+    ///
+    /// It is also where instructions get their head start, without a rule of their own: an instruction arrives as an
+    /// Adapter envelope (<c>docs/32</c>), whose lane is the Adapter, so it is never queued behind a Channel's turn.
+    /// </summary>
+    private static string LaneOf(RoutedEvent routedEvent) =>
+        (routedEvent.Target ?? routedEvent.Source).ToString();
+
+    /// <summary>
+    /// Queues one event behind the previous event of its lane, starting it as soon as that one finishes.
+    ///
+    /// Called from the pump's own loop and nothing else, which is what makes a plain dictionary the right container.
+    /// </summary>
+    private Task Enqueue(string lane, RoutedEvent routedEvent, CancellationToken cancellationToken)
+    {
+        var previous = _tails.TryGetValue(lane, out var tail) ? tail : Task.CompletedTask;
+        var next = AfterAsync(previous, routedEvent, cancellationToken);
+        _tails[lane] = next;
+        return next;
+    }
+
+    private async Task AfterAsync(Task previous, RoutedEvent routedEvent, CancellationToken cancellationToken)
+    {
+        // A lane whose previous event failed carries on. The failure was recorded where it happened; dropping everything
+        // after it would turn one bad message into a conversation that stopped answering.
+        try { await previous.ConfigureAwait(false); }
+        catch (Exception) { /* already reported by whichever event threw */ }
+
+        try { await HandleAsync(routedEvent, cancellationToken).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            // A dispatch answers with a Result, so reaching here is a bug rather than a refusal. Saying so is what keeps
+            // it from disappearing into an abandoned task.
             signalLog.Write(new()
             {
-                Id = intakeId,
-                // If a handler emitted this event, the intake is a branch of that handler, not a new root.
-                ParentId = routedEvent.CauseSignalId ?? SignalScope.CurrentId,
                 Group = "queue",
                 Name = routedEvent.Name,
                 StepId = routedEvent.EventId,
                 From = routedEvent.Source.ToString(),
-                To = routedEvent.Target?.ToString() ?? "",
-                Mechanism = "dequeue",
-                Outcome = "ok",
-                DurationMs = routedEvent.EnqueuedAt is { } enqueued ? (now - enqueued).TotalMilliseconds : 0,
-                Level = SignalLevel.Info
+                Mechanism = "pump",
+                Outcome = "crashed",
+                Level = SignalLevel.Error,
+                Detail = new Dictionary<string, string>
+                {
+                    ["type"] = ex.GetType().Name,
+                    ["message"] = ex.Message
+                }
             });
-            Result dispatched;
-            using (SignalScope.Enter(intakeId, routedEvent.EventId))
-            {
-                // The one look before dispatch. A handled event still settles (below): the mailbox file must still be
-                // acknowledged, or a restart would replay a message that has already been answered.
-                Result<EnvelopeDisposition>? intercepted = interceptor is null
-                    ? null
-                    : await interceptor.InterceptAsync(routedEvent, cancellationToken).ConfigureAwait(false);
-                dispatched = intercepted switch
-                {
-                    null => await dispatch(routedEvent, cancellationToken).ConfigureAwait(false),
-                    // Mine, and it went wrong: finished with an error, not passed on. An instruction that failed must
-                    // not fall through to a script and be read as text.
-                    { Ok: false, Error: { } failure } => Result.Failure(failure),
-                    { Value: EnvelopeDisposition.Handled } => Result.Success(),
-                    _ => await dispatch(routedEvent, cancellationToken).ConfigureAwait(false)
-                };
-            }
-            if (!dispatched.Ok)
-                signalLog.Write(new()
-                {
-                    ParentId = intakeId,
-                    Group = "queue",
-                    Name = routedEvent.Name,
-                    StepId = routedEvent.EventId,
-                    From = routedEvent.Source.ToString(),
-                    Mechanism = "pump",
-                    Outcome = "failed",
-                    Level = SignalLevel.Warn,
-                    Detail = new Dictionary<string, string>
-                    {
-                        ["code"] = dispatched.Error?.Code.ToString() ?? "unknown",
-                        ["message"] = dispatched.Error?.Message ?? ""
-                    }
-                });
-            // Settling happens for a finished round whatever its outcome: a poisoned event that failed is
-            // worse to retry forever than to acknowledge once and leave the failure in the log.
-            if (settler is null) continue;
-            var settled = await settler.SettleAsync(routedEvent, cancellationToken).ConfigureAwait(false);
-            if (!settled.Ok)
-                signalLog.Write(new()
-                {
-                    ParentId = intakeId,
-                    Group = "queue",
-                    Name = routedEvent.Name,
-                    StepId = routedEvent.EventId,
-                    From = routedEvent.Source.ToString(),
-                    Mechanism = "settle",
-                    Outcome = "failed",
-                    Level = SignalLevel.Warn,
-                    Detail = new Dictionary<string, string>
-                    {
-                        ["code"] = settled.Error?.Code.ToString() ?? "unknown",
-                        ["message"] = settled.Error?.Message ?? ""
-                    }
-                });
         }
+    }
+
+    private async ValueTask HandleAsync(RoutedEvent routedEvent, CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var intakeId = Guid.NewGuid();
+        signalLog.Write(new()
+        {
+            Id = intakeId,
+            // If a handler emitted this event, the intake is a branch of that handler, not a new root.
+            ParentId = routedEvent.CauseSignalId ?? SignalScope.CurrentId,
+            Group = "queue",
+            Name = routedEvent.Name,
+            StepId = routedEvent.EventId,
+            From = routedEvent.Source.ToString(),
+            To = routedEvent.Target?.ToString() ?? "",
+            Mechanism = "dequeue",
+            Outcome = "ok",
+            DurationMs = routedEvent.EnqueuedAt is { } enqueued ? (now - enqueued).TotalMilliseconds : 0,
+            Level = SignalLevel.Info
+        });
+        Result dispatched;
+        using (SignalScope.Enter(intakeId, routedEvent.EventId))
+        {
+            // The one look before dispatch. A handled event still settles (below): the mailbox file must still be
+            // acknowledged, or a restart would replay a message that has already been answered.
+            Result<EnvelopeDisposition>? intercepted = interceptor is null
+                ? null
+                : await interceptor.InterceptAsync(routedEvent, cancellationToken).ConfigureAwait(false);
+            dispatched = intercepted switch
+            {
+                null => await dispatch(routedEvent, cancellationToken).ConfigureAwait(false),
+                // Mine, and it went wrong: finished with an error, not passed on. An instruction that failed must
+                // not fall through to a script and be read as text.
+                { Ok: false, Error: { } failure } => Result.Failure(failure),
+                { Value: EnvelopeDisposition.Handled } => Result.Success(),
+                _ => await dispatch(routedEvent, cancellationToken).ConfigureAwait(false)
+            };
+        }
+        if (!dispatched.Ok)
+            signalLog.Write(new()
+            {
+                ParentId = intakeId,
+                Group = "queue",
+                Name = routedEvent.Name,
+                StepId = routedEvent.EventId,
+                From = routedEvent.Source.ToString(),
+                Mechanism = "pump",
+                Outcome = "failed",
+                Level = SignalLevel.Warn,
+                Detail = new Dictionary<string, string>
+                {
+                    ["code"] = dispatched.Error?.Code.ToString() ?? "unknown",
+                    ["message"] = dispatched.Error?.Message ?? ""
+                }
+            });
+        // Settling happens for a finished round whatever its outcome: a poisoned event that failed is
+        // worse to retry forever than to acknowledge once and leave the failure in the log.
+        if (settler is null) return;
+        var settled = await settler.SettleAsync(routedEvent, cancellationToken).ConfigureAwait(false);
+        if (!settled.Ok)
+            signalLog.Write(new()
+            {
+                ParentId = intakeId,
+                Group = "queue",
+                Name = routedEvent.Name,
+                StepId = routedEvent.EventId,
+                From = routedEvent.Source.ToString(),
+                Mechanism = "settle",
+                Outcome = "failed",
+                Level = SignalLevel.Warn,
+                Detail = new Dictionary<string, string>
+                {
+                    ["code"] = settled.Error?.Code.ToString() ?? "unknown",
+                    ["message"] = settled.Error?.Message ?? ""
+                }
+            });
     }
 }
