@@ -1,6 +1,8 @@
 using ALN.Contracts;
 using ALN.Coin;
+using ALN.Graph;
 using ALN.Graph.Contracts;
+using ALN.Runtime;
 using ALN.Scripting.Jint;
 
 namespace ALN.Tests;
@@ -62,7 +64,8 @@ public sealed class CoinScriptTests
         Assert.Equal(100, (await ledger.ReadAsync(default)).Value!.Balance);
     }
 
-    /// <summary>A real Jint executor behind the narrow port the purse uses.</summary>
+    /// A real Jint executor behind the narrow port the purse uses.
+    /// </summary>
     private sealed class RealScripts(string source) : ICoinScripts
     {
         private static readonly Address Target = new("channel", "test", "one");
