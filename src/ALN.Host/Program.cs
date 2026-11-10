@@ -197,8 +197,7 @@ webProviders.Add(new ALN.Web.LocalProvider(netAccess, webOptions.LocalAllowPriva
     webOptions.LocalTimeoutSeconds));
 var webGateway = new ALN.Web.WebGateway(webProviders, webOptions, auditSink, signalLog);
 var webToolsSource = sessionExtensions.Register(new ALN.Web.WebTools(webGateway, webOptions));
-if (!webToolsSource.Ok) { Console.Error.WriteLine(webToolsSource.Error?.Message); return 1; }
-// The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
+if (!webToolsSource.Ok) { Console.Error.WriteLine(webToolsSource.Error?.Message); return 1; }// The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.
 // The startup receipt: whoever restores something says what it restored, and the host prints it once.
@@ -247,6 +246,10 @@ var sessions = new SessionManager(data.Root, extensions: sessionExtensions, sign
 // the session that started it (docs/28 §9.4). Before it — and never, in a host without sessions — the row is still
 // written, and the session reads it at its next turn.
 jobs.Waker = sessions;
+// Which people this conversation keeps in mind. Registered after the Sessions because the roster lives on one: joining
+// is the model's own decision (docs/31 §5), and it reaches the Session through the same manager a turn does.
+var peopleMemoryTools = sessionExtensions.Register(new ALN.Identity.PersonMemoryTools(personDirectory, sessions));
+if (!peopleMemoryTools.Ok) { Console.Error.WriteLine(peopleMemoryTools.Error?.Message); return 1; }
 var reloadState = new ModuleReloadStateStore();
 // The action table exists before anything runs, because the modules that implement actions are the ones that
 // register them: a manager is created (and readied) inside a package load, long before startup finishes, and it

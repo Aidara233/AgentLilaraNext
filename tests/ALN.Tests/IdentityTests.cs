@@ -669,15 +669,83 @@ public sealed class IdentityTests : IDisposable
         Assert.Contains("sender=\"路人丙\"", user, StringComparison.Ordinal);
         Assert.Contains("<note>带 person", user, StringComparison.Ordinal);
 
-        // And having met him, the next round carries the roster: the id is remembered on the Session's own state.
+        // And the roster is empty: traffic does not decide who matters (docs/31 §5).
+        Assert.DoesNotContain("<section name=\"people\"", user, StringComparison.Ordinal);
+
+        // The conversation decides, through the tool.
+        var remembered = await sessions.RememberAsync("s-1", "xiaolin", default);
+        Assert.True(remembered.Ok, remembered.Error?.Detail);
+
+        // From now on every round carries him, and only him: the stranger who spoke is not on the roster either.
         var second = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
         Assert.True(second.Ok, second.Error?.Detail ?? second.Error?.Message);
         var next = model.Requests.Last().Messages
             .First(message => message.Content?.Contains("<channel_messages", StringComparison.Ordinal) == true).Content!;
         Assert.Contains("<section name=\"people\"", next, StringComparison.Ordinal);
         Assert.Contains("小林（L1 operator）：我妹妹。", next, StringComparison.Ordinal);
-        // The stranger is not in it: the roster is the people this process knows, not everybody who spoke.
         Assert.DoesNotContain("路人丙（", next, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_session_remembers_exactly_the_people_it_was_told_to()
+    {
+        var sessions = new SessionManager(_root, new ScriptedModel(), new SessionExtensionRegistry());
+        var opened = await sessions.OpenAsync("s-1", new SessionSpec("default", "ok", "1"), default);
+        Assert.True(opened.Ok, opened.Error?.Detail);
+
+        var remembered = await sessions.RememberAsync("s-1", "xiaolin", default);
+        Assert.True(remembered.Ok, remembered.Error?.Detail);
+        Assert.Equal(["xiaolin"], remembered.Value!.Select(seen => seen.Id));
+
+        // Remembering twice is the same list, not a second line.
+        var again = await sessions.RememberAsync("s-1", "xiaolin", default);
+        Assert.Single(again.Value!);
+        Assert.Single(sessions.GetState("s-1").Value!.People!);
+
+        var forgotten = await sessions.ForgetAsync("s-1", "xiaolin", default);
+        Assert.True(forgotten.Ok, forgotten.Error?.Detail);
+        Assert.Empty(forgotten.Value!);
+        // Forgetting somebody who was never there is a no-op, not an error: the caller's intent is already true.
+        Assert.True((await sessions.ForgetAsync("s-1", "nobody", default)).Ok);
+        // And remembering against a Session that does not exist does not create one.
+        Assert.False((await sessions.RememberAsync("no-such-session", "xiaolin", default)).Ok);
+        Assert.False(Directory.Exists(Path.Combine(_root, "modules", "no-such-session")));
+    }
+
+    [Fact]
+    public async Task Somebody_already_on_the_roster_gets_a_newer_time_when_he_speaks_again()
+    {
+        Write("xiaolin", """{"name":"小林","accounts":[{"adapter":"adapter.qq#main","account":"1234567"}]}""");
+        var people = await Load();
+        var store = OpenStore();
+        Assert.True((await store.AppendAsync(new StoredMessage("m1", Channel, "group-123456", "m1", "1234567",
+            "第一句", new DateTimeOffset(2026, 11, 1, 8, 0, 0, TimeSpan.Zero),
+            SenderName: "小林", Person: "xiaolin"), default)).Ok);
+
+        var contributors = new SessionExtensionRegistry();
+        Assert.True(contributors.Register(new ChannelDeltaSource(new FileChannelDeltaSource(store, store),
+            new StubChannels(), people)).Ok);
+        var sessions = new SessionManager(_root, new ScriptedModel(), contributors);
+        var binding = new ChannelBinding(Adapter, "group-123456");
+        var spec = new SessionSpec("default", "ok", "1");
+        var first = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
+        Assert.True(first.Ok, first.Error?.Detail ?? first.Error?.Message);
+        // Speaking here put nobody on the roster.
+        Assert.Empty(sessions.GetState("s-1").Value!.People ?? []);
+
+        Assert.True((await sessions.RememberAsync("s-1", "xiaolin", default)).Ok);
+
+        // A newer message from him, hand-dated into the future so this does not depend on which clock is ahead.
+        var later = DateTimeOffset.UtcNow.AddMinutes(5);
+        Assert.True((await store.AppendAsync(new StoredMessage("m2", Channel, "group-123456", "m2", "1234567",
+            "第二句", later, SenderName: "小林", Person: "xiaolin"), default)).Ok);
+        var second = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
+        Assert.True(second.Ok, second.Error?.Detail ?? second.Error?.Message);
+
+        // The host did the arithmetic and nothing else: the person was already there, so his time moved forward.
+        var seen = Assert.Single(sessions.GetState("s-1").Value!.People!);
+        Assert.Equal("xiaolin", seen.Id);
+        Assert.Equal(later, seen.At);
     }
 
     [Fact]
@@ -735,6 +803,36 @@ public sealed class IdentityTests : IDisposable
         var seen = Assert.Single(back.People!);
         Assert.Equal("aidara", seen.Id);
         Assert.Equal(Stamp(spokenMinutesAgo: 5), seen.At);
+    }
+
+    [Fact]
+    public async Task The_remember_tool_refuses_a_name_that_fits_two_people()
+    {
+        Write("a", """{"name":"小林","accounts":[{"adapter":"adapter.qq#main","account":"1"}]}""");
+        Write("b", """{"name":"小林","accounts":[{"adapter":"adapter.qq#main","account":"2"}]}""");
+        Write("c", """{"name":"阿伟","accounts":[{"adapter":"adapter.qq#main","account":"3"}]}""");
+        var people = await Load();
+        var sessions = new SessionManager(_root, new ScriptedModel(), new SessionExtensionRegistry());
+        Assert.True((await sessions.OpenAsync("s-1", new SessionSpec("default", "ok", "1"), default)).Ok);
+        var tools = new PersonMemoryTools(people, sessions);
+        var remember = Assert.Single((await tools.ToolsAsync(Request(), default)).Value!,
+            offer => offer.Tool.Name == PersonMemoryTools.RememberToolName).Tool;
+
+        var unique = await remember.ExecuteAsync(new ModelToolCall("c1", "remember_person", """{"name":"阿伟"}"""), default);
+        Assert.True(unique.Ok, unique.Error?.Detail);
+        Assert.Contains("记住了", unique.Value!.Content, StringComparison.Ordinal);
+        Assert.Equal(["c"], sessions.GetState("s-1").Value!.People!.Select(seen => seen.Id));
+
+        // A name two people share is refused rather than guessed: remembering the wrong one survives in every round.
+        var ambiguous = await remember.ExecuteAsync(new ModelToolCall("c2", "remember_person", """{"name":"小林"}"""), default);
+        Assert.False(ambiguous.Ok);
+        Assert.Equal(ErrorCode.Conflict, ambiguous.Error!.Code);
+        Assert.Contains("a, b", ambiguous.Error.Message, StringComparison.Ordinal);
+
+        // Somebody who is not on the identity table cannot be remembered — the card comes first.
+        var unknown = await remember.ExecuteAsync(new ModelToolCall("c3", "remember_person", """{"id":"nobody"}"""), default);
+        Assert.False(unknown.Ok);
+        Assert.Contains("whois", unknown.Error!.Message, StringComparison.Ordinal);
     }
 
     // ---- helpers ---------------------------------------------------------------------------------

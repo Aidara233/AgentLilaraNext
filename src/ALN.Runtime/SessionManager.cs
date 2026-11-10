@@ -12,7 +12,7 @@ namespace ALN.Runtime;
 
 /// <summary>Runs one serialized model step per activation and persists completed turns.</summary>
 [Module(SessionManagerId, Category = "session", Role = ModuleRole.Manager, Singleton = true)]
-public sealed partial class SessionManager : ISessionManager, ISessionWaker, IModuleIndex, IModuleWiring, IInstanceSink, IModule, IRequireModules
+public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISessionPeopleRoster, IModuleIndex, IModuleWiring, IInstanceSink, IModule, IRequireModules
 {
     public const string SessionManagerId = ModuleNames.SessionManager;
     public const string SessionTypeId = "session.chat";
@@ -2756,10 +2756,9 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
         if (additions.Count == 0)
             return Result<PersistedTimeline>.Success(new(state, record.History));
 
-        // Who this Session now knows: every registered person who has spoken here, once. Kept on the state rather than
-        // recomputed from the timeline because a compacted timeline loses the older rows, and "I have met this person"
-        // must survive that (docs/31 §5).
-        var known = WithPeople(state.People, additions);
+        // The arithmetic only: whoever is on the roster and spoke again gets a newer time. Nobody joins this way —
+        // joining is the model's own call, through remember_person (docs/31 §5).
+        var known = Touched(state.People, additions);
         var nextState = state with { Revision = state.Revision + 1, People = known };
         var committed = await CommitAsync(record, new SessionPendingCommit(nextState, additions), cancellationToken)
             .ConfigureAwait(false);
@@ -2770,31 +2769,100 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
     private static string TimelineKey(string source, string id) => $"{source}\n{id}";
 
     /// <summary>
-    /// The state's roster plus whoever these entries say spoke, each keeping the latest time he was heard.
-    ///
-    /// Late rather than first: a person who has been quiet for a week should not push out the one who spoke a minute
-    /// ago, and the roster is capped (docs/31 §5). Two messages from the same person in one hand-out take the later
-    /// time — a batch can arrive out of order.
+    /// The roster's arithmetic, and nothing more: whoever is already on it and speaks again gets a newer "last heard"
+    /// time. <b>Nobody joins this way</b> — joining is <see cref="ISessionPeopleRoster.RememberAsync"/>, because deciding
+    /// that somebody matters is the conversation's judgement and not the traffic's (docs/31 §5).
     /// </summary>
-    private static IReadOnlyList<PersonSeen>? WithPeople(IReadOnlyList<PersonSeen>? known,
+    private static IReadOnlyList<PersonSeen>? Touched(IReadOnlyList<PersonSeen>? roster,
         IEnumerable<SessionHistoryEntry> entries)
     {
-        Dictionary<string, PersonSeen>? merged = null;
+        if (roster is not { Count: > 0 }) return roster;
+        var byId = roster.ToDictionary(seen => seen.Id, StringComparer.Ordinal);
+        var changed = false;
         foreach (var (person, at) in entries.SelectMany(entry => entry.ChannelMessages ?? [])
                      .Where(message => !string.IsNullOrWhiteSpace(message.Person))
                      .Select(message => (message.Person!, message.At)))
         {
-            merged ??= known is { Count: > 0 }
-                ? known.ToDictionary(seen => seen.Id, StringComparer.Ordinal)
-                : new Dictionary<string, PersonSeen>(StringComparer.Ordinal);
-            merged[person] = merged.TryGetValue(person, out var prior) && prior.At >= at
-                ? prior
-                : new PersonSeen(person, at);
+            if (!byId.TryGetValue(person, out var prior) || prior.At >= at) continue;
+            byId[person] = new PersonSeen(person, at);
+            changed = true;
         }
-        if (merged is null) return known;
+        if (!changed) return roster;
         // Stored in id order so the file is diffable and two runs against the same history write the same bytes; the
         // roster does its own ordering by time when it renders.
-        return merged.Values.OrderBy(seen => seen.Id, StringComparer.Ordinal).ToArray();
+        return byId.Values.OrderBy(seen => seen.Id, StringComparer.Ordinal).ToArray();
+    }
+
+    /// <summary>
+    /// Adds or removes one person on a Session's roster, with the Session's gate held for zero time: an edit made while
+    /// a turn is running would be overwritten when that turn commits the state it read, and "your edit vanished" is not
+    /// something a caller can diagnose. Refused rather than queued, for the same reason a wake-up is.
+    /// </summary>
+    private async ValueTask<Result<IReadOnlyList<PersonSeen>>> EditRosterAsync(string sessionId,
+        Func<IReadOnlyList<PersonSeen>, IReadOnlyList<PersonSeen>> edit, CancellationToken cancellationToken)
+    {
+        if (!IsValidSessionId(sessionId))
+            return Result<IReadOnlyList<PersonSeen>>.Failure(new(ErrorCode.Invalid, IdRule));
+        if (!_loaded.TryGetValue(sessionId, out var record))
+        {
+            var directory = ResolveSessionDirectory(sessionId);
+            // Never created here: remembering a person is not a reason for a conversation to start existing.
+            if (!Directory.Exists(directory) || !IsSessionDirectory(directory))
+                return Result<IReadOnlyList<PersonSeen>>.Failure(new(ErrorCode.Invalid,
+                    $"There is no Session called {sessionId}."));
+            var loaded = await LoadAsync(sessionId, requestedSpec: null, cancellationToken).ConfigureAwait(false);
+            if (!loaded.Ok || loaded.Value is null)
+                return Result<IReadOnlyList<PersonSeen>>.Failure(loaded.Error!);
+            record = loaded.Value;
+        }
+
+        var gate = _sessionGates.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
+        if (!await gate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            return Result<IReadOnlyList<PersonSeen>>.Failure(new(ErrorCode.Conflict,
+                $"Session {sessionId} is in the middle of a turn; ask again when it is done.", Retryable: true));
+        try
+        {
+            var current = record.State.People ?? [];
+            var next = edit(current);
+            // The same reference means the edit had nothing to do — no revision, no write.
+            if (ReferenceEquals(next, current)) return Result<IReadOnlyList<PersonSeen>>.Success(current);
+
+            var state = record.State with { Revision = record.State.Revision + 1, People = next };
+            var committed = await CommitAsync(record, new SessionPendingCommit(state, []), cancellationToken)
+                .ConfigureAwait(false);
+            return committed.Ok
+                ? Result<IReadOnlyList<PersonSeen>>.Success(next)
+                : Result<IReadOnlyList<PersonSeen>>.Failure(committed.Error!);
+        }
+        finally { gate.Release(); }
+    }
+
+    public ValueTask<Result<IReadOnlyList<PersonSeen>>> RememberAsync(string sessionId, string personId,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(personId))
+            return ValueTask.FromResult(Result<IReadOnlyList<PersonSeen>>.Failure(
+                new(ErrorCode.Invalid, "A person id is required.")));
+        var id = personId.Trim();
+        return EditRosterAsync(sessionId,
+            roster => roster.Any(seen => string.Equals(seen.Id, id, StringComparison.Ordinal))
+                ? roster
+                : [.. roster, new PersonSeen(id, DateTimeOffset.UtcNow)],
+            cancellationToken);
+    }
+
+    public ValueTask<Result<IReadOnlyList<PersonSeen>>> ForgetAsync(string sessionId, string personId,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(personId))
+            return ValueTask.FromResult(Result<IReadOnlyList<PersonSeen>>.Failure(
+                new(ErrorCode.Invalid, "A person id is required.")));
+        var id = personId.Trim();
+        return EditRosterAsync(sessionId,
+            roster => roster.Any(seen => string.Equals(seen.Id, id, StringComparison.Ordinal))
+                ? roster.Where(seen => !string.Equals(seen.Id, id, StringComparison.Ordinal)).ToArray()
+                : roster,
+            cancellationToken);
     }
 
     private static IReadOnlyList<SessionChannelMessage> CollectChannelTimeline(IReadOnlyList<SessionHistoryEntry> history)

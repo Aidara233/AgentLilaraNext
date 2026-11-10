@@ -393,6 +393,32 @@ public interface ISession : IModule
         CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// Which registered people one Session keeps in front of the model, decided by the model itself.
+///
+/// <b>It is not a list of everybody who spoke.</b> A group conversation is mostly people who will never be seen again,
+/// and a roster assembled from traffic is a roster of whoever happened to be loud — the assistant ends up carrying a
+/// dozen names it has no use for and no way to tell which two of them matter. So joining is a decision somebody makes
+/// on purpose, and the one who can make it is the one having the conversation (docs/31 §5).
+///
+/// What the host still does on its own is the arithmetic: when somebody already on the list speaks again, his "last
+/// heard" time is refreshed, because that is what keeps the roster ordered by who is still here. Recording a fact is not
+/// deciding who matters.
+/// </summary>
+public interface ISessionPeopleRoster
+{
+    /// <summary>
+    /// Puts one person on this Session's roster, if he is not already there. Joining is not a decision the host can make
+    /// for the caller: the person must already exist in the identity table, and this verb never creates one.
+    /// </summary>
+    ValueTask<Result<IReadOnlyList<PersonSeen>>> RememberAsync(string sessionId, string personId,
+        CancellationToken cancellationToken);
+
+    /// <summary>Takes one person off the roster. Removing somebody who is not on it is a no-op, not an error.</summary>
+    ValueTask<Result<IReadOnlyList<PersonSeen>>> ForgetAsync(string sessionId, string personId,
+        CancellationToken cancellationToken);
+}
+
 public interface ISessionManager
 {
     /// <summary>
