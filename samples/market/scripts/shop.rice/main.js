@@ -12,6 +12,6 @@ function describe() {
 }
 
 async function buy(args, ctx) {
-  await ctx.actions.call("rice.add", { bowls: 100, reason: "买饭" });
-  return { text: "补了 100 份白饭。", bag: [] };
+  await ctx.actions.call("rice.add", { bites: 100, reason: "买饭" });
+  return { text: "补了一碗白饭（100 口）。", bag: [] };
 }

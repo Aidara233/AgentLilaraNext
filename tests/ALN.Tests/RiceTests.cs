@@ -22,15 +22,15 @@ public sealed class RiceTests
         Assert.True((await ledger.AddAsync(3, "topup", "test", default)).Ok);
 
         Assert.True((await ledger.ChargeRoundAsync("s-1", 1, default)).Ok);
-        Assert.Equal(2, (await ledger.ReadAsync(default)).Value!.Bowls);
+        Assert.Equal(2, (await ledger.ReadAsync(default)).Value!.Bites);
 
         // The framework retrying step 1 must not cost a second bowl: the cursor, not a window of keys, is the guard.
         var again = await ledger.ChargeRoundAsync("s-1", 1, default);
         Assert.True(again.Ok);
-        Assert.Equal(2, again.Value!.Bowls);
+        Assert.Equal(2, again.Value!.Bites);
 
         Assert.True((await ledger.ChargeRoundAsync("s-1", 2, default)).Ok);
-        Assert.Equal(1, (await ledger.ReadAsync(default)).Value!.Bowls);
+        Assert.Equal(1, (await ledger.ReadAsync(default)).Value!.Bites);
     }
 
     [Fact]
@@ -45,7 +45,7 @@ public sealed class RiceTests
         Assert.True(one.Ok, one.Error?.Message);
         Assert.False(two.Ok);
         Assert.Equal(ErrorCode.Denied, two.Error!.Code);
-        Assert.Equal(0, (await ledger.ReadAsync(default)).Value!.Bowls);
+        Assert.Equal(0, (await ledger.ReadAsync(default)).Value!.Bites);
     }
 
     [Fact]
@@ -82,7 +82,7 @@ public sealed class RiceTests
         var taken = await ledger.TakeAsync(5, "spill", "test", default);
 
         Assert.False(taken.Ok);
-        Assert.Equal(2, (await ledger.ReadAsync(default)).Value!.Bowls);
+        Assert.Equal(2, (await ledger.ReadAsync(default)).Value!.Bites);
     }
 
     private sealed class MemoryStore : IStateStore

@@ -4,22 +4,22 @@ using ALN.Contracts;
 namespace ALN.Rice;
 
 /// <summary>
-/// Lilara's larder: one number of bowls for the whole framework, and a cursor per Session.
+/// Lilara's larder: one number of bites for the whole framework, and a cursor per Session.
 ///
 /// The cursor is the idempotency key. A round is identified by <c>(session, step)</c> and steps only go up, so
 /// remembering the last step charged for a Session is enough — no window of keys to age out, and a retried step
 /// cannot be charged twice.
 /// </summary>
-public sealed record RiceState(long Bowls, long Revision, IReadOnlyDictionary<string, int> Charged)
+public sealed record RiceState(long Bites, long Revision, IReadOnlyDictionary<string, int> Charged)
 {
-    public static RiceState Empty(long bowls = 0) => new(bowls, 0,
+    public static RiceState Empty(long bites = 0) => new(bites, 0,
         new Dictionary<string, int>(StringComparer.Ordinal));
 
     public int ChargedUpTo(string sessionId) => Charged.TryGetValue(sessionId, out var step) ? step : 0;
 }
 
 /// <summary>
-/// The larder's single write path: eat one bowl for a round, or add/take bowls.
+/// The larder's single write path: eat one bowl for a round, or add/take bites.
 ///
 /// Every change is one <see cref="IAtomicWork.AtomicallyAsync"/>: read, decide, write. Two Sessions eating at the same
 /// moment therefore cannot both spend the last bowl.
@@ -62,32 +62,32 @@ public sealed class RiceLedger(IStateStore store, IAtomicWork atomic, ISignalLog
         ChangeAsync($"eat:{sessionId}", $"session:{sessionId}", state =>
         {
             if (state.ChargedUpTo(sessionId) >= step) return Result<RiceState>.Success(state);
-            if (state.Bowls <= 0) return Result<RiceState>.Failure(new(ErrorCode.Denied, "白饭用完了。"));
+            if (state.Bites <= 0) return Result<RiceState>.Failure(new(ErrorCode.Denied, "白饭用完了。"));
             var charged = new Dictionary<string, int>(state.Charged, StringComparer.Ordinal) { [sessionId] = step };
             return Result<RiceState>.Success(state with
             {
-                Bowls = state.Bowls - 1,
+                Bites = state.Bites - 1,
                 Revision = state.Revision + 1,
                 Charged = charged
             });
         }, cancellationToken);
 
-    /// <summary>Adds bowls. Only a top-up, a shop script, or a person with the depth gets here.</summary>
-    public ValueTask<Result<RiceState>> AddAsync(long bowls, string reason, string actor,
+    /// <summary>Adds bites. Only a top-up, a shop script, or a person with the depth gets here.</summary>
+    public ValueTask<Result<RiceState>> AddAsync(long bites, string reason, string actor,
         CancellationToken cancellationToken) =>
-        ChangeAsync(reason, actor, state => bowls <= 0
-            ? Result<RiceState>.Failure(new(ErrorCode.Invalid, $"补的份数必须大于 0（收到 {bowls}）。"))
-            : Result<RiceState>.Success(state with { Bowls = state.Bowls + bowls, Revision = state.Revision + 1 }),
+        ChangeAsync(reason, actor, state => bites <= 0
+            ? Result<RiceState>.Failure(new(ErrorCode.Invalid, $"补的口数必须大于 0（收到 {bites}）。"))
+            : Result<RiceState>.Success(state with { Bites = state.Bites + bites, Revision = state.Revision + 1 }),
             cancellationToken);
 
-    /// <summary>Takes bowls away (a spill, an experiment). Never below zero.</summary>
-    public ValueTask<Result<RiceState>> TakeAsync(long bowls, string reason, string actor,
+    /// <summary>Takes bites away (a spill, an experiment). Never below zero.</summary>
+    public ValueTask<Result<RiceState>> TakeAsync(long bites, string reason, string actor,
         CancellationToken cancellationToken) =>
-        ChangeAsync(reason, actor, state => bowls <= 0
-            ? Result<RiceState>.Failure(new(ErrorCode.Invalid, $"扣的份数必须大于 0（收到 {bowls}）。"))
-            : state.Bowls < bowls
-                ? Result<RiceState>.Failure(new(ErrorCode.Denied, $"只有 {state.Bowls} 份，不够扣 {bowls}。"))
-                : Result<RiceState>.Success(state with { Bowls = state.Bowls - bowls, Revision = state.Revision + 1 }),
+        ChangeAsync(reason, actor, state => bites <= 0
+            ? Result<RiceState>.Failure(new(ErrorCode.Invalid, $"扣的口数必须大于 0（收到 {bites}）。"))
+            : state.Bites < bites
+                ? Result<RiceState>.Failure(new(ErrorCode.Denied, $"只有 {state.Bites} 口，不够扣 {bites}。"))
+                : Result<RiceState>.Success(state with { Bites = state.Bites - bites, Revision = state.Revision + 1 }),
             cancellationToken);
 
     private ValueTask<Result<RiceState>> ChangeAsync(string reason, string actor,
@@ -129,14 +129,31 @@ public sealed class RiceLedger(IStateStore store, IAtomicWork atomic, ISignalLog
             Level = SignalLevel.Info,
             Detail = new Dictionary<string, string>
             {
-                ["bowls"] = state.Bowls.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["bites"] = state.Bites.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 ["revision"] = state.Revision.ToString(System.Globalization.CultureInfo.InvariantCulture)
             }
         });
         if (audit is not null)
             await audit.AppendAsync(new AuditRecord(DateTimeOffset.UtcNow, Guid.Empty, actor, Larder, reason, "ok",
-                $"bowls={state.Bowls} revision={state.Revision}"), cancellationToken).ConfigureAwait(false);
+                $"bites={state.Bites} revision={state.Revision}"), cancellationToken).ConfigureAwait(false);
 
         return Result<RiceState>.Success(state);
     }
+}
+
+/// <summary>
+/// The unit a person buys in and the unit a Session eats in.
+///
+/// One purchase is one bowl, a bowl is <see cref="BitesPerBowl"/> bites, and a round eats one bite — so the number in
+/// the larder is also "how many rounds are left", which is the only number the model can plan with. Showing bites
+/// first and bowls second keeps the arithmetic visible: 86 bites is 86 rounds, and a bit under one bowl.
+/// </summary>
+public static class RiceUnits
+{
+    public const long BitesPerBowl = 100;
+
+    public static double Bowls(long bites) => bites / (double)BitesPerBowl;
+
+    public static string Describe(long bites) =>
+        $"{bites} 口（≈{Bowls(bites):0.##} 碗，还能跑 {bites} 轮）";
 }

@@ -14,7 +14,7 @@ namespace ALN.Rice;
 /// </summary>
 public sealed class RiceAdmission(RiceLedger ledger) : IRoundAdmission
 {
-    public const string BuyHint = "买饭：coin_buy rice-100（2 枚硬币补 100 份），或等人 //rice topup。";
+    public const string BuyHint = "买饭：coin_buy rice-100（2 枚硬币补 100 口），或等人 //rice topup。";
 
     public string Id => "rice.admission";
 
@@ -28,7 +28,7 @@ public sealed class RiceAdmission(RiceLedger ledger) : IRoundAdmission
         // larder is unreadable — admits: a plugin with a bug must not be able to starve every Session at once.
         if (!charged.Ok)
             return Result<RoundAdmission>.Success(charged.Error?.Code == ErrorCode.Denied
-                ? RoundAdmission.No($"这一轮没有跑：白饭用完了（0 份）。{BuyHint}")
+                ? RoundAdmission.No($"这一轮没有跑：白饭用完了（0 口）。{BuyHint}")
                 : RoundAdmission.Yes);
 
         return Result<RoundAdmission>.Success(RoundAdmission.Yes);
@@ -45,7 +45,7 @@ public sealed class RiceTools(RiceLedger ledger) : ISessionToolSource
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
     private static readonly ModelToolDefinition Definition = new(Wallet,
-        "看看还能吃几顿：白饭按轮数算，每运行一轮消耗 1 份。免费。",
+        "看看还能吃几顿：白饭按轮数算，每运行一轮消耗 1 口。免费。",
         """{"type":"object","properties":{}}""");
 
     public ValueTask<Result<IReadOnlyList<SessionToolOffer>>> ToolsAsync(RoundContextRequest request,
@@ -66,10 +66,11 @@ public sealed class RiceTools(RiceLedger ledger) : ISessionToolSource
         var state = read.Value;
         return Result<SessionToolResult>.Success(new SessionToolResult(JsonSerializer.Serialize(new
         {
-            bowls = state.Bowls,
-            rounds = state.Bowls,
+            bites = state.Bites,
+            rounds = state.Bites,
             thisSessionAtRound = state.ChargedUpTo(sessionId),
-            perRound = 1
+            perRound = 1,
+            bitesPerBowl = RiceUnits.BitesPerBowl
         }, Json), null));
     }
 
@@ -97,14 +98,14 @@ public sealed class RiceContextSource(RiceLedger ledger) : IFloatingContextSourc
             return Result<IReadOnlyList<RoundContextContribution>>.Success([]);
 
         var state = read.Value;
-        var line = $"白饭：{state.Bowls} 份（还能跑 {state.Bowls} 轮）· 每轮 1 份";
+        var line = $"白饭：{RiceUnits.Describe(state.Bites)} · 每轮 1 口";
         return Result<IReadOnlyList<RoundContextContribution>>.Success(
             [new RoundContextContribution("rice.wallet", "rice", line)]);
     }
 }
 
 /// <summary>
-/// The two verbs that move bowls, and nothing else uses them. Their capability is <c>rice.control</c>, which is not in
+/// The two verbs that move bites, and nothing else uses them. Their capability is <c>rice.control</c>, which is not in
 /// <see cref="AccessLevels"/> and therefore answers <c>full</c>: a shop script may fill the larder exactly when it
 /// could already do anything else, and a model cannot feed itself.
 /// </summary>
@@ -116,9 +117,9 @@ public static class RiceActions
 
     private const string ParamsJson = """
         {"type":"object","properties":{
-          "bowls":{"type":"integer","description":"多少份，必须大于 0"},
+          "bites":{"type":"integer","description":"多少口，必须大于 0"},
           "reason":{"type":"string","description":"一句话说明为什么动米缸，会进审计"}
-        },"required":["bowls","reason"]}
+        },"required":["bites","reason"]}
         """;
 
     public static Result Register(IControlPlane plane, RiceLedger ledger)
@@ -127,44 +128,44 @@ public static class RiceActions
 
         var add = plane.Register(
             new ActionDescriptor(Add, "往米缸里补饭（商店脚本走这里）", Control, Mutating: true,
-                ParamsJson: ParamsJson, Subject: "bowls"),
+                ParamsJson: ParamsJson, Subject: "bites"),
             async (actor, arguments, cancellationToken) =>
             {
-                var (bowls, reason, error) = Read(arguments);
+                var (bites, reason, error) = Read(arguments);
                 if (error is not null) return Result<JsonElement>.Failure(error);
-                var added = await ledger.AddAsync(bowls, $"script:{reason}", actor.Id, cancellationToken)
+                var added = await ledger.AddAsync(bites, $"script:{reason}", actor.Id, cancellationToken)
                     .ConfigureAwait(false);
                 return added.Ok && added.Value is not null
                     ? Result<JsonElement>.Success(JsonSerializer.SerializeToElement(
-                        new { bowls = added.Value.Bowls, revision = added.Value.Revision }))
+                        new { bites = added.Value.Bites, revision = added.Value.Revision }))
                     : Result<JsonElement>.Failure(added.Error!);
             });
         if (!add.Ok) return add;
 
         var take = plane.Register(
             new ActionDescriptor(Take, "从米缸里拿走饭（要 full）", Control, Mutating: true,
-                ParamsJson: ParamsJson, Subject: "bowls"),
+                ParamsJson: ParamsJson, Subject: "bites"),
             async (actor, arguments, cancellationToken) =>
             {
-                var (bowls, reason, error) = Read(arguments);
+                var (bites, reason, error) = Read(arguments);
                 if (error is not null) return Result<JsonElement>.Failure(error);
-                var taken = await ledger.TakeAsync(bowls, $"script:{reason}", actor.Id, cancellationToken)
+                var taken = await ledger.TakeAsync(bites, $"script:{reason}", actor.Id, cancellationToken)
                     .ConfigureAwait(false);
                 return taken.Ok && taken.Value is not null
                     ? Result<JsonElement>.Success(JsonSerializer.SerializeToElement(
-                        new { bowls = taken.Value.Bowls, revision = taken.Value.Revision }))
+                        new { bites = taken.Value.Bites, revision = taken.Value.Revision }))
                     : Result<JsonElement>.Failure(taken.Error!);
             });
         return take.Ok ? Result.Success() : take;
     }
 
-    private static (long Bowls, string Reason, Error? Error) Read(JsonElement arguments)
+    private static (long Bites, string Reason, Error? Error) Read(JsonElement arguments)
     {
-        var bowls = arguments.TryGetProperty("bowls", out var amount) ? amount.GetInt64() : 0;
+        var bites = arguments.TryGetProperty("bites", out var amount) ? amount.GetInt64() : 0;
         var reason = arguments.TryGetProperty("reason", out var why) ? why.GetString() : null;
-        if (bowls <= 0) return (0, string.Empty, new(ErrorCode.Invalid, "bowls 必须是大于 0 的整数。"));
+        if (bites <= 0) return (0, string.Empty, new(ErrorCode.Invalid, "bites 必须是大于 0 的整数。"));
         if (string.IsNullOrWhiteSpace(reason)) return (0, string.Empty, new(ErrorCode.Invalid, "reason 不能为空。"));
-        return (bowls, reason!, null);
+        return (bites, reason!, null);
     }
 }
 
@@ -189,24 +190,24 @@ public static class RiceService
         CommandNode[] nodes =
         [
             new("rice", "米缸：白饭按轮算（//rice <子指令>）", AccessLevel.Agent),
-            new("rice.wallet", "还剩几份", AccessLevel.Agent, Body: async (context, cancellationToken) =>
+            new("rice.wallet", "还剩几口", AccessLevel.Agent, Body: async (context, cancellationToken) =>
             {
                 var read = await ledger.ReadAsync(cancellationToken).ConfigureAwait(false);
                 if (read.Error is not null || read.Value is null)
                     return Result<string>.Failure(read.Error ?? new(ErrorCode.Unavailable, "读不到米缸。"));
                 return Result<string>.Success(
-                    $"白饭：{read.Value.Bowls} 份（还能跑 {read.Value.Bowls} 轮）· 每轮 1 份 · 第 {read.Value.Revision} 版");
+                    $"白饭：{RiceUnits.Describe(read.Value.Bites)} · 每轮 1 口 · 第 {read.Value.Revision} 版");
             }),
-            new("rice.topup", "补饭（要 full）", AccessLevel.Full, Usage: "//rice topup <份数>",
+            new("rice.topup", "补饭（要 full）", AccessLevel.Full, Usage: "//rice topup <口数>",
                 Body: async (context, cancellationToken) =>
                 {
-                    if (context.Arguments.Count == 0 || !long.TryParse(context.Arguments[0], out var bowls))
-                        return Result<string>.Failure(new(ErrorCode.Invalid, "用法：//rice topup <份数>"));
-                    var added = await ledger.AddAsync(bowls, "topup", context.Actor.Id, cancellationToken)
+                    if (context.Arguments.Count == 0 || !long.TryParse(context.Arguments[0], out var bites))
+                        return Result<string>.Failure(new(ErrorCode.Invalid, "用法：//rice topup <口数>"));
+                    var added = await ledger.AddAsync(bites, "topup", context.Actor.Id, cancellationToken)
                         .ConfigureAwait(false);
                     if (!added.Ok || added.Value is null)
                         return Result<string>.Failure(added.Error ?? new(ErrorCode.Unavailable, "没补上。"));
-                    return Result<string>.Success($"补了 {bowls} 份，现在有 {added.Value.Bowls} 份。");
+                    return Result<string>.Success($"补了 {bites} 口，现在有 {added.Value.Bites} 口。");
                 })
         ];
 
