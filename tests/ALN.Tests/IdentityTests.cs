@@ -632,6 +632,52 @@ public sealed class IdentityTests : IDisposable
         Assert.False(Directory.Exists(Path.Combine(_root, "elsewhere")));
     }
 
+    [Fact]
+    public async Task The_conversation_shows_which_speakers_the_table_placed_and_which_it_did_not()
+    {
+        Write("xiaolin", """{"name":"小林","note":"我妹妹。","level":"operator","accounts":[{"adapter":"adapter.qq#main","account":"1234567"}]}""");
+        var people = await Load();
+
+        var store = OpenStore();
+        Assert.True((await store.AppendAsync(new StoredMessage("m1", Channel, "group-123456", "m1", "1234567",
+            "帮我看看这个", new DateTimeOffset(2026, 11, 1, 8, 0, 0, TimeSpan.Zero),
+            SenderName: "🔥龙傲天🔥", Person: "xiaolin"), default)).Ok);
+        Assert.True((await store.AppendAsync(new StoredMessage("m2", Channel, "group-123456", "m2", "999",
+            "路过", new DateTimeOffset(2026, 11, 1, 8, 0, 1, TimeSpan.Zero), SenderName: "路人丙"), default)).Ok);
+
+        var contributors = new SessionExtensionRegistry();
+        Assert.True(contributors.Register(new ChannelDeltaSource(new FileChannelDeltaSource(store, store),
+            new StubChannels(), people)).Ok);
+        Assert.True(contributors.Register(new PersonRosterSource(people)).Ok);
+        var model = new ScriptedModel();
+        var sessions = new SessionManager(_root, model, contributors);
+        var binding = new ChannelBinding(Adapter, "group-123456");
+        var spec = new SessionSpec("default", "Answer briefly.", "1");
+
+        var first = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
+        Assert.True(first.Ok, first.Error?.Detail ?? first.Error?.Message);
+
+        var user = model.Requests.Last().Messages
+            .First(message => message.Content?.Contains("<channel_messages", StringComparison.Ordinal) == true).Content!;
+        // The one the table placed: the name that does not change, and the id that says which person it was.
+        Assert.Contains("sender=\"小林\"", user, StringComparison.Ordinal);
+        Assert.Contains("person=\"xiaolin\"", user, StringComparison.Ordinal);
+        // The stranger keeps what the platform called him and carries no person at all — which is the difference the
+        // note explains, and the whole reason it is said out loud only when somebody is attributed.
+        Assert.Contains("sender=\"路人丙\"", user, StringComparison.Ordinal);
+        Assert.Contains("<note>带 person", user, StringComparison.Ordinal);
+
+        // And having met him, the next round carries the roster: the id is remembered on the Session's own state.
+        var second = await sessions.TurnAsync("s-1", spec, Guid.NewGuid(), new SessionTurnInput([], Channel, binding), null, default);
+        Assert.True(second.Ok, second.Error?.Detail ?? second.Error?.Message);
+        var next = model.Requests.Last().Messages
+            .First(message => message.Content?.Contains("<channel_messages", StringComparison.Ordinal) == true).Content!;
+        Assert.Contains("<section name=\"people\"", next, StringComparison.Ordinal);
+        Assert.Contains("小林（L1 operator）：我妹妹。", next, StringComparison.Ordinal);
+        // The stranger is not in it: the roster is the people this process knows, not everybody who spoke.
+        Assert.DoesNotContain("路人丙（", next, StringComparison.Ordinal);
+    }
+
     // ---- helpers ---------------------------------------------------------------------------------
 
     private void Write(string id, string json)
@@ -709,5 +755,40 @@ public sealed class IdentityTests : IDisposable
     private sealed class NullAudit : IAuditSink
     {
         public ValueTask AppendAsync(AuditRecord record, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+    }
+
+    /// <summary>A model that answers "ok" and keeps every request it was handed, so a test can read what it saw.</summary>
+    private sealed class ScriptedModel : IModelManager
+    {
+        public List<ModelRequest> Requests { get; } = [];
+
+        public ValueTask<Result<IAsyncEnumerable<ModelEvent>>> CompleteAsync(string profileId, ModelRequest request,
+            CancellationToken cancellationToken)
+        {
+            Requests.Add(request);
+            return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Success(Stream()));
+        }
+
+        private static async IAsyncEnumerable<ModelEvent> Stream(
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.Yield();
+            yield return new TextDelta("ok");
+            yield return new ModelCompleted(StopReason.EndTurn, new ModelUsage(1, 1), null);
+        }
+
+        public Result RegisterFactory(string packageId, IModelProviderFactory factory) => Result.Success();
+        public Result RemovePackageFactories(string packageId) => Result.Success();
+        public IReadOnlyList<ModelProviderTypeInfo> ListTypes() => [];
+        public ValueTask<Result<IModelProvider>> CreateAsync(ModelProviderSpec spec, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public ValueTask<Result<IModelProvider>> CreateAsync(string category, string instance, string configurationJson,
+            CancellationToken cancellationToken) => throw new NotSupportedException();
+        public ValueTask<Result> DestroyAsync(Address provider, CancellationToken cancellationToken) => ValueTask.FromResult(Result.Success());
+        public Result<IModelProvider> Get(Address provider) => Result<IModelProvider>.Failure(new(ErrorCode.Invalid, "No providers."));
+        public IReadOnlyList<ModelProviderInfo> List() => [];
+        public Result RegisterProfile(ModelProfile profile) => Result.Success();
+        public Result RemoveProfile(string profileId) => Result.Success();
+        public IReadOnlyList<ModelProfile> ListProfiles() => [];
     }
 }

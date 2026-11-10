@@ -3266,6 +3266,11 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
         var elided = Math.Max(0, messages.Count - RecentChannelMessages);
         head.Append("<channel_messages shown=\"").Append(messages.Count - elided)
             .Append("\" total=\"").Append(messages.Count).AppendLine("\">");
+        // Said only when there is something to say it about: a deployment where nobody is registered pays nothing, and
+        // one line in a block that otherwise carries no such attribute would be a rule for a shape the model cannot see.
+        if (messages.Any(message => !string.IsNullOrEmpty(message.Person)))
+            head.AppendLine("<note>带 person 的消息来自我认得的人，值是他的身份 id（要更多就用 whois 查这个 id）。"
+                + "没有 person 的是平台给的名字：可能是同名的另一个人，也可能是完全陌生的人。</note>");
         if (elided > 0)
             head.Append("<omitted count=\"").Append(elided).Append("\">省略更早的 ").Append(elided)
                 .Append(" 条消息（本请求只带最近 ").Append(RecentChannelMessages).AppendLine(" 条）。</omitted>");
@@ -3311,6 +3316,10 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
                 .Append("\" source=\"").Append(EscapeXmlAttribute(message.Source)).Append('"');
             if (!string.IsNullOrEmpty(message.Sender))
                 chunk.Append(" sender=\"").Append(EscapeXmlAttribute(message.Sender)).Append('"');
+            // The attributed person, by id rather than by a flag: the model can carry it straight into `whois`, and an
+            // id cannot be confused with a name the way two people called 小林 can (docs/31 §4).
+            if (!string.IsNullOrEmpty(message.Person))
+                chunk.Append(" person=\"").Append(EscapeXmlAttribute(message.Person)).Append('"');
             chunk.Append(" at=\"").Append(message.At.ToString("O", System.Globalization.CultureInfo.InvariantCulture)).AppendLine("\">")
                 .AppendLine(EscapeXmlText(message.Content));
             // The receipt is inside the message, where the words would have been: it belongs to that message, and a
