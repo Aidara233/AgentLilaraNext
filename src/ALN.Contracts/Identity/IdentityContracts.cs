@@ -111,6 +111,88 @@ public interface IPersonDirectoryReload
     ValueTask<PersonDirectoryReport> ReloadAsync(CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// What somebody may be written down as. Deliberately <b>not</b> a <see cref="Person"/>: a level is missing from it,
+/// and the type is where that absence has to live.
+///
+/// A caller that could pass a level would be a caller that could promote somebody, and "the model may tidy up who is
+/// who" would become "the model may decide who it must obey". The field is not validated away at the edge — it is
+/// not expressible at all (docs/31 §7.1).
+/// </summary>
+public sealed record PersonInput(string Id, string Name, string? Note = null,
+    IReadOnlyList<PersonAccount>? Accounts = null, bool Self = false);
+
+/// <summary>What a write produced: the person as the table now holds him, and anything the rescan refused.</summary>
+public sealed record PersonWriteReport(Person Person, IReadOnlyList<PersonProblem> Rejected);
+
+/// <summary>
+/// Keeping the table up to date from inside the process — the model's own bookkeeping, at agent level.
+///
+/// Three separate verbs rather than one with an optional field, because what they are allowed to reach is not the
+/// same: <see cref="SetAsync"/> and <see cref="RemoveAsync"/> never touch a level (their input cannot say one), and
+/// <see cref="SetLevelAsync"/> touches nothing else. A single verb taking a whole card would need a rule at runtime
+/// that says "this field is ignored for you", and a rule that is checked is a rule that can be got wrong; a shape
+/// that cannot carry the field is a rule that cannot be broken.
+/// </summary>
+public interface IPersonDirectoryEditing
+{
+    /// <summary>
+    /// Writes one card, creating it when there is none. The level of an existing person is kept; a new one starts at
+    /// <see cref="AccessLevel.Agent"/> — which is the safe default for a card nobody wrote by hand (docs/31 §7.1).
+    /// </summary>
+    ValueTask<Result<PersonWriteReport>> SetAsync(PersonInput input, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Takes a person out of the table by removing his card. <b>The directory stays</b>, with whatever else is in it:
+    /// that folder is his file, and a verb about identity has no business emptying a folder it does not own
+    /// (docs/31 §1).
+    /// </summary>
+    ValueTask<Result> RemoveAsync(string id, CancellationToken cancellationToken);
+
+    /// <summary>Writes one field and nothing else. Nobody but an operator reaches this; see the type's own remarks.</summary>
+    ValueTask<Result<Person>> SetLevelAsync(string id, AccessLevel level, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// What a person's id may be, since it is a directory name and a name somebody types. One rule, in one place, so that
+/// the scanner, the writer and the action all refuse the same things.
+/// </summary>
+public static class PersonIds
+{
+    /// <summary>A ceiling on readability, not on the file system: an id is a name people read and type.</summary>
+    public const int MaxLength = 96;
+
+    /// <summary>
+    /// Whether this can be a person's id. No separators and no characters a file system forbids — an id that could
+    /// escape its folder would be a card that can be written anywhere, which is the one thing a path rule exists to
+    /// prevent. Leading dots are refused as well: "." and ".." are not names, they are directions.
+    /// </summary>
+    public static bool IsUsable(string? id)
+    {
+        if (string.IsNullOrWhiteSpace(id)) return false;
+        if (id.Length > MaxLength) return false;
+        if (id.Trim().Length != id.Length) return false;
+        if (id[0] == '.') return false;
+        foreach (var character in id)
+        {
+            if (character is '/' or '\\' or ':' or '*' or '?' or '"' or '<' or '>' or '|') return false;
+            if (char.IsControl(character)) return false;
+        }
+        return true;
+    }
+
+    /// <summary>The reason an id cannot be used, in the words a caller can act on. Null means it can.</summary>
+    public static string? Problem(string? id)
+    {
+        if (IsUsable(id)) return null;
+        if (string.IsNullOrWhiteSpace(id)) return "a person needs an id: it is the directory name under identify/";
+        if (id.Trim().Length != id.Length) return "an id must not begin or end with a space";
+        if (id[0] == '.') return "an id must not start with a dot: '.' and '..' are directions, not names";
+        if (id.Length > MaxLength) return $"an id must be at most {MaxLength} characters";
+        return "an id must not contain a path separator, a control character, or any of : * ? \" < > |";
+    }
+}
+
 /// <summary>What one scan produced: who is on the table, and every file that was refused with the reason.</summary>
 /// <param name="People">Accepted people, ordered by id.</param>
 /// <param name="Rejected">Files that did not become a person. Never fatal: one broken file is one person missing.</param>
@@ -129,8 +211,25 @@ public static class IdentityActions
     /// <summary>Everybody on the table. A read: "who do you recognise" is a question an assistant should answer.</summary>
     public const string List = "identity.people.list";
 
-    /// <summary>One person, by id or by account — the action behind the model's <c>whois</c>.</summary>
+    /// <summary>
+    /// One person, by id or by account — the action behind the model's <c>whois</c>.
+    /// </summary>
     public const string Get = "identity.people.get";
+
+    /// <summary>
+    /// Write somebody's card: name, note, accounts, self. <b>Not a level.</b> A whole-card write, because a verb that
+    /// merged would make "leave this field alone" and "clear this field" the same request (docs/31 §7.1).
+    /// </summary>
+    public const string Set = "identity.people.set";
+
+    /// <summary>Take somebody off the table by removing his card; the folder and its other contents stay.</summary>
+    public const string Remove = "identity.people.remove";
+
+    /// <summary>
+    /// Set how deep an instruction from this person may be taken. The only verb that writes a level, and the only one
+    /// in this family that a model cannot reach at any level.
+    /// </summary>
+    public const string Level = "identity.people.level";
 
     /// <summary>
     /// Read the directory again. Operator level: it decides who the process believes about who said what, which is a

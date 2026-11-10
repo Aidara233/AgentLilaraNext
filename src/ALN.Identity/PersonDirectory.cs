@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using ALN.Contracts;
 
 namespace ALN.Identity;
@@ -14,7 +15,7 @@ namespace ALN.Identity;
 /// empty because one JSON was missing a comma would be a table that stops recognising everybody over a typo
 /// (docs/31 §9.1).
 /// </summary>
-public sealed class PersonDirectory : IPersonDirectory, IPersonDirectoryReload
+public sealed class PersonDirectory : IPersonDirectory, IPersonDirectoryReload, IPersonDirectoryEditing
 {
     /// <summary>The data-root folder this reads. Named for what happens in it — recognising people — and not for the
     /// module that does it; a directory name is not an id (<c>C-02</c> is about <c>modules/&lt;id&gt;/</c>).</summary>
@@ -161,6 +162,182 @@ public sealed class PersonDirectory : IPersonDirectory, IPersonDirectoryReload
         _table = Table.Build(byId, byAccountId, ordered, self);
         return ValueTask.FromResult(new PersonDirectoryReport(ordered, problems));
     }
+
+    /// <summary>
+    /// Writes one card, keeping whatever else is in it.
+    ///
+    /// <b>The level is not written here and cannot be:</b> <see cref="PersonInput"/> has no such field, so a caller
+    /// cannot express a promotion even by accident. An existing level survives the write; a new card starts at
+    /// <see cref="AccessLevel.Agent"/> (docs/31 §7.1).
+    ///
+    /// The file is read first and only the three fields this verb owns are replaced: anything else a person put in
+    /// that card — a shape a later release does not know about yet — must come back out the way it went in.
+    /// </summary>
+    public async ValueTask<Result<PersonWriteReport>> SetAsync(PersonInput input, CancellationToken cancellationToken)
+    {
+        if (input is null) return Result<PersonWriteReport>.Failure(new(ErrorCode.Invalid, "A person is required."));
+        if (PersonIds.Problem(input.Id) is { } idProblem)
+            return Result<PersonWriteReport>.Failure(new(ErrorCode.Invalid, idProblem));
+        if (string.IsNullOrWhiteSpace(input.Name))
+            return Result<PersonWriteReport>.Failure(new(ErrorCode.Invalid,
+                "A person needs a name: it is what the model will call him."));
+        if (input.Name.Trim().Length > MaxNameLength)
+            return Result<PersonWriteReport>.Failure(new(ErrorCode.Invalid, $"A name must be at most {MaxNameLength} characters."));
+        if (input.Note is { } note && note.Length > MaxNoteLength)
+            return Result<PersonWriteReport>.Failure(new(ErrorCode.Invalid, $"A note must be at most {MaxNoteLength} characters."));
+
+        var accounts = input.Accounts ?? [];
+        if (accounts.Count == 0)
+            return Result<PersonWriteReport>.Failure(new(ErrorCode.Invalid,
+                "A person needs at least one account: somebody nobody can arrive as cannot be recognised."));
+        if (accounts.Count > MaxAccounts)
+            return Result<PersonWriteReport>.Failure(new(ErrorCode.Invalid, $"A person has at most {MaxAccounts} accounts."));
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var account in accounts)
+        {
+            if (string.IsNullOrWhiteSpace(account.Account) || account.Account.Trim().Length > MaxAccountLength)
+                return Result<PersonWriteReport>.Failure(new(ErrorCode.Invalid, "An account needs an id of its own."));
+            if (!account.Adapter.IsInstance)
+                return Result<PersonWriteReport>.Failure(new(ErrorCode.Invalid,
+                    $"'{account.Adapter}' is not an adapter instance address; it has to be one like adapter.qq#main."));
+            if (!seen.Add(account.Key))
+                return Result<PersonWriteReport>.Failure(new(ErrorCode.Conflict,
+                    $"{account.Adapter} / {account.Account} is listed twice."));
+            // The check that makes this a table rather than a set of guesses. Against the loaded table, so a caller
+            // hears about it before a file is touched.
+            if (Find(account.Adapter, account.Account) is { } owner && !string.Equals(owner.Id, input.Id, StringComparison.Ordinal))
+                return Result<PersonWriteReport>.Failure(new(ErrorCode.Conflict,
+                    $"{account.Adapter} / {account.Account} already belongs to '{owner.Id}'; a platform account belongs to one person.",
+                    owner.Id));
+        }
+
+        if (input.Self && Self is { } mine && !string.Equals(mine.Id, input.Id, StringComparison.Ordinal))
+            return Result<PersonWriteReport>.Failure(new(ErrorCode.Conflict,
+                $"'{mine.Id}' is already the set of accounts that are mine; only one person can be self.", mine.Id));
+
+        var path = Path.Combine(Root, input.Id, InfoFileName);
+        var card = ReadCard(path);
+        card["name"] = input.Name.Trim();
+        if (string.IsNullOrWhiteSpace(input.Note)) card.Remove("note");
+        else card["note"] = input.Note.Trim();
+
+        var written = new JsonArray();
+        foreach (var account in accounts)
+            written.Add(new JsonObject { ["adapter"] = account.Adapter.ToString(), ["account"] = account.Account });
+        card["accounts"] = written;
+
+        // Absent rather than false when it is not set: a card that says "self": false is a card that says something
+        // about the person, and the default is not a statement.
+        if (input.Self) card["self"] = true; else card.Remove("self");
+
+        try
+        {
+            WriteCard(path, card);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return Result<PersonWriteReport>.Failure(new(ErrorCode.Unavailable,
+                $"Could not write {input.Id}'s card.", ex.Message));
+        }
+
+        var report = await ReloadAsync(cancellationToken).ConfigureAwait(false);
+        // The scan is the authority: a card the reader refuses is a write that did not take, even though the bytes
+        // landed. Saying "written" here would be the lie that shows up as "it forgot who I was" an hour later.
+        return FindById(input.Id) is { } person
+            ? Result<PersonWriteReport>.Success(new PersonWriteReport(person, report.Rejected))
+            : Result<PersonWriteReport>.Failure(new(ErrorCode.Conflict,
+                $"The card was written but the scan refused it: " +
+                $"{report.Rejected.FirstOrDefault(problem => problem.Path.EndsWith(input.Id, StringComparison.Ordinal))?.Reason ?? "see identity.reload"}"));
+    }
+
+    /// <summary>
+    /// Takes somebody out of the table by taking away his card. The folder stays, with everything else in it — a verb
+    /// about identity does not get to empty a folder that is somebody's own (docs/31 §1).
+    ///
+    /// A person who is not there is an error rather than a shrug: "I removed him" and "there was nobody by that name"
+    /// are different answers, and only one of them means the table changed.
+    /// </summary>
+    public async ValueTask<Result> RemoveAsync(string id, CancellationToken cancellationToken)
+    {
+        if (PersonIds.Problem(id) is { } problem) return Result.Failure(new(ErrorCode.Invalid, problem));
+        var path = Path.Combine(Root, id, InfoFileName);
+        if (!File.Exists(path))
+            return Result.Failure(new(ErrorCode.Invalid, $"There is nobody called '{id}' on this table."));
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return Result.Failure(new(ErrorCode.Unavailable, $"Could not remove {id}'s card.", ex.Message));
+        }
+        await ReloadAsync(cancellationToken).ConfigureAwait(false);
+        return Result.Success();
+    }
+
+    /// <summary>
+    /// Writes the one field this verb owns. Everything else in the card is left exactly as it is, including fields this
+    /// release does not know about.
+    /// </summary>
+    public async ValueTask<Result<Person>> SetLevelAsync(string id, AccessLevel level, CancellationToken cancellationToken)
+    {
+        if (PersonIds.Problem(id) is { } problem) return Result<Person>.Failure(new(ErrorCode.Invalid, problem));
+        if (FindById(id) is null)
+            return Result<Person>.Failure(new(ErrorCode.Invalid, $"There is nobody called '{id}' on this table."));
+
+        var path = Path.Combine(Root, id, InfoFileName);
+        var card = ReadCard(path);
+        card["level"] = level.ToString().ToLowerInvariant();
+        try
+        {
+            WriteCard(path, card);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return Result<Person>.Failure(new(ErrorCode.Unavailable, $"Could not write {id}'s card.", ex.Message));
+        }
+        await ReloadAsync(cancellationToken).ConfigureAwait(false);
+        return FindById(id) is { } person
+            ? Result<Person>.Success(person)
+            : Result<Person>.Failure(new(ErrorCode.Conflict, $"The card was written but the scan refused it."));
+    }
+
+    /// <summary>
+    /// The card as it is on disk, or an empty one. A card that cannot be parsed becomes an empty one on purpose: this
+    /// verb is also how somebody repairs a file they broke, and refusing to touch it would leave them no way back.
+    /// </summary>
+    private static JsonObject ReadCard(string path)
+    {
+        if (!File.Exists(path)) return new JsonObject();
+        try
+        {
+            return JsonNode.Parse(File.ReadAllText(path)) as JsonObject ?? new JsonObject();
+        }
+        catch (JsonException)
+        {
+            return new JsonObject();
+        }
+    }
+
+    /// <summary>
+    /// Writes the card in one move: a temporary file in the same folder, then a rename. A half-written card is the one
+    /// state this table must never produce — it would be a person who exists but cannot be read.
+    /// </summary>
+    private static void WriteCard(string path, JsonObject card)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        // A name of its own per write: two callers writing the same card at the same time would otherwise share one
+        // temporary file and rename each other's half-finished bytes into place. The last write still wins, which is
+        // what a whole-card write means — but nobody gets a mixture of two cards (docs/31 §12).
+        var temporary = Path.Combine(Path.GetDirectoryName(path)!,
+            $"{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
+        File.WriteAllText(temporary, card.ToJsonString(WriteOptions));
+        File.Move(temporary, path, overwrite: true);
+    }
+
+    private static readonly JsonSerializerOptions WriteOptions = new(JsonSerializerDefaults.Web)
+    { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 
     /// <summary>One person's card, or null when the file does not describe one.</summary>
     private static ParsedPerson? ReadOne(string id, string path, List<PersonProblem> problems)

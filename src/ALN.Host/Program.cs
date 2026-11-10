@@ -265,7 +265,8 @@ if (!adapterActions.Ok)
 // The identity verbs. Registered here rather than inside a package because the directory itself is a host concern:
 // no plugin owns the folder, and a table that could be replaced by loading a package would be a table somebody could
 // replace by loading a package.
-var identityActions = ALN.Identity.IdentityActionSet.Register(controlPlane, personDirectory, personDirectory);
+var identityActions = ALN.Identity.IdentityActionSet.Register(controlPlane, personDirectory, personDirectory,
+    personDirectory);
 if (!identityActions.Ok)
 {
     Console.Error.WriteLine(identityActions.Error?.Message ?? "Identity action registration failed.");

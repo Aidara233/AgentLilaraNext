@@ -80,7 +80,10 @@ public static class AccessLevels
         [Capabilities.PromptsWrite] = AccessLevel.Operator,
         // Asking who somebody is costs nothing and answers a question the model would otherwise guess at.
         [Capabilities.IdentityRead] = AccessLevel.Agent,
-        // Rescanning decides which accounts this process believes belong to whom: a deployment decision.
+        // Keeping the cards up to date is the model's own bookkeeping, deliberately at the same depth as reading them:
+        // what it may not touch is the level, and that lives behind IdentityControl below (docs/31 §7.1).
+        [Capabilities.IdentityWrite] = AccessLevel.Agent,
+        // Setting somebody's level, and rescanning the folder: a deployment decision either way.
         [Capabilities.IdentityControl] = AccessLevel.Operator,
         [Capabilities.ArchiveControl] = AccessLevel.Operator,
         [Capabilities.ModulesControl] = AccessLevel.Operator,
@@ -296,8 +299,15 @@ public static class Capabilities
     public const string IdentityRead = "identity.read";
 
     /// <summary>
-    /// Reading the identity folder again. Operator level: it decides who this process believes about who said what,
-    /// which is a deployment decision even though no code and no capability changes with it.
+    /// Keeping the table up to date: who somebody is, what he is called here, which accounts are his. Agent level on
+    /// purpose — a person's own card is exactly the kind of thing an assistant is expected to maintain while talking to
+    /// him, and the one field that would matter, <c>level</c>, is not in this family's reach at all (docs/31 §7.1).
+    /// </summary>
+    public const string IdentityWrite = "identity.write";
+
+    /// <summary>
+    /// What a card's <c>level</c> is, and reading the folder again. Operator level: the first is the number the
+    /// instruction system will trust, and the second decides which accounts this process believes belong to whom.
     /// </summary>
     public const string IdentityControl = "identity.control";
 

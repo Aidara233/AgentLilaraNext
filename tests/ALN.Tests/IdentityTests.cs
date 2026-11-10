@@ -315,7 +315,7 @@ public sealed class IdentityTests : IDisposable
         Write("xiaolin", """{"name":"小林","level":"operator","accounts":[{"adapter":"adapter.qq#main","account":"1234567"}]}""");
         var people = await Load();
         var plane = new ControlPlane(new NullAudit(), NullSignalLog.Instance);
-        Assert.True(IdentityActionSet.Register(plane, people, people).Ok);
+        Assert.True(IdentityActionSet.Register(plane, people, people, people).Ok);
 
         var answer = await plane.InvokeAsync(Actor.System, IdentityActions.List, JsonDocument.Parse("{}").RootElement, default);
 
@@ -326,6 +326,248 @@ public sealed class IdentityTests : IDisposable
         Assert.Equal("1234567", row.GetProperty("accounts")[0].GetProperty("account").GetString());
     }
 
+    // ---- writing a card --------------------------------------------------------------------------
+
+    [Fact]
+    public async Task A_model_can_write_a_card_and_the_person_it_makes_starts_at_the_bottom()
+    {
+        var people = await Load();
+        var plane = Plane(people);
+
+        var answer = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+            {"id":"xiaolin","name":"小林","note":"我妹妹。","accounts":[{"adapter":"adapter.qq#main","account":"1234567"}]}
+            """), default);
+
+        Assert.True(answer.Ok, answer.Error?.Detail);
+        var person = people.FindById("xiaolin")!;
+        Assert.Equal("小林", person.Name);
+        Assert.Equal("我妹妹。", person.Note);
+        // A card nobody wrote by hand is not trusted with anything: the safe default is the one that gives away nothing.
+        Assert.Equal(AccessLevel.Agent, person.Level);
+        Assert.Equal("xiaolin", people.Find(Adapter, "1234567")!.Id);
+    }
+
+    [Fact]
+    public async Task A_model_may_fix_a_name_and_a_note_but_not_whose_accounts_they_are()
+    {
+        Write("xiaolin", """{"name":"小林","note":"旧","level":"operator","accounts":[{"adapter":"adapter.qq#main","account":"1"}]}""");
+        var people = await Load();
+        var plane = Plane(people);
+
+        // The harmless half: how he is described, at any level.
+        var renamed = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+            {"id":"xiaolin","name":"林妹妹","note":"改过了","accounts":[{"adapter":"adapter.qq#main","account":"1"}]}
+            """), default);
+        Assert.True(renamed.Ok, renamed.Error?.Detail);
+        Assert.Equal("林妹妹", people.FindById("xiaolin")!.Name);
+
+        // The half that is not harmless: an account is who his words belong to, so this card is a decision, and a
+        // decision needs somebody who is trusted with one.
+        var denied = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+            {"id":"xiaolin","name":"林妹妹","accounts":[{"adapter":"adapter.qq#main","account":"1"},
+                                                       {"adapter":"adapter.qq#main","account":"999"}]}
+            """), default);
+        Assert.False(denied.Ok);
+        Assert.Equal(ErrorCode.Denied, denied.Error!.Code);
+        Assert.Contains("L1 operator", denied.Error.Message, StringComparison.Ordinal);
+        // Not vacuous: the refused write left the card exactly as the accepted one put it.
+        Assert.Null(people.Find(Adapter, "999"));
+        Assert.Equal("改过了", people.FindById("xiaolin")!.Note);
+
+        // And an operator can do it, because that is what the level is for.
+        var allowed = await plane.InvokeAsync(Operator(), IdentityActions.Set, Arguments("""
+            {"id":"xiaolin","name":"林妹妹","accounts":[{"adapter":"adapter.qq#main","account":"1"},
+                                                       {"adapter":"adapter.qq#main","account":"999"}]}
+            """), default);
+        Assert.True(allowed.Ok, allowed.Error?.Detail);
+        Assert.Equal("xiaolin", people.Find(Adapter, "999")!.Id);
+    }
+
+    [Fact]
+    public async Task Writing_a_card_never_touches_the_level_it_has()
+    {
+        Write("xiaolin", """{"name":"小林","level":"full","accounts":[{"adapter":"adapter.qq#main","account":"1"}]}""");
+        var people = await Load();
+        var plane = Plane(people);
+
+        // An operator rewriting the card, which is the strongest caller that can reach this verb at all.
+        var written = await plane.InvokeAsync(Operator(), IdentityActions.Set, Arguments("""
+            {"id":"xiaolin","name":"小林","accounts":[{"adapter":"adapter.qq#main","account":"1"}]}
+            """), default);
+
+        Assert.True(written.Ok, written.Error?.Detail);
+        // The field was not in the request and is not in the answer: only identity.people.level writes it.
+        Assert.Equal(AccessLevel.Full, people.FindById("xiaolin")!.Level);
+    }
+
+    [Fact]
+    public async Task A_card_that_says_level_is_refused_rather_than_quietly_ignored()
+    {
+        var people = await Load();
+        var plane = Plane(people);
+
+        var answer = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+            {"id":"xiaolin","name":"小林","level":"full","accounts":[{"adapter":"adapter.qq#main","account":"1"}]}
+            """), default);
+
+        Assert.False(answer.Ok);
+        // Being told "done" while nothing happened is the worse failure: the next thing the caller does is based on it.
+        Assert.Contains("identity.people.level", answer.Error!.Message, StringComparison.Ordinal);
+        Assert.Empty(people.List());
+    }
+
+    [Fact]
+    public async Task A_model_cannot_raise_a_level_and_an_operator_can()
+    {
+        Write("xiaolin", """{"name":"小林","accounts":[{"adapter":"adapter.qq#main","account":"1"}]}""");
+        var people = await Load();
+        var plane = Plane(people);
+
+        var refused = await plane.InvokeAsync(Model(), IdentityActions.Level, Arguments("""{"id":"xiaolin","level":"operator"}"""), default);
+        Assert.False(refused.Ok);
+        Assert.Equal(AccessLevel.Agent, people.FindById("xiaolin")!.Level);
+
+        var raised = await plane.InvokeAsync(Operator(), IdentityActions.Level, Arguments("""{"id":"xiaolin","level":"operator"}"""), default);
+        Assert.True(raised.Ok, raised.Error?.Detail);
+        Assert.Equal(AccessLevel.Operator, people.FindById("xiaolin")!.Level);
+    }
+
+    [Fact]
+    public async Task A_model_can_remove_somebody_with_no_level_but_not_somebody_with_one()
+    {
+        Write("a", """{"name":"普通人","accounts":[{"adapter":"adapter.qq#main","account":"1"}]}""");
+        Write("b", """{"name":"有等级的","level":"operator","accounts":[{"adapter":"adapter.qq#main","account":"2"}]}""");
+        var people = await Load();
+        var plane = Plane(people);
+
+        var refused = await plane.InvokeAsync(Model(), IdentityActions.Remove, Arguments("""{"id":"b"}"""), default);
+        Assert.False(refused.Ok);
+        Assert.Equal(ErrorCode.Denied, refused.Error!.Code);
+        Assert.NotNull(people.FindById("b"));
+
+        var removed = await plane.InvokeAsync(Model(), IdentityActions.Remove, Arguments("""{"id":"a"}"""), default);
+        Assert.True(removed.Ok, removed.Error?.Detail);
+        Assert.Null(people.FindById("a"));
+        Assert.Null(people.Find(Adapter, "1"));
+    }
+
+    [Fact]
+    public async Task Removing_a_person_takes_the_card_and_leaves_the_folder()
+    {
+        Write("xiaolin", """{"name":"小林","accounts":[{"adapter":"adapter.qq#main","account":"1"}]}""");
+        var people = await Load();
+        var plane = Plane(people);
+        var folder = Path.Combine(_root, PersonDirectory.DirectoryName, "xiaolin");
+        var extra = Path.Combine(folder, "avatar.png");
+        await File.WriteAllTextAsync(extra, "not really a picture");
+
+        Assert.True((await plane.InvokeAsync(Model(), IdentityActions.Remove, Arguments("""{"id":"xiaolin"}"""), default)).Ok);
+
+        // The card is the identity; the folder is somebody's own drawer. A verb about identity does not empty it.
+        Assert.False(File.Exists(Path.Combine(folder, PersonDirectory.InfoFileName)));
+        Assert.True(File.Exists(extra));
+        Assert.Empty(people.List());
+    }
+
+    [Fact]
+    public async Task Removing_somebody_who_is_not_there_is_an_error_rather_than_a_shrug()
+    {
+        var people = await Load();
+        var plane = Plane(people);
+
+        var answer = await plane.InvokeAsync(Model(), IdentityActions.Remove, Arguments("""{"id":"nobody"}"""), default);
+
+        Assert.False(answer.Ok);
+        Assert.Equal(ErrorCode.Invalid, answer.Error!.Code);
+    }
+
+    [Fact]
+    public async Task An_account_cannot_be_taken_away_from_the_person_who_has_it()
+    {
+        Write("a", """{"name":"甲","accounts":[{"adapter":"adapter.qq#main","account":"111"}]}""");
+        var people = await Load();
+        var plane = Plane(people);
+
+        var answer = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+            {"id":"b","name":"乙","accounts":[{"adapter":"adapter.qq#main","account":"111"}]}
+            """), default);
+
+        Assert.False(answer.Ok);
+        Assert.Equal(ErrorCode.Conflict, answer.Error!.Code);
+        Assert.Null(people.FindById("b"));
+        Assert.Equal("a", people.Find(Adapter, "111")!.Id);
+    }
+
+    [Fact]
+    public async Task Only_one_set_of_accounts_can_be_mine()
+    {
+        Write("a", """{"name":"我","self":true,"accounts":[{"adapter":"adapter.qq#main","account":"111"}]}""");
+        var people = await Load();
+        var plane = Plane(people);
+
+        var answer = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+            {"id":"b","name":"也是我","self":true,"accounts":[{"adapter":"adapter.qq#main","account":"222"}]}
+            """), default);
+
+        Assert.False(answer.Ok);
+        Assert.Equal(ErrorCode.Conflict, answer.Error!.Code);
+        Assert.Equal("a", people.Self!.Id);
+    }
+
+    [Fact]
+    public async Task Writing_a_card_keeps_whatever_else_somebody_put_in_it()
+    {
+        Write("xiaolin", """
+            {"name":"小林","avatar":"a.png","tags":["family"],
+             "accounts":[{"adapter":"adapter.qq#main","account":"1"}]}
+            """);
+        var people = await Load();
+        var plane = Plane(people);
+
+        var written = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+            {"id":"xiaolin","name":"林妹妹","accounts":[{"adapter":"adapter.qq#main","account":"1"}]}
+            """), default);
+        Assert.True(written.Ok, written.Error?.Detail);
+
+        // This release does not know what "avatar" or "tags" are, which is exactly why it must not throw them away:
+        // a card is a file somebody else may be keeping things in.
+        var card = await File.ReadAllTextAsync(Path.Combine(_root, PersonDirectory.DirectoryName, "xiaolin",
+            PersonDirectory.InfoFileName));
+        Assert.Contains("\"avatar\"", card, StringComparison.Ordinal);
+        Assert.Contains("\"tags\"", card, StringComparison.Ordinal);
+        Assert.Contains("林妹妹", card, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_person_nobody_can_arrive_as_is_refused_before_the_file_is_touched()
+    {
+        var people = await Load();
+        var plane = Plane(people);
+
+        var answer = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+            {"id":"xiaolin","name":"小林","accounts":[]}
+            """), default);
+
+        Assert.False(answer.Ok);
+        var folder = Path.Combine(_root, PersonDirectory.DirectoryName, "xiaolin");
+        Assert.False(File.Exists(Path.Combine(folder, PersonDirectory.InfoFileName)));
+    }
+
+    [Fact]
+    public async Task An_id_that_could_escape_the_folder_is_refused()
+    {
+        var people = await Load();
+        var plane = Plane(people);
+
+        var answer = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+            {"id":"../elsewhere","name":"逃出去的人","accounts":[{"adapter":"adapter.qq#main","account":"1"}]}
+            """), default);
+
+        Assert.False(answer.Ok);
+        Assert.Equal(ErrorCode.Invalid, answer.Error!.Code);
+        Assert.False(Directory.Exists(Path.Combine(_root, "elsewhere")));
+    }
+
     // ---- helpers ---------------------------------------------------------------------------------
 
     private void Write(string id, string json)
@@ -334,6 +576,23 @@ public sealed class IdentityTests : IDisposable
         Directory.CreateDirectory(directory);
         File.WriteAllText(Path.Combine(directory, PersonDirectory.InfoFileName), json);
     }
+
+    /// <summary>The action table over this table, with an audit sink that keeps nothing. Registration is tested elsewhere.</summary>
+    private static ControlPlane Plane(IPersonDirectory people)
+    {
+        var plane = new ControlPlane(new NullAudit(), NullSignalLog.Instance);
+        Assert.True(IdentityActionSet.Register(plane, people, (IPersonDirectoryReload)people,
+            (IPersonDirectoryEditing)people).Ok);
+        return plane;
+    }
+
+    private static JsonElement Arguments(string json) => JsonDocument.Parse(json).RootElement.Clone();
+
+    /// <summary>The model, at the shallowest level there is: what a session's own turn reaches by default.</summary>
+    private static Actor Model() => new("model:s-1", ActorKind.Model, ActionTools.ModelCapabilities, AccessLevel.Agent);
+
+    /// <summary>A person driving this process on purpose.</summary>
+    private static Actor Operator() => new("operator", ActorKind.User, [Actor.Any], AccessLevel.Operator);
 
     private async Task<PersonDirectory> Load()
     {
