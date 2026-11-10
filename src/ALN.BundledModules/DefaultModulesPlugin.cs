@@ -52,11 +52,25 @@ public sealed class DefaultModulesPlugin : IModulePlugin
             var report = context.HostServices.GetService(typeof(IRestoreReporter)) as IRestoreReporter;
             var atomic = context.HostServices.GetService(typeof(IAtomicWork)) as IAtomicWork;
             var queue = context.HostServices.GetService(typeof(IQueuedMessageStore)) as IQueuedMessageStore;
+            // Media is the one store two components need: the graph (speak's image blocks) and the Channel (a picture that
+            // arrived with a message). Read here, before either is built, because passing it to one and assuming the
+            // other would find it by name is exactly the bug this line replaced: a ChannelManager constructed without
+            // it answers every attachment with "this host has no media store; they were dropped" — a note, not a failure,
+            // so nothing ever said so. An inbound picture then cost a download and left no file.
+            var media = context.HostServices.GetService(typeof(IMediaStore)) as IMediaStore;
+            // Said at startup, where somebody reads it. Without this, a host that forgot to register a media store drops
+            // every attachment with a note written after the receipt has already been printed — which is how a picture
+            // can cost a download, land nowhere, and leave nothing behind but a model saying it cannot see pictures.
+            if (media is null)
+                report?.Note("channels", "this host has no media store: an attachment that arrives with a message is "
+                    + "dropped, and speak cannot send a picture");
             var channels = new ChannelManager(events, bindings, catalog,
                 context.HostServices.GetService(typeof(IChannelSpecStore)) as IChannelSpecStore,
                 context.HostServices.GetService(typeof(IMessageStore)) as IMessageStore,
                 context.HostServices.GetService(typeof(IParameterRegistry)) as IParameterRegistry,
                 state, report, atomic, queue, registry, types: types,
+                // Optional for the graph's sake below, required in practice for anything that carries a picture.
+                media: media,
                 // Optional: a host without an identity table still routes messages, they simply arrive from strangers.
                 people: context.HostServices.GetService(typeof(IPersonDirectory)) as IPersonDirectory);
             // The channel verbs are the Channel module's, so it registers them: the table is handed out, not filled in
@@ -65,9 +79,6 @@ public sealed class DefaultModulesPlugin : IModulePlugin
             var channelActions = channels.RegisterActions(HostService<IControlPlane>(context));
             if (!channelActions.Ok) return ValueTask.FromResult(channelActions);
             var executor = new JintScriptExecutor();
-            // Media is optional for the graph: without it, speak's image blocks say so. The ChannelManager above gets the
-            // same store through host services, which is where both of them ask for it by contract name.
-            var media = context.HostServices.GetService(typeof(IMediaStore)) as IMediaStore;
             var graph = new GraphManager(catalog, types, executor, audit, journal, state, report, media);
             if (bindings is IInstanceBindingsProxy proxy) proxy.Bind(graph);
             // The mount verbs are the graph's: it owns the rules, and it owns what a scope may name.

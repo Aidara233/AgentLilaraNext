@@ -1234,8 +1234,13 @@ public sealed class GraphIntegrationTests : IDisposable
     }
 
     private ScriptPackage AdapterIntake() => new(
+        // 256 MiB, matching what the shipped script declares. Not decoration: Jint's LimitMemory compares this thread's
+        // allocation since the engine was built (JintMemoryLimitTests), so under xUnit's parallelism a test that runs
+        // while this one awaits is charged to this engine — the budget a lone run has plenty of is spent by a neighbour.
+        // The script's own body allocates nothing; the number exists so a test about routing does not fail on that.
         new("adapter.channel-intake", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
-            [ScriptCapabilities.ChannelAccept, ScriptCapabilities.SelfAdapterPoll], TrustDomain.Builtin),
+            [ScriptCapabilities.ChannelAccept, ScriptCapabilities.SelfAdapterPoll], TrustDomain.Builtin,
+            MemoryLimitBytes: 256L * 1024 * 1024),
         "async function onEvent(event, ctx) { await ctx.channel.accept(); }");
 
     /// <summary>A manual script: nothing attaches it, so it only runs once somebody mounts it by instance.</summary>

@@ -25,6 +25,14 @@ public sealed class SignalModuleLogger(ISignalLog signalLog, string moduleId) : 
             if (!signalLog.IsEnabled(level)) return;
             var text = message ?? "";
             if (text.Length > 2_000) text = text[..2_000];
+            // The sentence always travels, even when there is structure beside it. Dropping it whenever a caller had
+            // detail to give meant a record could say {"file":"x.jpg","status":"400"} and never say what happened —
+            // so a grep for the thing you were looking for found nothing, and the log looked like it had not been
+            // written at all. A detail that already carries "message" keeps its own.
+            var payload = detail is { Count: > 0 }
+                ? new Dictionary<string, string>(detail, StringComparer.Ordinal)
+                : new Dictionary<string, string>(StringComparer.Ordinal);
+            payload.TryAdd("message", text);
             signalLog.Write(new()
             {
                 Group = "module",
@@ -35,7 +43,7 @@ public sealed class SignalModuleLogger(ISignalLog signalLog, string moduleId) : 
                 Mechanism = "log",
                 Outcome = outcome,
                 Level = level,
-                Detail = detail is { Count: > 0 } ? detail : new Dictionary<string, string> { ["message"] = text }
+                Detail = payload
             });
         }
         catch
