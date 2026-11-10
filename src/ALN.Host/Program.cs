@@ -454,6 +454,12 @@ if (!scripts.Ok || scripts.Value is null)
     return 1;
 }
 var loaded = await graph.LoadAsync(scripts.Value, CancellationToken.None);
+
+// A refused script used to leave one trace: a good that vanished from the shelf. The reason was collected into a list
+// nobody printed, so "why is this script not loaded" cost four rounds of reading code. One line per refusal, at the
+// moment it happens, is the whole fix.
+foreach (var issue in graph.RejectedScripts)
+    Console.WriteLine($"scripts: {issue.Path} 被拒 — {issue.Reason}");
 if (!loaded.Ok)
 {
     Console.Error.WriteLine($"Graph loading failed: {loaded.Error?.Message} {loaded.Error?.Detail}");

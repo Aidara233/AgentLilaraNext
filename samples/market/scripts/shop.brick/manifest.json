@@ -9,7 +9,7 @@
   "trustDomain": "trusted",
   "call": "box_brick",
   "tool": {
-    "name": "shop_brick",
+    "name": "shop.brick",
     "description": "砖的结算脚本",
     "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
     "access": "full"

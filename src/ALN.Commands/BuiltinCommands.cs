@@ -108,8 +108,22 @@ public static class BuiltinCommands
         JsonValueKind.Number => value.GetRawText(),
         JsonValueKind.True => "true",
         JsonValueKind.False => "false",
-        JsonValueKind.Array => $"共 {value.GetArrayLength()} 项",
+        JsonValueKind.Array => SpellArray(value),
         JsonValueKind.Object => "…",
         _ => "null"
     };
+
+    /// <summary>
+    /// A short array is worth printing in full. "rejected: 1 item" is exactly how a refused script stayed invisible
+    /// for several rounds: the reason was in that array, and the instruction reported only its length.
+    /// </summary>
+    private static string SpellArray(JsonElement value)
+    {
+        var items = value.EnumerateArray().ToArray();
+        if (items.Length == 0) return "无";
+        if (items.Length > 3) return $"共 {items.Length} 项";
+        return string.Join(" | ", items.Select(item => item.ValueKind == JsonValueKind.Object
+            ? string.Join("，", item.EnumerateObject().Select(property => $"{property.Name}={Spell(property.Value)}"))
+            : Spell(item)));
+    }
 }

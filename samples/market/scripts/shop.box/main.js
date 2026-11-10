@@ -20,5 +20,5 @@ async function box(args) {
 }
 
 function describe() {
-  return { name: "shop_box", description: "盲盒的结算脚本", parametersJson: "{\"type\":\"object\",\"properties\":{}}", access: "full" };
+  return { name: "shop.box", description: "盲盒的结算脚本", parametersJson: "{\"type\":\"object\",\"properties\":{}}", access: "full" };
 }

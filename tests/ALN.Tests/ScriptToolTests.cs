@@ -194,15 +194,16 @@ public sealed class ScriptToolTests : IDisposable
         var source = new ScriptCallTools(_graph);
         var atAgent = (await source.ToolsAsync(new RoundContextRequest("s-1", Guid.NewGuid(), 1, Level: AccessLevel.Agent),
             default)).Value!;
-        Assert.Equal(["tool.open", "tool.own"], atAgent.Select(offer => offer.Definition.Name).Order().ToArray());
+        // The model sees the wire name: dots become underscores at the boundary (see ScriptCallTools.WireName).
+        Assert.Equal(["tool_open", "tool_own"], atAgent.Select(offer => offer.Definition.Name).Order().ToArray());
 
         var atFull = (await source.ToolsAsync(new RoundContextRequest("s-2", Guid.NewGuid(), 1, Level: AccessLevel.Full),
             default)).Value!;
-        Assert.Equal(["tool.kept", "tool.open", "tool.own"],
+        Assert.Equal(["tool_kept", "tool_open", "tool_own"],
             atFull.Select(offer => offer.Definition.Name).Order().ToArray());
 
         // And the definition says who is doing the work and who may ask — the two facts a caller needs.
-        var deep = atAgent.Single(offer => offer.Definition.Name == "tool.open");
+        var deep = atAgent.Single(offer => offer.Definition.Name == "tool_open");
         Assert.Contains("来自", deep.Definition.Description);
         Assert.Contains("L2 full", deep.Definition.Description);
         Assert.Contains("不按调用它的会话", deep.Definition.Description);
@@ -309,7 +310,7 @@ public sealed class ScriptToolTests : IDisposable
                 // Offered to the maker, and callable by it, every time.
                 var offers = (await new ScriptCallTools(_graph).ToolsAsync(
                     new RoundContextRequest("s-1", Guid.NewGuid(), 1, Level: maker), default)).Value!;
-                Assert.Contains(offers, offer => offer.Definition.Name == name);
+                Assert.Contains(offers, offer => offer.Definition.Name == name.Replace('.', '_'));
                 var called = await _graph.InvokeToolAsync(package.Manifest.Id, """{"text":"hi"}""", default);
                 Assert.True(called.Ok, called.Error?.Message);
             }

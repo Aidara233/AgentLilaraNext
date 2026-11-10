@@ -8,7 +8,7 @@ function main() {
 }
 
 function describe() {
-  return { name: "shop_rice", description: "买饭的结算脚本", parametersJson: "{\"type\":\"object\",\"properties\":{}}", access: "full" };
+  return { name: "shop.rice", description: "买饭的结算脚本", parametersJson: "{\"type\":\"object\",\"properties\":{}}", access: "full" };
 }
 
 async function buy(args, ctx) {

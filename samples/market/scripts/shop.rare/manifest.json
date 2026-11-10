@@ -9,7 +9,7 @@
   "trustDomain": "trusted",
   "call": "box_rare",
   "tool": {
-    "name": "shop_rare",
+    "name": "shop.rare",
     "description": "稀罕物的结算脚本",
     "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
     "access": "full"

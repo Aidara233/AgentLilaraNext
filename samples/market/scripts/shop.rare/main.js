@@ -5,5 +5,5 @@ async function box_rare(args) {
 }
 
 function describe() {
-  return { name: "shop_rare", description: "稀罕物的结算脚本", parametersJson: "{\"type\":\"object\",\"properties\":{}}", access: "full" };
+  return { name: "shop.rare", description: "稀罕物的结算脚本", parametersJson: "{\"type\":\"object\",\"properties\":{}}", access: "full" };
 }

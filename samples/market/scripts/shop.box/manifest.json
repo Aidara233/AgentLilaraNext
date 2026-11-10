@@ -9,7 +9,7 @@
   "trustDomain": "trusted",
   "call": "box",
   "tool": {
-    "name": "shop_box",
+    "name": "shop.box",
     "description": "盲盒的结算脚本",
     "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
     "access": "full"

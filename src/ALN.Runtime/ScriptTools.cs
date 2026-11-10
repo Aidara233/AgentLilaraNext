@@ -490,17 +490,43 @@ public sealed class ScriptCallTools(IGraphRuntime graph) : ISessionToolSource
         // deeper Session may call. Calling a tool never hands the caller the tool's authority, so there is nothing to be
         // gained by hiding a deep tool from a shallow Session — and everything to lose, because that is the whole way
         // work gets done for someone who cannot do it themselves.
-        var offers = graph.ToolScripts
-            .Where(package => package.Tool is not null && package.Tool.Access <= request.Level)
-            .Select(package => new SessionToolOffer(
+        // The manifest name is the authority: it is namespaced on purpose ("shop.rice"), and the dot is what keeps a
+        // script's tool away from the Session's own names and the modules'. The model, however, only accepts bare
+        // identifiers as function names — asking it for "shop.rice" is an HTTP 400 for the whole request, and the only
+        // symptom in the chat is a Session that stopped answering. So the wire name is derived here, at the boundary,
+        // and the manifest keeps saying what it means.
+        var taken = new HashSet<string>(StringComparer.Ordinal);
+        var offers = new List<SessionToolOffer>();
+        foreach (var package in graph.ToolScripts)
+        {
+            if (package.Tool is null || package.Tool.Access > request.Level) continue;
+            offers.Add(new SessionToolOffer(
                 new ScriptCallTool(graph, package),
-                new ModelToolDefinition(package.Tool!.Name, Describe(package), package.Tool.ParametersJson),
+                new ModelToolDefinition(WireName(package.Tool.Name, taken), Describe(package),
+                    package.Tool.ParametersJson),
                 // A script tool can act: it has the same ctx an event handler has, so a turn that only called one has
                 // not spoken to anybody just because it produced text.
                 ActsExternally: true,
-                MinLevel: package.Tool!.Access))
-            .ToArray();
+                MinLevel: package.Tool!.Access));
+        }
         return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(offers));
+    }
+
+    /// <summary>
+    /// A name the model will accept, derived from the name the manifest means. Dots become underscores; a collision
+    /// (shop.a.b and shop.a_b) gets a number. The pair (offer.Definition.Name, offer.Tool) is what routes a call back,
+    /// so nothing downstream needs to know the two names differ.
+    /// </summary>
+    private static string WireName(string name, HashSet<string> taken)
+    {
+        var wire = name.Replace('.', '_');
+        if (taken.Add(wire)) return wire;
+        for (var suffix = 2; suffix < 100; suffix++)
+        {
+            var candidate = $"{wire}_{suffix}";
+            if (taken.Add(candidate)) return candidate;
+        }
+        return $"{wire}_x";
     }
 
     /// <summary>
