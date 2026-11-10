@@ -10,7 +10,7 @@
   "call": "buy",
   "tool": {
     "name": "shop.rice",
-    "description": "买饭的结算脚本：2 枚硬币换 100 份白饭",
+    "description": "白饭套餐的结算脚本：碗 100 口、盆 500 口、锅 2000 口、桶 5000 口",
     "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
     "access": "full"
   }
