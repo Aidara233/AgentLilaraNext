@@ -143,7 +143,7 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
         IReadOnlyList<SessionToolOffer> offers =
         [
             new(new ListTool(this), ListDefinition, ActsExternally: false),
-            new(new ReloadTool(this, request.Level), ReloadDefinition, ActsExternally: false),
+            new(new ReloadTool(this, request.Level, request.SessionId), ReloadDefinition, ActsExternally: false),
             // Mounting does change what a channel answers to from now on, but it says nothing to the conversation: the
             // next message does. Keeping it non-external is what lets a turn mount and then speak in the same step
             // without the reply being taken for the effect. The level travels with it: a Session mounts what it could be,
@@ -201,7 +201,7 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
         }
     }
 
-    private sealed class ReloadTool(ScriptTools owner, AccessLevel level) : ISessionTool
+    private sealed class ReloadTool(ScriptTools owner, AccessLevel level, string? sessionId) : ISessionTool
     {
         public string Name => ReloadToolName;
         public bool EndsTurn => false;
@@ -213,7 +213,7 @@ public sealed class ScriptTools(IGraphRuntime graph, IGraphScriptCatalog catalog
             // without a plane says so instead of quietly doing the work anyway.
             if (owner._plane is null)
                 return Result<SessionToolResult>.Failure(new(ErrorCode.Unavailable, "This host has no control plane."));
-            var actor = new Actor(ActionTools.ActorId, ActorKind.Model, ActionTools.ModelCapabilities, level);
+            var actor = new Actor(ActionTools.ActorIdFor(sessionId), ActorKind.Model, ActionTools.ModelCapabilities, level);
             var acted = await owner._plane.InvokeAsync(actor, ScriptActions.Reload,
                 JsonSerializer.SerializeToElement(new { }), cancellationToken).ConfigureAwait(false);
             if (!acted.Ok)

@@ -170,21 +170,22 @@ public sealed class SessionDeliveryTests : IDisposable
         Assert.True(_sessions.RegisterActions(plane).Ok);
         Assert.True((await _sessions.OpenAsync("s-target", Spec(AccessLevel.Full), default)).Ok);
 
-        // An agent-level caller: the point is that this is allowed, and that the reply says who it was.
+        // An agent-level caller: the point is that this is allowed, and that the reply says who it was — the model's id
+        // names the Session, so the relay says which conversation asked rather than just "a model".
         var asked = await plane.InvokeAsync(
-            new Actor("model", ActorKind.Model, [Actor.Any], AccessLevel.Agent),
+            new Actor("model:s-caller", ActorKind.Model, [Actor.Any], AccessLevel.Agent),
             SessionActions.Message,
             JsonSerializer.SerializeToElement(new { id = "s-target", text = "这条我做不到，你可以吗？", wake = false }),
             default);
 
         Assert.True(asked.Ok, asked.Error?.Message);
-        Assert.Equal("session:model", asked.Value.GetProperty("from").GetString());
+        Assert.Equal("model:s-caller", asked.Value.GetProperty("from").GetString());
         Assert.Equal("L0 agent", asked.Value.GetProperty("fromLevel").GetString());
         Assert.False(asked.Value.GetProperty("wake").GetBoolean());
 
         var entries = await ReadHistoryAsync("s-target");
         var relayed = Assert.Single(entries, entry => entry.Relay is not null);
-        Assert.Equal("session:model", relayed.Relay!.From);
+        Assert.Equal("model:s-caller", relayed.Relay!.From);
     }
 
     private async Task<SessionHistoryEntry[]> ReadHistoryAsync(string sessionId)

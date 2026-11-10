@@ -36,12 +36,13 @@ public sealed class ActionToolsTests : IDisposable
         return plane;
     }
 
-    private static async Task<ISessionTool> ToolAsync(ActionTools tools, string name, AccessLevel level = AccessLevel.Agent)
+    private static async Task<ISessionTool> ToolAsync(ActionTools tools, string name, AccessLevel level = AccessLevel.Agent,
+        string sessionId = "s")
     {
         // The level is the request's, because that is where it comes from in a real turn (see SessionManager): the
         // source is registered once for the process, so a level captured at construction would be a level that never
         // changes again.
-        var offers = await tools.ToolsAsync(new RoundContextRequest("s", Guid.NewGuid(), 1, Level: level), default);
+        var offers = await tools.ToolsAsync(new RoundContextRequest(sessionId, Guid.NewGuid(), 1, Level: level), default);
         Assert.True(offers.Ok, offers.Error?.Message);
         return offers.Value!.Single(offer => offer.Definition.Name == name).Tool;
     }
@@ -120,13 +121,34 @@ public sealed class ActionToolsTests : IDisposable
 
         Assert.StartsWith("ok: " + ChannelActions.Create, created);
         Assert.True(channels.Get(new Address("channel", "conversation", "probe-a")).Ok);
-        // The record is the half that has to survive: who called it, and against what.
+        // The record is the half that has to survive: who called it, and against what. "Who" names the Session, because
+        // one constant for every Session is a record that cannot be joined back to the message that caused the call.
         var record = Assert.Single(_audit, entry => entry.Action == ChannelActions.Create);
-        Assert.Equal(ActionTools.ActorId, record.Actor);
+        Assert.Equal("model:s", record.Actor);
         Assert.Contains("subject=probe-a", record.Detail);
         var signal = Assert.Single(_signals.Snapshot(), row => row.Name == ChannelActions.Create && row.Outcome == "ok");
-        Assert.Equal(ActionTools.ActorId, signal.From);
+        Assert.Equal("model:s", signal.From);
         Assert.Equal("probe-a", signal.Detail!["subject"]);
+    }
+
+    [Fact]
+    public async Task The_record_names_the_Session_that_called_it_not_just_the_model()
+    {
+        var plane = PlaneWithChannels(out _);
+        // One source, two rounds, two Sessions. An id read once at construction would write the first Session's name on
+        // every record after it — the same failure the level had once (docs/07 §9: nothing per-round may be cached in an
+        // object registered once for the process).
+        var tools = new ActionTools(plane);
+        foreach (var sessionId in new[] { "s-alpha", "s-beta" })
+        {
+            var call = await ToolAsync(tools, ActionTools.CallToolName, sessionId: sessionId);
+            var listed = Text(await call.ExecuteAsync(new("c1", ActionTools.CallToolName,
+                """{"action":"ACTION"}""".Replace("ACTION", ChannelActions.List, StringComparison.Ordinal)), default));
+            Assert.StartsWith("ok: " + ChannelActions.List, listed);
+        }
+
+        var actors = _audit.Where(entry => entry.Action == ChannelActions.List).Select(entry => entry.Actor).ToArray();
+        Assert.Equal(["model:s-alpha", "model:s-beta"], actors);
     }
 
     [Fact]

@@ -31,6 +31,18 @@ public sealed class ActionTools(IControlPlane plane) : ISessionToolSource
     public const string ActorId = "model";
 
     /// <summary>
+    /// The same identity, naming the Session it is acting in: <c>model:&lt;session id&gt;</c>.
+    ///
+    /// One constant for every Session was a record with no answer in it. "The model did it" is true of every Session in
+    /// this process, so a log line carrying only that cannot be joined back to the message that caused it — which is the
+    /// one question docs/06 §9 requires an audit to answer ("this message made somebody read what"). The kind stays in
+    /// front because a record has to say <i>what</i> acted as well as <i>where</i>: a Session id alone would read as a
+    /// Session deciding, and a model is not one.
+    /// </summary>
+    public static string ActorIdFor(string? sessionId) =>
+        string.IsNullOrWhiteSpace(sessionId) ? ActorId : $"{ActorId}:{sessionId}";
+
+    /// <summary>
     /// What a model may do. Everything: this host's stance is that the model is an operator of this system, not a
     /// guest of it, so the grant is the whole table rather than a list somebody keeps in step by hand. What is kept is
     /// the record — every call writes down who, what and against which subject.
@@ -74,13 +86,16 @@ public sealed class ActionTools(IControlPlane plane) : ISessionToolSource
         // change visible on disk, in the audit and in the signal while the model kept the authority it started with —
         // which is the opposite of what setting a level is for. Both tools take it from the same request, so the list
         // and the call cannot disagree about what this caller may reach.
+        //
+        // Who it is travels with the round for the same reason: one source serves every Session, so a Session id read
+        // once at construction would be the first Session's name on every record this process ever writes.
         var level = request.Level;
         IReadOnlyList<SessionToolOffer> offers =
         [
             new(new ListActionTool(this, level), ListDefinition, ActsExternally: false),
             // Calling an action can talk to the outside world (channels.send), but the tool itself is not the reply:
             // whatever the model wants a person to read, it still has to say.
-            new(new CallActionTool(this, level), CallDefinition, ActsExternally: false)
+            new(new CallActionTool(this, level, request.SessionId), CallDefinition, ActsExternally: false)
         ];
         return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(offers));
     }
@@ -128,7 +143,7 @@ public sealed class ActionTools(IControlPlane plane) : ISessionToolSource
         }
     }
 
-    private sealed class CallActionTool(ActionTools owner, AccessLevel level) : ISessionTool
+    private sealed class CallActionTool(ActionTools owner, AccessLevel level, string? sessionId) : ISessionTool
     {
         public string Name => CallToolName;
         public bool EndsTurn => false;
@@ -148,7 +163,7 @@ public sealed class ActionTools(IControlPlane plane) : ISessionToolSource
                 ? args.Clone()
                 : JsonSerializer.SerializeToElement(new { });
 
-            var actor = new Actor(ActorId, ActorKind.Model, ModelCapabilities, level);
+            var actor = new Actor(ActorIdFor(sessionId), ActorKind.Model, ModelCapabilities, level);
             var result = await owner._plane.InvokeAsync(actor, actionId, payload, cancellationToken).ConfigureAwait(false);
 
             var text = new StringBuilder();

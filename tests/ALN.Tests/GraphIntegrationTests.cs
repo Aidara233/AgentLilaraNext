@@ -943,7 +943,7 @@ public sealed class GraphIntegrationTests : IDisposable
 
         // Through the plane means the record exists: who asked, and for what.
         Assert.Contains(_audit.ReadAudit(),
-            entry => entry.Action == ScriptActions.Reload && entry.Actor == ActionTools.ActorId);
+            entry => entry.Action == ScriptActions.Reload && entry.Actor == ActionTools.ActorIdFor("s"));
     }
 
     /// <summary>

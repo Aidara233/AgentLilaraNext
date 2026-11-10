@@ -65,7 +65,15 @@ public sealed partial class SessionManager
                 if (!arguments.TryReadText("text", out var text) || text.Trim().Length == 0)
                     return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "sessions.message requires 'text'."));
                 var wake = arguments.TryGetProperty("wake", out var wakeJson) && wakeJson.ValueKind == JsonValueKind.True;
-                var sender = actor.Kind == ActorKind.Script ? $"script:{actor.Id}" : $"session:{actor.Id}";
+                // A model's id already says what it is and which Session it is acting in ("model:<session id>", see
+                // ActionTools.ActorIdFor), so prefixing it again would read as a Session called "model:…". The other
+                // kinds carry a bare name and get their prefix here.
+                var sender = actor.Kind switch
+                {
+                    ActorKind.Script => $"script:{actor.Id}",
+                    ActorKind.Model when actor.Id.StartsWith(ActionTools.ActorId + ":", StringComparison.Ordinal) => actor.Id,
+                    _ => $"session:{actor.Id}"
+                };
                 var sent = await DeliverAsync(id.Trim(), text, sender, actor.Level, wake, ct).ConfigureAwait(false);
                 if (!sent.Ok) return Result<JsonElement>.Failure(sent.Error!);
                 return Result<JsonElement>.Success(ActionArgs.JsonOf(new
