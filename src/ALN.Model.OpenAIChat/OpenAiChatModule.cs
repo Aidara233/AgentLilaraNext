@@ -178,6 +178,16 @@ internal sealed class OpenAiChatProvider : IModelProvider, IModelProviderReconfi
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly HttpClient _http = new();
+
+    /// <summary>
+    /// How long the response stream may go without a single line before it is treated as dead.
+    ///
+    /// <see cref="HttpClient.Timeout"/> does not cover this: with <c>ResponseHeadersRead</c> it stops applying once the
+    /// headers are in, so a connection that stays open and then says nothing would be waited on forever. The whole
+    /// point of that setting is to read a stream that takes minutes, so the guard has to be per line rather than per
+    /// request: three minutes of silence is not a slow model, it is a dead socket.
+    /// </summary>
+    private static readonly TimeSpan StreamIdleTimeout = TimeSpan.FromMinutes(3);
     /// <summary>Replaced whole, read whole. A request that already started keeps the settings it began with.</summary>
     private OpenAiChatRuntimeOptions _options;
 
@@ -306,13 +316,27 @@ internal sealed class OpenAiChatProvider : IModelProvider, IModelProviderReconfi
             string? finishReason = null;
             string? responseId = null;
             var sawDone = false;
+            // Reset on every line read: silence is measured line by line, not request by request (see StreamIdleTimeout).
+            using var idle = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             while (true)
             {
                 string? line = null;
                 Exception? readError = null;
-                try { line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false); }
+                var idled = false;
+                idle.CancelAfter(StreamIdleTimeout);
+                try { line = await reader.ReadLineAsync(idle.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { idled = true; }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
                 catch (Exception ex) { readError = ex; }
+                if (idled)
+                {
+                    // Yielded rather than thrown: this is the model's answer failing, and the turn has to be able to say
+                    // why instead of dying on it.
+                    yield return new ModelFailed(new(ErrorCode.Timeout,
+                        $"The response stream said nothing for {StreamIdleTimeout.TotalSeconds:0} seconds.",
+                        Retryable: true));
+                    yield break;
+                }
                 if (readError is not null) throw readError;
                 if (line is null) break;
                 if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;

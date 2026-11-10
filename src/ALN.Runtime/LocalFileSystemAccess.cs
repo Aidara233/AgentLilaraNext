@@ -180,7 +180,7 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
 
     private ValueTask<Result> SaveCoreAsync(string scope, string path, Stream content, bool asHost,
         CancellationToken cancellationToken) =>
-        Run(cancellationToken, () =>
+        RunAsync(cancellationToken, async () =>
         {
             ArgumentNullException.ThrowIfNull(content);
             if (!asHost && RefuseWrite(scope) is { } readOnly) return Result.Failure(readOnly);
@@ -202,19 +202,26 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
             try
             {
                 long written = 0;
-                using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                // Asynchronous all the way through. This method used to build the stream synchronously and block on
+                // content.ReadAsync().GetAwaiter().GetResult() inside it, which meant every byte of a 64 MB transfer held
+                // a pool thread for as long as the disk took — an `async` signature in front of IO that never yielded.
+                await using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                                 81_920, FileOptions.Asynchronous))
                 {
                     var buffer = new byte[81_920];
                     int read;
-                    while ((read = content.ReadAsync(buffer, cancellationToken).AsTask().GetAwaiter().GetResult()) > 0)
+                    while ((read = await content.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
                     {
                         written += read;
                         // Checked as it goes: refusing after the disk is full is not a refusal, it is a mess.
                         if (written > IBinaryFileAccess.MaxTransferBytes)
                             return Result.Failure(new(ErrorCode.Invalid,
                                 $"The content is larger than the {IBinaryFileAccess.MaxTransferBytes} allowed for one transfer."));
-                        stream.Write(buffer, 0, read);
+                        await stream.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
                     }
+                    // The one deliberate block: .NET offers no asynchronous "flush to disk", and the alternative is a file
+                    // whose bytes are still in the page cache when the caller is told it is written. It is bounded to this
+                    // one file and happens after the bytes are already there, so it is not the long part of a transfer.
                     stream.Flush(flushToDisk: true);
                 }
                 File.Move(temporary, absolute, overwrite: true);
@@ -513,6 +520,28 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
         try
         {
             return await Task.Run(operation, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException
+                                      or System.Security.SecurityException or ArgumentException)
+        {
+            return Result.Failure(new(ErrorCode.Unavailable, "File operation failed.", ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// The same error mapping, for operations that are genuinely asynchronous.
+    ///
+    /// <see cref="Run"/> exists for the ones that are not: it parks a synchronous body on a pool thread so the caller's is
+    /// not held. That is the wrong shape for a stream being copied — the body would then hold a pool thread for as long
+    /// as the disk takes, and a few of those in flight is the thread pool gone. Bytes are moved with awaits instead.
+    /// </summary>
+    private static async ValueTask<Result> RunAsync(CancellationToken cancellationToken, Func<Task<Result>> operation)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        try
+        {
+            return await operation().ConfigureAwait(false);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException
