@@ -213,7 +213,8 @@ public sealed class NetActionsTests : IDisposable
     }
 
     /// <summary>Answers exactly one request and stops: enough for one action, and no port left listening afterwards.</summary>
-    private static Task<(int Port, Task Served)> ServeOnceAsync()
+    private static Task<(int Port, Task Served)> ServeOnceAsync(int status = 200, string body = "hello",
+        string? extraHeader = null)
     {
         var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
         listener.Start();
@@ -225,11 +226,12 @@ public sealed class NetActionsTests : IDisposable
             // One read is enough: the request head arrives in one segment for a GET, and the answer does not depend on
             // what was in it.
             _ = await stream.ReadAsync(new byte[2048]);
-            var body = System.Text.Encoding.UTF8.GetBytes("hello");
-            var head = $"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {body.Length}\r\n"
+            var payload = System.Text.Encoding.UTF8.GetBytes(body);
+            var head = $"HTTP/1.1 {status} Done\r\nContent-Type: application/json\r\nContent-Length: {payload.Length}\r\n"
+                       + (extraHeader is null ? "" : extraHeader + "\r\n")
                        + "Connection: close\r\n\r\n";
             await stream.WriteAsync(System.Text.Encoding.ASCII.GetBytes(head));
-            await stream.WriteAsync(body);
+            await stream.WriteAsync(payload);
             await stream.FlushAsync();
             listener.Stop();
         });

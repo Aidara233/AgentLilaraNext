@@ -33,6 +33,7 @@
     <ProjectReference Include="..\..\src\ALN.Archive\ALN.Archive.csproj" />
     <ProjectReference Include="..\..\src\ALN.Model.OpenAIChat\ALN.Model.OpenAIChat.csproj" />
     <ProjectReference Include="..\..\src\ALN.Net\ALN.Net.csproj" />
+    <ProjectReference Include="..\..\src\ALN.Web\ALN.Web.csproj" />
     <!-- The sample plugin is loaded by a test as a real package: the artifact that ships is the artifact tested. -->
     <ProjectReference Include="..\..\samples\plugins\sample.environment\SampleEnvironment.csproj" />
   </ItemGroup>

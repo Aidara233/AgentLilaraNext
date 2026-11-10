@@ -16,6 +16,7 @@
     <Project Path="src/ALN.Runtime/ALN.Runtime.csproj" />
     <Project Path="src/ALN.Scripting.Jint/ALN.Scripting.Jint.csproj" />
     <Project Path="src/ALN.Ssh/ALN.Ssh.csproj" />
+    <Project Path="src/ALN.Web/ALN.Web.csproj" />
     <Project Path="src/ALN.Storage.Sqlite/ALN.Storage.Sqlite.csproj" />
     <Project Path="src/ALN.WebUi/ALN.WebUi.csproj" />
   </Folder>

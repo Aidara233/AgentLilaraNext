@@ -157,10 +157,34 @@ foreach (var issue in netTargets.Issues)
 // key sits on the same disk buys the feeling of safety rather than the thing.
 var netSecrets = new ALN.Ssh.FileSecretStore(Path.Combine(data.Root, "net", "secrets"));
 var netAccess = new ALN.Net.HttpNetAccess(netTargets.Targets, auditSink, signalLog, netSecrets);
-// The model's one tool for this: net_fetch, which takes a target's name and a path. Registered here rather than in a
-// module because the allowlist above is a host decision — and it offers nothing when there is nothing to reach.
-var netToolsSource = sessionExtensions.Register(new NetTools(netAccess));
-if (!netToolsSource.Ok) { Console.Error.WriteLine(netToolsSource.Error?.Message); return 1; }
+// The raw door, as a tool: any address, any method, the answer exactly as it came. It sits beside the page reader
+// rather than instead of it — one asks "what does this page say", the other "what does this endpoint reply".
+var httpToolsSource = sessionExtensions.Register(new ALN.Net.HttpTools(netAccess));
+if (!httpToolsSource.Ok) { Console.Error.WriteLine(httpToolsSource.Error?.Message); return 1; }
+// Search and fetch, through whichever provider this deployment picked (docs/30). The providers are code and not
+// packages: they have no lifecycle of their own, no phase to be ordered in, and nothing to unload — they are called
+// when somebody asks and are otherwise not there. The file decides which one does which job, and mixing them (search
+// with one, fetch with another) is the arrangement that usually makes most sense.
+var webSettings = ALN.Web.WebOptionsFile.Read(ALN.Web.WebOptionsFile.PathIn(data.Root));
+foreach (var issue in webSettings.Issues) Console.Error.WriteLine($"web: {issue}");
+var webOptions = webSettings.Options;
+var webProviders = new ALN.Web.WebProviderRegistry();
+// Two providers implement both halves, so the interface is named at the call site: which table a provider sits in is
+// a decision the deployment file already made, and the registry should not have to guess it from the type.
+var deepSeek = new ALN.Web.DeepSeekProvider(netAccess, webOptions.DeepSeekTarget, webOptions.DeepSeekCount,
+    webOptions.DeepSeekLocalization);
+webProviders.Add((ALN.Contracts.ISearchProvider)deepSeek);
+webProviders.Add((ALN.Contracts.IFetchProvider)deepSeek);
+var tavily = new ALN.Web.TavilyProvider(netAccess, webOptions.TavilyTarget, webOptions.MaxResults,
+    webOptions.TavilyDepth, webOptions.TavilyTopic, webOptions.TavilyCountry, webOptions.TavilyLanguage);
+webProviders.Add((ALN.Contracts.ISearchProvider)tavily);
+webProviders.Add((ALN.Contracts.IFetchProvider)tavily);
+// The only one that fetches with this process's own socket, and so the only one that can reach a local address.
+webProviders.Add(new ALN.Web.LocalProvider(netAccess, webOptions.LocalAllowPrivate, webOptions.LocalMaxBytes,
+    webOptions.LocalTimeoutSeconds));
+var webGateway = new ALN.Web.WebGateway(webProviders, webOptions, auditSink, signalLog);
+var webToolsSource = sessionExtensions.Register(new ALN.Web.WebTools(webGateway, webOptions));
+if (!webToolsSource.Ok) { Console.Error.WriteLine(webToolsSource.Error?.Message); return 1; }
 // The second half of activation: the Session pulls whatever the Channel has not handed over yet at the
 // moment it assembles the request, so activation itself can stay a signal with no payload. Its cursor is
 // component state, so it goes through the state store rather than a path the host invents.
@@ -170,6 +194,10 @@ restore.Note("net", netTargets.Targets.Count == 0
     ? "none — this process may reach nothing (net/targets.json is absent or empty)"
     : $"{netTargets.Targets.Count} target(s): {string.Join(", ", netTargets.Targets.Select(t => t.Name))}" +
       (netTargets.Issues.Count == 0 ? "" : $", {netTargets.Issues.Count} refused entry(ies)"));
+restore.Note("web", webOptions.Search is null && webOptions.Fetch is null
+    ? "off — no provider chosen (web/search.json is absent); the tools will not be offered"
+    : $"search={webOptions.Search ?? "(none)"} fetch={webOptions.Fetch ?? "(none)"}; " +
+      $"can search: {string.Join(", ", webProviders.SearchNames)}; can fetch: {string.Join(", ", webProviders.FetchNames)}");
 // Memory is not in the database any more, so its number is a directory listing rather than a count of rows. A
 // library that cannot be read at startup is not worth stopping for: the receipt says so and the host carries on.
 var memoryGroups = await memoryLibrary.GroupsAsync(CancellationToken.None);
@@ -806,6 +834,14 @@ if (!netActions.Ok)
     // A verb that failed to register is a door that is not there while everything else runs, which is exactly the
     // state that reads as "the feature is broken" three days later. Stop instead.
     Console.Error.WriteLine(netActions.Error?.Message ?? "The network verbs could not be registered.");
+    return 1;
+}
+// The raw door as a verb too, so a script (ctx.actions.call) and a person (the web UI) reach the same rules the model
+// does. Nothing is checked against a list here — the audit line is the control.
+var httpActions = ALN.Net.HttpActions.Register(controlPlane, netAccess);
+if (!httpActions.Ok)
+{
+    Console.Error.WriteLine(httpActions.Error?.Message ?? "http.request could not be registered.");
     return 1;
 }
 if (!packageActions.Ok)

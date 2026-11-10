@@ -44,9 +44,11 @@ public sealed record NetPolicy
     public IReadOnlyList<string> Paths { get; init; } = [];
 
     /// <summary>
-    /// Request headers a caller may set. Empty (the default) means none. <c>Host</c>, <c>Authorization</c>,
-    /// <c>Cookie</c>, <c>Content-Length</c> and <c>Transfer-Encoding</c> are refused even when listed: those are how a
-    /// caller would talk to a different server than the one this target names.
+    /// Request headers a caller may set. <b>Empty means any</b> — the same rule <see cref="Paths"/> follows, because
+    /// two lists that both mean "narrow it down" should not disagree about what an empty one means. <c>Host</c>,
+    /// <c>Authorization</c>, <c>Cookie</c>, <c>Content-Length</c>, <c>Transfer-Encoding</c> and <c>Connection</c> are
+    /// refused even when listed: the first three are how a caller would talk to a different server than the one this
+    /// target names, and the last three let a caller reshape the framing a proxy will see.
     /// </summary>
     public IReadOnlyList<string> Headers { get; init; } = [];
 
@@ -121,6 +123,10 @@ public sealed record NetRequest(
 /// <param name="Truncated">Set by whoever applied the limit, never inferred from a short body.</param>
 /// <param name="FinalUri">Where the answer actually came from — differs from the request only when redirects were
 /// allowed, and is reported so a caller can see that it was moved.</param>
+/// <param name="Headers">
+/// The response headers, flattened. Present because a raw caller needs them and a page reader ignores them: "what did
+/// the server say about itself" is a different question from "what did the page say", and only one of them is content.
+/// </param>
 public sealed record NetResponse(
     int Status,
     string? ContentType,
@@ -128,7 +134,8 @@ public sealed record NetResponse(
     long Bytes,
     bool Truncated,
     Uri FinalUri,
-    TimeSpan Elapsed);
+    TimeSpan Elapsed,
+    IReadOnlyDictionary<string, string>? Headers = null);
 
 /// <summary>
 /// Why a call did not reach an answer, in the kinds a caller can act on differently.
@@ -218,4 +225,39 @@ public interface INetTargetEditing
 
     /// <summary>Forgets a target. Calls already in flight finish; the name stops resolving for new ones.</summary>
     Result Remove(string name);
+}
+
+/// <summary>
+/// One request to an address that was never written down: the shape a page fetch or a raw HTTP call takes.
+///
+/// It exists because "read the page at this URL" is a real thing to ask for and cannot be expressed as a name. What it
+/// is <b>not</b> is a second, looser <see cref="INetAccess"/>: the same gates run (method, origin, resolved address,
+/// ceiling, rate, deadline), and the only step skipped is "is this name in the file a person wrote".
+/// </summary>
+/// <param name="Address">Absolute http(s), no user name in it. The origin becomes the target for the duration of the
+/// call, and it is what a redirect is held to.</param>
+/// <param name="Caller">Who to write into the audit line — the port cannot know, and a guess is worse than a fact.</param>
+public sealed record AdHocRequest(
+    Uri Address,
+    string Method = "GET",
+    IReadOnlyDictionary<string, string>? Headers = null,
+    ReadOnlyMemory<byte>? Body = null,
+    int? MaxBytes = null,
+    int? TimeoutSeconds = null,
+    string? Caller = null);
+
+/// <summary>
+/// The door for an address somebody handed over, rather than one written in configuration.
+///
+/// A separate interface, and injected by constructor into the one provider that needs it, for the same reason
+/// <see cref="INetTargetEditing"/> is separate: a caller that can fetch any address should not be the same object as
+/// every caller that can fetch an approved one. Holding it is the privilege; not holding it is the constraint.
+///
+/// The policy travels with the call because there is no target to carry it: who may reach what is decided by whoever
+/// holds this interface, per call, and a policy that allows private addresses is a decision that has to be visible in
+/// the code that made it.
+/// </summary>
+public interface IAdHocNetAccess
+{
+    ValueTask<Result<NetResponse>> SendAsync(AdHocRequest request, NetPolicy policy, CancellationToken cancellationToken);
 }

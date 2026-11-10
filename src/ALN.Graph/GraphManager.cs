@@ -33,7 +33,10 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         // A script reaches the network only by declaring this and then calling the net.fetch action. The names it may
         // ask for are the host's allowlist, not its own — a narrower, per-script list is a manifest change that has
         // not been made yet (docs/29 §7).
-        Capabilities.NetRead
+        Capabilities.NetRead,
+        // The raw door, reachable from a script that declares it: ctx.actions.call('http.request', …). No allowlist
+        // stands in front of it, so the audit line is the only record — which is why the name is this explicit.
+        Capabilities.NetRequest
     };
     private readonly ICatalog _catalog;
     private readonly IModuleTypeCatalog _types;

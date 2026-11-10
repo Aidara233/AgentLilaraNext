@@ -19,7 +19,7 @@ namespace ALN.Net;
 /// Every one of those refusals is written down before it is returned. A refusal that leaves no trace is
 /// indistinguishable from a bug, and "the model says it can't reach the docs site" is a question someone will ask.
 /// </summary>
-public sealed class HttpNetAccess : INetAccess, INetTargetEditing, IAsyncDisposable
+public sealed class HttpNetAccess : INetAccess, INetTargetEditing, IAdHocNetAccess, IAsyncDisposable
 {
     /// <summary>
     /// Above this, a response is not a document: it is a file somebody pointed a fetch tool at. Refused instead of
@@ -31,6 +31,12 @@ public sealed class HttpNetAccess : INetAccess, INetTargetEditing, IAsyncDisposa
     /// <summary>Where a target's decision about private addresses travels to the connect callback, which knows the
     /// socket but not the target.</summary>
     private static readonly HttpRequestOptionsKey<bool> AllowPrivateKey = new("aln.net.allow-private");
+
+    /// <summary>
+    /// The gate every ad hoc call shares. A target named in the file gets its own; an address handed over must not,
+    /// because a name invented per call would leave one dictionary entry behind per host ever fetched.
+    /// </summary>
+    private const string AdHocGateKey = "\u0000ad-hoc";
 
     /// <summary>
     /// Headers a caller may never set, even if a policy lists them. Each one is a way to talk to a different server
@@ -132,6 +138,50 @@ public sealed class HttpNetAccess : INetAccess, INetTargetEditing, IAsyncDisposa
             return await Refuse(request, started, new NetFailure(NetErrorKind.NoSuchTarget, "No such target.",
                 "the name is not in net/targets.json"), cancellationToken);
 
+        return await SendToAsync(target, request, target.Name, started, cancellationToken);
+    }
+
+    /// <summary>
+    /// An address somebody handed over instead of a name from the file.
+    ///
+    /// The origin of that address becomes a target for exactly this call — same policy shape, same gates, same audit
+    /// line (its name is <c>local:&lt;authority&gt;</c>, so "where did this connection go" stays answerable). The gate is
+    /// shared and fixed rather than keyed by that name: a name invented per call must not leave an entry behind that
+    /// outlives it.
+    /// </summary>
+    public async ValueTask<Result<NetResponse>> SendAsync(AdHocRequest request, NetPolicy policy,
+        CancellationToken cancellationToken)
+    {
+        var started = Stopwatch.GetTimestamp();
+        var address = request.Address;
+        // Only the shape is checked here. Whether the address resolves somewhere reachable is the resolve gate's job
+        // below, and a URL carrying a user name is refused because that is a credential on its way into an audit line.
+        var wellFormed = address.IsAbsoluteUri
+                         && (address.Scheme == Uri.UriSchemeHttp || address.Scheme == Uri.UriSchemeHttps)
+                         && address.UserInfo.Length == 0;
+        var authority = wellFormed ? address.Authority : "?";
+        var origin = wellFormed ? address.GetLeftPart(UriPartial.Authority) + "/" : "http://invalid.invalid/";
+        var target = new NetTarget($"local:{authority}", new Uri(origin), policy);
+        var path = wellFormed && address.PathAndQuery.Length > 0 ? address.PathAndQuery : "/";
+        var named = new NetRequest(target.Name, request.Method, path, request.Headers, request.Body, request.MaxBytes,
+            request.TimeoutSeconds, request.Caller);
+        if (!wellFormed)
+            return await Refuse(named, started, new NetFailure(NetErrorKind.Invalid,
+                "That is not an address this can fetch.",
+                "an absolute http or https URL with no user name in it"), cancellationToken);
+
+        return await SendToAsync(target, named, AdHocGateKey, started, cancellationToken);
+    }
+
+    /// <summary>
+    /// The path a request takes once its destination is decided — named, or handed over.
+    ///
+    /// Everything from here down is identical for both, which is what keeps "temporary" from quietly meaning "less
+    /// checked": a target a person wrote and an address somebody just gave are the same six gates.
+    /// </summary>
+    private async ValueTask<Result<NetResponse>> SendToAsync(NetTarget target, NetRequest request, string gateKey,
+        long started, CancellationToken cancellationToken)
+    {
         var policy = target.Policy;
         var method = (request.Method ?? "").Trim().ToUpperInvariant();
         if (method.Length == 0 || !policy.Methods.Any(m => string.Equals(m, method, StringComparison.OrdinalIgnoreCase)))
@@ -154,14 +204,14 @@ public sealed class HttpNetAccess : INetAccess, INetTargetEditing, IAsyncDisposa
             if (ForbiddenHeaders.Contains(name))
                 return await Refuse(request, started, new NetFailure(NetErrorKind.NotAllowed,
                     $"Header '{name}' is set by the target, not by the caller."), cancellationToken);
-            if (!policy.Headers.Any(h => string.Equals(h, name, StringComparison.OrdinalIgnoreCase)))
+            if (policy.Headers.Count > 0 && !policy.Headers.Any(h => string.Equals(h, name, StringComparison.OrdinalIgnoreCase)))
                 return await Refuse(request, started, new NetFailure(NetErrorKind.NotAllowed,
                     $"Header '{name}' is not allowed on {request.Target}.",
-                    "allowed: " + (policy.Headers.Count == 0 ? "none" : string.Join(", ", policy.Headers))), cancellationToken);
+                    "allowed: " + string.Join(", ", policy.Headers)), cancellationToken);
             headers.Add(new(name, value ?? ""));
         }
 
-        var gate = _gates.GetOrAdd(target.Name, _ => new Gate(policy.MaxConcurrent));
+        var gate = _gates.GetOrAdd(gateKey, _ => new Gate(policy.MaxConcurrent));
         if (!gate.TryReserveCall(policy.CallsPerMinute, out var retryAfter))
             return await Refuse(request, started, new NetFailure(NetErrorKind.Throttled,
                 $"{request.Target} is over its rate ({policy.CallsPerMinute} per minute).",
@@ -198,7 +248,16 @@ public sealed class HttpNetAccess : INetAccess, INetTargetEditing, IAsyncDisposa
                 using var message = new HttpRequestMessage(new HttpMethod(method), current);
                 message.Options.Set(AllowPrivateKey, policy.AllowPrivate);
                 if (request.Body is { Length: > 0 } body) message.Content = new ByteArrayContent(body.ToArray());
-                foreach (var (name, value) in headers) message.Headers.TryAddWithoutValidation(name, value);
+                foreach (var (name, value) in headers)
+                {
+                    // Content-Type belongs to the content, not to the request: on the message's own header collection it
+                    // is silently dropped, and a POST without one is a POST the far side has to guess about.
+                    if (message.Content is not null &&
+                        string.Equals(name, "Content-Type", StringComparison.OrdinalIgnoreCase))
+                        message.Content.Headers.TryAddWithoutValidation(name, value);
+                    else
+                        message.Headers.TryAddWithoutValidation(name, value);
+                }
 
                 if (!await TryAuthorize(message, target, deadline.Token))
                     return await Refuse(request, started, new NetFailure(NetErrorKind.NotAllowed,
@@ -279,9 +338,14 @@ public sealed class HttpNetAccess : INetAccess, INetTargetEditing, IAsyncDisposa
         }
 
         var text = Encoding.UTF8.GetString(collected.GetBuffer(), 0, (int)collected.Length);
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, values) in response.Headers)
+            headers[name] = string.Join(", ", values);
+        foreach (var (name, values) in response.Content.Headers)
+            headers[name] = string.Join(", ", values);
         var answer = new NetResponse((int)response.StatusCode, response.Content.Headers.ContentType?.ToString(), text,
             collected.Length, truncated, response.RequestMessage?.RequestUri ?? target.Base,
-            Stopwatch.GetElapsedTime(started));
+            Stopwatch.GetElapsedTime(started), headers);
         await Note(request, truncated ? "truncated" : "ok",
             $"{answer.Status} {collected.Length} byte(s)", started, cancellationToken: CancellationToken.None);
         return Result<NetResponse>.Success(answer);

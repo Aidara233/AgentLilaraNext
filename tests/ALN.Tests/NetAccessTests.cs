@@ -346,6 +346,88 @@ public sealed class NetAccessTests
         Assert.Empty(load.Issues);
     }
 
+    [Fact]
+    public async Task An_address_handed_over_is_fetched_under_the_same_ceilings()
+    {
+        await using var server = new TinyServer();
+        // No targets at all: this is the door for an address that was never written down.
+        await using var net = new HttpNetAccess([]);
+        var policy = new NetPolicy { AllowPrivate = true, MaxResponseBytes = 64, TimeoutSeconds = 5 };
+
+        var result = await net.SendAsync(new AdHocRequest(new Uri(server.Base + "/big"), Caller: "test"), policy,
+            default);
+
+        Assert.True(result.Ok, result.Error?.Detail);
+        Assert.True(result.Value!.Truncated);
+        Assert.Equal(64, result.Value.Bytes);
+    }
+
+    [Fact]
+    public async Task An_address_handed_over_still_bows_to_the_private_address_rule()
+    {
+        await using var server = new TinyServer();
+        await using var net = new HttpNetAccess([]);
+        var policy = new NetPolicy { AllowPrivate = false, TimeoutSeconds = 5 };
+
+        var result = await net.SendAsync(new AdHocRequest(new Uri(server.Base + "/ok")), policy, default);
+
+        Assert.False(result.Ok);
+        // "Temporary" must not mean "less checked": the resolved-address gate is the same one.
+        Assert.Equal(nameof(NetErrorKind.PrivateAddress), result.Error!.Detail!.Split(':')[0]);
+    }
+
+    [Theory]
+    [InlineData("file:///etc/passwd")]
+    [InlineData("https://user:pw@example.com/x")]
+    [InlineData("/relative")]
+    public async Task An_address_that_is_not_one_is_refused_before_anything_is_opened(string address)
+    {
+        await using var net = new HttpNetAccess([]);
+        var policy = new NetPolicy { AllowPrivate = true, TimeoutSeconds = 5 };
+
+        var result = await net.SendAsync(
+            new AdHocRequest(new Uri(address, UriKind.RelativeOrAbsolute)), policy, default);
+
+        Assert.False(result.Ok);
+        Assert.Equal(ErrorCode.Invalid, result.Error!.Code);
+        Assert.Equal(nameof(NetErrorKind.Invalid), result.Error.Detail!.Split(':')[0]);
+    }
+
+    [Fact]
+    public async Task An_address_handed_over_is_recorded_under_a_name_that_says_it_was_one()
+    {
+        await using var server = new TinyServer();
+        var audit = new RecordingAudit();
+        await using var net = new HttpNetAccess([], audit);
+        var policy = new NetPolicy { AllowPrivate = true, TimeoutSeconds = 5 };
+
+        var result = await net.SendAsync(new AdHocRequest(new Uri(server.Base + "/ok"), Caller: "web:local"), policy,
+            default);
+
+        Assert.True(result.Ok, result.Error?.Detail);
+        var record = Assert.Single(audit.Records);
+        Assert.Equal("web:local", record.Actor);
+        // The name is invented, but it still answers "where did this connection go".
+        Assert.StartsWith("local:127.0.0.1:", record.Target.Instance, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_credential_header_is_still_out_of_reach_for_an_address_handed_over()
+    {
+        await using var server = new TinyServer();
+        await using var net = new HttpNetAccess([]);
+        // Empty header list means "any" now — the same rule paths follow, so a raw call needs no extra switch…
+        var policy = new NetPolicy { AllowPrivate = true, TimeoutSeconds = 5 };
+
+        var result = await net.SendAsync(new AdHocRequest(new Uri(server.Base + "/echo"), "GET",
+            new Dictionary<string, string> { ["Authorization"] = "Bearer x", ["X-Trace"] = "1" }), policy, default);
+
+        Assert.False(result.Ok);
+        // …but Authorization is the exception, even here: it is a credential on its way to an audit line, and the
+        // caller that needs one has a named target with a secret for it.
+        Assert.Contains("Authorization", result.Error!.Message, StringComparison.Ordinal);
+    }
+
     private sealed class RecordingAudit : IAuditSink
     {
         public List<AuditRecord> Records { get; } = [];

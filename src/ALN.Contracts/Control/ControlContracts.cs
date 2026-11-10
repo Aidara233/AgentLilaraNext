@@ -65,6 +65,9 @@ public static class AccessLevels
         // the credential behind one target — is a deployment decision.
         [Capabilities.NetRead] = AccessLevel.Agent,
         [Capabilities.NetControl] = AccessLevel.Operator,
+        // The raw door: an address the caller names, no allowlist in front of it. Agent level because reading a page
+        // and calling an endpoint are the same act, and the audit line is what stands in for the missing list.
+        [Capabilities.NetRequest] = AccessLevel.Agent,
 
         // Changing the shape of the process: a person's decision, made on purpose, written down in the audit.
         [Capabilities.AdaptersControl] = AccessLevel.Operator,
@@ -313,5 +316,19 @@ public static class Capabilities
     /// for the reason every control is: an allowlist somebody can extend from a conversation is not an allowlist, and
     /// what travels through these targets leaves this machine.
     /// </summary>
+    /// <summary>
+    /// Changing the list of places this process may reach, or the credential one of them uses. Deeper than reading it,
+    /// for the reason every control is: an allowlist somebody can extend from a conversation is not an allowlist, and
+    /// what travels through these targets leaves this machine.
+    /// </summary>
     public const string NetControl = "net.control";
+
+    /// <summary>
+    /// Sending one HTTP request to an address the caller names — the raw door, not the curated one.
+    ///
+    /// Agent level, deliberately: "fetch this page" and "call this endpoint" are the same shape of act, and a verb
+    /// the model cannot use is a verb that only a person can use — which is what <c>net.control</c> is for. What
+    /// differs from <see cref="NetRead"/> is that nothing here is pre-approved, so the record is the control.
+    /// </summary>
+    public const string NetRequest = "net.request";
 }
