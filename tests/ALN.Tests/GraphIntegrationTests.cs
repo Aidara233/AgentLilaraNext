@@ -15,6 +15,13 @@ namespace ALN.Tests;
 
 public sealed class GraphIntegrationTests : IDisposable
 {
+    /// <summary>
+    /// Every script in this file declares <c>MemoryLimitBytes: 256 MiB</c>, matching what the shipped scripts declare.
+    /// Not padding: Jint's <c>LimitMemory</c> compares <b>this thread's allocation since the engine was built</b>
+    /// (<c>JintMemoryLimitTests</c>), so under xUnit's parallelism a test that runs while this one awaits inside
+    /// <c>ctx.channel.accept()</c> spends this script's budget. A test about routing then fails with "script allocated
+    /// 33 MB" while the script itself allocates nothing — measured: the same commit failed at 34 MB, 134 MB, and passed.
+    /// </summary>
     private readonly string _root = Path.Combine(Path.GetTempPath(), "aln-channel-tests-" + Guid.NewGuid().ToString("N"));
     private readonly SqliteStore _audit;
     // These tests assert on the whole dispatch graph, down to every queue step, so they ask for Debug explicitly.
@@ -125,7 +132,7 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         static ScriptPackage Replying(string version) => new(
             new("channel.bound-reply", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",
-                [ScriptCapabilities.ChannelReply], TrustDomain.Builtin),
+                [ScriptCapabilities.ChannelReply],  TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             $"async function onEvent(event, ctx) {{ await ctx.channel.reply({{ platformConversationId: event.binding.platformConversationId, text: '{version}:' + event.text }}); }}");
 
         Assert.True((await _graph.LoadAsync([AdapterIntake(), Replying("v1")], default)).Ok);
@@ -168,7 +175,7 @@ public sealed class GraphIntegrationTests : IDisposable
         // Same id, a capability this host does not have: refused at the door.
         var refused = new ScriptPackage(
             new("channel.bound-reply", 2, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted],
-                "onEvent", ["channel.teleport"], TrustDomain.Builtin),
+                "onEvent", ["channel.teleport"],  TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             "async function onEvent(event, ctx) { }");
         // The load succeeds and the script does not: refusing an edited body must not take the working one away.
         Assert.True((await _graph.LoadAsync([AdapterIntake(), refused], default)).Ok);
@@ -220,7 +227,7 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         static ScriptPackage Replying(string id, string body) => new(
             new(id, 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",
-                [ScriptCapabilities.ChannelReply], TrustDomain.Builtin),
+                [ScriptCapabilities.ChannelReply],  TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             $"async function onEvent(event, ctx) {{ {body} }}");
 
         var defaultMode = Replying("channel.multi-default",
@@ -247,7 +254,7 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         var unknown = new ScriptPackage(
             new("channel.multi-unknown", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted],
-                "onEvent", [ScriptCapabilities.ChannelReply], TrustDomain.Builtin),
+                "onEvent", [ScriptCapabilities.ChannelReply],  TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             "async function onEvent(event, ctx) { await ctx.channel.reply({ " +
             "platformConversationId: event.binding.platformConversationId, text: '不会发出去', mode: 'image' }); }");
         Assert.True((await _graph.LoadAsync([AdapterIntake(), unknown], default)).Ok);
@@ -288,7 +295,7 @@ public sealed class GraphIntegrationTests : IDisposable
 
         var chat = new ScriptPackage(
             new("channel.talk", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",
-                [ScriptCapabilities.SessionActivate, ScriptCapabilities.ChannelReply], TrustDomain.Builtin),
+                [ScriptCapabilities.SessionActivate, ScriptCapabilities.ChannelReply],  TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             """
             async function onEvent(event, ctx) {
               const spec = {
@@ -344,7 +351,7 @@ public sealed class GraphIntegrationTests : IDisposable
 
         var deep = new ScriptPackage(
             new("channel.deep", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",
-                [ScriptCapabilities.SessionActivate, ScriptCapabilities.SessionOpen], TrustDomain.Trusted),
+                [ScriptCapabilities.SessionActivate, ScriptCapabilities.SessionOpen],  TrustDomain.Trusted, MemoryLimitBytes: 256L * 1024 * 1024),
             """
             async function onEvent(event, ctx) {
               // Reading the refusal is part of the behaviour: the call is rejected, and the script has to see that.
@@ -403,7 +410,7 @@ public sealed class GraphIntegrationTests : IDisposable
 
         var greeter = new ScriptPackage(
             new("schedule.greeter", 1, "channel", MountMode.Default, [EventNames.ScheduleDue], "onEvent",
-                [ScriptCapabilities.SessionOpen], TrustDomain.Builtin),
+                [ScriptCapabilities.SessionOpen],  TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             """
             async function onEvent(event, ctx) {
               const out = JSON.parse(await ctx.session.open({
@@ -581,7 +588,7 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         var loggingIntake = new ScriptPackage(
             new("adapter.log-intake", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
-                [ScriptCapabilities.ChannelAccept], TrustDomain.Builtin),
+                [ScriptCapabilities.ChannelAccept],  TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             "async function onEvent(event, ctx) { ctx.log.info('saw message', { conversation: event.platformConversationId }); await ctx.channel.accept(); }");
         Assert.True((await _graph.LoadAsync([loggingIntake], default)).Ok);
         Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
@@ -613,7 +620,7 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         var chatty = new ScriptPackage(
             new("adapter.chatty", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent", [],
-                TrustDomain.Builtin),
+                 TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             "async function onEvent(event, ctx) { for (let i = 0; i < 500; i++) ctx.log.error('spam ' + i); }");
         Assert.True((await _graph.LoadAsync([chatty], default)).Ok);
         Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
@@ -636,11 +643,11 @@ public sealed class GraphIntegrationTests : IDisposable
         // Two scripts mounted on the same adapter and event: one event, two lanes.
         var first = new ScriptPackage(
             new("adapter.fan-a", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent", [],
-                TrustDomain.Builtin),
+                 TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             "async function onEvent(event, ctx) { ctx.log.info('a'); }");
         var second = new ScriptPackage(
             new("adapter.fan-b", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent", [],
-                TrustDomain.Builtin),
+                 TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             "async function onEvent(event, ctx) { ctx.log.warn('b'); }");
         Assert.True((await _graph.LoadAsync([first, second], default)).Ok);
         Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
@@ -685,7 +692,7 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         var intake = new ScriptPackage(
             new("adapter.router", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
-                [ScriptCapabilities.ChannelRoute], TrustDomain.Builtin),
+                [ScriptCapabilities.ChannelRoute],  TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             "async function onEvent(event, ctx) { return await ctx.channel.route({ channelId: event.platformConversationId }); }");
         var loaded = await _graph.LoadAsync([intake], default);
         Assert.True(loaded.Ok, loaded.Error?.Detail ?? loaded.Error?.Message);
@@ -712,7 +719,7 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         var intake = new ScriptPackage(
             new("adapter.router-move", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
-                [ScriptCapabilities.ChannelRoute], TrustDomain.Builtin),
+                [ScriptCapabilities.ChannelRoute],  TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             "async function onEvent(event, ctx) { return await ctx.channel.route({ channelId: 'shared' }); }");
         Assert.True((await _graph.LoadAsync([intake], default)).Ok);
         Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
@@ -777,7 +784,7 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         var intake = new ScriptPackage(
             new("adapter.router-denied", 1, "adapter", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
-                [ScriptCapabilities.SelfAdapterPoll], TrustDomain.Builtin),
+                [ScriptCapabilities.SelfAdapterPoll],  TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             "async function onEvent(event, ctx) { await ctx.channel.route({ channelId: event.platformConversationId }); }");
         Assert.True((await _graph.LoadAsync([intake], default)).Ok);
         Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
@@ -805,7 +812,7 @@ public sealed class GraphIntegrationTests : IDisposable
         // A script that says it wants "gadget" targets. Nothing in the graph knows that word.
         var watcher = new ScriptPackage(
             new("gadget.watcher", 1, "gadget", MountMode.Default, [EventNames.AdapterEnvelope], "onEvent",
-                [ScriptCapabilities.ChannelAccept], TrustDomain.Builtin),
+                [ScriptCapabilities.ChannelAccept],  TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
             "async function onEvent(event, ctx) { }");
 
         Assert.True((await graph.LoadAsync([watcher], default)).Ok);
@@ -1261,7 +1268,7 @@ public sealed class GraphIntegrationTests : IDisposable
 
         var prober = new ScriptPackage(
             new("channel.prober", 1, "channel", MountMode.Manual, [EventNames.ChannelMessageAccepted], "onEvent",
-                [ScriptCapabilities.ChannelReply, Capabilities.ModulesRead], TrustDomain.Trusted),
+                [ScriptCapabilities.ChannelReply, Capabilities.ModulesRead],  TrustDomain.Trusted, MemoryLimitBytes: 256L * 1024 * 1024),
             """
             async function onEvent(event, ctx) {
               const listed = await ctx.actions.list();
@@ -1305,7 +1312,7 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         static ScriptPackage Greedy() => new(
             new("channel.greedy", 1, "channel", MountMode.Manual, [EventNames.ChannelMessageAccepted], "onEvent",
-                [Capabilities.ModelsControl], TrustDomain.Trusted),
+                [Capabilities.ModelsControl],  TrustDomain.Trusted, MemoryLimitBytes: 256L * 1024 * 1024),
             "async function onEvent(event, ctx) { }",
             Level: AccessLevel.Agent);
 
@@ -1359,7 +1366,7 @@ public sealed class GraphIntegrationTests : IDisposable
             new("channel.greeter", 1, "channel", MountMode.Manual,
                 [EventNames.ChannelMessageAccepted, EventNames.LifecycleStart, EventNames.LifecycleStop,
                     EventNames.SessionTurnFinished], "onEvent",
-                [ScriptCapabilities.ChannelReply], TrustDomain.Trusted),
+                [ScriptCapabilities.ChannelReply],  TrustDomain.Trusted, MemoryLimitBytes: 256L * 1024 * 1024),
             """
             async function onEvent(event, ctx) {
               if (ctx.eventName === "channel.message.accepted") return;
@@ -1394,12 +1401,12 @@ public sealed class GraphIntegrationTests : IDisposable
 
     private static ScriptPackage ManualTagger(string id, string text) => new(
         new(id, 1, "channel", MountMode.Manual, [EventNames.ChannelMessageAccepted], "onEvent",
-            [ScriptCapabilities.ChannelReply], TrustDomain.Trusted),
+            [ScriptCapabilities.ChannelReply],  TrustDomain.Trusted, MemoryLimitBytes: 256L * 1024 * 1024),
         $"async function onEvent(event, ctx) {{ await ctx.channel.reply({{ platformConversationId: event.binding.platformConversationId, text: '{text}' }}); }}");
 
     private ScriptPackage ChannelReply() => new(
         new("channel.bound-reply", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",
-            [ScriptCapabilities.ChannelReply], TrustDomain.Builtin),
+            [ScriptCapabilities.ChannelReply],  TrustDomain.Builtin, MemoryLimitBytes: 256L * 1024 * 1024),
         "async function onEvent(event, ctx) { await ctx.channel.reply({ platformConversationId: event.binding.platformConversationId, text: event.text, replyTo: event.platformMessageId }); }");
 
     private static OutboundMessage ReadOutbound(string path) => JsonSerializer.Deserialize<OutboundMessage>(File.ReadAllText(path))!;

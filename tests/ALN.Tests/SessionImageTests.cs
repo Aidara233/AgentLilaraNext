@@ -178,6 +178,70 @@ public sealed class SessionImageTests : IDisposable
     }
 
     [Fact]
+    public async Task Fs_read_hands_a_picture_over_when_the_filesystem_module_is_built_the_way_the_host_builds_it()
+    {
+        // The host does not hand FileSystemTools to the Session: it builds the module from its module.json, that module
+        // registers itself, and the session spec declares nothing but speak. This is that path end to end — the one
+        // place where "the tool answered with a sentence about a picture" and "the model was shown the picture" differ.
+        var access = Access();
+        var store = new FileMediaStore(access);
+        var ingested = await store.IngestAsync(MediaKind.Image, new MemoryStream(Png(4, 3)), default);
+        Assert.True(ingested.Ok, ingested.Error?.Message);
+
+        var extensions = new SessionExtensionRegistry();
+        var built = FileSystemModule.FromManifest(
+            new ModuleManifest(new ModuleId(FileSystemModule.TypeId), FileSystemModule.TypeId, Enabled: true,
+                ConfigJson: """{"scopes":["media","workspace"]}"""),
+            access, extensions, store);
+        Assert.True(built.Ok, built.Error?.Message);
+        Assert.True((await ((IKernelModule)built.Value!).InitializeAsync(default)).Ok);
+
+        var model = new ScriptedModel(ModelCapabilities.Streaming | ModelCapabilities.Vision,
+            [new ToolCallDelta(0, "call-1", "fs_read",
+                 JsonSerializer.Serialize(new { scope = FileScopes.Media, path = ingested.Value!.Path })),
+             new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))],
+            [new ToolCallDelta(0, "call-2", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
+        var sessions = new SessionManager(_root, models: model, extensions: extensions, files: access);
+
+        // Nothing declared: fs_read reaches the model because a module offers it, which is how every real Session works.
+        var turn = await sessions.TurnAsync("s-1", Spec([]), Guid.NewGuid(),
+            new SessionTurnInput([], null, null), null, default);
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+
+        var answer = model.Requests[^1].Messages.Single(message => message.ToolCallId == "call-1");
+        Assert.True(answer.HasImage);
+        Assert.IsType<ImagePart>(answer.Parts![^1]);
+    }
+
+    [Fact]
+    public async Task Every_message_that_carried_a_picture_gets_its_turn_not_only_the_first_in_the_block()
+    {
+        // "Only the first of a batch is shown" is about **one message** that carried several pictures. The index used to
+        // run across the whole channel_context, so as soon as the timeline held a second picture every later one had
+        // index > 0 and was refused — a conversation that had ever carried two pictures never showed another, and the
+        // receipt said "一次到达多张，只自动看第一张" about a batch it was not in.
+        var (stored, _) = await StoredPictureAsync();
+        var model = new ScriptedModel(ModelCapabilities.Streaming | ModelCapabilities.Vision,
+            [new ToolCallDelta(0, "call-2", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
+        var sessions = Manager(model);
+        var timeline = new[]
+        {
+            new SessionChannelMessage("m-1", "user", "小明", "第一张", DateTimeOffset.UtcNow, [stored]),
+            new SessionChannelMessage("m-2", "user", "小明", "第二张", DateTimeOffset.UtcNow, [stored])
+        };
+
+        var turn = await sessions.TurnAsync("s-1", Spec([]), Guid.NewGuid(),
+            new SessionTurnInput(timeline, null, null), null, default);
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+
+        var pictures = model.Requests[^1].Messages
+            .Where(message => message.HasImage)
+            .SelectMany(message => message.Parts!.OfType<ImagePart>())
+            .ToArray();
+        Assert.Equal(2, pictures.Length);
+    }
+
+    [Fact]
     public async Task A_model_manager_reached_through_the_catalog_sees_pictures_too()
     {
         // Installed exactly the way the host installs it: `catalog:`, and no `models:`. The constructor allows that on

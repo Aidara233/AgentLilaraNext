@@ -3429,18 +3429,21 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
                 .Append(" 条消息（本请求只带最近 ").Append(RecentChannelMessages).AppendLine(" 条）。</omitted>");
         parts.Add(new TextPart(head.ToString()));
 
-        // Counted, not guessed: "first only" is a position and "how many per turn" is a running total, and both are
-        // about this request rather than about the message.
-        var offered = 0;
+        // Counted per message, because "first" is about an arrival — one message that carried several pictures — and
+        // not about the block. The counter used to run across the whole channel_context, so the moment the timeline
+        // held two pictures every later one had index > 0 and was refused with "only the first of a batch is shown":
+        // a conversation that had ever carried two pictures never showed another, and the receipt blamed the batch it
+        // was standing in. `shown` stays a running total on purpose — maxAutoViewsPerTurn is about the turn.
         var shown = 0;
         for (var index = elided; index < messages.Count; index++)
         {
             var message = messages[index];
             var pictures = new List<ImagePart>();
             var receipts = new List<string>();
+            var arrived = 0;
             foreach (var reference in message.Media ?? [])
             {
-                var decision = _media.Decide(offered++, reference.MediaType, reference.Bytes, shown);
+                var decision = _media.Decide(arrived++, reference.MediaType, reference.Bytes, shown);
                 var label = MediaImages.Describe(reference);
                 if (decision.Shown && seesImages)
                 {
