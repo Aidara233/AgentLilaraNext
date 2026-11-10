@@ -106,6 +106,53 @@ public static class ChatPayload
     }
 
     /// <summary>
+    /// A tool as this protocol wants it.
+    ///
+    /// <see cref="Parameters"/> is the reason this lives here instead of being spelled out at the call site: a tool whose
+    /// source did not give a usable schema used to take the whole request down, because the schema was deserialized
+    /// inside the builder and a bad one threw. A turn that never called that tool still failed to start — and the error
+    /// said nothing about which tool was at fault. A tool nobody described is a tool with no arguments, and that is a
+    /// thing this protocol can say.
+    /// </summary>
+    public static object Tool(ModelToolDefinition tool) => new
+    {
+        type = "function",
+        function = new
+        {
+            name = tool.Name,
+            description = tool.Description,
+            parameters = Parameters(tool.ParametersJson),
+        }
+    };
+
+    /// <summary>
+    /// A parameter schema, or the empty object schema when there is not a usable one.
+    ///
+    /// Malformed and absent are treated the same on purpose: the request needs an object schema, the schema is the
+    /// provider's contract rather than ours, and refusing the whole turn over a field a script left out punishes every
+    /// tool in the list. The tool is still offered, still callable, and a script that then complains about missing
+    /// arguments is a script saying so — which is where that belongs.
+    /// </summary>
+    public static JsonElement Parameters(string? parametersJson)
+    {
+        if (!string.IsNullOrWhiteSpace(parametersJson))
+        {
+            try
+            {
+                var parsed = JsonSerializer.Deserialize<JsonElement>(parametersJson);
+                // An array or a bare string is not an object schema; neither will be accepted by a provider, and both
+                // are worse than the empty one.
+                if (parsed.ValueKind == JsonValueKind.Object) return parsed;
+            }
+            catch (JsonException)
+            {
+                // Fall through to the empty schema.
+            }
+        }
+        return JsonSerializer.SerializeToElement(new { type = "object", properties = new { } });
+    }
+
+    /// <summary>
     /// The <c>content</c> field: a string when the message is text, an array of parts when it is not.
     ///
     /// The two shapes are not interchangeable — a provider accepts both, but only the array form can carry a picture —
@@ -186,7 +233,12 @@ internal sealed class OpenAiChatProvider : IModelProvider, IModelProviderReconfi
         Error? requestError = null;
         try { httpRequest = BuildRequest(request, settings); }
         catch (Exception ex) when (ex is JsonException or ArgumentException or InvalidOperationException)
-        { requestError = new(ErrorCode.Invalid, "Model request could not be mapped to OpenAI Chat.", ex.Message); }
+        {
+            // The type is part of the message on purpose: "could not be mapped" with a bare parser message is a bug
+            // report nobody can act on, and this one used to arrive without ever naming the field or the tool.
+            requestError = new(ErrorCode.Invalid, "Model request could not be mapped to OpenAI Chat.",
+                $"{ex.GetType().Name}: {ex.Message}");
+        }
         if (requestError is not null)
         {
             yield return new ModelFailed(requestError);
@@ -337,11 +389,7 @@ internal sealed class OpenAiChatProvider : IModelProvider, IModelProviderReconfi
         if (request.Sampling?.Stop is { Count: > 0 } stop) body["stop"] = stop;
         if (request.Tools is { Count: > 0 })
         {
-            body["tools"] = request.Tools.Select(tool => new
-            {
-                type = "function",
-                function = new { name = tool.Name, description = tool.Description, parameters = JsonSerializer.Deserialize<JsonElement>(tool.ParametersJson) }
-            }).ToArray();
+            body["tools"] = request.Tools.Select(ChatPayload.Tool).ToArray();
             body["tool_choice"] = "auto";
         }
         return new HttpRequestMessage(HttpMethod.Post, settings.Endpoint) { Content = JsonContent.Create(body, options: JsonOptions) };
