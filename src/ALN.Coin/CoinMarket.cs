@@ -33,7 +33,7 @@ public sealed class CoinMarket(CoinLedger ledger, CoinCatalogue catalogue, ICoin
     public int Capacity => capacity;
 
     public async ValueTask<Result<CoinTradeResult>> BuyAsync(string sessionId, string goodId, int count,
-        string actor, CancellationToken cancellationToken, string? idempotencyKey = null)
+        string actor, CancellationToken cancellationToken, string? idempotencyKey = null, string? channel = null)
     {
         if (count is < 1 or > 99)
             return Result<CoinTradeResult>.Failure(new(ErrorCode.Invalid, $"一次买 1 到 99 件（收到 {count}）。"));
@@ -79,7 +79,11 @@ public sealed class CoinMarket(CoinLedger ledger, CoinCatalogue catalogue, ICoin
             new
             {
                 kind = "buy", good = good.Id, count, paid = price, balance = paid.Value!.Balance,
-                bag = paid.Value.Bag, actor
+                bag = paid.Value.Bag, actor,
+                // Which Channel asked, when the caller knew. A good whose script does not care ignores it; one that sells
+                // "today this Channel eats free" cannot work without it, and finding it out inside a script would mean
+                // reaching into a Session's state from somewhere that owns no Sessions.
+                channel
             }, cancellationToken).ConfigureAwait(false);
         if (!settled.Ok) return await RefundAsync(paid.Value!, price, $"buy:{good.Id}", actor, settled.Error!, cancellationToken)
             .ConfigureAwait(false);

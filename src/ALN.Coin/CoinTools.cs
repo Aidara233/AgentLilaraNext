@@ -52,6 +52,10 @@ public sealed class CoinToolSource(CoinLedger ledger, CoinMarket market) : ISess
         CancellationToken cancellationToken)
     {
         var session = string.IsNullOrWhiteSpace(request.SessionId) ? "session" : request.SessionId;
+        // Which Channel is buying. The market itself cannot find this out — it is handed a Session id and nothing else —
+        // and a settlement script that sells "today this Channel eats free" has to know which Channel asked. The tool
+        // layer is the only one of the two that has the request in hand, so the address travels from here.
+        var channel = request.Channel?.ToString();
         IReadOnlyList<SessionToolOffer> offers =
         [
             new(new Tool(Wallet, (call, ct) => ShowWalletAsync(ct)), WalletDefinition,
@@ -60,7 +64,7 @@ public sealed class CoinToolSource(CoinLedger ledger, CoinMarket market) : ISess
                 ActsExternally: false),
             new(new Tool(Bag, (call, ct) => ShowBagAsync(ct)), BagDefinition,
                 ActsExternally: false),
-            new(new Tool(Buy, (call, ct) => BuyAsync(call, session, ct)), BuyDefinition),
+            new(new Tool(Buy, (call, ct) => BuyAsync(call, session, channel, ct)), BuyDefinition),
             new(new Tool(Use, (call, ct) => UseAsync(call, session, ct)), UseDefinition)
         ];
         return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(offers));
@@ -115,7 +119,7 @@ public sealed class CoinToolSource(CoinLedger ledger, CoinMarket market) : ISess
     }
 
     private async ValueTask<Result<SessionToolResult>> BuyAsync(ModelToolCall call, string sessionId,
-        CancellationToken cancellationToken)
+        string? channel, CancellationToken cancellationToken)
     {
         var arguments = Parse(call.ArgumentsJson);
         if (arguments is null) return Failure(new(ErrorCode.Invalid, "参数不是 JSON。"));
@@ -123,7 +127,8 @@ public sealed class CoinToolSource(CoinLedger ledger, CoinMarket market) : ISess
         var count = arguments.Value.TryGetProperty("count", out var many) && many.TryGetInt32(out var parsed) ? parsed : 1;
         if (string.IsNullOrWhiteSpace(id)) return Failure(new(ErrorCode.Invalid, "要说买哪一件：id。"));
 
-        var trade = await market.BuyAsync(sessionId, id!, count, $"model:{sessionId}", cancellationToken, call.Id)
+        var trade = await market.BuyAsync(sessionId, id!, count, $"model:{sessionId}", cancellationToken, call.Id,
+                channel)
             .ConfigureAwait(false);
         if (!trade.Ok || trade.Value is null) return Failure(trade.Error!);
         return Answer(JsonSerializer.Serialize(new

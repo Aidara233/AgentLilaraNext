@@ -76,14 +76,18 @@ public sealed class RiceTools(RiceLedger ledger, TimeProvider? time = null) : IS
             // What this conversation can still spend without touching the larder. Kept apart from `rounds` instead of
             // being added into it: 86 bites plus 43 free rounds is not 129 of anything, and a model that read it that
             // way would plan for a turn count nobody promised.
-            freeRoundsHere = state.Allowances.Where(entry => entry.Covers(request.Channel, now))
+            freeRoundsHere = state.Allowances.Where(entry => entry.Covers(request.Channel, now) && !entry.Unlimited)
                 .Sum(entry => entry.Remaining),
+            // A count cannot say "as many rounds as it takes", and inventing a number for that would be worse than a
+            // flag: the model would plan against a limit nobody set.
+            unlimitedHere = state.Allowances.Any(entry => entry.Covers(request.Channel, now) && entry.Unlimited),
             waivers = state.Allowances
-                .Where(entry => entry.Remaining > 0 && entry.Until > now)
+                .Where(entry => entry.IsLive(now))
                 .Select(entry => new
                 {
                     id = entry.Id,
                     channel = entry.Channel,
+                    unlimited = entry.Unlimited,
                     remaining = entry.Remaining,
                     until = entry.Until,
                     reason = entry.Reason
@@ -119,10 +123,12 @@ public sealed class RiceContextSource(RiceLedger ledger, TimeProvider? time = nu
         // What is free here, in one clause, and only when there is something to say: this line is read every round, and
         // "免单剩 0 轮" repeating on every turn of the day is noise that makes the number that matters harder to see.
         var now = (time ?? TimeProvider.System).GetLocalNow();
-        var free = state.Allowances.Where(entry => entry.Covers(request.Channel, now))
-            .Sum(entry => entry.Remaining);
-        var line = $"白饭：{RiceUnits.Describe(state.Bites)} · 每轮 1 口" +
-                   (free > 0 ? $" · 本频道免单剩 {free} 轮" : "");
+        var covering = state.Allowances.Where(entry => entry.Covers(request.Channel, now)).ToArray();
+        var free = covering.Where(entry => !entry.Unlimited).Sum(entry => entry.Remaining);
+        var tail = covering.Any(entry => entry.Unlimited) ? " · 本频道今日免单"
+            : free > 0 ? $" · 本频道免单剩 {free} 轮"
+            : "";
+        var line = $"白饭：{RiceUnits.Describe(state.Bites)} · 每轮 1 口{tail}";
         return Result<IReadOnlyList<RoundContextContribution>>.Success(
             [new RoundContextContribution("rice.wallet", "rice", line)]);
     }
@@ -150,11 +156,12 @@ public static class RiceActions
 
     private const string WaiveParamsJson = """
         {"type":"object","properties":{
-          "bites":{"type":"integer","description":"这次免单能抵多少轮。每轮 1 口，所以它也就是多少口"},
+          "bites":{"type":"integer","description":"这次免单能抵多少轮。每轮 1 口，所以它也就是多少口。和 unlimited 二选一"},
+          "unlimited":{"type":"boolean","description":"true = 到期之前每一轮都免，不计数。和 bites 二选一"},
           "channel":{"type":"string","description":"只给这个频道免单，写实例地址，如 channel.conversation#qq-group-616565017。不写就是所有频道"},
           "until":{"type":"string","description":"到什么时候为止，带时区的 ISO8601，如 2026-11-10T23:59:59+08:00。不写就是今天 24 点（本地时区）"},
           "reason":{"type":"string","description":"一句话说明为什么免单，会进审计"}
-        },"required":["bites","reason"]}
+        },"required":["reason"]}
         """;
 
     private const string UnwaiveParamsJson = """
@@ -207,6 +214,8 @@ public static class RiceActions
                 var now = (time ?? TimeProvider.System).GetLocalNow();
                 var bites = arguments.TryGetProperty("bites", out var amount) ? amount.GetInt64() : 0;
                 var reason = arguments.TryGetProperty("reason", out var why) ? why.GetString() : null;
+                var unlimited = arguments.TryGetProperty("unlimited", out var flag) &&
+                                flag.ValueKind == JsonValueKind.True;
 
                 DateTimeOffset? until = null;
                 if (arguments.TryGetProperty("until", out var untilElement) &&
@@ -223,7 +232,7 @@ public static class RiceActions
                     ? channelElement.GetString()
                     : null;
 
-                var made = MakeWaiver(bites, channel, until, reason, now);
+                var made = MakeWaiver(bites, channel, until, reason, now, unlimited);
                 if (!made.Ok) return Result<JsonElement>.Failure(made.Error!);
 
                 var granted = await ledger.GrantWaiverAsync(made.Value!, actor.Id, cancellationToken)
@@ -233,6 +242,7 @@ public static class RiceActions
                     {
                         id = made.Value!.Id,
                         channel = made.Value.Channel,
+                        unlimited = made.Value.Unlimited,
                         remaining = made.Value.Remaining,
                         until = made.Value.Until
                     }))
@@ -265,9 +275,11 @@ public static class RiceActions
     /// of quietly turning it into UTC midnight.
     /// </summary>
     public static Result<RiceWaiver> MakeWaiver(long bites, string? channel, DateTimeOffset? until, string? reason,
-        DateTimeOffset now)
+        DateTimeOffset now, bool unlimited = false)
     {
-        if (bites <= 0) return Result<RiceWaiver>.Failure(new(ErrorCode.Invalid, "bites 必须是大于 0 的整数。"));
+        if (!unlimited && bites <= 0)
+            return Result<RiceWaiver>.Failure(new(ErrorCode.Invalid,
+                "bites 必须是大于 0 的整数（要今天全部免费，就写 unlimited: true）。"));
         if (string.IsNullOrWhiteSpace(reason)) return Result<RiceWaiver>.Failure(new(ErrorCode.Invalid, "reason 不能为空。"));
 
         string? named = null;
@@ -283,7 +295,8 @@ public static class RiceActions
         // "all of today" are the same promise.
         var deadline = until ?? new DateTimeOffset(now.Year, now.Month, now.Day, 0, 0, 0, now.Offset).AddDays(1);
         var id = "w-" + Guid.NewGuid().ToString("N")[..8];
-        return Result<RiceWaiver>.Success(new RiceWaiver(id, named, bites, deadline, reason!.Trim(), now));
+        return Result<RiceWaiver>.Success(new RiceWaiver(id, named, unlimited ? 0 : bites, deadline, reason!.Trim(), now,
+            unlimited));
     }
 
     private static (long Bites, string Reason, Error? Error) Read(JsonElement arguments)
@@ -323,11 +336,14 @@ public static class RiceService
                 if (read.Error is not null || read.Value is null)
                     return Result<string>.Failure(read.Error ?? new(ErrorCode.Unavailable, "读不到米缸。"));
                 var now = (time ?? TimeProvider.System).GetLocalNow();
-                var free = read.Value.Allowances.Where(entry => entry.Remaining > 0 && entry.Until > now).ToArray();
+                var live = read.Value.Allowances.Where(entry => entry.IsLive(now)).ToArray();
                 return Result<string>.Success(
                     $"白饭：{RiceUnits.Describe(read.Value.Bites)} · 每轮 1 口 · 第 {read.Value.Revision} 版" +
-                    (free.Length > 0
-                        ? $" · 免单 {free.Length} 条共 {free.Sum(entry => entry.Remaining)} 轮（//rice waivers）"
+                    (live.Length > 0
+                        ? " · 免单 " + live.Length + " 条" +
+                          (live.Any(entry => entry.Unlimited)
+                              ? "（含不限量，//rice waivers）"
+                              : $"共 {live.Sum(entry => entry.Remaining)} 轮（//rice waivers）")
                         : ""));
             }),
             new("rice.topup", "补饭（要 full）", AccessLevel.Full, Usage: "//rice topup <口数>",
@@ -383,10 +399,10 @@ public static class RiceService
                         return Result<string>.Failure(read.Error ?? new(ErrorCode.Unavailable, "读不到米缸。"));
 
                     var now = (time ?? TimeProvider.System).GetLocalNow();
-                    var live = read.Value.Allowances.Where(entry => entry.Remaining > 0 && entry.Until > now).ToArray();
+                    var live = read.Value.Allowances.Where(entry => entry.IsLive(now)).ToArray();
                     if (live.Length == 0) return Result<string>.Success("没有生效的免单，每轮照常扣 1 口。");
                     return Result<string>.Success("免单：\n" + string.Join("\n", live.Select(entry =>
-                        $"- {entry.Id}：{entry.Remaining} 轮" +
+                        $"- {entry.Id}：{entry.RoundsLabel}" +
                         (entry.Channel is { } only ? $"（{only}）" : "（所有频道）") +
                         $"，到 {entry.Until:yyyy-MM-dd HH:mm zzz}，{entry.Reason}")));
                 })

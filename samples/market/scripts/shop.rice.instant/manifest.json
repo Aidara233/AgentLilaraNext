@@ -1,0 +1,17 @@
+{
+  "id": "shop.rice.instant",
+  "version": 1,
+  "targetType": "channel",
+  "mount": "manual",
+  "events": ["channel.message.accepted"],
+  "entryPoint": "main",
+  "capabilities": ["rice.control"],
+  "trustDomain": "trusted",
+  "call": "buy",
+  "tool": {
+    "name": "shop.rice.instant",
+    "description": "自热米饭的结算脚本：今日多 500 轮白饭，到 24:00 作废",
+    "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
+    "access": "full"
+  }
+}

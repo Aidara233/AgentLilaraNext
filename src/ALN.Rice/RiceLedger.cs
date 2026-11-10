@@ -18,18 +18,31 @@ namespace ALN.Rice;
 /// write "today is free everywhere" without naming every conversation, and a Channel-specific allowance still wins
 /// nothing over a global one — the earliest deadline is served first either way.</param>
 /// <param name="Remaining">How many rounds it still pays for. "A temporary 500 bites" is exactly this number, because
-/// a round costs one bite: the two ways of saying it are the same fact.</param>
+/// a round costs one bite: the two ways of saying it are the same fact. Meaningless when <paramref name="Unlimited"/>
+/// is set, and left at whatever the writer put there rather than being kept in step.</param>
 /// <param name="Until">When it stops paying. Expiry is lazy — a waiver past this instant is simply never matched, and
 /// is dropped the next time the table is written — so nothing has to run at midnight, and a host that was down at
 /// midnight still gets the right answer.</param>
+/// <param name="Unlimited">
+/// "Every round until it expires", rather than a count. It is a flag and not a very large number because a number that
+/// means "infinite" has to be recognised as such in every place that reads it — the countdown, the "used up" purge, the
+/// display — and one of those places would eventually forget. A count of rounds is also honest about what it is: a
+/// promise someone can read off and check.
+/// </param>
 public sealed record RiceWaiver(string Id, string? Channel, long Remaining, DateTimeOffset Until, string Reason,
-    DateTimeOffset CreatedAt)
+    DateTimeOffset CreatedAt, bool Unlimited = false)
 {
     /// <summary>Whether this allowance can pay for a round belonging to <paramref name="channel"/> right now.</summary>
     public bool Covers(Address? channel, DateTimeOffset now) =>
-        Remaining > 0 &&
+        (Unlimited || Remaining > 0) &&
         Until > now &&
         (Channel is null || (channel is { } target && string.Equals(Channel, target.ToString(), StringComparison.Ordinal)));
+
+    /// <summary>What is left, in the words a person reads. One place, because it is said in three.</summary>
+    public string RoundsLabel => Unlimited ? "不限" : $"{Remaining} 轮";
+
+    /// <summary>Whether this row is still worth keeping: not spent, not expired.</summary>
+    public bool IsLive(DateTimeOffset now) => (Unlimited || Remaining > 0) && Until > now;
 }
 
 /// <summary>
@@ -129,7 +142,12 @@ public sealed class RiceLedger(IStateStore store, IAtomicWork atomic, ISignalLog
                 {
                     Bites = state.Bites - 1,
                     Revision = state.Revision + 1,
-                    Charged = charged
+                    Charged = charged,
+                    // Paying the larder is a write too, so it is also when dead rows go: a table that tidied itself only
+                    // on the days something matched would keep expired rows for as long as nobody bought anything.
+                    Waivers = now is { } paidAt
+                        ? state.Allowances.Where(entry => entry.IsLive(paidAt)).ToArray()
+                        : state.Waivers
                 });
 
             // Paid by the allowance: the larder does not move, but the allowance does. This write is also the one that
@@ -138,10 +156,10 @@ public sealed class RiceLedger(IStateStore store, IAtomicWork atomic, ISignalLog
             // WaiverFor only matches when there was an instant to match against, so this is that instant.
             var chargedAt = now!.Value;
             var kept = state.Allowances
-                .Select(entry => string.Equals(entry.Id, waiver.Id, StringComparison.Ordinal)
+                .Select(entry => string.Equals(entry.Id, waiver.Id, StringComparison.Ordinal) && !entry.Unlimited
                     ? entry with { Remaining = entry.Remaining - 1 }
                     : entry)
-                .Where(entry => entry.Remaining > 0 && entry.Until > chargedAt)
+                .Where(entry => entry.IsLive(chargedAt))
                 .ToArray();
             return Result<RiceState>.Success(state with
             {
@@ -185,13 +203,13 @@ public sealed class RiceLedger(IStateStore store, IAtomicWork atomic, ISignalLog
         {
             if (state.Allowances.Any(entry => string.Equals(entry.Id, waiver.Id, StringComparison.Ordinal)))
                 return Result<RiceState>.Failure(new(ErrorCode.Conflict, $"已经有一条豁免叫 {waiver.Id} 了。"));
-            if (waiver.Remaining <= 0)
+            if (!waiver.Unlimited && waiver.Remaining <= 0)
                 return Result<RiceState>.Failure(new(ErrorCode.Invalid, "豁免的口数必须大于 0。"));
             if (waiver.Until <= waiver.CreatedAt)
                 return Result<RiceState>.Failure(new(ErrorCode.Invalid, "豁免的到期时间必须晚于创建时间。"));
 
             var live = state.Allowances
-                .Where(entry => entry.Remaining > 0 && entry.Until > waiver.CreatedAt)
+                .Where(entry => entry.IsLive(waiver.CreatedAt))
                 .ToArray();
             return Result<RiceState>.Success(state with
             {

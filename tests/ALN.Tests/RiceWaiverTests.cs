@@ -193,6 +193,30 @@ public sealed class RiceWaiverTests
         Assert.Empty((await ledger.ReadAsync(default)).Value!.Allowances);
     }
 
+    [Fact]
+    public async Task An_unlimited_allowance_pays_every_round_until_it_expires()
+    {
+        var ledger = Ledger();
+        Assert.True((await ledger.AddAsync(10, "topup", "test", default)).Ok);
+        // Remaining is zero on purpose: an unlimited allowance carries no count, and granting one must not be read as
+        // "a promise of zero rounds".
+        var unlimited = new RiceWaiver("w-u", Group.ToString(), 0, Midnight, "test", Noon.AddHours(-1), Unlimited: true);
+        Assert.True((await ledger.GrantWaiverAsync(unlimited, "test", default)).Ok);
+
+        for (var step = 1; step <= 5; step++)
+            Assert.Equal(10, (await ledger.ChargeRoundAsync("s-1", step, Group, Noon, default)).Value!.Bites);
+
+        var live = Assert.Single((await ledger.ReadAsync(default)).Value!.Allowances);
+        Assert.True(live.Unlimited);
+        Assert.Equal(0, live.Remaining);            // never counted down, never "used up"
+
+        // Midnight is where the promise ends: not because anything ran at midnight, but because the next round after it
+        // no longer matches. The dead row goes with that write.
+        var after = await ledger.ChargeRoundAsync("s-1", 6, Group, Midnight, default);
+        Assert.Equal(9, after.Value!.Bites);
+        Assert.Empty(after.Value.Allowances);
+    }
+
     private sealed class MemoryStore : IStateStore
     {
         private readonly Dictionary<string, string> _values = new(StringComparer.Ordinal);

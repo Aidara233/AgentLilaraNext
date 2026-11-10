@@ -4,10 +4,13 @@
     { "id": "test-brick", "name": "一块砖", "price": 1,   "script": "shop.brick", "stock": -1 },
     { "id": "test-box",   "name": "盲盒",   "price": 30,  "script": "shop.box",   "stock": -1 },
 
-    { "id": "rice-bowl",   "name": "一碗白饭", "price": 2,  "script": "shop.rice", "stock": -1 },
-    { "id": "rice-basin",  "name": "一盆白饭", "price": 8,  "script": "shop.rice", "stock": -1 },
-    { "id": "rice-pot",    "name": "一锅白饭", "price": 30, "script": "shop.rice", "stock": -1 },
-    { "id": "rice-bucket", "name": "一桶白饭", "price": 70, "script": "shop.rice", "stock": -1 },
+    { "id": "rice-bowl",    "name": "一碗白饭", "price": 2,  "script": "shop.rice", "stock": -1 },
+    { "id": "rice-basin",   "name": "一盆白饭", "price": 8,  "script": "shop.rice", "stock": -1 },
+    { "id": "rice-pot",     "name": "一锅白饭", "price": 30, "script": "shop.rice", "stock": -1 },
+    { "id": "rice-bucket",  "name": "一桶白饭", "price": 70, "script": "shop.rice", "stock": -1 },
+
+    { "id": "rice-unlimited", "name": "免费续饭", "price": 5, "script": "shop.rice.unlimited", "stock": -1 },
+    { "id": "rice-instant",   "name": "自热米饭", "price": 6, "script": "shop.rice.instant",   "stock": -1 },
 
     { "id": "test-rare",  "name": "稀罕物", "price": 100, "script": "shop.rare",  "stock": 1, "oncePerSession": true }
   ]

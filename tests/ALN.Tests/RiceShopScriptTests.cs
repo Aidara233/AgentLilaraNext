@@ -23,6 +23,8 @@ public sealed class RiceShopScriptTests
             new CoinGood("rice-basin", "一盆白饭", 8, "shop.rice"),
             new CoinGood("rice-pot", "一锅白饭", 30, "shop.rice"),
             new CoinGood("rice-bucket", "一桶白饭", 70, "shop.rice"),
+            new CoinGood("rice-unlimited", "免费续饭", 5, "shop.rice.unlimited"),
+            new CoinGood("rice-instant", "自热米饭", 6, "shop.rice.instant"),
             // Deliberately not in the script's menu: the shelf is one file a person edits, the menu is another.
             new CoinGood("rice-forklift", "白饭叉车", 5, "shop.rice")
         ],
@@ -67,11 +69,72 @@ public sealed class RiceShopScriptTests
         Assert.Equal(100, (await ledger.ReadAsync(default)).Value!.Balance);
     }
 
+    [Fact]
+    public async Task The_free_refill_sells_one_Channels_day_from_the_channel_the_settlement_carried()
+    {
+        var api = new RecordingApi();
+        var (market, ledger) = Market(api, "shop.rice.unlimited");
+        await ledger.CreditAsync(100, "topup", "test", default);
+
+        var bought = await market.BuyAsync("s-1", "rice-unlimited", 1, "model:s-1", default, "call-1",
+            channel: "channel.conversation#qq-group-616565017");
+
+        Assert.True(bought.Ok, bought.Error?.Message);
+        var call = Assert.Single(api.Calls);
+        Assert.Equal("rice.waive", call.Action);
+
+        using var grant = System.Text.Json.JsonDocument.Parse(call.ArgumentsJson);
+        Assert.True(grant.RootElement.GetProperty("unlimited").GetBoolean());
+        Assert.Equal("channel.conversation#qq-group-616565017", grant.RootElement.GetProperty("channel").GetString());
+        // No `until`: the server's default is the end of today, and a script that spelled that out would have to know
+        // which timezone it is running in — which is exactly the thing it cannot know.
+        Assert.False(grant.RootElement.TryGetProperty("until", out _));
+    }
+
+    [Fact]
+    public async Task The_free_refill_will_not_guess_when_nobody_named_a_channel()
+    {
+        var api = new RecordingApi();
+        var (market, ledger) = Market(api, "shop.rice.unlimited");
+        await ledger.CreditAsync(100, "topup", "test", default);
+
+        // A Session with no Channel — started by a script, or by hand — has nothing to point the promise at. Guessing
+        // would be selling somebody else's conversation, so the purchase fails and the money goes back.
+        var bought = await market.BuyAsync("s-1", "rice-unlimited", 1, "model:s-1", default, "call-1");
+
+        Assert.False(bought.Ok);
+        Assert.Empty(api.Calls);
+        Assert.Equal(100, (await ledger.ReadAsync(default)).Value!.Balance);
+    }
+
+    [Theory]
+    [InlineData(1, 500)]
+    [InlineData(2, 1000)]
+    public async Task The_instant_rice_buys_its_rounds_and_multiplies_by_count(int count, long bites)
+    {
+        var api = new RecordingApi();
+        var (market, ledger) = Market(api, "shop.rice.instant");
+        await ledger.CreditAsync(100, "topup", "test", default);
+
+        var bought = await market.BuyAsync("s-1", "rice-instant", count, "model:s-1", default, "call-1");
+
+        Assert.True(bought.Ok, bought.Error?.Message);
+        var call = Assert.Single(api.Calls);
+        Assert.Equal("rice.waive", call.Action);
+
+        using var grant = System.Text.Json.JsonDocument.Parse(call.ArgumentsJson);
+        Assert.Equal(bites, grant.RootElement.GetProperty("bites").GetInt64());
+        // Not "unlimited", and not spelled out with an `until`: it is a number of rounds, and the day it expires on is
+        // the host's business.
+        Assert.False(grant.RootElement.TryGetProperty("unlimited", out _));
+        Assert.False(grant.RootElement.TryGetProperty("until", out _));
+    }
+
     /// <summary>Builds the purse on a real script host reading the sample folder the way a person would copy it.</summary>
-    private static (CoinMarket Market, CoinLedger Ledger) Market(IScriptApi api)
+    private static (CoinMarket Market, CoinLedger Ledger) Market(IScriptApi api, string script = "shop.rice")
     {
         var ledger = new CoinLedger(new MemoryStore(), new MemoryAtomic());
-        return (new CoinMarket(ledger, Shelf, new SampleScript(api)), ledger);
+        return (new CoinMarket(ledger, Shelf, new SampleScript(api, script)), ledger);
     }
 
     private static long Bites(string argumentsJson)
@@ -80,33 +143,33 @@ public sealed class RiceShopScriptTests
         return document.RootElement.GetProperty("bites").GetInt64();
     }
 
-    private static string SampleScriptPath()
+    private static string SampleScriptPath(string id = "shop.rice")
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "ALN.slnx")))
             directory = directory.Parent;
         Assert.NotNull(directory);
-        var script = Path.Combine(directory!.FullName, "samples", "market", "scripts", "shop.rice", "main.js");
+        var script = Path.Combine(directory!.FullName, "samples", "market", "scripts", id, "main.js");
         Assert.True(File.Exists(script), $"no sample script at {script}");
         return script;
     }
 
     /// <summary>The sample script, unchanged, behind the narrow port the purse uses.</summary>
-    private sealed class SampleScript(IScriptApi api) : ICoinScripts
+    private sealed class SampleScript(IScriptApi api, string id = "shop.rice") : ICoinScripts
     {
         private static readonly Address Target = new("channel", "test", "one");
 
-        public IReadOnlyList<string> Loaded => ["shop.rice"];
+        public IReadOnlyList<string> Loaded => [id];
 
-        public bool CanRun(string script) => string.Equals(script, "shop.rice", StringComparison.Ordinal);
+        public bool CanRun(string script) => string.Equals(script, id, StringComparison.Ordinal);
 
         public ValueTask<Result<string>> InvokeAsync(string script, string argumentsJson,
             CancellationToken cancellationToken)
         {
             var package = new ScriptPackage(
-                new ScriptManifest("shop.rice", 1, "channel", MountMode.Manual, [], "main", ["rice.control"],
-                    TrustDomain.Trusted, Call: "buy", Tool: new ScriptToolSpec("shop.rice", "白饭套餐", "{}")),
-                File.ReadAllText(SampleScriptPath()));
+                new ScriptManifest(id, 1, "channel", MountMode.Manual, [], "main", ["rice.control"],
+                    TrustDomain.Trusted, Call: "buy", Tool: new ScriptToolSpec(id, "白饭", "{}")),
+                File.ReadAllText(SampleScriptPath(id)));
             return new JintScriptExecutor().InvokeAsync(package, Target, argumentsJson, api, cancellationToken);
         }
     }

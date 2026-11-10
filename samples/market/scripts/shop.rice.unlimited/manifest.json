@@ -1,0 +1,17 @@
+{
+  "id": "shop.rice.unlimited",
+  "version": 1,
+  "targetType": "channel",
+  "mount": "manual",
+  "events": ["channel.message.accepted"],
+  "entryPoint": "main",
+  "capabilities": ["rice.control"],
+  "trustDomain": "trusted",
+  "call": "buy",
+  "tool": {
+    "name": "shop.rice.unlimited",
+    "description": "免费续饭的结算脚本：一个频道今日免单，不限轮数",
+    "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
+    "access": "full"
+  }
+}
