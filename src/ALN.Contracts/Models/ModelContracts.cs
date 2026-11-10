@@ -209,11 +209,16 @@ public sealed record ModelProfile(
     public bool CanSeeImages => Capabilities is { } declared && declared.HasFlag(ModelCapabilities.Vision);
 
     /// <summary>
-    /// What a Session assumes when the profile declares no <see cref="ContextWindow"/>. 128k is the smallest window
-    /// among the models this system is run against, and guessing low keeps a Session working on a smaller model too —
-    /// guessing high turns the first symptom into a provider error nobody can act on.
+    /// What a Session assumes when the profile declares no <see cref="ContextWindow"/>. One million tokens, because
+    /// that is the window models ask to be run against now and a guess has to be <em>some</em> number.
+    ///
+    /// Guessing high is the expensive direction, and it is worth being explicit about what it costs: the budget is what
+    /// decides when folding starts and when compaction runs, so a window larger than the model really has means the
+    /// request grows past the provider's limit and the refusal lands on a turn nobody can fix — the history that made it
+    /// too big is still there, so the next turn is refused too. A profile whose model is smaller than this should say so
+    /// (<c>contextWindow</c> in its file); the startup receipt names every profile still on the guess.
     /// </summary>
-    public const int AssumedContextWindow = 128 * 1024;
+    public const int AssumedContextWindow = 1024 * 1024;
 
     /// <summary>The window to plan against: what was declared, or the floor a Session can still be useful in.</summary>
     public int EffectiveContextWindow => ContextWindow is > 0 and var declared ? declared : AssumedContextWindow;
