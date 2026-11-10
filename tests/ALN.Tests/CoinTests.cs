@@ -183,6 +183,25 @@ public sealed class CoinTests
     }
 
     [Fact]
+    public async Task A_once_per_session_good_is_refused_the_second_time_for_the_same_session()
+    {
+        var catalogue = new CoinCatalogue(
+            [new CoinGood("hint", "提示", 10, "shop.hint", OncePerSession: true)], [], []);
+        var market = Market(Giving("shop.hint", """{"bag":[],"text":"一条提示"}"""), catalogue);
+        await Ledger().CreditAsync(100, "topup", "test", default);
+
+        var first = await market.BuyAsync("s-1", "hint", 1, "model:s-1", default, "c-1");
+        var second = await market.BuyAsync("s-1", "hint", 1, "model:s-1", default, "c-2");
+        var other = await market.BuyAsync("s-2", "hint", 1, "model:s-2", default, "c-3");
+
+        Assert.True(first.Ok, first.Error?.Message);
+        Assert.False(second.Ok);
+        Assert.Contains("只能买一次", second.Error!.Message);
+        Assert.True(other.Ok, other.Error?.Message);        // the limit is per Session, not per purse
+        Assert.Equal(80, (await Ledger().ReadAsync(default)).Value!.Balance);
+    }
+
+    [Fact]
     public void Moving_money_by_script_needs_full_and_says_so_in_the_table()
     {
         var plane = new RecordingPlane();

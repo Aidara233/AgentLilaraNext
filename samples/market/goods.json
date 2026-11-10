@@ -3,6 +3,6 @@
     { "id": "test-air",   "name": "空气",   "price": 0,   "script": "shop.air",   "stock": -1 },
     { "id": "test-brick", "name": "一块砖", "price": 1,   "script": "shop.brick", "stock": -1 },
     { "id": "test-box",   "name": "盲盒",   "price": 30,  "script": "shop.box",   "stock": -1 },
-    { "id": "test-rare",  "name": "稀罕物", "price": 100, "script": "shop.rare",  "stock": 1 }
+    { "id": "test-rare",  "name": "稀罕物", "price": 100, "script": "shop.rare",  "stock": 1, "oncePerSession": true }
   ]
 }

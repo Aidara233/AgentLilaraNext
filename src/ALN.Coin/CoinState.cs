@@ -40,7 +40,12 @@ public sealed record CoinState(
 /// </summary>
 /// <param name="Script">A callable script (<c>manifest.tool.callable</c>) the graph can run as a function.</param>
 /// <param name="Stock">Remaining units across the whole deployment, or -1 for unlimited.</param>
-public sealed record CoinGood(string Id, string Name, long Price, string Script, int Stock = -1);
+public sealed record CoinGood(string Id, string Name, long Price, string Script, int Stock = -1,
+    /// <summary>
+    /// At most one per Session. Not a stock limit: a thing that only makes sense once for a given conversation (a
+    /// hint, a reroll) can be unlimited across the deployment and still useless the second time to the same Session.
+    /// </summary>
+    bool OncePerSession = false);
 
 /// <summary>
 /// A thing that can be in the bag. Its <paramref name="Use"/> script decides what using it does, including how many

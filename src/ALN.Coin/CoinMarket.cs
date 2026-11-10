@@ -58,6 +58,10 @@ public sealed class CoinMarket(CoinLedger ledger, CoinCatalogue catalogue, ICoin
         if (good.Stock >= 0 && purse.SoldOf(good.Id) + count > good.Stock)
             return Result<CoinTradeResult>.Failure(new(ErrorCode.Conflict, $"{good.Name} 只剩 {Math.Max(0, good.Stock - purse.SoldOf(good.Id))} 件。"));
 
+        if (good.OncePerSession &&
+            purse.Purchased.TryGetValue(sessionId, out var mine) && mine.TryGetValue(good.Id, out var had) && had > 0)
+            return Result<CoinTradeResult>.Failure(new(ErrorCode.Conflict, $"{good.Name} 每个会话只能买一次。"));
+
         var price = good.Price * count;
         if (good.Price < 0)
             return Result<CoinTradeResult>.Failure(new(ErrorCode.Invalid, $"{good.Id} 的价格是负数，货架有误。"));
