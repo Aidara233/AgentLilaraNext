@@ -1,0 +1,17 @@
+{
+  "id": "shop.air",
+  "version": 1,
+  "targetType": "channel",
+  "mount": "manual",
+  "events": [],
+  "entryPoint": "main",
+  "capabilities": [],
+  "trustDomain": "trusted",
+  "call": "box_air",
+  "tool": {
+    "name": "shop.air",
+    "description": "空气的结算脚本",
+    "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
+    "access": "full"
+  }
+}

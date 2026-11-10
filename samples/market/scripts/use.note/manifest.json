@@ -1,0 +1,17 @@
+{
+  "id": "use.note",
+  "version": 1,
+  "targetType": "channel",
+  "mount": "manual",
+  "events": [],
+  "entryPoint": "main",
+  "capabilities": [],
+  "trustDomain": "trusted",
+  "call": "use_note",
+  "tool": {
+    "name": "use.note",
+    "description": "便签的使用脚本（不消耗）",
+    "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
+    "access": "full"
+  }
+}

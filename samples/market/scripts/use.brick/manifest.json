@@ -1,0 +1,17 @@
+{
+  "id": "use.brick",
+  "version": 1,
+  "targetType": "channel",
+  "mount": "manual",
+  "events": [],
+  "entryPoint": "main",
+  "capabilities": [],
+  "trustDomain": "trusted",
+  "call": "use_brick",
+  "tool": {
+    "name": "use.brick",
+    "description": "砖的使用脚本（用不掉）",
+    "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
+    "access": "full"
+  }
+}

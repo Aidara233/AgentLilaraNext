@@ -1,0 +1,17 @@
+{
+  "id": "use.candy",
+  "version": 1,
+  "targetType": "channel",
+  "mount": "manual",
+  "events": [],
+  "entryPoint": "main",
+  "capabilities": [],
+  "trustDomain": "trusted",
+  "call": "use_candy",
+  "tool": {
+    "name": "use.candy",
+    "description": "糖的使用脚本（消耗一件）",
+    "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
+    "access": "full"
+  }
+}

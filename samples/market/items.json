@@ -1,6 +1,7 @@
 {
   "items": [
     { "id": "test-candy", "name": "一颗糖",  "use": "use.candy" },
+    { "id": "test-brick", "name": "一块砖",  "use": "use.brick" },
     { "id": "test-note",  "name": "一张便签", "use": "use.note" }
   ]
 }
