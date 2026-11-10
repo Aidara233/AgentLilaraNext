@@ -14,7 +14,7 @@ namespace ALN.Rice;
 /// </summary>
 public sealed class RiceAdmission(RiceLedger ledger) : IRoundAdmission
 {
-    public const string BuyHint = "买饭：coin_buy rice-100（2 枚硬币补 100 口），或等人 //rice topup。";
+    public const string BuyHint = "买饭：coin_buy rice-bowl（2 枚硬币补 100 口），或等人 //rice topup。";
 
     public string Id => "rice.admission";
 
