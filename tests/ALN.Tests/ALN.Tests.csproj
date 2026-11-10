@@ -37,6 +37,7 @@
     <ProjectReference Include="..\..\src\ALN.Identity\ALN.Identity.csproj" />
     <ProjectReference Include="..\..\src\ALN.Commands\ALN.Commands.csproj" />
     <ProjectReference Include="..\..\src\ALN.Coin\ALN.Coin.csproj" />
+    <ProjectReference Include="..\..\src\ALN.Rice\ALN.Rice.csproj" />
     <!-- The sample plugin is loaded by a test as a real package: the artifact that ships is the artifact tested. -->
     <ProjectReference Include="..\..\samples\plugins\sample.environment\SampleEnvironment.csproj" />
   </ItemGroup>

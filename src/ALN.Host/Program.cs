@@ -511,6 +511,11 @@ if (!purse.Ok) Console.Error.WriteLine(purse.Error?.Message ?? "The purse did no
 else
     Console.WriteLine($"purse: {coinCatalogue.Goods.Count} goods, {coinCatalogue.Items.Count} items on the shelf");
 
+// The larder: one bowl per round for the whole framework. A refusal closes the turn, not the Session.
+var riceLedger = new ALN.Rice.RiceLedger(stateStore, storage, signalLog, auditSink);
+var larder = ALN.Rice.RiceService.Install(sessionExtensions, commandRegistry, controlPlane, riceLedger);
+if (!larder.Ok) Console.Error.WriteLine(larder.Error?.Message ?? "The larder did not install.");
+
 var pump = new EventPump(queue, graph.DispatchAsync, signalLog,
     // Two things are owed after a round: the mailbox file stays claimed until the event it carries is done,
     // and a Channel message stops being "accepted but unfinished" so a restart has nothing to replay.

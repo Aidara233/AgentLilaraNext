@@ -9,6 +9,7 @@
     <Project Path="src/ALN.Clock/ALN.Clock.csproj" />
     <Project Path="src/ALN.Commands/ALN.Commands.csproj" />
     <Project Path="src/ALN.Coin/ALN.Coin.csproj" />
+    <Project Path="src/ALN.Rice/ALN.Rice.csproj" />
     <Project Path="src/ALN.Contracts/ALN.Contracts.csproj" />
     <Project Path="src/ALN.Graph.Contracts/ALN.Graph.Contracts.csproj" />
     <Project Path="src/ALN.Graph/ALN.Graph.csproj" />

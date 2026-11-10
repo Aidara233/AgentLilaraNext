@@ -1,0 +1,17 @@
+{
+  "id": "shop.rice",
+  "version": 1,
+  "targetType": "channel",
+  "mount": "manual",
+  "events": [],
+  "entryPoint": "main",
+  "capabilities": ["rice.control"],
+  "trustDomain": "trusted",
+  "call": "buy",
+  "tool": {
+    "name": "shop.rice",
+    "description": "买饭的结算脚本：2 枚硬币换 100 份白饭",
+    "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
+    "access": "full"
+  }
+}

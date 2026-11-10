@@ -84,8 +84,11 @@ public sealed class CoinSampleTests
             // purse through coin.credit.
             Assert.Equal(AccessLevel.Full, box.Level);
             // Every sample script must resolve, not just the box: a manifest the loader drops is a product that sells
-            // nothing, and the shelf would silently shrink.
-            Assert.Equal(7, loaded.Value!.Count);
+            // nothing, and the shelf would silently shrink. Counted rather than hard-coded, so adding a script to the
+            // samples does not quietly turn this into a test of an old number.
+            Assert.Equal(
+                Directory.EnumerateDirectories(Path.Combine(Samples(), "scripts")).Count(),
+                loaded.Value!.Count);
         }
         finally
         {
