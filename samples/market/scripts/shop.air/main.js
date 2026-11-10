@@ -5,5 +5,5 @@ async function box_air(args) {
 }
 
 function describe() {
-  return { name: "shop.air", description: "空气的结算脚本", parametersJson: "{\"type\":\"object\",\"properties\":{}}", access: "full" };
+  return { name: "shop_air", description: "空气的结算脚本", parametersJson: "{\"type\":\"object\",\"properties\":{}}", access: "full" };
 }

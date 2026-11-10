@@ -5,5 +5,5 @@ async function box_brick(args) {
 }
 
 function describe() {
-  return { name: "shop.brick", description: "砖的结算脚本", parametersJson: "{\"type\":\"object\",\"properties\":{}}", access: "full" };
+  return { name: "shop_brick", description: "砖的结算脚本", parametersJson: "{\"type\":\"object\",\"properties\":{}}", access: "full" };
 }

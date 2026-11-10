@@ -9,7 +9,7 @@
   "trustDomain": "trusted",
   "call": "box_air",
   "tool": {
-    "name": "shop.air",
+    "name": "shop_air",
     "description": "空气的结算脚本",
     "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
     "access": "full"

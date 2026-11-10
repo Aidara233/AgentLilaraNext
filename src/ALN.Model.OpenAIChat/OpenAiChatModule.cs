@@ -291,8 +291,12 @@ internal sealed class OpenAiChatProvider : IModelProvider, IModelProviderReconfi
                 var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
                 if (body.Length > 4_000) body = body[..4_000];
                 var retryable = response.StatusCode == HttpStatusCode.TooManyRequests || (int)response.StatusCode >= 500;
+                // The status alone is not a diagnosis. The body names the field that was wrong — usually a tool schema
+                // or a message shape — and the people reading this are looking at a chat window, not at a log. Keep
+                // enough of it here to act on, and the whole thing in the detail.
+                var why = body.Length > 240 ? body[..240] + "…" : body;
                 yield return new ModelFailed(new(retryable ? ErrorCode.Unavailable : ErrorCode.Invalid,
-                    $"OpenAI Chat returned HTTP {(int)response.StatusCode}.", body, retryable));
+                    $"OpenAI Chat returned HTTP {(int)response.StatusCode}: {why}", body, retryable));
                 yield break;
             }
 

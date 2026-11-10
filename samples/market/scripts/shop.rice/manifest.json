@@ -9,7 +9,7 @@
   "trustDomain": "trusted",
   "call": "buy",
   "tool": {
-    "name": "shop.rice",
+    "name": "shop_rice",
     "description": "买饭的结算脚本：2 枚硬币换 100 份白饭",
     "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
     "access": "full"
