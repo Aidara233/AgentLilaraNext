@@ -10,7 +10,14 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
     IChannelSpecStore? specs = null, IMessageStore? messages = null, IParameterRegistry? parameters = null,
     IStateStore? state = null, IRestoreReporter? report = null, IAtomicWork? atomic = null, IQueuedMessageStore? queue = null,
     IArchiveRegistry? archive = null, IInstanceHost? instances = null, IModuleTypeCatalog? types = null,
-    IMediaStore? media = null)
+    IMediaStore? media = null,
+    /// <summary>
+    /// Who the people in these conversations are, when this host keeps an identity table (docs/31). Null is legal and
+    /// means "nobody is recognised": every message then travels with no person on it, which is what every message did
+    /// before the table existed. Optional rather than required because a Channel's job does not become "know who people
+    /// are" — it becomes "carry along what that table said, when there is one".
+    /// </summary>
+    IPersonDirectory? people = null)
     : IChannelManager, IModuleIndex, IModuleWiring, IInstanceSink, ILifecycleParticipant, IModule, IRequireModules
 {
     /// <inheritdoc />
@@ -63,6 +70,8 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
     /// <summary>Where a picture that arrived with a message goes. Null means "this host stores nothing", and then the
     /// attachment is dropped with a note rather than taking the message down with it.</summary>
     private readonly IMediaStore? _media = media;
+    /// <summary>Who is who, when this host has a table for it. Null means every message arrives from a stranger.</summary>
+    private readonly IPersonDirectory? _people = people;
     private IInstanceHost? _instances = instances;
     /// <summary>Instances by name. The address lives on the instance; the name is the key, so nothing has to take one
     /// apart to look something up.</summary>
@@ -478,9 +487,13 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
                     _report.Note("channels", $"the adapter could not name the sender of a message ({ex.Message}); using the id");
                 }
             }
+            // Who said it, by the only name that does not change: the identity table's id (docs/31 §4). Asked once here
+            // and written onto both the message and its row, because it cannot be recomputed later — the table may have
+            // changed and the adapter may be gone. A stranger answers null, which is an answer, not a failure.
+            var person = _people?.Find(envelope.Adapter, envelope.Sender);
             var message = new ChannelMessage(envelope.EventId, channel.Address, binding, envelope.PlatformMessageId,
                 envelope.Text, envelope.At, envelope.Sender, envelope.MentionsSelf, senderRemark, senderName,
-                await IngestAsync(envelope, cancellationToken).ConfigureAwait(false));
+                person?.Id, await IngestAsync(envelope, cancellationToken).ConfigureAwait(false));
             // One fact, one transaction: the history row and the "accepted but unfinished" marker are written
             // together. Half of them is either a message nobody will look at or a marker naming nothing.
             var duplicate = false;
@@ -492,6 +505,7 @@ public sealed partial class ChannelManager(IEventSink events, IInstanceBindings 
                     var recorded = await _messages.AppendAsync(new StoredMessage(envelope.EventId.ToString("D"),
                         channel.Address, envelope.PlatformConversationId, envelope.PlatformMessageId,
                         envelope.Sender, envelope.Text, envelope.At, SenderName: senderName, SenderRemark: senderRemark,
+                        Person: person?.Id,
                         // The delta that reaches a Session an hour later reads this row, so the pointers travel with it:
                         // a message that is half a picture would otherwise look like somebody who said nothing.
                         Media: message.Media),

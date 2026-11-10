@@ -78,6 +78,10 @@ public static class AccessLevels
         [Capabilities.ModelsControl] = AccessLevel.Operator,
         [Capabilities.ParamsWrite] = AccessLevel.Operator,
         [Capabilities.PromptsWrite] = AccessLevel.Operator,
+        // Asking who somebody is costs nothing and answers a question the model would otherwise guess at.
+        [Capabilities.IdentityRead] = AccessLevel.Agent,
+        // Rescanning decides which accounts this process believes belong to whom: a deployment decision.
+        [Capabilities.IdentityControl] = AccessLevel.Operator,
         [Capabilities.ArchiveControl] = AccessLevel.Operator,
         [Capabilities.ModulesControl] = AccessLevel.Operator,
         [Capabilities.GraphControl] = AccessLevel.Operator,
@@ -284,6 +288,18 @@ public static class Capabilities
     public const string PromptsRead = "prompts.read";
     /// Editing a prompt changes what the next turn says. A viewer with prompts.read may look, not rewrite.
     public const string PromptsWrite = "prompts.write";
+
+    /// <summary>
+    /// Who the people in a conversation are. A read, because "who is this" is a question an assistant should answer
+    /// rather than guess from a nickname — the whole point of the identity table (docs/31).
+    /// </summary>
+    public const string IdentityRead = "identity.read";
+
+    /// <summary>
+    /// Reading the identity folder again. Operator level: it decides who this process believes about who said what,
+    /// which is a deployment decision even though no code and no capability changes with it.
+    /// </summary>
+    public const string IdentityControl = "identity.control";
 
     /// <summary>
     /// Asking the folders to be read again. Deliberately not <see cref="GraphControl"/>: a reload applies what is

@@ -20,7 +20,7 @@ namespace ALN.Storage.Sqlite;
 /// </summary>
 public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomicWork, IQueuedMessageStore, IDisposable
 {
-    private const int SchemaVersion = 7;
+    private const int SchemaVersion = 8;
     private const int SqliteConstraint = 19;
     private const int SqliteBusy = 5;
     private const int SqliteLocked = 6;
@@ -112,8 +112,8 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                 return Result.Failure(new(ErrorCode.Invalid, $"Message owner is not a valid instance address: {message.Owner}"));
             using var command = Command(
                 "INSERT INTO message(id, owner, conversation, platform_message_id, sender, sender_name, sender_remark, " +
-                "text, at, direction, reply_to, media) " +
-                "VALUES($id, $owner, $conversation, $platform, $sender, $senderName, $senderRemark, $text, $at, $direction, $replyTo, $media);");
+                "text, at, direction, reply_to, media, person) " +
+                "VALUES($id, $owner, $conversation, $platform, $sender, $senderName, $senderRemark, $text, $at, $direction, $replyTo, $media, $person);");
             command.Parameters.AddWithValue("$id", message.Id);
             command.Parameters.AddWithValue("$owner", message.Owner.ToString());
             command.Parameters.AddWithValue("$conversation", message.PlatformConversationId);
@@ -121,6 +121,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             command.Parameters.AddWithValue("$sender", (object?)message.Sender ?? DBNull.Value);
             command.Parameters.AddWithValue("$senderName", (object?)message.SenderName ?? DBNull.Value);
             command.Parameters.AddWithValue("$senderRemark", (object?)message.SenderRemark ?? DBNull.Value);
+            command.Parameters.AddWithValue("$person", (object?)message.Person ?? DBNull.Value);
             command.Parameters.AddWithValue("$text", message.Text);
             command.Parameters.AddWithValue("$at", Timestamp(message.At));
             command.Parameters.AddWithValue("$direction", (int)message.Direction);
@@ -147,7 +148,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             if (!owner.IsInstance)
                 return Result<IReadOnlyList<StoredMessage>>.Failure(new(ErrorCode.Invalid, $"Not an instance address: {owner}"));
             using var command = Command(
-                "SELECT id, conversation, platform_message_id, sender, sender_name, sender_remark, text, at, direction, reply_to, media FROM message " +
+                "SELECT id, conversation, platform_message_id, sender, sender_name, sender_remark, text, at, direction, reply_to, media, person FROM message " +
                 "WHERE owner=$owner ORDER BY at, id;");
             command.Parameters.AddWithValue("$owner", owner.ToString());
             var messages = new List<StoredMessage>();
@@ -163,9 +164,12 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                     reader.GetString(6),
                     DateTimeOffset.Parse(reader.GetString(7), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
                     (MessageDirection)reader.GetInt32(8), reader.IsDBNull(9) ? null : reader.GetString(9),
-                    reader.IsDBNull(4) ? null : reader.GetString(4),
-                    reader.IsDBNull(5) ? null : reader.GetString(5),
-                    MediaOf(reader.IsDBNull(10) ? null : reader.GetString(10))));
+                    SenderName: reader.IsDBNull(4) ? null : reader.GetString(4),
+                    SenderRemark: reader.IsDBNull(5) ? null : reader.GetString(5),
+                    // Written by a build that had no identity table: the row simply does not name a person, which is
+                    // what every row meant before this column existed (docs/31 §4).
+                    Person: reader.IsDBNull(11) ? null : reader.GetString(11),
+                    Media: MediaOf(reader.IsDBNull(10) ? null : reader.GetString(10))));
             }
             return Result<IReadOnlyList<StoredMessage>>.Success(messages);
         });
@@ -222,7 +226,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
         RunAsync(cancellationToken, Result<IReadOnlyList<StoredMessage>>.Failure, "Message history could not be read.", () =>
         {
             using var command = Command(
-                "SELECT id, conversation, platform_message_id, sender, sender_name, sender_remark, text, at, direction, reply_to, media FROM message " +
+                "SELECT id, conversation, platform_message_id, sender, sender_name, sender_remark, text, at, direction, reply_to, media, person FROM message " +
                 "WHERE owner=$owner ORDER BY at DESC, id DESC LIMIT $limit;");
             command.Parameters.AddWithValue("$owner", owner.ToString());
             command.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 5000));
@@ -237,9 +241,10 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                     reader.GetString(6),
                     DateTimeOffset.Parse(reader.GetString(7), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
                     (MessageDirection)reader.GetInt32(8), reader.IsDBNull(9) ? null : reader.GetString(9),
-                    reader.IsDBNull(4) ? null : reader.GetString(4),
-                    reader.IsDBNull(5) ? null : reader.GetString(5),
-                    MediaOf(reader.IsDBNull(10) ? null : reader.GetString(10))));
+                    SenderName: reader.IsDBNull(4) ? null : reader.GetString(4),
+                    SenderRemark: reader.IsDBNull(5) ? null : reader.GetString(5),
+                    Person: reader.IsDBNull(11) ? null : reader.GetString(11),
+                    Media: MediaOf(reader.IsDBNull(10) ? null : reader.GetString(10))));
             }
             messages.Reverse();
             return Result<IReadOnlyList<StoredMessage>>.Success(messages);
@@ -515,6 +520,13 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
             // would be a second copy per message (docs/28 §3). Older rows have none, which is what they had.
             Execute("ALTER TABLE message ADD COLUMN media TEXT NULL;");
         }
+        if (current < 8 && !HasColumn("message", "person"))
+        {
+            // Which human said this, when the identity table knew him at write time (docs/31 §4). Only the column: the
+            // rows already there keep saying exactly what they said, because a name that was not recorded then cannot
+            // be invented now. A transcript is read for years; a guess would sit in it for as long as it does.
+            Execute("ALTER TABLE message ADD COLUMN person TEXT NULL;");
+        }
         Execute($"PRAGMA user_version = {SchemaVersion};");
     }
 
@@ -580,6 +592,7 @@ public sealed class SqliteStore : IStateStore, IMessageStore, IAuditSink, IAtomi
                 sender TEXT NULL,
                 sender_name TEXT NULL,
                 sender_remark TEXT NULL,
+                person TEXT NULL,
                 text TEXT NOT NULL,
                 at TEXT NOT NULL,
                 direction INTEGER NOT NULL DEFAULT 0,

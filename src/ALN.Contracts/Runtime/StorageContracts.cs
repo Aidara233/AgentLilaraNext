@@ -29,6 +29,12 @@ public sealed record StoredMessage(
     /// <summary>The remark this account had given the sender, when it had one. An extra, never a substitute.</summary>
     string? SenderRemark = null,
     /// <summary>
+    /// The person this message came from, when the identity table knew him when the row was written (docs/31 §4).
+    /// Recorded for the same reason the two name fields above are: who he is cannot be recomputed later — the adapter
+    /// may be gone, the table may have changed, and a transcript read tomorrow should still say who spoke.
+    /// </summary>
+    string? Person = null,
+    /// <summary>
     /// What the message carried that is not words, by reference (docs/28 §3). Stored so that a delta handed to a
     /// Session a minute later still knows a picture came with the sentence — the bytes are on disk, and this is the
     /// pointer the row keeps instead of a copy of them.

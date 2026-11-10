@@ -84,7 +84,16 @@ public sealed record SessionState(
     /// Whether the deadline above ends with this Session being archived. Meaningless without a deadline, which
     /// is why "release without a timeout" is refused instead of being treated as "release never".
     /// </summary>
-    bool WaitRelease = false);
+    bool WaitRelease = false,
+    /// <summary>
+    /// The registered people this Session has seen speak, in the order they were first noticed.
+    ///
+    /// Kept because the roster in the round context has to be <i>this conversation's</i> people, not everybody the
+    /// identity table knows: an assistant told about twelve strangers it has never met reads a page of noise every
+    /// round (docs/31 §5). Absent on a Session written before this field existed — a turn with an empty roster is the
+    /// same thing as a turn before anybody new spoke.
+    /// </summary>
+    IReadOnlyList<string>? People = null);
 
 public sealed record SessionUsage(long InputTokens, long OutputTokens, long CacheReadTokens = 0, long CacheWriteTokens = 0)
 {
@@ -151,7 +160,12 @@ public sealed record SessionChannelMessage(
     /// text is what everything downstream reads when it cannot look: the rendering puts a receipt in the text and the
     /// parts beside it (docs/28 §1, §4).
     /// </summary>
-    IReadOnlyList<MediaRef>? Media = null);
+    IReadOnlyList<MediaRef>? Media = null,
+    /// <summary>
+    /// The person this came from, when the identity table knew him (docs/31 §4). On the timeline record so that a
+    /// transcript read later can still say which human it was — the same reason the two name fields exist beside it.
+    /// </summary>
+    string? Person = null);
 
 /// <summary>Durable channel messages accepted for one Session activation, plus the Channel they came from.</summary>
 public sealed record SessionTurnInput(
@@ -231,14 +245,25 @@ public sealed record RoundContextRequest(
     /// operator may change while the Session runs: a source that cached it would keep offering what it was allowed
     /// to offer when it started.
     /// </summary>
-    AccessLevel Level = AccessLevel.Agent);
+    AccessLevel Level = AccessLevel.Agent,
+    /// <summary>
+    /// The registered people this Session has seen speak, by id (<see cref="SessionState.People"/>). Carried on the
+    /// request so the roster source never has to reach into the Session's own state — a source asks what it was given.
+    /// </summary>
+    IReadOnlyList<string>? People = null);
 
 /// <summary>Ephemeral context to render into this model request; it is never persisted in Session history.</summary>
 public sealed record RoundContextContribution(string Id, string Section, string Content, int Order = 0);
 
 public sealed record SessionTimelineContribution(string Id, string? Sender, string Content, DateTimeOffset At,
     /// <summary>What arrived with it that is not words, by reference (docs/28 §1) — a pointer, never the bytes.</summary>
-    IReadOnlyList<MediaRef>? Media = null);
+    IReadOnlyList<MediaRef>? Media = null,
+    /// <summary>
+    /// The person the message came from, when the identity table knew him (docs/31 §4). Carried so that the turn can
+    /// write it into the timeline and remember that it has met this person — the roster is built from that, and a
+    /// roster rebuilt from message text would have to parse names, which is exactly what the table exists to avoid.
+    /// </summary>
+    string? Person = null);
 
 public interface ISessionTimelineWriter
 {

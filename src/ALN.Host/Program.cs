@@ -93,6 +93,19 @@ var timeSource = sessionExtensions.Register(new TimeContextSource());
 if (!timeSource.Ok) { Console.Error.WriteLine(timeSource.Error?.Message); return 1; }
 var channelInfoSource = sessionExtensions.Register(new ChannelInfoSource());
 if (!channelInfoSource.Ok) { Console.Error.WriteLine(channelInfoSource.Error?.Message); return 1; }
+// Who the people in these conversations are (docs/31): one directory per person under identify/, read once here and
+// again only when somebody asks. No file watching — an edit caught halfway through being saved would become an
+// identity, and a wrong identity is the one kind of mistake that never announces itself.
+var personDirectory = new ALN.Identity.PersonDirectory(data.Root);
+var peopleReport = await personDirectory.ReloadAsync(CancellationToken.None);
+foreach (var problem in peopleReport.Rejected)
+    Console.Error.WriteLine($"identity: {problem.Path}: {problem.Reason}");
+// The table as a tool, and the same table as a few lines every round: one answers "who is this", the other keeps the
+// answer in front of the model so it does not have to ask again after every compaction.
+var identityToolsSource = sessionExtensions.Register(new ALN.Identity.IdentityTools(personDirectory));
+if (!identityToolsSource.Ok) { Console.Error.WriteLine(identityToolsSource.Error?.Message); return 1; }
+var peopleRosterSource = sessionExtensions.Register(new ALN.Identity.PersonRosterSource(personDirectory));
+if (!peopleRosterSource.Ok) { Console.Error.WriteLine(peopleRosterSource.Error?.Message); return 1; }
 // Everything a model may reach on disk goes through this one port, and the scopes it knows are registered here and
 // nowhere else. The memory library is the first; another is added by registering it here and naming it in that
 // module's own module.json — never by a module inventing a path.
@@ -198,6 +211,11 @@ restore.Note("web", webOptions.Search is null && webOptions.Fetch is null
     ? "off — no provider chosen (web/search.json is absent); the tools will not be offered"
     : $"search={webOptions.Search ?? "(none)"} fetch={webOptions.Fetch ?? "(none)"}; " +
       $"can search: {string.Join(", ", webProviders.SearchNames)}; can fetch: {string.Join(", ", webProviders.FetchNames)}");
+restore.Note("identity", peopleReport.People.Count == 0
+    ? $"none — every message arrives from a stranger ({ALN.Identity.PersonDirectory.DirectoryName}/ is absent or empty)"
+    : $"{peopleReport.People.Count} person(s): " + string.Join(", ", peopleReport.People.Select(person =>
+          person.Self ? $"{person.Name} (self)" : $"{person.Name} (L{(int)person.Level})")) +
+      (peopleReport.Rejected.Count == 0 ? "" : $"; {peopleReport.Rejected.Count} refused"));
 // Memory is not in the database any more, so its number is a directory listing rather than a count of rows. A
 // library that cannot be read at startup is not worth stopping for: the receipt says so and the host carries on.
 var memoryGroups = await memoryLibrary.GroupsAsync(CancellationToken.None);
@@ -244,6 +262,15 @@ if (!adapterActions.Ok)
     Console.Error.WriteLine(adapterActions.Error?.Message ?? "Adapter action registration failed.");
     return 1;
 }
+// The identity verbs. Registered here rather than inside a package because the directory itself is a host concern:
+// no plugin owns the folder, and a table that could be replaced by loading a package would be a table somebody could
+// replace by loading a package.
+var identityActions = ALN.Identity.IdentityActionSet.Register(controlPlane, personDirectory, personDirectory);
+if (!identityActions.Ok)
+{
+    Console.Error.WriteLine(identityActions.Error?.Message ?? "Identity action registration failed.");
+    return 1;
+}
 var hostServices = new HostServiceProvider(
     (typeof(IControlPlane), controlPlane),
     (typeof(IAdapterManager), adapters),
@@ -281,6 +308,10 @@ var hostServices = new HostServiceProvider(
     // And the door a bridge fetches a picture through, when one was configured: the adapter asks for it by contract name
     // and gets null when the operator did not open one — which is exactly "keep using base64".
     (typeof(IMediaUrlSource), (object)mediaEndpoint!),
+    // Who is who. Two names for one object: the hot path asks only the reading half, and reloading is a separate
+    // contract so that nothing which identifies a speaker can rebuild the table underneath itself.
+    (typeof(IPersonDirectory), personDirectory),
+    (typeof(IPersonDirectoryReload), personDirectory),
     (typeof(ModuleHostPaths), new ModuleHostPaths(AppContext.BaseDirectory, data.Root)));
 var moduleServices = new ModuleServiceRegistry(hostServices);
 var moduleUnloads = new ModuleUnloadCoordinator();
@@ -359,7 +390,7 @@ if (!registered.Ok)
 // register would look exactly like one with nothing in it.
 restore.Note("modules", $"{modules.Count} registered: {string.Join(", ", modules.List().Where(row => row.Role is not ModuleRole.Instance).Select(row => row.Id.Value))}");
 var channelDelta = new FileChannelDeltaSource(messageStore, stateStore);
-var deltaSource = sessionExtensions.Register(new ChannelDeltaSource(channelDelta, channels));
+var deltaSource = sessionExtensions.Register(new ChannelDeltaSource(channelDelta, channels, personDirectory));
 if (!deltaSource.Ok) { Console.Error.WriteLine(deltaSource.Error?.Message); return 1; }
 // The manager owns adapter startup and the stop sweep; the clock interval belongs to the Adapter, which is the
 // only thing that knows how its transport wants to be polled.

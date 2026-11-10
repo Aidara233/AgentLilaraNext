@@ -11,6 +11,7 @@
     <Project Path="src/ALN.Graph.Contracts/ALN.Graph.Contracts.csproj" />
     <Project Path="src/ALN.Graph/ALN.Graph.csproj" />
     <Project Path="src/ALN.Host/ALN.Host.csproj" />
+    <Project Path="src/ALN.Identity/ALN.Identity.csproj" />
     <Project Path="src/ALN.Model.OpenAIChat/ALN.Model.OpenAIChat.csproj" />
     <Project Path="src/ALN.Net/ALN.Net.csproj" />
     <Project Path="src/ALN.Runtime/ALN.Runtime.csproj" />

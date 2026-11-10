@@ -56,7 +56,9 @@ public sealed class DefaultModulesPlugin : IModulePlugin
                 context.HostServices.GetService(typeof(IChannelSpecStore)) as IChannelSpecStore,
                 context.HostServices.GetService(typeof(IMessageStore)) as IMessageStore,
                 context.HostServices.GetService(typeof(IParameterRegistry)) as IParameterRegistry,
-                state, report, atomic, queue, registry, types: types);
+                state, report, atomic, queue, registry, types: types,
+                // Optional: a host without an identity table still routes messages, they simply arrive from strangers.
+                people: context.HostServices.GetService(typeof(IPersonDirectory)) as IPersonDirectory);
             // The channel verbs are the Channel module's, so it registers them: the table is handed out, not filled in
             // from outside. Failing here is a startup failure — a verb that silently did not exist would only be
             // discovered by whoever tried to use it.

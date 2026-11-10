@@ -1563,7 +1563,7 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
             // offers are gathered before the model is shown anything. Assembly mistakes (a declared tool nobody
             // provides) fail here, before a single token is spent.
             var request = new RoundContextRequest(sessionId, activationId, state.StepNumber + 1,
-                input.Channel ?? PersistedChannel(state), input.Binding, record.Spec.Level);
+                input.Channel ?? PersistedChannel(state), input.Binding, record.Spec.Level, state.People);
             var offered = await CollectToolsAsync(request, cancellationToken).ConfigureAwait(false);
             var resolved = ResolveTools(record.Spec, tools, offered);
             if (!resolved.Ok || resolved.Value is null) return Result<SessionTurnResult>.Failure(resolved.Error!);
@@ -2736,7 +2736,8 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
         var additions = new List<SessionHistoryEntry>();
         foreach (var item in contributions)
         {
-            var message = new SessionChannelMessage(item.Id, item.Source, item.Sender, item.Content, item.At, item.Media);
+            var message = new SessionChannelMessage(item.Id, item.Source, item.Sender, item.Content, item.At, item.Media,
+                item.Person);
             var key = TimelineKey(message.Source, message.Id);
             if (byKey.TryGetValue(key, out var prior))
             {
@@ -2755,7 +2756,11 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
         if (additions.Count == 0)
             return Result<PersistedTimeline>.Success(new(state, record.History));
 
-        var nextState = state with { Revision = state.Revision + 1 };
+        // Who this Session now knows: every registered person who has spoken here, once. Kept on the state rather than
+        // recomputed from the timeline because a compacted timeline loses the older rows, and "I have met this person"
+        // must survive that (docs/31 §5).
+        var known = WithPeople(state.People, additions);
+        var nextState = state with { Revision = state.Revision + 1, People = known };
         var committed = await CommitAsync(record, new SessionPendingCommit(nextState, additions), cancellationToken)
             .ConfigureAwait(false);
         if (!committed.Ok) return Result<PersistedTimeline>.Failure(committed.Error!);
@@ -2763,6 +2768,24 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
     }
 
     private static string TimelineKey(string source, string id) => $"{source}\n{id}";
+
+    /// <summary>
+    /// The state's roster plus whoever these entries say spoke. Order is first-heard, which is stable across rounds
+    /// because appending only ever adds to the end (the roster itself sorts by id when it renders).
+    /// </summary>
+    private static IReadOnlyList<string>? WithPeople(IReadOnlyList<string>? known, IEnumerable<SessionHistoryEntry> entries)
+    {
+        List<string>? people = null;
+        foreach (var person in entries.SelectMany(entry => entry.ChannelMessages ?? []).Select(message => message.Person))
+        {
+            if (string.IsNullOrWhiteSpace(person)) continue;
+            if (known is not null && known.Contains(person, StringComparer.Ordinal)) continue;
+            people ??= known is { Count: > 0 } ? [.. known] : [];
+            if (people.Contains(person, StringComparer.Ordinal)) continue;
+            people.Add(person);
+        }
+        return people ?? known;
+    }
 
     private static IReadOnlyList<SessionChannelMessage> CollectChannelTimeline(IReadOnlyList<SessionHistoryEntry> history)
     {
@@ -3124,7 +3147,7 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
                 throw new ArgumentException($"Timeline contribution from {source} is invalid or oversized.");
             if (collected.Any(existing => StringComparer.Ordinal.Equals(existing.Id, item.Id)))
                 throw new ArgumentException($"Duplicate timeline contribution id from {source}: {item.Id}");
-            collected.Add(new(source, item.Id, item.Sender, item.Content, item.At, item.Media));
+            collected.Add(new(source, item.Id, item.Sender, item.Content, item.At, item.Media, item.Person));
         }
         _ = activationId;
         return collected;
@@ -3334,6 +3357,7 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
     private static bool SameMessage(SessionChannelMessage one, SessionChannelMessage other) =>
         StringComparer.Ordinal.Equals(one.Id, other.Id) && StringComparer.Ordinal.Equals(one.Source, other.Source) &&
         StringComparer.Ordinal.Equals(one.Sender, other.Sender) && StringComparer.Ordinal.Equals(one.Content, other.Content) &&
+        StringComparer.Ordinal.Equals(one.Person, other.Person) &&
         one.At == other.At && SameMedia(one.Media, other.Media);
 
     private static bool SameMedia(IReadOnlyList<MediaRef>? left, IReadOnlyList<MediaRef>? right)    {
@@ -3354,7 +3378,9 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
     private sealed record CollectedRoundContext(string Source, string Id, string Section, string Content, int Order);
     private sealed record CollectedTimelineMessage(string Source, string Id, string? Sender, string Content, DateTimeOffset At,
         /// <summary>What came with it, by reference — the same pointers the row keeps (docs/28 §3).</summary>
-        IReadOnlyList<MediaRef>? Media = null);
+        IReadOnlyList<MediaRef>? Media = null,
+        /// <summary>Who said it, when the identity table knew him (docs/31 §4).</summary>
+        string? Person = null);
     private sealed record CollectedRoundContextSnapshot(
         IReadOnlyList<CollectedRoundContext> RoundContext,
         IReadOnlyList<CollectedTimelineMessage> Timeline,

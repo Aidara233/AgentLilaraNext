@@ -140,6 +140,12 @@ public sealed record ChannelMessage(Guid MessageId, Address Channel, ChannelBind
     /// of them is safe to answer somebody by.</summary>
     string? SenderName = null,
     /// <summary>
+    /// The id of the person these messages come from, when the identity table knows him (docs/31 §4). The id, not the
+    /// name: a name is a label that can be rewritten, and a row that carried it would stop meaning the same person the
+    /// moment somebody fixed a typo in <c>info.json</c>.
+    /// </summary>
+    string? Person = null,
+    /// <summary>
     /// What arrived with the message that was not words: a picture, a voice note, a file — by reference, because the
     /// bytes live once in the media area and a Channel row that inlined them would be a second copy written on every
     /// message (docs/28 §3). The receipt line in <see cref="Text"/> is what a model reads when it is not shown one.

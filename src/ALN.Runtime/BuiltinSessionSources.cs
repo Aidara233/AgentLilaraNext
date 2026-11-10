@@ -42,7 +42,8 @@ public sealed class TimeContextSource(TimeProvider? timeProvider = null) : IFloa
 /// were dropped. A model that is told "and there were 40 more before this" can ask about them; a model that is
 /// silently handed the tail of a conversation cannot even tell that it is missing context.
 /// </summary>
-public sealed class ChannelDeltaSource(IChannelDeltaSource source, IChannelManager channels) : ITimelineSource
+public sealed class ChannelDeltaSource(IChannelDeltaSource source, IChannelManager channels,
+    IPersonDirectory? people = null) : ITimelineSource
 {
     public const string SourceId = "channel.delta";
 
@@ -66,11 +67,19 @@ public sealed class ChannelDeltaSource(IChannelDeltaSource source, IChannelManag
             entries.Add(new SessionTimelineContribution($"omitted-{value.Messages[0].Id}", "system",
                 $"省略更早的 {value.Omitted} 条消息（频道窗口上限）。", value.Messages[0].At));
         foreach (var message in value.Messages)
+        {
+            // The name a stored row carries is what the platform called him that day. If the identity table knows the
+            // account, the conversation says what he is called here instead — so a rename on the platform reads as the
+            // same person rather than as somebody new (docs/31 §4). A stranger keeps the platform's naming untouched.
+            var known = message.Person is { } personId ? people?.FindById(personId) : null;
             entries.Add(new SessionTimelineContribution(message.Id,
-                // The name recorded with the message, then the id. Outbound rows have neither name nor sender, and
-                // the composer already answers that case with an empty string.
-                ChannelMessage.Compose(message.SenderName, message.Sender, message.SenderRemark),
-                message.Text, message.At, message.Media));
+                known is not null
+                    ? ChannelMessage.Compose(known.Name, message.Sender, message.SenderRemark)
+                    // The name recorded with the message, then the id. Outbound rows have neither name nor sender, and
+                    // the composer already answers that case with an empty string.
+                    : ChannelMessage.Compose(message.SenderName, message.Sender, message.SenderRemark),
+                message.Text, message.At, message.Media, message.Person));
+        }
 
         // The cursor moves when this turn has been written down, not now: a turn that dies still owes these
         // messages to the next one.
