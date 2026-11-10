@@ -1,0 +1,6 @@
+{
+  "items": [
+    { "id": "test-candy", "name": "一颗糖",  "use": "use.candy" },
+    { "id": "test-note",  "name": "一张便签", "use": "use.note" }
+  ]
+}

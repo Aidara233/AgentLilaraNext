@@ -483,10 +483,40 @@ if (storedAdapters.Value!.Count == 0)
 using var shutdown = new CancellationTokenSource();
 using var pumpStop = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; shutdown.Cancel(); };
+// Instructions: the one stage between an Adapter and a Channel. An instruction is answered here and the message goes
+// no further — no Channel row, no "accepted but unfinished" marker, no delta, no Session turn — which is only possible
+// before the first dispatcher has seen it. Everything an instruction does, it does by calling the control plane as the
+// person who typed it, so a level is still the only thing that decides depth.
+var commandOptions = ALN.Commands.CommandOptions.FromEnvironment();
+var commandRegistry = new ALN.Commands.CommandRegistry(commandOptions, signalLog, auditSink);
+var commandSeed = ALN.Commands.BuiltinCommands.Register(commandRegistry, controlPlane);
+if (!commandSeed.Ok)
+{
+    Console.Error.WriteLine(commandSeed.Error?.Message ?? "Command registration failed.");
+    return 1;
+}
+var commandInterceptor = new ALN.Commands.CommandInterceptor(commandRegistry, adapters, personDirectory);
+Console.WriteLine($"instructions: prefix '{commandOptions.Prefix}', {commandRegistry.Visible(AccessLevel.Operator).Count} " +
+                  $"for a person, scripted {(commandOptions.Scripted ? "on" : "off")}");
+
+// The purse: Lilara's own money, one number for the whole framework. The shelf and the bag are separate files, and
+// what a purchase yields is decided by the good's script — never by the catalogue.
+var coinScripts = new ALN.Coin.GraphCoinScripts(graph);
+var coinCatalogue = ALN.Coin.CoinCatalogueFile.Load(data.Root, coinScripts);
+foreach (var issue in coinCatalogue.Issues) Console.WriteLine($"market: {issue}");
+var coinLedger = new ALN.Coin.CoinLedger(stateStore, storage, signalLog, auditSink);
+var coinMarket = new ALN.Coin.CoinMarket(coinLedger, coinCatalogue, coinScripts);
+var purse = ALN.Coin.CoinService.Install(sessionExtensions, commandRegistry, coinLedger, coinMarket);
+if (!purse.Ok) Console.Error.WriteLine(purse.Error?.Message ?? "The purse did not install.");
+else
+    Console.WriteLine($"purse: {coinCatalogue.Goods.Count} goods, {coinCatalogue.Items.Count} items on the shelf");
+
 var pump = new EventPump(queue, graph.DispatchAsync, signalLog,
     // Two things are owed after a round: the mailbox file stays claimed until the event it carries is done,
     // and a Channel message stops being "accepted but unfinished" so a restart has nothing to replay.
-    new EventSettlers(new ChannelAcceptSettler(channels), new InboundAckSettler(acks)));
+    new EventSettlers(new ChannelAcceptSettler(channels), new InboundAckSettler(acks)),
+    // Before dispatch: an instruction is taken out of the stream here, so nothing downstream can see it.
+    commandInterceptor);
 var pumpTask = pump.RunAsync(pumpStop.Token);
 var clockTask = clock.RunAsync(shutdown.Token);
 // Deadlines a Session declared with wait. Started here, next to the other long-running loops, so that stopping

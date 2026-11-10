@@ -487,7 +487,12 @@ public sealed class EventQueue : IEventSink
     public void Complete() => _queue.Writer.TryComplete();
 }
 
-public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationToken, ValueTask<Result>> dispatch, ISignalLog signalLog, IEventSettler? settler = null)
+/// <param name="interceptor">
+/// One look at an event before it is dispatched, or null for "nobody needs one". Instructions live here
+/// (<c>ALN.Commands</c>): they answer a message and the message then goes nowhere — no Channel, no script, no Session —
+/// which is only possible before the first dispatcher sees it.
+/// </param>
+public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationToken, ValueTask<Result>> dispatch, ISignalLog signalLog, IEventSettler? settler = null, IEnvelopeInterceptor? interceptor = null)
 {
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -512,7 +517,22 @@ public sealed class EventPump(EventQueue queue, Func<RoutedEvent, CancellationTo
             });
             Result dispatched;
             using (SignalScope.Enter(intakeId, routedEvent.EventId))
-                dispatched = await dispatch(routedEvent, cancellationToken).ConfigureAwait(false);
+            {
+                // The one look before dispatch. A handled event still settles (below): the mailbox file must still be
+                // acknowledged, or a restart would replay a message that has already been answered.
+                Result<EnvelopeDisposition>? intercepted = interceptor is null
+                    ? null
+                    : await interceptor.InterceptAsync(routedEvent, cancellationToken).ConfigureAwait(false);
+                dispatched = intercepted switch
+                {
+                    null => await dispatch(routedEvent, cancellationToken).ConfigureAwait(false),
+                    // Mine, and it went wrong: finished with an error, not passed on. An instruction that failed must
+                    // not fall through to a script and be read as text.
+                    { Ok: false, Error: { } failure } => Result.Failure(failure),
+                    { Value: EnvelopeDisposition.Handled } => Result.Success(),
+                    _ => await dispatch(routedEvent, cancellationToken).ConfigureAwait(false)
+                };
+            }
             if (!dispatched.Ok)
                 signalLog.Write(new()
                 {

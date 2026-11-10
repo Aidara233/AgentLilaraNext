@@ -13,6 +13,8 @@
     <ProjectReference Include="..\ALN.Net\ALN.Net.csproj" />
     <ProjectReference Include="..\ALN.Web\ALN.Web.csproj" />
     <ProjectReference Include="..\ALN.Identity\ALN.Identity.csproj" />
+    <ProjectReference Include="..\ALN.Commands\ALN.Commands.csproj" />
+    <ProjectReference Include="..\ALN.Coin\ALN.Coin.csproj" />
   </ItemGroup>
   <PropertyGroup>
     <OutputType>Exe</OutputType>
