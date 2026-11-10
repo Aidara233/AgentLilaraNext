@@ -74,9 +74,10 @@ public sealed class CoinSampleTests
             var box = Assert.Single(loaded.Value!, package => package.Manifest.Id == "shop.box");
             Assert.Equal("box", box.Manifest.Call);
             Assert.Equal(AccessLevel.Full, box.Level);
-            // The loader binds "call" and the folder decides the level, which is what a purchase needs. It does
-            // <b>not</b> put the manifest's "tool" block on the package: a definition comes from the script's own
-            // describe(), so a settlement script without one has no definition and is still callable (see CanRun).
+            // The catalogue resolves files, not tool definitions: Tool is null here and is filled in later, when the
+            // graph loads the package and asks the script describe(). That is why every sample script has one —
+            // GraphManager.InvokeToolAsync refuses a package whose Tool is still null, so without describe() the shelf
+            // would look fine and every purchase would fail.
             Assert.Null(box.Tool);
             Assert.Equal("box", box.Manifest.Call);
             // scripts/trusted is a person's folder, so the package is Full — that is what lets its script credit the

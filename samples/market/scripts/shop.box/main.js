@@ -18,3 +18,7 @@ async function box(args) {
     bag: [{ item: "test-candy", count: 2 }]
   };
 }
+
+function describe() {
+  return { name: "shop.box", description: "盲盒的结算脚本", parametersJson: "{\"type\":\"object\",\"properties\":{}}", access: "full" };
+}
