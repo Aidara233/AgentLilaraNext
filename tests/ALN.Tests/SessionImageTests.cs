@@ -43,8 +43,11 @@ public sealed class SessionImageTests : IDisposable
             readOnlyScopes: [FileScopes.Media]);
 
     /// <summary>A scripted model: one canned step per call. <paramref name="capabilities"/> is what its profile declares.</summary>
-    private sealed class ScriptedModel(ModelCapabilities? capabilities, params ModelEvent[][] steps) : IModelManager
+    private sealed class ScriptedModel(ModelCapabilities? capabilities, params ModelEvent[][] steps) : IModelManager, IModule
     {
+        /// <summary>Named the way the host's catalog names it, so a manager found by name is this one.</summary>
+        public ModuleId Id { get; } = new(ModuleNames.ModelManager);
+
         public List<ModelRequest> Requests { get; } = [];
 
         public ValueTask<Result<IAsyncEnumerable<ModelEvent>>> CompleteAsync(string profileId, ModelRequest request,
@@ -79,6 +82,34 @@ public sealed class SessionImageTests : IDisposable
         [
             new("default", new Address("model.openai-chat#one"), "scripted", Capabilities: capabilities)
         ];
+    }
+
+    /// <summary>
+    /// A catalog holding one model manager, which is what the host has: it builds the Session manager with
+    /// <c>catalog:</c> and no <c>models:</c>, and the constructor allows that. Anything that then reads a private
+    /// <c>_models</c> field instead of asking the catalog sees null — which is how a profile that declared Vision
+    /// became a model that "cannot see", with the receipt blaming the profile.
+    /// </summary>
+    private sealed class ModelOnlyCatalog(IModule model) : ICatalog
+    {
+        public IModule? Find(ModuleId id) =>
+            string.Equals(id.Value, ModuleNames.ModelManager, StringComparison.Ordinal) ? model : null;
+
+        public Result<IModule> Require(ModuleId id) =>
+            Find(id) is { } found
+                ? Result<IModule>.Success(found)
+                : Result<IModule>.Failure(new(ErrorCode.Invalid, $"Nothing named {id.Value}."));
+
+        public CatalogEntry? Describe(ModuleId id) => Find(id) is { } found
+            ? new CatalogEntry(found.Id, "model.openai-chat", "model", ModuleRole.Manager)
+            : null;
+
+        public IReadOnlyList<CatalogEntry> List(string? category = null, string? typeId = null) =>
+            Describe(model.Id) is { } row ? [row] : [];
+
+        public Result Attach(IModule module) => Result.Success();
+        public Result Observe(IModuleIndex index) => Result.Success();
+        public Result Detach(ModuleId id) => Result.Success();
     }
 
     private sealed class Offers(params SessionToolOffer[] offers) : ISessionToolbox
@@ -144,6 +175,25 @@ public sealed class SessionImageTests : IDisposable
         var picture = Assert.IsType<ImagePart>(context.Parts![^2]);
         Assert.Equal(Png(4, 3), picture.Bytes.ToArray());
         Assert.Equal("image/png", picture.MediaType);
+    }
+
+    [Fact]
+    public async Task A_model_manager_reached_through_the_catalog_sees_pictures_too()
+    {
+        // Installed exactly the way the host installs it: `catalog:`, and no `models:`. The constructor allows that on
+        // purpose ("a session manager needs a model manager, or a catalog to find one in"), and every other lookup here
+        // asks the catalog. `ModelSeesImages` read the private field instead, so on the real host it was null and it
+        // answered "cannot see" for a profile whose file declares Vision — and the receipt blamed the profile for it.
+        var (stored, _) = await StoredPictureAsync();
+        var model = new ScriptedModel(ModelCapabilities.Streaming | ModelCapabilities.Vision,
+            [new ToolCallDelta(0, "call-2", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
+        var sessions = new SessionManager(_root, catalog: new ModelOnlyCatalog(model), files: Access());
+
+        var turn = await sessions.TurnAsync("s-1", Spec([]), Guid.NewGuid(),
+            new SessionTurnInput([Said(stored, "看这个")], null, null), null, default);
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+
+        Assert.Contains(model.Requests[^1].Messages, message => message.HasImage);
     }
 
     [Fact]

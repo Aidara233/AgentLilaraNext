@@ -77,11 +77,13 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
     /// </summary>
     public IReadOnlyList<string> Requires => _catalog is null ? [] : [ModuleNames.ModelManager];
 
-    /// <summary>The model manager, by name when a catalog was given — modules do not hold each other.</summary>
+    /// <summary>The model manager, by name when a catalog was given — modules do not hold each other. Null when this
+    /// host has none: a question that is worth asking "maybe not" is not worth throwing over.</summary>
+    private IModelManager? FindModels() =>
+        _catalog?.Find(new ModuleId(ModuleNames.ModelManager)) as IModelManager ?? _models;
+
     private IModelManager Models =>
-        _catalog?.Find(new ModuleId(ModuleNames.ModelManager)) as IModelManager
-        ?? _models
-        ?? throw new InvalidOperationException("No model manager answered, and none was handed in.");
+        FindModels() ?? throw new InvalidOperationException("No model manager answered, and none was handed in.");
 
     private readonly ISignalLog _signalLog;
     /// <summary>
@@ -3341,8 +3343,13 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
     /// </summary>
     private bool ModelSeesImages(string profileId)
     {
-        if (_models is null || string.IsNullOrWhiteSpace(profileId)) return false;
-        var profile = _models.ListProfiles().FirstOrDefault(candidate =>
+        if (string.IsNullOrWhiteSpace(profileId)) return false;
+        // Asked the same way every other lookup here does it — by name through the catalog. Reading the field directly
+        // was the bug: the host builds this manager with `catalog:` and no `models:`, which the constructor explicitly
+        // allows, so `_models` was null and this answered "cannot see" for a profile whose file declared Vision. Every
+        // picture then arrived as a receipt saying the profile had not declared it, which was a lie about that file.
+        if (FindModels() is not { } models) return false;
+        var profile = models.ListProfiles().FirstOrDefault(candidate =>
             string.Equals(candidate.Id, profileId, StringComparison.Ordinal));
         return profile?.CanSeeImages == true;
     }
