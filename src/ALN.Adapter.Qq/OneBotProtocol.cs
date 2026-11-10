@@ -236,29 +236,87 @@ public static partial class OneBotProtocol
         var images = new List<OneBotImage>();
         if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("message", out var message))
         {
-            if (message.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var segment in message.EnumerateArray())
-                {
-                    if (segment.ValueKind != JsonValueKind.Object) continue;
-                    if (!TryString(segment, "type", out var type) || type != "image") continue;
-                    if (!segment.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) continue;
-                    images.Add(new OneBotImage(
-                        TryString(data, "url", out var url) ? Blank(url) : null,
-                        TryString(data, "file", out var file) ? Blank(file) : null));
-                }
-                return images;
-            }
-            if (message.ValueKind == JsonValueKind.String)
-            {
+            if (message.ValueKind == JsonValueKind.Array) ReadImageSegments(message, images);
+            else if (message.ValueKind == JsonValueKind.String)
                 AppendCqImages(HtmlDecode(message.GetString() ?? string.Empty), images);
-                return images;
-            }
+            // Anything else — null, an object, a number — says nothing here and falls through to raw_message.
         }
-        // The fallback some bridges use when message_format is string but "message" was empty.
+        // The fallback is not only for a bridge that sends no "message" at all. Some send a *flattened* array — the
+        // picture already turned into the text "[图片]" — while raw_message still holds the original CQ code. Reading
+        // only one of the two is how the text says a picture arrived and the bytes never do (the asymmetry that made
+        // this silent: ReadText falls through, ReadImages used to return instead). De-duplicated by what names a
+        // picture on this platform, because both forms describing one picture must not fetch it twice.
         if (root.ValueKind == JsonValueKind.Object && TryString(root, "raw_message", out var raw))
             AppendCqImages(HtmlDecode(raw), images);
         return images;
+    }
+
+    /// <summary>
+    /// What a pushed event carried, as a shape rather than as content: which segment types, in which order, and whether
+    /// raw_message agrees.
+    ///
+    /// This exists because of a failure that had no voice. A bridge may hand a picture over as the <b>text</b>
+    /// "[图片]" — a segment of type <c>text</c> whose body is a placeholder — and then every layer below is correct and
+    /// silent while nobody ever sees a picture: no image segment, so no attachment, so nothing is ingested, so nothing
+    /// is shown. The text still says a picture arrived, which is the whole trap. Naming the shape turns "the model says
+    /// it cannot see pictures" into "the bridge sent the word instead of the picture".
+    ///
+    /// Only type names are reported — never a url, a file name, or any content. This is a diagnostic, not a copy.
+    /// </summary>
+    public static string ShapeOf(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object) return "not an object";
+        var shape = new List<string>(3);
+        if (!root.TryGetProperty("message", out var message)) shape.Add("message: absent");
+        else
+        {
+            switch (message.ValueKind)
+            {
+                case JsonValueKind.Array:
+                    var types = new List<string>(message.GetArrayLength());
+                    foreach (var segment in message.EnumerateArray())
+                        types.Add(segment.ValueKind == JsonValueKind.Object && TryString(segment, "type", out var type)
+                            ? type : "?");
+                    shape.Add($"message: [{string.Join(",", types)}]");
+                    break;
+                case JsonValueKind.String:
+                    shape.Add($"message: {CqTypesOf(HtmlDecode(message.GetString() ?? string.Empty))}");
+                    break;
+                default:
+                    shape.Add($"message: {message.ValueKind.ToString().ToLowerInvariant()}");
+                    break;
+            }
+        }
+        shape.Add(TryString(root, "raw_message", out var raw)
+            ? $"raw_message: {CqTypesOf(HtmlDecode(raw))}"
+            : "raw_message: absent");
+        return string.Join("; ", shape);
+    }
+
+    /// <summary>
+    /// The CQ segment types inside a string message, as names — the same answer <see cref="FlattenCqCodes"/> reads,
+    /// without the words between them. "no CQ" is an answer too: it says the text was handed over pre-flattened, which
+    /// is exactly the case worth telling apart from "the picture was never sent".
+    /// </summary>
+    private static string CqTypesOf(string text)
+    {
+        var types = new List<string>(4);
+        if (text.Length > 0)
+            foreach (Match match in CqCode().Matches(text)) types.Add(match.Groups["type"].Value);
+        return types.Count == 0 ? "no CQ" : string.Join(",", types);
+    }
+
+    private static void ReadImageSegments(JsonElement message, List<OneBotImage> images)
+    {
+        foreach (var segment in message.EnumerateArray())
+        {
+            if (segment.ValueKind != JsonValueKind.Object) continue;
+            if (!TryString(segment, "type", out var type) || type != "image") continue;
+            if (!segment.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) continue;
+            Remember(images, new OneBotImage(
+                TryString(data, "url", out var url) ? Blank(url) : null,
+                TryString(data, "file", out var file) ? Blank(file) : null));
+        }
     }
 
     private static void AppendCqImages(string text, List<OneBotImage> images)
@@ -269,9 +327,30 @@ public static partial class OneBotProtocol
             if (match.Groups["type"].Value != "image") continue;
             var args = match.Groups["args"].Value;
             // CQ arguments escape "&#44;" for a comma and "&#91;" for brackets: left as-is, the url is not a url.
-            images.Add(new OneBotImage(Blank(HtmlDecode(CqArgument(args, "url") ?? "")),
+            Remember(images, new OneBotImage(Blank(HtmlDecode(CqArgument(args, "url") ?? "")),
                 Blank(HtmlDecode(CqArgument(args, "file") ?? ""))));
         }
+    }
+
+    /// <summary>
+    /// One picture, once. The two spellings of a message describe the same picture differently — a segment almost
+    /// always carries both a url and a file name, a CQ code often carries only the name — so the comparison prefers
+    /// the more stable of the two and only falls back to the other when one side is missing it.
+    /// </summary>
+    private static void Remember(List<OneBotImage> images, OneBotImage image)
+    {
+        foreach (var existing in images)
+            if (SamePicture(existing, image)) return;
+        images.Add(image);
+    }
+
+    private static bool SamePicture(OneBotImage one, OneBotImage other)
+    {
+        if (!string.IsNullOrWhiteSpace(one.File) && !string.IsNullOrWhiteSpace(other.File))
+            return string.Equals(one.File, other.File, StringComparison.Ordinal);
+        if (!string.IsNullOrWhiteSpace(one.Url) && !string.IsNullOrWhiteSpace(other.Url))
+            return string.Equals(one.Url, other.Url, StringComparison.Ordinal);
+        return false;
     }
 
     /// <summary>The account the listener is logged in as, from a heartbeat or lifecycle meta event.</summary>

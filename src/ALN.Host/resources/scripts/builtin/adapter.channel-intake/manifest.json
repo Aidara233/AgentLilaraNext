@@ -9,5 +9,5 @@
   "trustDomain": "builtin",
   "maxStatements": 10000,
   "timeoutMilliseconds": 1000,
-  "memoryLimitBytes": 16777216
+  "memoryLimitBytes": 268435456
 }

@@ -464,6 +464,53 @@ public sealed class OneBotProtocolTests
             """), selfId: 10000)!.Text);
     }
 
+    [Fact]
+    public void A_flattened_array_does_not_hide_the_raw_CQ_code()
+    {
+        // The shape that made this silent: the bridge degrades the segment to the text "[图片]" in the array, while
+        // raw_message still holds the picture. ReadText falls through to raw_message and prints "[图片]"; ReadImages
+        // used to return at the array and find nothing — so the text said a picture arrived and no bytes ever did.
+        var images = OneBotProtocol.ReadImages(Parse("""
+            {"post_type":"message","message":[{"type":"text","data":{"text":"[图片]"}}],
+             "raw_message":"[CQ:image,file=c.jpg,url=https://gchat.qpic.cn/z]"}
+            """));
+
+        var image = Assert.Single(images);
+        Assert.Equal("c.jpg", image.File);
+        Assert.Equal("https://gchat.qpic.cn/z", image.Url);
+    }
+
+    [Fact]
+    public void One_picture_described_twice_is_fetched_once()
+    {
+        // Both spellings naming the same picture must not become two downloads: the file name is what the platform
+        // calls it, so that is what decides, and a CQ code that omits the url still matches its segment.
+        var images = OneBotProtocol.ReadImages(Parse("""
+            {"post_type":"message","message":[{"type":"image","data":{"file":"d.png","url":"https://gchat.qpic.cn/d"}}],
+             "raw_message":"[CQ:image,file=d.png]"}
+            """));
+
+        Assert.Single(images);
+    }
+
+    [Fact]
+    public void The_shape_of_an_event_names_the_segment_types_and_nothing_else()
+    {
+        // The diagnostic that turns "the model cannot see pictures" into "the bridge sent the word". Only type names:
+        // a url or a file name in a log line is a copy of something that did not need copying.
+        var shape = OneBotProtocol.ShapeOf(Parse("""
+            {"post_type":"message","message":[{"type":"text","data":{"text":"[图片]"}}],
+             "raw_message":"[CQ:image,file=secret-name.jpg,url=https://gchat.qpic.cn/secret]"}
+            """));
+
+        Assert.Contains("message: [text]", shape, StringComparison.Ordinal);
+        Assert.Contains("raw_message: image", shape, StringComparison.Ordinal);
+        Assert.DoesNotContain("secret", shape, StringComparison.Ordinal);
+        // "No message at all" and "a message with no CQ in it" are different answers, and both are worth telling apart.
+        Assert.Equal("message: absent; raw_message: absent", OneBotProtocol.ShapeOf(Parse("{}")));
+        Assert.Equal("message: no CQ; raw_message: absent", OneBotProtocol.ShapeOf(Parse("""{"message":"纯文字"}""")));
+    }
+
     // ---- files: a pointer, not bytes ---------------------------------------------------------------
 
     [Fact]

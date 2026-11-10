@@ -578,7 +578,7 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
         _names.Nudge();
         // Pictures: the segment says where one is, and fetching it is this Adapter's job. Bounded on purpose — a bridge
         // that hands over a disk image must be told no by size, not by the host running out of memory (docs/28 §5).
-        var attachments = await DownloadAsync(root, CancellationToken.None).ConfigureAwait(false);
+        var attachments = await DownloadAsync(root, inbound.Text, CancellationToken.None).ConfigureAwait(false);
         var envelope = new AdapterEnvelope(Address, Descriptor.PlatformId, inbound.ConversationId,
             inbound.MessageId, inbound.Text, inbound.At, inbound.SenderId, inbound.MentionsSelf,
             inbound.SenderName, _names.Remembered(inbound.SenderId), attachments);
@@ -595,8 +595,22 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
                 ["error"] = journaled.Error?.Message ?? string.Empty
             });
         _acks?.Expect(envelope.EventId, settle => AcknowledgeJournalAsync(envelope.EventId, settle));
+        var payload = JsonSerializer.Serialize(envelope, JsonOptions);
+        // How big a message becomes on its way to the Channel, measured rather than assumed. Picture bytes are base64
+        // inside this JSON, and a script that parses it spends several times the string's size before it can do anything
+        // — which is how an ordinary photo becomes an event large enough to blow a 16 MiB script budget. This line is
+        // what turns that from a mystery into a number.
+        if (payload.Length > InboundPayloadWarnBytes)
+            _log.Warn("an inbound envelope is large", new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["bytes"] = payload.Length.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["attachments"] = (attachments?.Count ?? 0).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["attachmentBytes"] = (attachments?.Sum(attachment => (long)attachment.Bytes.Length) ?? 0)
+                    .ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["shape"] = OneBotProtocol.ShapeOf(root)
+            });
         var published = await _sink.PublishAsync(new RoutedEvent(EventNames.AdapterEnvelope, Address,
-            envelope.EventId, JsonSerializer.Serialize(envelope, JsonOptions)), CancellationToken.None).ConfigureAwait(false);
+            envelope.EventId, payload), CancellationToken.None).ConfigureAwait(false);
         if (!published.Ok)
         {
             // It stays journaled: the next start tries again rather than pretending it was delivered.
@@ -715,10 +729,15 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
     /// because a Content-Length is a claim. <b>The fetch is bounded in time</b> — a bridge whose media endpoint hangs must
     /// not hold up every later message in the socket.
     /// </summary>
-    private async ValueTask<IReadOnlyList<InboundAttachment>?> DownloadAsync(JsonElement root, CancellationToken cancellationToken)
+    private async ValueTask<IReadOnlyList<InboundAttachment>?> DownloadAsync(JsonElement root, string text,
+        CancellationToken cancellationToken)
     {
         var images = OneBotProtocol.ReadImages(root);
-        if (images.Count == 0) return null;
+        if (images.Count == 0)
+        {
+            ReportUndeliveredPicture(root, text);
+            return null;
+        }
         var attachments = new List<InboundAttachment>(images.Count);
         foreach (var image in images)
         {
@@ -728,8 +747,47 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
             // something a model is shown.
             attachments.Add(new InboundAttachment(MediaKind.Image, GuessImageType(bytes, image.File), bytes));
         }
+        // Said out loud, because the interesting number is the one that is smaller: a bridge that offered three
+        // pictures and a fetcher that could reach one of them is a conversation about one picture, and nothing else
+        // downstream can tell that from "he sent one".
+        _log.Info("inbound pictures", new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["offered"] = images.Count.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["fetched"] = attachments.Count.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        });
         return attachments.Count == 0 ? null : attachments;
     }
+
+    /// <summary>
+    /// The bridge said a message carried a picture, and handed over no way to fetch one.
+    ///
+    /// This is the one failure in the inbound media path that used to have no voice at all, and it was the worst one to
+    /// keep quiet: every layer below it behaves correctly, so the only symptom anybody sees is a model insisting it
+    /// cannot see pictures. Two shapes produce it, and they call for opposite fixes — a segment of type <c>text</c> whose
+    /// body is already the placeholder (the bridge degraded it), or no <c>image</c> segment anywhere while the words say
+    /// "[图片]" (the bridge sent the word). <see cref="OneBotProtocol.ShapeOf"/> tells them apart.
+    /// </summary>
+    private void ReportUndeliveredPicture(JsonElement root, string text)
+    {
+        // Only "[图片]": a face, a voice clip or a video is a placeholder this build never fetches by design, so warning
+        // about those would train whoever reads the log to ignore this line.
+        if (!text.Contains(PicturePlaceholder, StringComparison.Ordinal)) return;
+        _log.Warn("a message says it carried a picture but the bridge offered nothing to fetch", new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["shape"] = OneBotProtocol.ShapeOf(root),
+            ["text"] = text.Length > 200 ? text[..200] : text
+        });
+    }
+
+    /// <summary>What a picture becomes in text when it cannot be had. One spelling, so the check above cannot drift.</summary>
+    private const string PicturePlaceholder = "[图片]";
+
+    /// <summary>
+    /// When an envelope's JSON is big enough to be worth a line in the log. A text message is a few hundred bytes even
+    /// with a long paragraph; a picture arrives as base64, so one photo of a megabyte is already 1.4 MB here. One
+    /// mebibyte is the point where the size stops being ordinary and starts being a fact an operator should know.
+    /// </summary>
+    private const int InboundPayloadWarnBytes = 1024 * 1024;
 
     /// <summary>
     /// One picture's bytes, by whichever of the three doors the bridge offers.
