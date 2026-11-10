@@ -1,5 +1,6 @@
 using System.Text.Json;
 using ALN.Contracts;
+using ALN.Graph;
 
 namespace ALN.Tests;
 
@@ -49,6 +50,55 @@ public sealed class CoinSampleTests
         Assert.NotEmpty(items);
         foreach (var (id, script) in goods.Concat(items))
             Assert.True(scripts.Contains(script!), $"{id} points at '{script}', and there is no such folder under scripts/");
+    }
+
+    [Fact]
+    public async Task The_loader_reads_the_sample_manifests()
+    {
+        // The one thing the other tests cannot answer: are the manifest *field names* right? A script is only sold if
+        // the loader resolves it into a callable package, and that resolution is where "call", "trustDomain" and
+        // "mount" have to mean something.
+        var root = Directory.CreateTempSubdirectory("coin-samples-").FullName;
+        try
+        {
+            var programRoot = Path.Combine(root, "program");
+            var dataRoot = Path.Combine(root, "data");
+            var trusted = Path.Combine(dataRoot, "scripts", "trusted");
+            Directory.CreateDirectory(programRoot);
+            Copy(Path.Combine(Samples(), "scripts"), trusted);
+
+            var catalog = new JsonScriptCatalog(programRoot, dataRoot);
+            var loaded = await catalog.LoadAsync(default);
+
+            Assert.True(loaded.Ok, loaded.Error?.Message);
+            var box = Assert.Single(loaded.Value!, package => package.Manifest.Id == "shop.box");
+            Assert.Equal("box", box.Manifest.Call);
+            Assert.Equal(AccessLevel.Full, box.Level);
+            // The loader binds "call" and the folder decides the level, which is what a purchase needs. It does
+            // <b>not</b> put the manifest's "tool" block on the package: a definition comes from the script's own
+            // describe(), so a settlement script without one has no definition and is still callable (see CanRun).
+            Assert.Null(box.Tool);
+            Assert.Equal("box", box.Manifest.Call);
+            // scripts/trusted is a person's folder, so the package is Full — that is what lets its script credit the
+            // purse through coin.credit.
+            Assert.Equal(AccessLevel.Full, box.Level);
+            // Every sample script must resolve, not just the box: a manifest the loader drops is a product that sells
+            // nothing, and the shelf would silently shrink.
+            Assert.Equal(7, loaded.Value!.Count);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    private static void Copy(string source, string target)
+    {
+        Directory.CreateDirectory(target);
+        foreach (var file in Directory.EnumerateFiles(source))
+            File.Copy(file, Path.Combine(target, Path.GetFileName(file)));
+        foreach (var directory in Directory.EnumerateDirectories(source))
+            Copy(directory, Path.Combine(target, Path.GetFileName(directory)));
     }
 
     [Fact]

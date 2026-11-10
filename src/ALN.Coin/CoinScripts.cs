@@ -20,10 +20,17 @@ public interface ICoinScripts
 /// <summary>The production answer: the graph's tool scripts, which are the only ones with "one entry, one answer".</summary>
 public sealed class GraphCoinScripts(IGraphRuntime graph) : ICoinScripts
 {
+    /// <summary>
+    /// Callable means "the manifest names an entry point", not "the tool definition was resolved". Resolving a
+    /// definition is what the loader does for the model's tool list, and it prefers the script's own <c>describe()</c>
+    /// over the manifest's <c>tool</c> block — so a settlement script that has a <c>call</c> but no <c>describe()</c>
+    /// has no definition and is still perfectly callable. Gating the shelf on that would hide every such script.
+    /// </summary>
     public bool CanRun(string script) =>
-        graph.ToolScripts.Any(package => string.Equals(package.Manifest.Id, script, StringComparison.Ordinal)) &&
         graph.Scripts.Any(entry =>
-            string.Equals(entry.Package.Manifest.Id, script, StringComparison.Ordinal) && entry.Enabled);
+            entry.Enabled &&
+            string.Equals(entry.Package.Manifest.Id, script, StringComparison.Ordinal) &&
+            entry.Package.Manifest.Call is not null);
 
     public ValueTask<Result<string>> InvokeAsync(string script, string argumentsJson,
         CancellationToken cancellationToken) =>
