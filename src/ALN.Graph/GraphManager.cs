@@ -36,7 +36,12 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         Capabilities.NetRead,
         // The raw door, reachable from a script that declares it: ctx.actions.call('http.request', …). No allowlist
         // stands in front of it, so the audit line is the only record — which is why the name is this explicit.
-        Capabilities.NetRequest
+        Capabilities.NetRequest,
+        // The purse and the larder (docs/33, docs/34). Neither name is in AccessLevels, so both answer Full — a
+        // settlement script may move money and rice exactly when it could already do anything else. They are listed
+        // here because a capability a script cannot name is a capability no script can use: the shelf script that
+        // buys rice was rejected for declaring rice.control, and the only symptom was an empty shop.
+        "coin.control", "rice.control"
     };
     private readonly ICatalog _catalog;
     private readonly IModuleTypeCatalog _types;
