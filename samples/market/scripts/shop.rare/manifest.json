@@ -3,7 +3,7 @@
   "version": 1,
   "targetType": "channel",
   "mount": "manual",
-  "events": [],
+  "events": ["channel.message.accepted"],
   "entryPoint": "main",
   "capabilities": [],
   "trustDomain": "trusted",

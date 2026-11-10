@@ -121,6 +121,9 @@ public sealed class CoinSampleTests
             // events; call is the one the purse invokes.
             Assert.False(string.IsNullOrWhiteSpace(manifest.GetProperty("entryPoint").GetString()));
             Assert.False(string.IsNullOrWhiteSpace(manifest.GetProperty("call").GetString()));
+            // WhyRejected refuses a script that declares no event at all, even one whose only job is to settle a
+            // purchase — so "events": [] is not a valid manifest, it is a script that never loads.
+            Assert.NotEmpty(manifest.GetProperty("events").EnumerateArray());
             Assert.True(File.Exists(Path.Combine(folder, "main.js")), $"{name} has no main.js");
         }
     }
