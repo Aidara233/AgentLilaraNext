@@ -1,4 +1,6 @@
 using ALN.Contracts.Models;
+using System.Globalization;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace ALN.Contracts.Sessions;
@@ -54,6 +56,86 @@ public sealed record SessionToolPolicy(IReadOnlyList<string>? Only = null, IRead
     }
 }
 
+/// <summary>
+/// One registered person this Session has met, and when he last said something here.
+///
+/// The time is what makes the roster answer the question it is asked: a conversation with forty people in its history
+/// must still put the two who are talking now in front of the model, and only the last-spoken time can tell it which
+/// two those are (docs/31 §5).
+/// </summary>
+public sealed record PersonSeen(string Id, DateTimeOffset At);
+
+/// <summary>
+/// Reads and writes <see cref="SessionState.People"/>, and tolerates the shape it had before it carried times.
+///
+/// A plain <c>string[]</c> is still on disk in every Session written before this release. Changing the property's type
+/// without this would make those files fail to deserialize — and a Session whose state cannot be read is treated as
+/// "not mine" and quietly rebuilt, which is the worst way to lose a conversation. A bare id reads as
+/// <see cref="DateTimeOffset.MinValue"/>: "he spoke here, we did not write down when", which sorts last and is honest
+/// about what the file actually said.
+/// </summary>
+public sealed class PersonSeenJson : JsonConverter<IReadOnlyList<PersonSeen>?>
+{
+    public override IReadOnlyList<PersonSeen>? Read(ref Utf8JsonReader reader, Type typeToConvert,
+        JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.Null) return null;
+        if (reader.TokenType != JsonTokenType.StartArray)
+            throw new JsonException("people must be an array of ids or of {id, at} objects.");
+        var people = new List<PersonSeen>();
+        while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+        {
+            if (reader.TokenType == JsonTokenType.String)
+            {
+                if (reader.GetString() is { Length: > 0 } legacy) people.Add(new PersonSeen(legacy, DateTimeOffset.MinValue));
+                continue;
+            }
+            if (reader.TokenType != JsonTokenType.StartObject)
+            {
+                reader.Skip();
+                continue;
+            }
+            string? id = null;
+            var at = DateTimeOffset.MinValue;
+            while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
+            {
+                if (reader.TokenType != JsonTokenType.PropertyName) continue;
+                var name = reader.GetString();
+                if (!reader.Read()) break;
+                if (string.Equals(name, "id", StringComparison.OrdinalIgnoreCase) && reader.TokenType == JsonTokenType.String)
+                    id = reader.GetString();
+                else if (string.Equals(name, "at", StringComparison.OrdinalIgnoreCase) &&
+                         reader.TokenType == JsonTokenType.String &&
+                         DateTimeOffset.TryParse(reader.GetString(), CultureInfo.InvariantCulture,
+                             DateTimeStyles.RoundtripKind, out var parsed))
+                    at = parsed;
+                else
+                    reader.Skip();
+            }
+            if (!string.IsNullOrWhiteSpace(id)) people.Add(new PersonSeen(id, at));
+        }
+        return people;
+    }
+
+    public override void Write(Utf8JsonWriter writer, IReadOnlyList<PersonSeen>? value, JsonSerializerOptions options)
+    {
+        if (value is null)
+        {
+            writer.WriteNullValue();
+            return;
+        }
+        writer.WriteStartArray();
+        foreach (var person in value)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("id", person.Id);
+            writer.WriteString("at", person.At);
+            writer.WriteEndObject();
+        }
+        writer.WriteEndArray();
+    }
+}
+
 /// <summary>Persisted state. Phase is intentionally transient and is not stored here.</summary>
 public sealed record SessionState(
     SessionStatus Status,
@@ -86,14 +168,14 @@ public sealed record SessionState(
     /// </summary>
     bool WaitRelease = false,
     /// <summary>
-    /// The registered people this Session has seen speak, in the order they were first noticed.
+    /// The registered people this Session has met, each with the last time he said something here.
     ///
-    /// Kept because the roster in the round context has to be <i>this conversation's</i> people, not everybody the
-    /// identity table knows: an assistant told about twelve strangers it has never met reads a page of noise every
-    /// round (docs/31 §5). Absent on a Session written before this field existed — a turn with an empty roster is the
-    /// same thing as a turn before anybody new spoke.
+    /// Kept because the roster in the round context has to be <i>this conversation's</i> people, and ordered by who is
+    /// still talking rather than by who arrived first: a conversation that has met forty people must still show the
+    /// two in it now (docs/31 §5). Absent on a Session written before this field existed — and a file written when it
+    /// was a plain list of ids still reads, through <see cref="PersonSeenJson"/>.
     /// </summary>
-    IReadOnlyList<string>? People = null);
+    [property: JsonConverter(typeof(PersonSeenJson))] IReadOnlyList<PersonSeen>? People = null);
 
 public sealed record SessionUsage(long InputTokens, long OutputTokens, long CacheReadTokens = 0, long CacheWriteTokens = 0)
 {
@@ -247,10 +329,11 @@ public sealed record RoundContextRequest(
     /// </summary>
     AccessLevel Level = AccessLevel.Agent,
     /// <summary>
-    /// The registered people this Session has seen speak, by id (<see cref="SessionState.People"/>). Carried on the
-    /// request so the roster source never has to reach into the Session's own state — a source asks what it was given.
+    /// The registered people this Session has met, by id and last-spoken time (<see cref="SessionState.People"/>).
+    /// Carried on the request so the roster source never has to reach into the Session's own state — a source asks what
+    /// it was given.
     /// </summary>
-    IReadOnlyList<string>? People = null);
+    IReadOnlyList<PersonSeen>? People = null);
 
 /// <summary>Ephemeral context to render into this model request; it is never persisted in Session history.</summary>
 public sealed record RoundContextContribution(string Id, string Section, string Content, int Order = 0);

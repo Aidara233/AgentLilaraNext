@@ -233,7 +233,7 @@ public sealed class IdentityTests : IDisposable
         var roster = new PersonRosterSource(people);
 
         // Met in the order b, a — the roster sorts by id, so two rounds cannot disagree about who is in the room.
-        var collected = await roster.CollectAsync(Request(people: ["b", "a"]), default);
+        var collected = await roster.CollectAsync(Request(people: [Seen("b", spokenMinutesAgo: 10), Seen("a")]), default);
         var text = Assert.Single(collected.Value!).Content;
 
         Assert.Equal("小林（L1 operator）：我妹妹。\n阿伟", text);
@@ -253,7 +253,9 @@ public sealed class IdentityTests : IDisposable
         var people = await Load();
         var roster = new PersonRosterSource(people);
 
-        var text = Assert.Single((await roster.CollectAsync(Request(people: ids), default)).Value!).Content;
+        var text = Assert.Single((await roster.CollectAsync(
+            Request(people: ids.Select((id, index) => new PersonSeen(id, Stamp(spokenMinutesAgo: index))).ToArray()),
+            default)).Value!).Content;
 
         // Twelve lines and a fourteenth: the count is what a model needs in order to know it may ask about more.
         Assert.Contains("还有 2 个", text, StringComparison.Ordinal);
@@ -678,6 +680,63 @@ public sealed class IdentityTests : IDisposable
         Assert.DoesNotContain("路人丙（", next, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task The_roster_puts_the_people_who_are_talking_now_first()
+    {
+        var ids = new List<string>();
+        for (var index = 0; index < 14; index++)
+        {
+            var id = $"p{index:00}";
+            Write(id, $$"""{"name":"人{{index}}","accounts":[{"adapter":"adapter.qq#main","account":"{{index}}"}]}""");
+            ids.Add(id);
+        }
+        var people = await Load();
+        var roster = new PersonRosterSource(people);
+
+        // The two that spoke most recently are the last two by id, so a roster capped by "first twelve by id" would
+        // have left exactly them out — which is the bug this ordering exists to prevent.
+        var seen = ids.Select((id, index) => new PersonSeen(id, Stamp(spokenMinutesAgo: 100 - index))).ToArray();
+        var text = Assert.Single((await roster.CollectAsync(Request(people: seen), default)).Value!).Content;
+
+        Assert.Contains("人12", text, StringComparison.Ordinal);
+        Assert.Contains("人13", text, StringComparison.Ordinal);
+        // The two that have been quiet longest are the two that fall off, and the count says how many did.
+        Assert.DoesNotContain("人0\n", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("人1\n", text, StringComparison.Ordinal);
+        Assert.Contains("还有 2 个", text, StringComparison.Ordinal);
+        // Among the twelve that make it, the order is still by id, so two rounds agree about who is present.
+        Assert.True(text.IndexOf("人10", StringComparison.Ordinal) < text.IndexOf("人12", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_roster_file_written_before_the_times_carried_existed_still_reads()
+    {
+        // Exactly what the previous release wrote: a list of ids. Reading it as anything else would make the Session's
+        // state unreadable, and an unreadable state is treated as "not mine" and quietly rebuilt.
+        var legacy = JsonSerializer.Deserialize<SessionState>(
+            """{"status":0,"stepNumber":3,"revision":9,"locked":false,"usage":{"inputTokens":1,"outputTokens":2},"schemaVersion":2,"people":["a","b"]}""",
+            new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+        Assert.NotNull(legacy);
+        Assert.Equal(["a", "b"], legacy!.People!.Select(seen => seen.Id));
+        Assert.All(legacy.People!, seen => Assert.Equal(DateTimeOffset.MinValue, seen.At));
+    }
+
+    [Fact]
+    public async Task The_state_round_trips_the_times_it_now_keeps()
+    {
+        var state = new SessionState(SessionStatus.Dormant, 3, 9, false, new SessionUsage(1, 2), 2,
+            People: [new PersonSeen("aidara", Stamp(spokenMinutesAgo: 5))]);
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+
+        var text = JsonSerializer.Serialize(state, options);
+        var back = JsonSerializer.Deserialize<SessionState>(text, options)!;
+
+        var seen = Assert.Single(back.People!);
+        Assert.Equal("aidara", seen.Id);
+        Assert.Equal(Stamp(spokenMinutesAgo: 5), seen.At);
+    }
+
     // ---- helpers ---------------------------------------------------------------------------------
 
     private void Write(string id, string json)
@@ -719,8 +778,14 @@ public sealed class IdentityTests : IDisposable
     }
 
     /// <summary>A round request with nothing but what the roster needs: a Session id and who it has met.</summary>
-    private static RoundContextRequest Request(IReadOnlyList<string>? people = null) =>
+    private static RoundContextRequest Request(IReadOnlyList<PersonSeen>? people = null) =>
         new("s-1", Guid.NewGuid(), 2, Channel, new ChannelBinding(Adapter, "group-123456"), AccessLevel.Agent, people);
+
+    /// <summary>A fixed instant, earlier the larger <paramref name="spokenMinutesAgo"/> is.</summary>
+    private static DateTimeOffset Stamp(int spokenMinutesAgo = 0) =>
+        new DateTimeOffset(2026, 11, 1, 8, 0, 0, TimeSpan.Zero).AddMinutes(-spokenMinutesAgo);
+
+    private static PersonSeen Seen(string id, int spokenMinutesAgo = 0) => new(id, Stamp(spokenMinutesAgo));
 
     private SqliteStore OpenStore()
     {

@@ -51,28 +51,34 @@ public sealed class PersonRosterSource(IPersonDirectory people) : IFloatingConte
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (request.People is not { Count: > 0 } ids)
+        if (request.People is not { Count: > 0 } seen)
             return ValueTask.FromResult(Result<IReadOnlyList<RoundContextContribution>>.Success([]));
 
-        // Sorted by id, not by appearance and not by depth: a roster that changes order between two rounds reads as
-        // people having changed, which is the one thing it must never suggest (docs/31 §5).
-        var persons = ids
-            .Select(id => _people.FindById(id))
-            .OfType<Person>()
-            .OrderBy(person => person.Id, StringComparer.Ordinal)
+        // Who is still in the room, by when he was last heard. Selection by time, presentation by id: the twelve that
+        // make it are the twelve talking lately, and those twelve keep a stable order so two rounds cannot disagree
+        // about who is present (docs/31 §5).
+        var known = seen
+            .Select(entry => _people.FindById(entry.Id) is { } person ? (Person: person, entry.At) : default)
+            .Where(candidate => candidate.Person is not null)
             .ToArray();
-        if (persons.Length == 0)
+        if (known.Length == 0)
             return ValueTask.FromResult(Result<IReadOnlyList<RoundContextContribution>>.Success([]));
 
-        var shown = persons.Take(MaxPeople).Select(Line).ToList();
-        if (persons.Length > shown.Count)
+        var recent = known
+            .OrderByDescending(candidate => candidate.At)
+            .ThenBy(candidate => candidate.Person!.Id, StringComparer.Ordinal)
+            .Take(MaxPeople)
+            .OrderBy(candidate => candidate.Person!.Id, StringComparer.Ordinal)
+            .Select(candidate => Line(candidate.Person!))
+            .ToList();
+        if (known.Length > recent.Count)
             // Said out loud rather than silently cut: a model that is told the roster is incomplete can look one up;
             // a model handed a truncated list believes it has seen everybody.
-            shown.Add($"（还有 {persons.Length - shown.Count} 个登记过的人也在这里说过话，没列出来。）");
+            recent.Add($"（还有 {known.Length - recent.Count} 个登记过的人也在这里说过话，没列出来。）");
 
         IReadOnlyList<RoundContextContribution> sections =
         [
-            new RoundContextContribution("people", SectionName, string.Join('\n', shown), Order)
+            new RoundContextContribution("people", SectionName, string.Join('\n', recent), Order)
         ];
         return ValueTask.FromResult(Result<IReadOnlyList<RoundContextContribution>>.Success(sections));
     }

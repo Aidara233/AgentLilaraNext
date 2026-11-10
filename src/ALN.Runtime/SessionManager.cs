@@ -2770,21 +2770,31 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, IMo
     private static string TimelineKey(string source, string id) => $"{source}\n{id}";
 
     /// <summary>
-    /// The state's roster plus whoever these entries say spoke. Order is first-heard, which is stable across rounds
-    /// because appending only ever adds to the end (the roster itself sorts by id when it renders).
+    /// The state's roster plus whoever these entries say spoke, each keeping the latest time he was heard.
+    ///
+    /// Late rather than first: a person who has been quiet for a week should not push out the one who spoke a minute
+    /// ago, and the roster is capped (docs/31 §5). Two messages from the same person in one hand-out take the later
+    /// time — a batch can arrive out of order.
     /// </summary>
-    private static IReadOnlyList<string>? WithPeople(IReadOnlyList<string>? known, IEnumerable<SessionHistoryEntry> entries)
+    private static IReadOnlyList<PersonSeen>? WithPeople(IReadOnlyList<PersonSeen>? known,
+        IEnumerable<SessionHistoryEntry> entries)
     {
-        List<string>? people = null;
-        foreach (var person in entries.SelectMany(entry => entry.ChannelMessages ?? []).Select(message => message.Person))
+        Dictionary<string, PersonSeen>? merged = null;
+        foreach (var (person, at) in entries.SelectMany(entry => entry.ChannelMessages ?? [])
+                     .Where(message => !string.IsNullOrWhiteSpace(message.Person))
+                     .Select(message => (message.Person!, message.At)))
         {
-            if (string.IsNullOrWhiteSpace(person)) continue;
-            if (known is not null && known.Contains(person, StringComparer.Ordinal)) continue;
-            people ??= known is { Count: > 0 } ? [.. known] : [];
-            if (people.Contains(person, StringComparer.Ordinal)) continue;
-            people.Add(person);
+            merged ??= known is { Count: > 0 }
+                ? known.ToDictionary(seen => seen.Id, StringComparer.Ordinal)
+                : new Dictionary<string, PersonSeen>(StringComparer.Ordinal);
+            merged[person] = merged.TryGetValue(person, out var prior) && prior.At >= at
+                ? prior
+                : new PersonSeen(person, at);
         }
-        return people ?? known;
+        if (merged is null) return known;
+        // Stored in id order so the file is diffable and two runs against the same history write the same bytes; the
+        // roster does its own ordering by time when it renders.
+        return merged.Values.OrderBy(seen => seen.Id, StringComparer.Ordinal).ToArray();
     }
 
     private static IReadOnlyList<SessionChannelMessage> CollectChannelTimeline(IReadOnlyList<SessionHistoryEntry> history)
