@@ -1,0 +1,17 @@
+{
+  "id": "shop.box",
+  "version": 1,
+  "targetType": "channel",
+  "mount": "manual",
+  "events": [],
+  "entryPoint": "main",
+  "capabilities": [],
+  "trustDomain": "trusted",
+  "call": "box",
+  "tool": {
+    "name": "shop.box",
+    "description": "盲盒的结算脚本",
+    "parametersJson": "{\"type\":\"object\",\"properties\":{}}",
+    "access": "full"
+  }
+}
