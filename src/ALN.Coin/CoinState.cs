@@ -16,12 +16,14 @@ public sealed record CoinState(
     long Revision,
     IReadOnlyList<CoinStack> Bag,
     IReadOnlyDictionary<string, int> Sold,
-    IReadOnlyDictionary<string, IReadOnlyDictionary<string, int>> Purchased)
+    IReadOnlyDictionary<string, IReadOnlyDictionary<string, int>> Purchased,
+    IReadOnlyList<string>? Settled = null)
 {
     public static CoinState Empty(long balance = 0) => new(
         balance, 0, [],
         new Dictionary<string, int>(StringComparer.Ordinal),
-        new Dictionary<string, IReadOnlyDictionary<string, int>>(StringComparer.Ordinal));
+        new Dictionary<string, IReadOnlyDictionary<string, int>>(StringComparer.Ordinal),
+        []);
 
     /// <summary>How many of one thing the purse currently holds. Zero when it holds none.</summary>
     public int CountOf(string item) =>

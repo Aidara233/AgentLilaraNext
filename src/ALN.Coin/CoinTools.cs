@@ -123,7 +123,7 @@ public sealed class CoinToolSource(CoinLedger ledger, CoinMarket market) : ISess
         var count = arguments.Value.TryGetProperty("count", out var many) && many.TryGetInt32(out var parsed) ? parsed : 1;
         if (string.IsNullOrWhiteSpace(id)) return Failure(new(ErrorCode.Invalid, "要说买哪一件：id。"));
 
-        var trade = await market.BuyAsync(sessionId, id!, count, $"model:{sessionId}", cancellationToken)
+        var trade = await market.BuyAsync(sessionId, id!, count, $"model:{sessionId}", cancellationToken, call.Id)
             .ConfigureAwait(false);
         if (!trade.Ok || trade.Value is null) return Failure(trade.Error!);
         return Answer(JsonSerializer.Serialize(new
@@ -143,7 +143,7 @@ public sealed class CoinToolSource(CoinLedger ledger, CoinMarket market) : ISess
         var count = arguments.Value.TryGetProperty("count", out var many) && many.TryGetInt32(out var parsed) ? parsed : 1;
         if (string.IsNullOrWhiteSpace(id)) return Failure(new(ErrorCode.Invalid, "要说用哪一件：id。"));
 
-        var trade = await market.UseAsync(sessionId, id!, count, $"model:{sessionId}", cancellationToken)
+        var trade = await market.UseAsync(sessionId, id!, count, $"model:{sessionId}", cancellationToken, call.Id)
             .ConfigureAwait(false);
         if (!trade.Ok || trade.Value is null) return Failure(trade.Error!);
         return Answer(JsonSerializer.Serialize(new

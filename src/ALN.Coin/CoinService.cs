@@ -43,9 +43,11 @@ public sealed class CoinContextSource(CoinLedger ledger, CoinMarket market) : IF
 /// </summary>
 public static class CoinService
 {
-    public static Result Install(ISessionExtensionRegistry extensions, ICommandRegistry commands, CoinLedger ledger,
-        CoinMarket market)
+    public static Result Install(ISessionExtensionRegistry extensions, ICommandRegistry commands, IControlPlane plane,
+        CoinLedger ledger, CoinMarket market)
     {
+        var verbs = CoinActions.Register(plane, ledger);
+        if (!verbs.Ok) return verbs;
         var tools = extensions.Register(new CoinToolSource(ledger, market));
         if (!tools.Ok) return tools;
         var context = extensions.Register(new CoinContextSource(ledger, market));

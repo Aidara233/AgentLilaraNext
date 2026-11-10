@@ -506,7 +506,7 @@ var coinCatalogue = ALN.Coin.CoinCatalogueFile.Load(data.Root, coinScripts);
 foreach (var issue in coinCatalogue.Issues) Console.WriteLine($"market: {issue}");
 var coinLedger = new ALN.Coin.CoinLedger(stateStore, storage, signalLog, auditSink);
 var coinMarket = new ALN.Coin.CoinMarket(coinLedger, coinCatalogue, coinScripts);
-var purse = ALN.Coin.CoinService.Install(sessionExtensions, commandRegistry, coinLedger, coinMarket);
+var purse = ALN.Coin.CoinService.Install(sessionExtensions, commandRegistry, controlPlane, coinLedger, coinMarket);
 if (!purse.Ok) Console.Error.WriteLine(purse.Error?.Message ?? "The purse did not install.");
 else
     Console.WriteLine($"purse: {coinCatalogue.Goods.Count} goods, {coinCatalogue.Items.Count} items on the shelf");

@@ -33,7 +33,7 @@ public sealed class CoinMarket(CoinLedger ledger, CoinCatalogue catalogue, ICoin
     public int Capacity => capacity;
 
     public async ValueTask<Result<CoinTradeResult>> BuyAsync(string sessionId, string goodId, int count,
-        string actor, CancellationToken cancellationToken)
+        string actor, CancellationToken cancellationToken, string? idempotencyKey = null)
     {
         if (count is < 1 or > 99)
             return Result<CoinTradeResult>.Failure(new(ErrorCode.Invalid, $"一次买 1 到 99 件（收到 {count}）。"));
@@ -45,6 +45,13 @@ public sealed class CoinMarket(CoinLedger ledger, CoinCatalogue catalogue, ICoin
         var before = await ledger.ReadAsync(cancellationToken).ConfigureAwait(false);
         if (!before.Ok || before.Value is null) return Result<CoinTradeResult>.Failure(before.Error!);
         var purse = before.Value;
+
+        // A retried tool call must not buy twice. The Channel's duplicate check is not in this path, and a model that
+        // times out does retry — so the key it was called with is the only thing standing between a timeout and a
+        // second purchase.
+        if (idempotencyKey is not null && (purse.Settled?.Contains(idempotencyKey, StringComparer.Ordinal) ?? false))
+            return Result<CoinTradeResult>.Failure(new(ErrorCode.Conflict,
+                "这一次已经结算过了，没有重复扣款。"));
 
         // Stock is checked here for the message and again inside the transaction: this one is for the model, that one
         // is the one that holds.
@@ -78,7 +85,7 @@ public sealed class CoinMarket(CoinLedger ledger, CoinCatalogue catalogue, ICoin
         {
             if (good.Stock >= 0 && state.SoldOf(good.Id) + count > good.Stock)
                 return Result<CoinState>.Failure(new(ErrorCode.Conflict, $"{good.Name} 已经卖完了。"));
-            return Apply(state, settled.Value!.Bag, good.Id, count, sessionId);
+            return Apply(state, settled.Value!.Bag, good.Id, count, sessionId, idempotencyKey);
         }, cancellationToken).ConfigureAwait(false);
         if (!applied.Ok)
             return await RefundAsync(paid.Value!, price, $"buy:{good.Id}", actor, applied.Error!, cancellationToken)
@@ -89,7 +96,7 @@ public sealed class CoinMarket(CoinLedger ledger, CoinCatalogue catalogue, ICoin
     }
 
     public async ValueTask<Result<CoinTradeResult>> UseAsync(string sessionId, string itemId, int count,
-        string actor, CancellationToken cancellationToken)
+        string actor, CancellationToken cancellationToken, string? idempotencyKey = null)
     {
         var item = catalogue.FindItem(itemId);
         if (item is null)
@@ -98,6 +105,8 @@ public sealed class CoinMarket(CoinLedger ledger, CoinCatalogue catalogue, ICoin
         var read = await ledger.ReadAsync(cancellationToken).ConfigureAwait(false);
         if (!read.Ok || read.Value is null) return Result<CoinTradeResult>.Failure(read.Error!);
         var have = read.Value.CountOf(item.Id);
+        if (idempotencyKey is not null && (read.Value.Settled?.Contains(idempotencyKey, StringComparer.Ordinal) ?? false))
+            return Result<CoinTradeResult>.Failure(new(ErrorCode.Conflict, "这一次已经结算过了。"));
         var wanted = count < 1 ? 1 : count;
         if (have < wanted)
             return Result<CoinTradeResult>.Failure(new(ErrorCode.Conflict, $"只有 {have} 件 {item.Name}。"));
@@ -116,7 +125,7 @@ public sealed class CoinMarket(CoinLedger ledger, CoinCatalogue catalogue, ICoin
 
         var applied = await ledger.ChangeAsync($"settle:use:{item.Id}", actor, state =>
         {
-            var bagged = Apply(state, settled.Value!.Bag, null, 0, sessionId);
+            var bagged = Apply(state, settled.Value!.Bag, null, 0, sessionId, idempotencyKey);
             if (!bagged.Ok || bagged.Value is null) return bagged;
             return consumed == 0 ? bagged : Remove(bagged.Value, item.Id, consumed);
         }, cancellationToken).ConfigureAwait(false);
@@ -177,7 +186,7 @@ public sealed class CoinMarket(CoinLedger ledger, CoinCatalogue catalogue, ICoin
     }
 
     private Result<CoinState> Apply(CoinState state, IReadOnlyList<CoinStack> delta, string? goodId, int soldCount,
-        string sessionId)
+        string sessionId, string? idempotencyKey)
     {
         var bag = state.Bag.Select(stack => stack with { }).ToList();
         foreach (var change in delta)
@@ -210,11 +219,19 @@ public sealed class CoinMarket(CoinLedger ledger, CoinCatalogue catalogue, ICoin
             purchased[sessionId] = mine;
         }
 
+        var settledKeys = (state.Settled ?? []).ToList();
+        if (idempotencyKey is not null && !settledKeys.Contains(idempotencyKey, StringComparer.Ordinal))
+        {
+            settledKeys.Add(idempotencyKey);
+            while (settledKeys.Count > 64) settledKeys.RemoveAt(0);
+        }
+
         return Result<CoinState>.Success(state with
         {
             Bag = bag,
             Sold = soldCounts,
             Purchased = purchased,
+            Settled = settledKeys,
             Revision = state.Revision + 1
         });
     }

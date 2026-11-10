@@ -161,6 +161,65 @@ public sealed class CoinTests
         Assert.Contains("还差 1", two.Error!.Message);
     }
 
+    [Fact]
+    public async Task A_retried_call_does_not_buy_twice()
+    {
+        var market = Market(Giving("shop.box", """{"bag":[{"item":"candy","count":2}]}"""));
+        await Ledger().CreditAsync(100, "topup", "test", default);
+
+        // The same tool call id, twice: a timeout and a retry must not cost two boxes.
+        var first = await market.BuyAsync("s-1", "box", 1, "model:s-1", default, "call-1");
+        var second = await market.BuyAsync("s-1", "box", 1, "model:s-1", default, "call-1");
+        var different = await market.BuyAsync("s-1", "box", 1, "model:s-1", default, "call-2");
+
+        Assert.True(first.Ok, first.Error?.Message);
+        Assert.False(second.Ok);
+        Assert.Equal(ErrorCode.Conflict, second.Error!.Code);
+        Assert.True(different.Ok, different.Error?.Message);
+
+        var state = (await Ledger().ReadAsync(default)).Value!;
+        Assert.Equal(40, state.Balance);        // 100 - 30 - 30, never three times
+        Assert.Equal(2, state.SoldOf("box"));
+    }
+
+    [Fact]
+    public void Moving_money_by_script_needs_full_and_says_so_in_the_table()
+    {
+        var plane = new RecordingPlane();
+
+        Assert.True(CoinActions.Register(plane, Ledger()).Ok);
+
+        // The depth of a verb is what stops a model from crediting itself: "coin.control" is not in AccessLevels, so
+        // it answers Full — which is a depth only a hand-written card or a trusted script can have.
+        var credit = Assert.Single(plane.Registered, action => action.Id == CoinActions.Credit);
+        Assert.Equal(AccessLevel.Full, credit.RequiredLevel);
+        var debit = Assert.Single(plane.Registered, action => action.Id == CoinActions.Debit);
+        Assert.Equal(AccessLevel.Full, debit.RequiredLevel);
+    }
+
+    private sealed class RecordingPlane : IControlPlane
+    {
+        public List<ActionDescriptor> Registered { get; } = [];
+
+        public IReadOnlyList<ActionDescriptor> Catalog => Registered;
+
+        public Result Register(ActionDescriptor descriptor, ActionHandler handler)
+        {
+            Registered.Add(descriptor);
+            return Result.Success();
+        }
+
+        public Result Register(ActionDescriptor descriptor, AuthorizedActionHandler handler)
+        {
+            Registered.Add(descriptor);
+            return Result.Success();
+        }
+
+        public ValueTask<Result<System.Text.Json.JsonElement>> InvokeAsync(Actor actor, string action,
+            System.Text.Json.JsonElement arguments, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+    }
+
     private sealed class MemoryStateStore : IStateStore
     {
         private readonly Dictionary<string, string> _values = new(StringComparer.Ordinal);
