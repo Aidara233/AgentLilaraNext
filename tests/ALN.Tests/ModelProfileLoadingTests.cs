@@ -1,6 +1,7 @@
 using System.Text.Json;
 using ALN.Contracts;
 using ALN.Contracts.Models;
+using ALN.Runtime;
 
 namespace ALN.Tests;
 
@@ -51,5 +52,63 @@ public sealed class ModelProfileLoadingTests
         Assert.True(registered.CanSeeImages);
         Assert.Equal(profile.ModelId, registered.ModelId);
         Assert.Equal(profile.ContextWindow, registered.ContextWindow);
+    }
+
+    [Fact]
+    public async Task The_file_loader_keeps_the_capabilities_it_reads()
+    {
+        // The test above starts from an already-deserialized spec, which is exactly why it did not catch the bug: the
+        // hand-rolled parser was one layer down, in the store. This one goes through the real loader.
+        var root = Directory.CreateTempSubdirectory("model-store-").FullName;
+        try
+        {
+            var directory = Path.Combine(root, "modules", "model.openai-chat#one");
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(Path.Combine(directory, "module.json"), """
+                {
+                  "id": "model.openai-chat#one",
+                  "type": "model.openai-chat",
+                  "config": {
+                    "enabled": true,
+                    "configuration": { "endpoint": "https://example.invalid" },
+                    "profiles": [
+                      { "id": "default", "modelId": "some-model", "capabilities": "Streaming, Vision" },
+                      { "id": "blind", "modelId": "some-model" }
+                    ]
+                  }
+                }
+                """);
+
+            var loaded = await new FileModelInstanceStore(root, new AnythingUnderModel()).LoadAllAsync(default);
+
+            Assert.True(loaded.Ok, loaded.Error?.Message);
+            var entry = Assert.Single(loaded.Value!);
+            Assert.True(Assert.Single(entry.Spec.Profiles!, candidate => candidate.Id == "default").CanSeeImages);
+            Assert.False(Assert.Single(entry.Spec.Profiles!, candidate => candidate.Id == "blind").CanSeeImages);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    [Fact]
+    public void A_capability_nobody_defined_is_refused_with_the_profile_that_said_it()
+    {
+        using var document = JsonDocument.Parse("""{ "id": "p", "modelId": "m", "capabilities": "Vision, Telepathy" }""");
+
+        var parsed = ModelProfileJson.Parse(document.RootElement, Json);
+
+        Assert.False(parsed.Ok);
+        Assert.Contains("Telepathy", parsed.Error!.Detail ?? parsed.Error.Message);
+    }
+
+    /// <summary>Enough of a type catalog to say "everything named model.* is a model" — the store asks nothing else.</summary>
+    private sealed class AnythingUnderModel : IModuleTypeCatalog
+    {
+        public bool IsKnownAbstract(string typeId) => typeId == "model";
+        public bool IsConcrete(string typeId) => typeId.StartsWith("model.", StringComparison.Ordinal);
+        public bool IsAssignableTo(string concreteTypeId, string abstractTypeId) =>
+            abstractTypeId == "model" && concreteTypeId.StartsWith("model.", StringComparison.Ordinal);
     }
 }

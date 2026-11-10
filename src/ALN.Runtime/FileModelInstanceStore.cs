@@ -199,26 +199,16 @@ public sealed class FileModelInstanceStore(string root, IModuleTypeCatalog? type
         var parsed = new List<ModelProfile>();
         foreach (var profile in profiles.EnumerateArray())
         {
-            if (!TryText(profile, "id", out var id) || !TryText(profile, "modelId", out var model)) continue;
-            SamplingSettings? sampling = null;
-            if (profile.TryGetProperty("defaultSampling", out var value) && value.ValueKind == JsonValueKind.Object)
-                sampling = value.Deserialize<SamplingSettings>(JsonOptions);
-            // A window that is not a positive number is refused rather than rounded or ignored: "128k" written as a
-            // string, or a zero someone meant as "unlimited", would otherwise look exactly like "nobody said" and
-            // the Session would quietly plan against the default instead of the number the operator believes it set.
-            int? contextWindow = null;
-            if (profile.TryGetProperty("contextWindow", out var window) && window.ValueKind != JsonValueKind.Null)
+            if (!TryText(profile, "id", out _) || !TryText(profile, "modelId", out _)) continue;
+            // One parser for every place that reads a profile: this record has grown a field before, and the four hand-rolled
+            // copies of it did not grow with it.
+            var parsedProfile = ModelProfileJson.Parse(profile, JsonOptions);
+            if (!parsedProfile.Ok)
             {
-                if (window.ValueKind != JsonValueKind.Number || !window.TryGetInt32(out var declared) || declared <= 0)
-                {
-                    error = $"Profile \"{id}\" declares a contextWindow that is not a positive whole number of tokens.";
-                    return null;
-                }
-                contextWindow = declared;
+                error = parsedProfile.Error!.Message;
+                return null;
             }
-            // The provider is implied by the file the profile lives in, so it stays empty here and the loader fills it
-            // from the address: a file that repeats its own address is a file that can disagree with its directory.
-            parsed.Add(new ModelProfile(id, default, model, sampling, contextWindow));
+            parsed.Add(parsedProfile.Value!);
         }
         return parsed;
     }

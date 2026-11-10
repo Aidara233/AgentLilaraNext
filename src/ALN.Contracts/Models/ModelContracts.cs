@@ -51,6 +51,92 @@ public static class ModelCapabilitiesJson
 }
 
 /// <summary>
+/// One profile, as a module file spells it.
+///
+/// The record <b>is</b> the format, so this is the only place that knows both sides. It exists because the same record used
+/// to be rebuilt field by field in five places, and the day a sixth field arrived (<see cref="ModelProfile.Capabilities"/>)
+/// four of them kept the old shape — silently. A profile that said it could see pictures came back blind, and the next
+/// save rewrote its file without that line at all, so the loss became permanent.
+/// </summary>
+public static class ModelProfileJson
+{
+    /// <summary>
+    /// Reads one profile. <paramref name="provider"/> is filled in by whoever knows it — a file does not repeat the
+    /// address it lives under, because a file that repeats its own address can disagree with its directory.
+    /// </summary>
+    public static Result<ModelProfile> Parse(System.Text.Json.JsonElement element, System.Text.Json.JsonSerializerOptions options,
+        Address provider = default)
+    {
+        if (element.ValueKind != System.Text.Json.JsonValueKind.Object)
+            return Result<ModelProfile>.Failure(new(ErrorCode.Invalid, "A profile must be a JSON object."));
+        var id = Text(element, "id");
+        if (id is null) return Result<ModelProfile>.Failure(new(ErrorCode.Invalid, "Each profile needs a non-empty \"id\"."));
+        // The file spells it "modelId"; the action takes "model". Both are read here because both are what somebody
+        // actually wrote, and one parser that took only one of them would make the two paths disagree about the same
+        // profile — which is the class of bug this whole file is about.
+        var model = Text(element, "modelId") ?? Text(element, "model");
+        if (model is null)
+            return Result<ModelProfile>.Failure(new(ErrorCode.Invalid, $"Profile \"{id}\" needs a non-empty \"modelId\"."));
+
+        SamplingSettings? sampling = null;
+        if (element.TryGetProperty("defaultSampling", out var samplingItem) &&
+            samplingItem.ValueKind == System.Text.Json.JsonValueKind.Object)
+        {
+            try { sampling = samplingItem.Deserialize<SamplingSettings>(options); }
+            catch (System.Text.Json.JsonException ex)
+            {
+                return Result<ModelProfile>.Failure(new(ErrorCode.Invalid,
+                    $"Profile \"{id}\" has malformed defaultSampling.", ex.Message));
+            }
+        }
+
+        // A window that is not a positive number is refused rather than rounded or ignored: "128k" written as a string, or
+        // a zero someone meant as "unlimited", would otherwise look exactly like "nobody said" and the Session would
+        // quietly plan against the default instead of the number the operator believes it set.
+        int? window = null;
+        if (element.TryGetProperty("contextWindow", out var windowItem) &&
+            windowItem.ValueKind != System.Text.Json.JsonValueKind.Null)
+        {
+            if (windowItem.ValueKind != System.Text.Json.JsonValueKind.Number || !windowItem.TryGetInt32(out var declared) ||
+                declared <= 0)
+                return Result<ModelProfile>.Failure(new(ErrorCode.Invalid,
+                    $"Profile \"{id}\" declares a contextWindow that is not a positive whole number of tokens."));
+            window = declared;
+        }
+
+        ModelCapabilities? capabilities = null;
+        if (element.TryGetProperty("capabilities", out var capabilityItem) &&
+            capabilityItem.ValueKind != System.Text.Json.JsonValueKind.Null)
+        {
+            try
+            {
+                capabilities = capabilityItem.ValueKind switch
+                {
+                    System.Text.Json.JsonValueKind.String => ModelCapabilitiesJson.Parse(capabilityItem.GetString()),
+                    System.Text.Json.JsonValueKind.Number when capabilityItem.TryGetInt32(out var flags) =>
+                        (ModelCapabilities)flags,
+                    _ => throw new System.Text.Json.JsonException(
+                        "capabilities must be names, as in \"Streaming, Vision\", or a number.")
+                };
+            }
+            catch (System.Text.Json.JsonException ex)
+            {
+                return Result<ModelProfile>.Failure(new(ErrorCode.Invalid,
+                    $"Profile \"{id}\" has capabilities this host cannot read.", ex.Message));
+            }
+        }
+
+        return Result<ModelProfile>.Success(new(id, provider, model, sampling, window, capabilities));
+    }
+
+    private static string? Text(System.Text.Json.JsonElement element, string name) =>
+        element.TryGetProperty(name, out var item) && item.ValueKind == System.Text.Json.JsonValueKind.String &&
+        !string.IsNullOrWhiteSpace(item.GetString())
+            ? item.GetString()!.Trim()
+            : null;
+}
+
+/// <summary>
 /// Reads a profile's capabilities as names (<c>"Streaming, Vision"</c>) or as a number, and always writes names.
 ///
 /// The file is written by a person and read by a person, so <c>5</c> is the wrong thing to require them to compute;

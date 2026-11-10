@@ -292,7 +292,11 @@ public sealed partial class ModelManager
                 }
                 var window = ReadContextWindow(item, out var windowFailure);
                 if (windowFailure is { } failure) return Result<JsonElement>.Failure(failure);
-                parsed.Add(new ModelProfile(idText.GetString()!.Trim(), default, modelText.GetString()!.Trim(), sampling, window));
+                // Same parser as the file loader. A profile that survives one path and loses a field in the other is how
+                // "I set it and it kept working until I restarted" happened once already.
+                var parsedProfile = ModelProfileJson.Parse(item, ActionJson);
+                if (!parsedProfile.Ok) return Result<JsonElement>.Failure(parsedProfile.Error!);
+                parsed.Add(parsedProfile.Value!);
             }
             profiles = parsed;
         }
@@ -416,8 +420,8 @@ public sealed partial class ModelManager
         if (windowError is { } error) return Result<JsonElement>.Failure(error);
         var capabilities = ReadCapabilities(arguments, out var capabilityError);
         if (capabilityError is { } capabilitiesError) return Result<JsonElement>.Failure(capabilitiesError);
-        var registered = RegisterProfile(new ModelProfile(id.Trim(), provider.Value, model.Trim(), sampling, window,
-            capabilities));
+        var profile = new ModelProfile(id.Trim(), provider.Value, model.Trim(), sampling, window, capabilities);
+        var registered = RegisterProfile(profile);
         if (!registered.Ok) return Result<JsonElement>.Failure(registered.Error!);
 
         // The live registry is not the file: a profile that is not written down dies at the next restart, and "it worked
@@ -429,8 +433,10 @@ public sealed partial class ModelManager
             {
                 // The provider is implied by the file it lives in, so the stored profile leaves it empty: a file that
                 // repeats its own address is a file that can disagree with its own directory.
-                var profiles = (instanceSpec.Profiles ?? []).Where(profile => profile.Id != id.Trim())
-                    .Append(new ModelProfile(id.Trim(), default, model.Trim(), sampling, window)).ToArray();
+                var profiles = (instanceSpec.Profiles ?? []).Where(candidate => candidate.Id != id.Trim())
+                    // The same profile that was just registered, with the provider blanked: the file must not repeat the
+                    // address it lives under, and rebuilding it here is how its capabilities would be lost on save.
+                    .Append(profile with { Provider = default }).ToArray();
                 var saved = await store.SaveAsync(provider.Value.ToString(), instanceSpec with { Profiles = profiles }, ct)
                     .ConfigureAwait(false);
                 if (!saved.Ok) return Result<JsonElement>.Failure(saved.Error!);
@@ -488,8 +494,9 @@ public sealed partial class ModelManager
             var stored = await store.ReadAsync(provider.ToString(), ct).ConfigureAwait(false);
             if (stored.Error is null && stored.Value is { } instanceSpec)
             {
-                var profiles = (instanceSpec.Profiles ?? []).Where(profile => profile.Id != id.Trim())
-                    .Append(new ModelProfile(id.Trim(), default, model, sampling, window)).ToArray();
+                var profiles = (instanceSpec.Profiles ?? []).Where(candidate => candidate.Id != id.Trim())
+                    // `updated` carries every field the profile had; only the provider is blanked for the file.
+                    .Append(updated with { Provider = default }).ToArray();
                 var saved = await store.SaveAsync(provider.ToString(), instanceSpec with { Profiles = profiles }, ct)
                     .ConfigureAwait(false);
                 if (!saved.Ok) return Result<JsonElement>.Failure(saved.Error!);
