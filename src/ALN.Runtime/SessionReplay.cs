@@ -1,4 +1,5 @@
 using System.Text.Json;
+using ALN.Contracts;
 using ALN.Contracts.Models;
 using ALN.Contracts.Sessions;
 
@@ -56,12 +57,12 @@ public static class SessionReplay
         // keeping one more round cost" stays comparable with the budget itself.
         for (var keep = Math.Clamp(keepActivations, 0, CountActivations(replayable)); ; keep--)
         {
-            var messages = Messages(replayable, OldestKeptIndex(replayable, keep), calls, out var folded);
+            var messages = Messages(replayable, OldestKeptIndex(replayable, keep), calls, out var folded, out var pictures);
             var tokens = TokenEstimator.Corrected(TokenEstimator.Estimate(messages), correction);
             // At zero kept activations there is nowhere left to go: what remains is the outline itself, and cutting
             // into that is compaction's job (a summary), not folding's.
             if (tokens <= budgetTokens || keep == 0)
-                return new ReplayPlan(messages, tokens, keep, folded);
+                return new ReplayPlan(messages, tokens, keep, folded, pictures);
         }
     }
 
@@ -98,9 +99,11 @@ public static class SessionReplay
     }
 
     private static IReadOnlyList<ModelMessage> Messages(IReadOnlyList<SessionHistoryEntry> replayable, int oldestKept,
-        IReadOnlyDictionary<string, string> calls, out int folded)
+        IReadOnlyDictionary<string, string> calls, out int folded, out IReadOnlyList<ReplayedPicture> pictures)
     {
         folded = 0;
+        var carried = new List<ReplayedPicture>();
+        pictures = carried;
         var messages = new List<ModelMessage>(replayable.Count);
         for (var index = 0; index < replayable.Count; index++)
         {
@@ -108,6 +111,11 @@ public static class SessionReplay
             if (index >= oldestKept)
             {
                 messages.Add(new ModelMessage(entry.Role, entry.Content, entry.ToolCalls, entry.ToolCallId));
+                // A picture the record brought is a pointer, and this is exactly where it would stop travelling: the
+                // message above is its text alone. Remembered instead of read — this builder is synchronous and owns no
+                // file port. SessionManager fills these in before the request goes out.
+                if (entry.Attachments is { Count: > 0 } brought)
+                    carried.Add(new ReplayedPicture(messages.Count - 1, brought));
                 continue;
             }
             // Old: the structure stays, the payload goes. A tool call without its matching result is refused by every
@@ -183,8 +191,27 @@ public static class SessionReplay
 /// One request's body, and what building it cost. Reported rather than kept private: "the request was this big" and
 /// "the request was this big because it kept no verbs" are the two facts a signal needs after a provider refuses one.
 /// </summary>
+/// <param name="Pictures">
+/// Messages that brought a picture and were rendered as their text only, because reading a file is not something this
+/// builder can do. The timeline already holds the pointer (<see cref="SessionHistoryEntry.Attachments"/>); whoever owns
+/// the file port fills these in. Empty when nothing carried one, which is the ordinary case and costs nothing.
+/// </param>
 public sealed record ReplayPlan(
     IReadOnlyList<ModelMessage> Messages,
     int EstimatedTokens,
     int KeptActivations,
-    int FoldedEntries);
+    int FoldedEntries,
+    IReadOnlyList<ReplayedPicture>? Pictures = null)
+{
+    /// <summary>Nothing to replay: what a Session with no history is handed, and equal to an empty build.</summary>
+    public static ReplayPlan Empty { get; } = new([], 0, 0, 0);
+}
+
+/// <summary>
+/// A replayed message that carried a picture, and where it sits in <see cref="ReplayPlan.Messages"/>.
+///
+/// A record of "there is something to read here", not a read: the builder decides what a request says, and a file port
+/// is not part of that. Kept as a position rather than as the message itself so that filling it in is a replacement in
+/// one list rather than a rebuild of the request.
+/// </summary>
+public sealed record ReplayedPicture(int Index, IReadOnlyList<MediaRef> Media);

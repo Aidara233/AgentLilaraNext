@@ -1620,6 +1620,10 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
             // What this Session's last request really cost, divided by what it was predicted to cost. The estimator is a
             // fit; this is the provider's own count correcting it, one call at a time.
             var correction = _calibration.For(sessionId);
+            // Asked before the request is assembled, not after: the replay needs the same answer to decide whether the
+            // pictures its records point at are worth reading. It is a fact about the model this Session talks to, so
+            // asking once per turn is right either way.
+            var seesImages = ModelSeesImages(record.Spec.ModelProfileId);
             var replay = SessionReplay.Build(history, actingTools > 0, replayBudget, correction: correction);
             // Folding first, because it is free and true. Compaction only when even the outline does not fit: it costs a
             // model call and loses detail, and neither is worth paying while an outline would do.
@@ -1630,6 +1634,10 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
                 history = record.History;
                 replay = SessionReplay.Build(history, actingTools > 0, replayBudget, correction: correction);
             }
+            // The timeline keeps pictures as pointers, and a replay that rebuilt only their text meant a picture a tool
+            // had shown became a sentence about a file nobody could see. Read here — once, for this request — and only
+            // for the records that are replayed as they were written: a folded result is old by definition.
+            replay = await AttachReplayedPicturesAsync(replay, seesImages, cancellationToken).ConfigureAwait(false);
             messages.AddRange(replay.Messages);
             RecordReplay(sessionId, replay, replayBudget, correction);
             var turnCeiling = (int)(window * (long)TurnCeilingPercent / 100);
@@ -1657,7 +1665,7 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
                 .ToArray();
             // Asked once per turn, because it is a fact about the model this Session talks to: a profile without Vision
             // means every picture becomes a receipt, and asking per tool call would be the same answer with more reads.
-            var seesImages = ModelSeesImages(record.Spec.ModelProfileId);
+            // (Asked earlier too, before the replay — same answer, used to decide what is worth reading.)
             var channelParts = await RenderChannelContextAsync(channelTimeline, notes, seesImages, cancellationToken)
                 .ConfigureAwait(false);
             if (channelParts.Count > 0)
@@ -3352,6 +3360,57 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
         var profile = models.ListProfiles().FirstOrDefault(candidate =>
             string.Equals(candidate.Id, profileId, StringComparison.Ordinal));
         return profile?.CanSeeImages == true;
+    }
+
+    /// <summary>
+    /// Puts the pictures back into a replayed request.
+    ///
+    /// The timeline already stores them — <see cref="SessionHistoryEntry.Attachments"/> is a pointer, not bytes — but a
+    /// replay that rebuilt only the text turned a picture a tool had shown into a sentence about a file nobody could
+    /// see. That is the difference between "the model looked at this a while ago" and "the model remembers looking",
+    /// and it is why a question asked two turns later was answered from the description rather than from the picture.
+    ///
+    /// Bounded on purpose, and covering the same ground as <see cref="ImageBudget"/>: newest first (what a turn answers
+    /// is "what just happened"), at most what one request may carry, and a picture that cannot be read keeps the
+    /// sentence that already said it was there. Nothing here decides <b>whether</b> this model may be shown one — a
+    /// profile without Vision gets its request exactly as it was.
+    /// </summary>
+    private async ValueTask<ReplayPlan> AttachReplayedPicturesAsync(ReplayPlan plan, bool seesImages,
+        CancellationToken cancellationToken)
+    {
+        if (!seesImages || plan.Pictures is not { Count: > 0 } carried) return plan;
+        var messages = plan.Messages.ToList();
+        var kept = 0;
+        long keptBytes = 0;
+        var attached = false;
+        for (var position = carried.Count - 1; position >= 0; position--)
+        {
+            var index = carried[position].Index;
+            if (index < 0 || index >= messages.Count) continue;
+            var parts = new List<ModelContentPart>(carried[position].Media.Count + 1);
+            var showed = 0;
+            foreach (var reference in carried[position].Media)
+            {
+                if (kept >= _media.MaxImagesPerRequest || keptBytes + reference.Bytes > _media.MaxImageBytesPerRequest)
+                    break;
+                var (part, _) = await MediaImages.LoadAsync(reference, _files, _media, seesImages, cancellationToken)
+                    .ConfigureAwait(false);
+                if (part is null) continue;
+                parts.Add(part);
+                kept++;
+                keptBytes += part.Bytes.Length;
+                showed++;
+            }
+            if (showed == 0) continue;
+            // The words stay exactly where they were; the pictures the record pointed at follow them, which is the same
+            // order <see cref="ToolResultMessageAsync"/> uses so that a replayed request reads like the original one.
+            var message = messages[index];
+            if (!string.IsNullOrEmpty(message.Content)) parts.Insert(0, new TextPart(message.Content));
+            messages[index] = message with { Parts = parts };
+            attached = true;
+        }
+        // Pictures is cleared rather than carried forward: a plan that has been filled in must not be filled in twice.
+        return attached ? plan with { Messages = messages, Pictures = null } : plan;
     }
 
     /// <summary>

@@ -214,6 +214,37 @@ public sealed class SessionImageTests : IDisposable
     }
 
     [Fact]
+    public async Task A_picture_a_tool_showed_is_still_there_on_the_next_turn()
+    {
+        // The timeline stores the picture as a pointer (SessionHistoryEntry.Attachments); the replay used to rebuild only
+        // the text, so a tool's picture became a sentence about a file nobody could see — and the turn after that
+        // answered questions about the picture from its description. This is the round trip.
+        var (stored, offers) = await StoredPictureAsync();
+        var model = new ScriptedModel(ModelCapabilities.Streaming | ModelCapabilities.Vision,
+            // First turn: read the picture, then stop.
+            [new ToolCallDelta(0, "call-1", "fs_read", JsonSerializer.Serialize(new { scope = FileScopes.Media, path = stored.Path })),
+             new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))],
+            [new ToolCallDelta(0, "call-2", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))],
+            // Second turn: say nothing, ask nothing — the point is what the request already carries.
+            [new ToolCallDelta(0, "call-3", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
+        var sessions = Manager(model);
+
+        var first = await sessions.TurnAsync("s-1", Spec(offers), Guid.NewGuid(),
+            new SessionTurnInput([], null, null), new Offers(offers), default);
+        Assert.True(first.Ok, first.Error?.Detail ?? first.Error?.Message);
+        var asked = await sessions.TurnAsync("s-1", Spec(offers), Guid.NewGuid(),
+            new SessionTurnInput([], null, null), new Offers(offers), default);
+        Assert.True(asked.Ok, asked.Error?.Detail ?? asked.Error?.Message);
+
+        // The second turn's request, not the first one's: the first turn ended with the picture already in hand.
+        var replayed = model.Requests[^1].Messages.Single(message => message.ToolCallId == "call-1");
+        Assert.True(replayed.HasImage);
+        // Words first, picture after — the same order the live turn used, so a replayed request reads like the original.
+        Assert.Contains(stored.Path, Assert.IsType<TextPart>(replayed.Parts![0]).Text, StringComparison.Ordinal);
+        Assert.Equal(Png(4, 3), Assert.IsType<ImagePart>(replayed.Parts![1]).Bytes.ToArray());
+    }
+
+    [Fact]
     public async Task Every_message_that_carried_a_picture_gets_its_turn_not_only_the_first_in_the_block()
     {
         // "Only the first of a batch is shown" is about **one message** that carried several pictures. The index used to
