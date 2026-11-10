@@ -145,6 +145,28 @@ public sealed partial class ModelManager
         return declared;
     }
 
+    /// <summary>
+    /// The capabilities a caller named, as names (<c>"Streaming, Vision"</c>). Absent means "not declared", which reads
+    /// as the least: a profile that says nothing gets receipts instead of pictures, not a refused request.
+    /// </summary>
+    private static ModelCapabilities? ReadCapabilities(JsonElement arguments, out Error? error)
+    {
+        error = null;
+        if (!arguments.TryGetProperty("capabilities", out var item) || item.ValueKind is JsonValueKind.Null)
+            return null;
+        if (item.ValueKind != JsonValueKind.String)
+        {
+            error = new(ErrorCode.Invalid, "capabilities must be a string such as \"Streaming, Vision\".");
+            return null;
+        }
+        try { return ModelCapabilitiesJson.Parse(item.GetString()); }
+        catch (JsonException ex)
+        {
+            error = new(ErrorCode.Invalid, "capabilities names something this host does not know.", ex.Message);
+            return null;
+        }
+    }
+
     /// <summary>The category a kind belongs to: read from the type tree, not taken from the address.</summary>
     private string CategoryOfKind(string kind)
     {
@@ -392,7 +414,10 @@ public sealed partial class ModelManager
         }
         var window = ReadContextWindow(arguments, out var windowError);
         if (windowError is { } error) return Result<JsonElement>.Failure(error);
-        var registered = RegisterProfile(new ModelProfile(id.Trim(), provider.Value, model.Trim(), sampling, window));
+        var capabilities = ReadCapabilities(arguments, out var capabilityError);
+        if (capabilityError is { } capabilitiesError) return Result<JsonElement>.Failure(capabilitiesError);
+        var registered = RegisterProfile(new ModelProfile(id.Trim(), provider.Value, model.Trim(), sampling, window,
+            capabilities));
         if (!registered.Ok) return Result<JsonElement>.Failure(registered.Error!);
 
         // The live registry is not the file: a profile that is not written down dies at the next restart, and "it worked

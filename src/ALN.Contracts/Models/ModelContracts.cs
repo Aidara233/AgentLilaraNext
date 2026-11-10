@@ -29,6 +29,25 @@ public static class ModelCapabilitiesJson
         if (capabilities.HasFlag(ModelCapabilities.Reasoning)) names.Add("Reasoning");
         return string.Join(", ", names);
     }
+
+    /// <summary>
+    /// The other direction, in one place: the converter below uses it, and so does the action that creates a profile,
+    /// because two implementations of "which capabilities does this string name" would eventually disagree about one of
+    /// them — and the one that mattered would be Vision, whose failure is quiet.
+    /// </summary>
+    public static ModelCapabilities Parse(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return ModelCapabilities.None;
+        var combined = ModelCapabilities.None;
+        foreach (var piece in text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!Enum.TryParse<ModelCapabilities>(piece, ignoreCase: true, out var single) ||
+                !Enum.IsDefined(typeof(ModelCapabilities), single))
+                throw new JsonException($"Unknown model capability: {piece}. Known: {Spell(ModelCapabilities.Streaming | ModelCapabilities.ToolCalls | ModelCapabilities.Vision | ModelCapabilities.Reasoning)}.");
+            combined |= single;
+        }
+        return combined;
+    }
 }
 
 /// <summary>
@@ -48,15 +67,7 @@ public sealed class ModelCapabilitiesJsonConverter : System.Text.Json.Serializat
             throw new System.Text.Json.JsonException("\"capabilities\" must be a string such as \"Streaming, Vision\".");
         var text = reader.GetString() ?? "";
         if (string.IsNullOrWhiteSpace(text)) return ModelCapabilities.None;
-        var combined = ModelCapabilities.None;
-        foreach (var piece in text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            if (!Enum.TryParse<ModelCapabilities>(piece, ignoreCase: true, out var single) ||
-                !Enum.IsDefined(typeof(ModelCapabilities), single))
-                throw new System.Text.Json.JsonException($"Unknown model capability: {piece}");
-            combined |= single;
-        }
-        return combined;
+        return ModelCapabilitiesJson.Parse(text);
     }
 
     public override void Write(System.Text.Json.Utf8JsonWriter writer, ModelCapabilities? value,

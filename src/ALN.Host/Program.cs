@@ -1066,8 +1066,11 @@ async Task<Result> LoadModelConfigurationAsync(IModelInstanceStore store){
         var providerAddress = createdProvider.Value.Address;
         foreach (var profile in entry.Spec.Profiles ?? [])
         {
-            var registered = modelManager.RegisterProfile(new(profile.Id, providerAddress, profile.ModelId,
-                profile.DefaultSampling, profile.ContextWindow));
+            // `with` rather than a fresh record: the file names every field, and this line's only business is swapping in
+            // the provider address the process just created. Rebuilding it field by field is how Capabilities was lost —
+            // a profile that declared Vision in its module.json came back as a model that could not see, and every
+            // picture became a receipt with no way to tell why.
+            var registered = modelManager.RegisterProfile(profile with { Provider = providerAddress });
             if (!registered.Ok) return registered;
         }
     }
@@ -1075,9 +1078,17 @@ async Task<Result> LoadModelConfigurationAsync(IModelInstanceStore store){
     // "it silently assumed a number" and "somebody chose that number" look identical from outside otherwise.
     var profiles = modelManager.ListProfiles();
     var assumed = profiles.Where(profile => profile.ContextWindowAssumed).Select(profile => profile.Id).ToArray();
+    // Eyes, said out loud. A profile that cannot see is not a broken deployment — most models cannot — but it decides
+    // that every picture becomes a receipt, and until now the only way to learn that was to send one and wonder. The
+    // asymmetry the design rests on (a missing sentence costs a sentence, a refused request costs every request after
+    // it) is only a good trade if the fact is visible somewhere.
+    var seeing = profiles.Where(profile => profile.CanSeeImages).Select(profile => profile.Id).ToArray();
     restore.Note("models", $"{profiles.Count} profile(s)" + (assumed.Length == 0
         ? ", all declare their context window"
-        : $"; context window unsaid for {string.Join(", ", assumed)} — those plan against {ModelProfile.AssumedContextWindow / 1024}k"));
+        : $"; context window unsaid for {string.Join(", ", assumed)} — those plan against {ModelProfile.AssumedContextWindow / 1024}k")
+        + (seeing.Length == 0
+            ? "; no profile declares Vision — every picture will arrive as a receipt"
+            : $"; can see pictures: {string.Join(", ", seeing)}"));
     return Result.Success();
 }
 
