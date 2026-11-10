@@ -4,18 +4,67 @@ using ALN.Contracts;
 namespace ALN.Rice;
 
 /// <summary>
-/// Lilara's larder: one number of bites for the whole framework, and a cursor per Session.
+/// An allowance that pays for a round instead of the larder.
 ///
-/// The cursor is the idempotency key. A round is identified by <c>(session, step)</c> and steps only go up, so
-/// remembering the last step charged for a Session is enough — no window of keys to age out, and a retried step
-/// cannot be charged twice.
+/// This is the difference between "this round is free" and "this round was paid for and then refunded". The larder's
+/// own number never moves, so what a person reads is what is true, and a policy that forgets to pay something back
+/// cannot quietly cost somebody their food. It is also why the whole feature is one row of data rather than a script
+/// watching for a deduction: a deduction is not something a script can watch (there is no such event), and "take it
+/// back afterwards" is only a design if nothing ever goes wrong in between.
 /// </summary>
-public sealed record RiceState(long Bites, long Revision, IReadOnlyDictionary<string, int> Charged)
+/// <param name="Id">What a person says to cancel it. Stable, and chosen by the writer, because the thing being
+/// cancelled is an intention ("today is on the house"), not a counter.</param>
+/// <param name="Channel">Which Channel it pays for; null pays for any. Null is not sloppiness: it is the only way to
+/// write "today is free everywhere" without naming every conversation, and a Channel-specific allowance still wins
+/// nothing over a global one — the earliest deadline is served first either way.</param>
+/// <param name="Remaining">How many rounds it still pays for. "A temporary 500 bites" is exactly this number, because
+/// a round costs one bite: the two ways of saying it are the same fact.</param>
+/// <param name="Until">When it stops paying. Expiry is lazy — a waiver past this instant is simply never matched, and
+/// is dropped the next time the table is written — so nothing has to run at midnight, and a host that was down at
+/// midnight still gets the right answer.</param>
+public sealed record RiceWaiver(string Id, string? Channel, long Remaining, DateTimeOffset Until, string Reason,
+    DateTimeOffset CreatedAt)
+{
+    /// <summary>Whether this allowance can pay for a round belonging to <paramref name="channel"/> right now.</summary>
+    public bool Covers(Address? channel, DateTimeOffset now) =>
+        Remaining > 0 &&
+        Until > now &&
+        (Channel is null || (channel is { } target && string.Equals(Channel, target.ToString(), StringComparison.Ordinal)));
+}
+
+/// <summary>
+/// A larder, plus what has been promised about it.
+///
+/// The cursor (<see cref="Charged"/>) is the idempotency key. A round is identified by <c>(session, step)</c> and steps
+/// only go up, so remembering the last step charged for a Session is enough — no window of keys to age out, and a
+/// retried step cannot be charged twice, whether it was paid by the larder or by an allowance.
+/// </summary>
+public sealed record RiceState(long Bites, long Revision, IReadOnlyDictionary<string, int> Charged,
+    IReadOnlyList<RiceWaiver>? Waivers = null)
 {
     public static RiceState Empty(long bites = 0) => new(bites, 0,
-        new Dictionary<string, int>(StringComparer.Ordinal));
+        new Dictionary<string, int>(StringComparer.Ordinal), []);
 
     public int ChargedUpTo(string sessionId) => Charged.TryGetValue(sessionId, out var step) ? step : 0;
+
+    /// <summary>The allowances, never null: state written before this field existed reads as "none".</summary>
+    public IReadOnlyList<RiceWaiver> Allowances => Waivers ?? [];
+
+    /// <summary>
+    /// The allowance that pays for this round, or null when the larder does.
+    ///
+    /// Earliest deadline first, and that is the only order that cannot waste food: an allowance about to expire is
+    /// worth more than one that is not, and serving it first is what stops "the one that was about to run out" from
+    /// running out unused. A null <paramref name="now"/> means the caller had no instant to offer — a round that cannot
+    /// say when it happened cannot claim today's allowance, so it pays like it always did.
+    /// </summary>
+    public RiceWaiver? WaiverFor(Address? channel, DateTimeOffset? now) =>
+        now is not { } at || at == default
+            ? null
+            : Allowances.Where(waiver => waiver.Covers(channel, at))
+                .OrderBy(waiver => waiver.Until)
+                .ThenBy(waiver => waiver.CreatedAt)
+                .FirstOrDefault();
 }
 
 /// <summary>
@@ -54,20 +103,51 @@ public sealed class RiceLedger(IStateStore store, IAtomicWork atomic, ISignalLog
     }
 
     /// <summary>
-    /// Eats one bowl for <c>(session, step)</c>. Charging the same step twice is a no-op, not a second bowl: a retried
-    /// round is the framework's own retry, and the framework's retries do not cost the model anything.
+    /// Eats one round that brought no source information: no Channel, no instant. It pays the way it always did, because
+    /// a round that cannot say which conversation it belongs to or when it happened cannot claim an allowance.
     /// </summary>
     public ValueTask<Result<RiceState>> ChargeRoundAsync(string sessionId, int step,
         CancellationToken cancellationToken) =>
+        ChargeRoundAsync(sessionId, step, channel: null, now: null, cancellationToken);
+
+    /// <summary>
+    /// Eats one round for <c>(session, step)</c>, out of an allowance when one covers it and out of the larder otherwise.
+    ///
+    /// Charging the same step twice is a no-op, not a second bowl — and that covers the allowance too: a retried round
+    /// must not spend the same waiver twice. A retried round is the framework's own retry, and the framework's retries
+    /// do not cost the model anything.
+    /// </summary>
+    public ValueTask<Result<RiceState>> ChargeRoundAsync(string sessionId, int step, Address? channel,
+        DateTimeOffset? now, CancellationToken cancellationToken) =>
         ChangeAsync($"eat:{sessionId}", $"session:{sessionId}", state =>
         {
             if (state.ChargedUpTo(sessionId) >= step) return Result<RiceState>.Success(state);
             var charged = new Dictionary<string, int>(state.Charged, StringComparer.Ordinal) { [sessionId] = step };
+            var waiver = state.WaiverFor(channel, now);
+            if (waiver is null)
+                return Result<RiceState>.Success(state with
+                {
+                    Bites = state.Bites - 1,
+                    Revision = state.Revision + 1,
+                    Charged = charged
+                });
+
+            // Paid by the allowance: the larder does not move, but the allowance does. This write is also the one that
+            // drops what has expired or been used up, so the table cannot grow forever and no sweep has to run at
+            // midnight — a host that was down at midnight still gets the right answer on its first round back.
+            // WaiverFor only matches when there was an instant to match against, so this is that instant.
+            var chargedAt = now!.Value;
+            var kept = state.Allowances
+                .Select(entry => string.Equals(entry.Id, waiver.Id, StringComparison.Ordinal)
+                    ? entry with { Remaining = entry.Remaining - 1 }
+                    : entry)
+                .Where(entry => entry.Remaining > 0 && entry.Until > chargedAt)
+                .ToArray();
             return Result<RiceState>.Success(state with
             {
-                Bites = state.Bites - 1,
                 Revision = state.Revision + 1,
-                Charged = charged
+                Charged = charged,
+                Waivers = kept
             });
         }, cancellationToken);
 
@@ -88,6 +168,53 @@ public sealed class RiceLedger(IStateStore store, IAtomicWork atomic, ISignalLog
                 ? Result<RiceState>.Failure(new(ErrorCode.Denied, $"只有 {state.Bites} 口，不够扣 {bites}。"))
                 : Result<RiceState>.Success(state with { Bites = state.Bites - bites, Revision = state.Revision + 1 }),
             cancellationToken);
+
+    /// <summary>
+    /// Promises that the next <paramref name="bites"/> rounds are on the house, on one Channel or (with null) on every
+    /// Channel, until <paramref name="until"/>.
+    ///
+    /// Adding, not replacing: two campaigns on the same Channel are two allowances, and the one expiring first is spent
+    /// first. A name that is already in the table is refused rather than silently overwritten — cancelling an intention
+    /// and then re-using its name would make "why did this stop working" a question with no answer.
+    ///
+    /// This write also drops what has expired or been spent, so the table stays the size of what is still true.
+    /// </summary>
+    public ValueTask<Result<RiceState>> GrantWaiverAsync(RiceWaiver waiver, string actor,
+        CancellationToken cancellationToken) =>
+        ChangeAsync($"waive:{waiver.Id}", actor, state =>
+        {
+            if (state.Allowances.Any(entry => string.Equals(entry.Id, waiver.Id, StringComparison.Ordinal)))
+                return Result<RiceState>.Failure(new(ErrorCode.Conflict, $"已经有一条豁免叫 {waiver.Id} 了。"));
+            if (waiver.Remaining <= 0)
+                return Result<RiceState>.Failure(new(ErrorCode.Invalid, "豁免的口数必须大于 0。"));
+            if (waiver.Until <= waiver.CreatedAt)
+                return Result<RiceState>.Failure(new(ErrorCode.Invalid, "豁免的到期时间必须晚于创建时间。"));
+
+            var live = state.Allowances
+                .Where(entry => entry.Remaining > 0 && entry.Until > waiver.CreatedAt)
+                .ToArray();
+            return Result<RiceState>.Success(state with
+            {
+                Revision = state.Revision + 1,
+                Waivers = [.. live, waiver]
+            });
+        }, cancellationToken);
+
+    /// <summary>
+    /// Takes an allowance back. Refused when nothing has that name: "cancelled" and "was never there" are different
+    /// answers, and a silent success would leave a person believing a free round they are still paying for.
+    /// </summary>
+    public ValueTask<Result<RiceState>> RevokeWaiverAsync(string id, string actor,
+        CancellationToken cancellationToken) =>
+        ChangeAsync($"unwaive:{id}", actor, state =>
+        {
+            var kept = state.Allowances
+                .Where(entry => !string.Equals(entry.Id, id, StringComparison.Ordinal))
+                .ToArray();
+            return kept.Length == state.Allowances.Count
+                ? Result<RiceState>.Failure(new(ErrorCode.Invalid, $"没有叫 {id} 的豁免。"))
+                : Result<RiceState>.Success(state with { Revision = state.Revision + 1, Waivers = kept });
+        }, cancellationToken);
 
     private ValueTask<Result<RiceState>> ChangeAsync(string reason, string actor,
         Func<RiceState, Result<RiceState>> change, CancellationToken cancellationToken) =>
@@ -129,7 +256,10 @@ public sealed class RiceLedger(IStateStore store, IAtomicWork atomic, ISignalLog
             Detail = new Dictionary<string, string>
             {
                 ["bites"] = state.Bites.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                ["revision"] = state.Revision.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                ["revision"] = state.Revision.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                // How many allowances were live at this write. Bites not moving while this is above zero is the whole
+                // story of a waived round, and it is the one place a later reader can see it.
+                ["allowances"] = state.Allowances.Count.ToString(System.Globalization.CultureInfo.InvariantCulture)
             }
         });
         if (audit is not null)

@@ -62,6 +62,15 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
     private readonly IJobRegistry? _jobs;
 
     /// <summary>
+    /// The host's clock, for the one thing a round needs to say out loud: when it happened.
+    ///
+    /// A policy that has to answer "is this still today" cannot call its own clock — it would disagree with the host
+    /// about midnight, and no test could put a round on a chosen day. Defaulted rather than required so that every
+    /// existing construction keeps working.
+    /// </summary>
+    private readonly TimeProvider _time;
+
+    /// <summary>
     /// The names this manager will look up. Declared only when it resolves them by name: with a model manager handed
     /// in directly there is nothing to look up, so claiming the name would make the kernel demand a module this
     /// instance does not use.
@@ -120,7 +129,7 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
     public SessionManager(string dataRoot, IModelManager? models = null, ISessionExtensionRegistry? extensions = null,
         ISignalLog? signalLog = null, IPromptLibrary? prompts = null, ICatalog? catalog = null, IEventSink? events = null,
         Func<int, TimeSpan>? retryDelay = null, IMediaPolicy? media = null, IBinaryFileAccess? files = null,
-        IJobRegistry? jobs = null)
+        IJobRegistry? jobs = null, TimeProvider? time = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         if (models is null && catalog is null)
@@ -144,6 +153,7 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
         // "interrupted" and the session is told once (docs/28 §9). Null means this host keeps no registry, and then
         // nothing is ever announced — which is what a test without one gets, and what the previous behaviour was.
         _jobs = jobs;
+        _time = time ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -163,8 +173,17 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
             .ToArray();
 
     /// <summary>The Channel a Session answers for, when the stored text still names a usable instance address.</summary>
-    private static Address ChannelAddress(string channel) =>
-        Address.TryParse(channel, out var parsed) && parsed.IsInstance ? parsed : default;
+    private static Address ChannelAddress(string channel) => ChannelOrNull(channel) ?? default;
+
+    /// <summary>
+    /// The same question, answered as "none" instead of "an address that points nowhere".
+    ///
+    /// The two shapes exist because the callers ask different things: a lifecycle notice needs an address to aim at
+    /// (and its own filter has already established there is one), while a round request says "this Session answers for
+    /// no Channel" and must not be able to mean "it answers for the default address".
+    /// </summary>
+    private static Address? ChannelOrNull(string? channel) =>
+        channel is not null && Address.TryParse(channel, out var parsed) && parsed.IsInstance ? parsed : null;
 
     /// <summary>
     /// Announces that a Session has started serving. Called once per Session per process — on load, not on every turn,
@@ -1905,7 +1924,11 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
     {
         var sources = _extensions.Admissions;
         if (sources.Count == 0) return RoundAdmission.Yes;
-        var request = new RoundAdmissionRequest(sessionId, state.StepNumber + 1, level);
+        // Which Channel this Session answers for, and when now is, travel with the round: neither can be derived by
+        // the policy that needs them — the first is data on the Session, the second belongs to the host's clock — and
+        // a policy that guessed at either would be answering a different question than the one it was asked (docs/34 §10).
+        var request = new RoundAdmissionRequest(sessionId, state.StepNumber + 1, level,
+            ChannelOrNull(state.Channel), _time.GetLocalNow());
         foreach (var source in sources)
         {
             var verdict = await source.AdmitAsync(request, cancellationToken).ConfigureAwait(false);

@@ -122,7 +122,22 @@ public interface IRoundAdmission
 }
 
 /// <param name="StepNumber">The round about to run: <c>state.StepNumber + 1</c>.</param>
-public sealed record RoundAdmissionRequest(string SessionId, int StepNumber, AccessLevel Level);
+/// <param name="SessionId">Which round this is, and for whom. A round is identified by <c>(Session, step)</c>, and the
+/// step only goes up, so an admission that acts on a round can be retried without acting twice.</param>
+/// <param name="Channel">
+/// The Channel this Session answers for, or null when it answers for none — a Session started by a script or by hand
+/// has no conversation to point at. It is carried because it cannot be derived: which Channel a Session belongs to is
+/// data on the Session (<c>SessionState.Channel</c>), so a policy that wanted it would otherwise have to be handed the
+/// state itself, and a policy that reaches into a Session's state is a policy that can be surprised by it.
+/// </param>
+/// <param name="Now">
+/// This round's instant, on the host's clock and in its time zone. Passed rather than looked up so that "today" means
+/// one thing: a policy that called its own clock would disagree with the host about midnight, and a test could not
+/// place a round on a particular day at all. <see cref="DateTimeOffset"/> and not <c>DateTime</c> — the offset is what
+/// makes "今日" local, and losing it is how a policy silently starts counting in UTC.
+/// </param>
+public sealed record RoundAdmissionRequest(string SessionId, int StepNumber, AccessLevel Level,
+    Address? Channel = null, DateTimeOffset Now = default);
 
 /// <summary>
 /// The answer. <paramref name="Note"/> is shown as the model's closing words when the round is refused, so write it
