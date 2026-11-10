@@ -150,11 +150,26 @@ public static class IdentityActionSet
                     return Result<JsonElement>.Failure(new(ErrorCode.Invalid, accountError!));
 
                 var id = rawId.Trim();
-                if (people.FindById(id) is { } existing && existing.Level > AccessLevel.Agent &&
-                    actor.Level < AccessLevel.Operator && ChangesAccounts(existing, accounts, self))
+                var existing = people.FindById(id);
+                // Who counts as "me" is nobody's bookkeeping but a person's: setting self, clearing it, or bringing a
+                // new card in already marked self — all of them decide which accounts the process treats as its own,
+                // and all of them need somebody who is trusted with that. Without this line an L0 caller could clear
+                // the flag on one card and set it on another, and the rule about levels below would never be reached.
+                if (self != (existing?.Self ?? false) && actor.Level < AccessLevel.Operator)
                 {
                     return Result<JsonElement>.Failure(new(ErrorCode.Denied,
-                        $"'{existing.Id}' is {AccessLevels.Describe(existing.Level)}, so which accounts are his is a "
+                        self
+                            ? "'self' says which accounts are mine, and that is a person's decision: marking accounts as "
+                              + $"mine needs {AccessLevels.Describe(AccessLevel.Operator)} or higher."
+                            : $"clearing 'self' on '{id}' needs {AccessLevels.Describe(AccessLevel.Operator)} or higher: "
+                              + "it decides which accounts the process treats as its own."));
+                }
+
+                if (existing is { } person && person.Level > AccessLevel.Agent && actor.Level < AccessLevel.Operator &&
+                    ChangesAccounts(person, accounts))
+                {
+                    return Result<JsonElement>.Failure(new(ErrorCode.Denied,
+                        $"'{person.Id}' is {AccessLevels.Describe(person.Level)}, so which accounts are his is a "
                         + $"person's decision: changing them needs {AccessLevels.Describe(AccessLevel.Operator)} or higher. "
                         + "His name and note you may change at any level; a level is not yours to write at all."));
                 }
@@ -186,12 +201,19 @@ public static class IdentityActionSet
                 if (!arguments.TryReadText("id", out var rawId) || rawId.Trim().Length == 0)
                     return Result<JsonElement>.Failure(new(ErrorCode.Invalid, "identity.people.remove requires 'id'."));
                 var id = rawId.Trim();
-                if (people.FindById(id) is { } existing && existing.Level > AccessLevel.Agent &&
-                    actor.Level < AccessLevel.Operator)
+                if (people.FindById(id) is { } existing && actor.Level < AccessLevel.Operator)
                 {
-                    return Result<JsonElement>.Failure(new(ErrorCode.Denied,
-                        $"'{existing.Id}' is {AccessLevels.Describe(existing.Level)}: removing him needs "
-                        + $"{AccessLevels.Describe(AccessLevel.Operator)} or higher."));
+                    // Two doors, and either one is enough to stop it. Deleting the self card is the same act as
+                    // clearing the flag — it decides which accounts the process treats as its own — so it gets the
+                    // same answer, not a loophole beside it.
+                    if (existing.Self)
+                        return Result<JsonElement>.Failure(new(ErrorCode.Denied,
+                            $"'{existing.Id}' is the set of accounts that are mine: removing it needs "
+                            + $"{AccessLevels.Describe(AccessLevel.Operator)} or higher."));
+                    if (existing.Level > AccessLevel.Agent)
+                        return Result<JsonElement>.Failure(new(ErrorCode.Denied,
+                            $"'{existing.Id}' is {AccessLevels.Describe(existing.Level)}: removing him needs "
+                            + $"{AccessLevels.Describe(AccessLevel.Operator)} or higher."));
                 }
                 var removed = await editing.RemoveAsync(id, cancellationToken).ConfigureAwait(false);
                 if (!removed.Ok) return Result<JsonElement>.Failure(removed.Error!);
@@ -218,12 +240,12 @@ public static class IdentityActionSet
     }
 
     /// <summary>
-    /// Whether this write would change <b>who is recognised as this person</b> — his accounts, or whether they are mine.
-    /// The name and the note are not in this question: those change how he is described, not whose words are his.
+    /// Whether this write would change <b>which accounts are recognised as this person</b>. The name and the note are
+    /// not in this question: those change how he is described, not whose words are his. Neither is <c>self</c> — that
+    /// one has a door of its own, independent of any level, because it decides which accounts are the bot's.
     /// </summary>
-    private static bool ChangesAccounts(Person person, IReadOnlyList<PersonAccount> accounts, bool self)
+    private static bool ChangesAccounts(Person person, IReadOnlyList<PersonAccount> accounts)
     {
-        if (person.Self != self) return true;
         var current = (person.Accounts ?? []).Select(account => account.Key).OrderBy(key => key, StringComparer.Ordinal);
         var wanted = accounts.Select(account => account.Key).OrderBy(key => key, StringComparer.Ordinal);
         return !current.SequenceEqual(wanted, StringComparer.Ordinal);

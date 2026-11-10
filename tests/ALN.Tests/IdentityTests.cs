@@ -505,13 +505,77 @@ public sealed class IdentityTests : IDisposable
         var people = await Load();
         var plane = Plane(people);
 
-        var answer = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+        // An operator, because the flag itself needs one — the clash is what this test is about.
+        var answer = await plane.InvokeAsync(Operator(), IdentityActions.Set, Arguments("""
             {"id":"b","name":"也是我","self":true,"accounts":[{"adapter":"adapter.qq#main","account":"222"}]}
             """), default);
 
         Assert.False(answer.Ok);
         Assert.Equal(ErrorCode.Conflict, answer.Error!.Code);
         Assert.Equal("a", people.Self!.Id);
+    }
+
+    [Fact]
+    public async Task A_model_cannot_say_which_accounts_are_mine()
+    {
+        var people = await Load();
+        var plane = Plane(people);
+
+        // Bringing a new card in already marked self is the same act as flagging an old one: without this, "mark
+        // these accounts as mine" would be reachable by creating a card rather than by editing one.
+        var created = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+            {"id":"me","name":"我","self":true,"accounts":[{"adapter":"adapter.qq#main","account":"1"}]}
+            """), default);
+        Assert.False(created.Ok);
+        Assert.Equal(ErrorCode.Denied, created.Error!.Code);
+        Assert.Null(people.Self);
+
+        var allowed = await plane.InvokeAsync(Operator(), IdentityActions.Set, Arguments("""
+            {"id":"me","name":"我","self":true,"accounts":[{"adapter":"adapter.qq#main","account":"1"}]}
+            """), default);
+        Assert.True(allowed.Ok, allowed.Error?.Detail);
+        Assert.Equal("me", people.Self!.Id);
+    }
+
+    [Fact]
+    public async Task A_model_cannot_flag_or_unflag_somebody_with_no_level_either()
+    {
+        Write("xiaolin", """{"name":"小林","accounts":[{"adapter":"adapter.qq#main","account":"1"}]}""");
+        Write("me", """{"name":"我","self":true,"accounts":[{"adapter":"adapter.qq#main","account":"2"}]}""");
+        var people = await Load();
+        var plane = Plane(people);
+
+        var flagged = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+            {"id":"xiaolin","name":"小林","self":true,"accounts":[{"adapter":"adapter.qq#main","account":"1"}]}
+            """), default);
+        Assert.False(flagged.Ok);
+        Assert.Equal(ErrorCode.Denied, flagged.Error!.Code);
+        Assert.Equal("me", people.Self!.Id);
+
+        var cleared = await plane.InvokeAsync(Model(), IdentityActions.Set, Arguments("""
+            {"id":"me","name":"我","accounts":[{"adapter":"adapter.qq#main","account":"2"}]}
+            """), default);
+        Assert.False(cleared.Ok);
+        Assert.Equal(ErrorCode.Denied, cleared.Error!.Code);
+        Assert.True(people.FindById("me")!.Self);
+    }
+
+    [Fact]
+    public async Task A_model_cannot_remove_the_card_that_is_mine()
+    {
+        Write("me", """{"name":"我","self":true,"accounts":[{"adapter":"adapter.qq#main","account":"2"}]}""");
+        var people = await Load();
+        var plane = Plane(people);
+
+        // Deleting the self card is clearing the flag by another road, so it gets the same door rather than a way round.
+        var refused = await plane.InvokeAsync(Model(), IdentityActions.Remove, Arguments("""{"id":"me"}"""), default);
+        Assert.False(refused.Ok);
+        Assert.Equal(ErrorCode.Denied, refused.Error!.Code);
+        Assert.NotNull(people.Self);
+
+        var removed = await plane.InvokeAsync(Operator(), IdentityActions.Remove, Arguments("""{"id":"me"}"""), default);
+        Assert.True(removed.Ok, removed.Error?.Detail);
+        Assert.Null(people.Self);
     }
 
     [Fact]
