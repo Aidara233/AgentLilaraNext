@@ -6,6 +6,7 @@ using ALN.Runtime;
 using Aln.Documents;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
+using S = DocumentFormat.OpenXml.Spreadsheet;
 using W = DocumentFormat.OpenXml.Wordprocessing;
 
 namespace ALN.Tests;
@@ -73,7 +74,11 @@ public sealed class DocumentToolsTests : IDisposable
         var (_, tools) = Open();
         var offers = (await tools.ToolsAsync(new RoundContextRequest("s-1", Guid.NewGuid(), 1), default)).Value!;
 
-        Assert.Equal(["doc_info", "doc_tree", "doc_read", "doc_create_docx", "doc_create_xlsx"],
+        Assert.Equal([
+                "doc_info", "doc_tree", "doc_read",
+                "doc_create_docx", "doc_create_xlsx",
+                "doc_edit_docx", "doc_edit_xlsx", "doc_edit_pptx"
+            ],
             offers.Select(offer => offer.Definition.Name));
         Assert.All(offers, offer => Assert.False(offer.ActsExternally));
         Assert.All(offers, offer => Assert.False(offer.Tool.EndsTurn));
@@ -282,5 +287,108 @@ public sealed class DocumentToolsTests : IDisposable
 
         Assert.False(answer.Ok);
         Assert.Contains(".docx", answer.Error!.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Editing_a_paragraph_replaces_its_text_and_leaves_a_backup()
+    {
+        var (access, tools) = Open();
+        Assert.True((await access.SaveAsync(FileScopes.Workspace, "q3.docx", Docx(), default)).Ok);
+
+        var edited = await CallAsync(tools, "doc_edit_docx",
+            """{"scope":"workspace","path":"q3.docx","edits":[{"index":2,"text":"改过的正文。"}]}""");
+        Assert.True(edited.Ok, edited.Error?.Message);
+        Assert.Contains(".bak", edited.Value!.Content, StringComparison.Ordinal);
+
+        var read = await CallAsync(tools, "doc_read", """{"scope":"workspace","path":"q3.docx","from":2,"to":2}""");
+        Assert.True(read.Ok, read.Error?.Message);
+        Assert.Contains("改过的正文。", read.Value!.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("第一段", read.Value.Content, StringComparison.Ordinal);
+
+        // The copy is the only thing between an edit and a lost document, so its existence is part of the contract.
+        Assert.True(File.Exists(Path.Combine(_root, "workspace", "q3.docx.bak")));
+    }
+
+    [Fact]
+    public async Task Editing_a_cell_writes_the_new_value()
+    {
+        var (_, tools) = Open();
+        Assert.True((await CallAsync(tools, "doc_create_xlsx",
+            """
+            {"scope":"workspace","path":"stock.xlsx","sheets":[
+              {"name":"库存","rows":[["名称","数量"],["苹果","42"]]}]}
+            """)).Ok);
+
+        var edited = await CallAsync(tools, "doc_edit_xlsx",
+            """{"scope":"workspace","path":"stock.xlsx","edits":[{"sheet":"库存","ref":"B2","text":"45"}]}""");
+        Assert.True(edited.Ok, edited.Error?.Message);
+
+        var read = await CallAsync(tools, "doc_read", """{"scope":"workspace","path":"stock.xlsx"}""");
+        Assert.True(read.Ok, read.Error?.Message);
+        Assert.Contains("| 苹果 | 45 |", read.Value!.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("| 苹果 | 42 |", read.Value.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_cell_that_held_a_formula_says_the_formula_is_gone()
+    {
+        var (_, tools) = Open();
+        Assert.True((await CallAsync(tools, "doc_create_xlsx",
+            """
+            {"scope":"workspace","path":"sum.xlsx","sheets":[{"name":"表","rows":[["a","1"],["b","2"]]}]}
+            """)).Ok);
+
+        // Put a formula into the sheet by hand: the creator does not write them, and this test is about editing one.
+        var path = Path.Combine(_root, "workspace", "sum.xlsx");
+        using (var document = SpreadsheetDocument.Open(path, isEditable: true))
+        {
+            var workbookPart = document.WorkbookPart!;
+            var sheet = workbookPart.Workbook!.Sheets!.Elements<S.Sheet>().First();
+            var worksheetPart = (WorksheetPart)workbookPart.GetPartById(sheet.Id!.Value!);
+            var row = worksheetPart.Worksheet!.GetFirstChild<S.SheetData>()!.Elements<S.Row>().Last();
+            row.AppendChild(new S.Cell
+            {
+                CellReference = "C2",
+                CellFormula = new S.CellFormula("SUM(B1:B2)"),
+                CellValue = new S.CellValue("3")
+            });
+            worksheetPart.Worksheet.Save();
+            workbookPart.Workbook.Save();
+        }
+
+        var edited = await CallAsync(tools, "doc_edit_xlsx",
+            """{"scope":"workspace","path":"sum.xlsx","edits":[{"sheet":"表","ref":"C2","text":"5"}]}""");
+
+        Assert.True(edited.Ok, edited.Error?.Message);
+        // The stale cache under a new formula would be a worse lie than no cache, so the formula goes and it is said.
+        Assert.Contains("公式", edited.Value!.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_paragraph_holding_a_field_is_refused_rather_than_rewritten()
+    {
+        var (access, tools) = Open();
+
+        var stream = new MemoryStream();
+        using (var document = WordprocessingDocument.Create(stream, WordprocessingDocumentType.Document, autoSave: true))
+        {
+            var main = document.AddMainDocumentPart();
+            main.Document = new W.Document(new W.Body(
+                new W.Paragraph(new W.Run(new W.Text("普通段落"))),
+                // A field is text that means something else as well: page number, cross-reference, date. Rewriting the
+                // text leaves the field instruction pointing at whatever it pointed at before, which is how a document
+                // opens fine and is wrong.
+                new W.Paragraph(new W.Run(new W.FieldCode { Text = " PAGE " }))));
+            main.Document.Save();
+        }
+        stream.Position = 0;
+        Assert.True((await access.SaveAsync(FileScopes.Workspace, "fields.docx", stream, default)).Ok);
+
+        var answer = await CallAsync(tools, "doc_edit_docx",
+            """{"scope":"workspace","path":"fields.docx","edits":[{"index":2,"text":"改这里"}]}""");
+
+        Assert.False(answer.Ok);
+        Assert.Equal(ErrorCode.Denied, answer.Error!.Code);
+        Assert.Contains("域", answer.Error.Message, StringComparison.Ordinal);
     }
 }

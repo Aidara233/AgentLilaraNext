@@ -90,7 +90,10 @@ public sealed partial class DocumentTools(IBinaryFileAccess files) : ISessionToo
             // Writing is the same kind of act as reading — it changes this disk, not anybody's inbox — so these are
             // not "acts externally" either: a round that only wrote a file has not spoken to anyone (docs/08 §5.1).
             new SessionToolOffer(new CreateTool(this, DocxToolName), DocxDefinition, ActsExternally: false),
-            new SessionToolOffer(new CreateTool(this, XlsxToolName), XlsxDefinition, ActsExternally: false)
+            new SessionToolOffer(new CreateTool(this, XlsxToolName), XlsxDefinition, ActsExternally: false),
+            new SessionToolOffer(new EditTool(this, EditDocxToolName), EditDocxDefinition, ActsExternally: false),
+            new SessionToolOffer(new EditTool(this, EditXlsxToolName), EditXlsxDefinition, ActsExternally: false),
+            new SessionToolOffer(new EditTool(this, EditPptxToolName), EditPptxDefinition, ActsExternally: false)
         ];
         return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(tools));
     }
@@ -318,6 +321,12 @@ public sealed partial class DocumentTools(IBinaryFileAccess files) : ISessionToo
             value.TryGetDouble(out var number)
                 ? number
                 : null;
+
+        /// <summary>An array of objects, or nothing when the argument is missing or is not an array.</summary>
+        public static IEnumerable<JsonElement> Items(JsonElement root, string name) =>
+            root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Array
+                ? value.EnumerateArray()
+                : [];
 
         /// <summary>
         /// A two-dimensional block of cell text. Numbers and booleans are taken as they are written in the JSON rather
