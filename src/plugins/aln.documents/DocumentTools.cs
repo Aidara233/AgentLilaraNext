@@ -46,14 +46,6 @@ public sealed class DocumentTools(IBinaryFileAccess files) : ISessionToolSource
         return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(tools));
     }
 
-    /// <summary>What the bytes are, decided by the bytes. A name is a claim; the first few bytes are not.</summary>
-    private static string Sniff(ReadOnlySpan<byte> head) =>
-        head.Length >= 4 && head[0] == 0x50 && head[1] == 0x4B && (head[2] == 0x03 || head[2] == 0x05) ? "ZIP 容器（.docx / .xlsx / .pptx 都是这个外壳，里面装什么还要再看）"
-        : head.Length >= 5 && head[0] == 0x25 && head[1] == 0x50 && head[2] == 0x44 && head[3] == 0x46 && head[4] == 0x2D ? "PDF"
-        : head.Length >= 4 && head[0] == 0xD0 && head[1] == 0xCF && head[2] == 0x11 && head[3] == 0xE0 ? "OLE 复合文档（.doc / .xls / .ppt，或者是加了密码的 OOXML——这两种还要再分开）"
-        : head.Length == 0 ? "空文件"
-        : "没认出来的字节";
-
     private static string Sizes(long bytes) => bytes < 1024 ? $"{bytes} 字节" : $"{bytes / 1024.0:0.#} KB";
 
     private sealed class InfoTool(DocumentTools owner) : ISessionTool
@@ -87,15 +79,33 @@ public sealed class DocumentTools(IBinaryFileAccess files) : ISessionToolSource
 
             await using (stream)
             {
-                var buffer = new byte[8];
-                var read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
                 var length = stream.CanSeek ? stream.Length : -1;
+                var parsed = DocumentReader.Read(stream);
+                if (!parsed.Ok || parsed.Value is not { } document)
+                {
+                    // A refusal that already names what the bytes were is the useful answer; prefixing it with the path
+                    // says which file it was about without hiding the reason.
+                    var error = parsed.Error ?? new Error(ErrorCode.Unavailable, "这个文件读不出来。");
+                    return Result<SessionToolResult>.Failure(
+                        new Error(error.Code, $"{scope}/{path}：{error.Message}", error.Detail));
+                }
 
                 var text = new StringBuilder();
-                text.Append($"{scope}/{path}：").Append(Sniff(buffer.AsSpan(0, read)));
+                text.Append($"{scope}/{path}：").Append(document.Format);
                 if (length >= 0) text.Append("，").Append(Sizes(length));
                 text.Append("。\n");
-                text.Append("现在只做到判断格式——解析还没接上，所以还给不出内容、页数或表格数。");
+
+                var parts = new List<string>();
+                if (document.Count(SectionKind.Paragraph) is var paragraphs and > 0) parts.Add($"段落 {paragraphs}");
+                if (document.Count(SectionKind.Table) is var tables and > 0) parts.Add($"表格 {tables}");
+                if (document.Count(SectionKind.Sheet) is var sheets and > 0) parts.Add($"工作表 {sheets}");
+                if (document.Count(SectionKind.Slide) is var slides and > 0) parts.Add($"幻灯片 {slides}");
+                if (document.Count(SectionKind.Page) is var pages and > 0) parts.Add($"页 {pages}");
+                text.Append(parts.Count == 0 ? "没有读出任何内容。" : string.Join("，", parts));
+                text.Append($"；共 {document.Characters} 字符。");
+                if (document.Truncated)
+                    text.Append("\n（读取到上限就停了，后面的内容还没读——用范围参数分次读。）");
+
                 return Result<SessionToolResult>.Success(new SessionToolResult(text.ToString()));
             }
         }

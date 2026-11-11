@@ -6,10 +6,18 @@
     <Nullable>enable</Nullable>
     <!-- A plugin is a plain library: the host loads it, nothing loads the host. -->
     <IsPackable>false</IsPackable>
+    <!-- The package carries its own dependencies. A plugin's NuGet libraries are private to it, and the loader resolves
+         them from the directory this assembly sits in (docs/18 §3). A library build otherwise leaves them in the NuGet
+         cache, where only the build machine can see them — the package would load here and nowhere else. -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\ALN.Contracts\ALN.Contracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="DocumentFormat.OpenXml" Version="3.5.1" />
   </ItemGroup>
 
 </Project>

@@ -1,10 +1,12 @@
-using System.IO.Compression;
 using System.Text;
 using ALN.Contracts;
 using ALN.Contracts.Models;
 using ALN.Contracts.Sessions;
 using ALN.Runtime;
 using Aln.Documents;
+using DocumentFormat.OpenXml;
+using DocumentFormat.OpenXml.Packaging;
+using W = DocumentFormat.OpenXml.Wordprocessing;
 
 namespace ALN.Tests;
 
@@ -39,21 +41,21 @@ public sealed class DocumentToolsTests : IDisposable
         return await offer.Tool.ExecuteAsync(new ModelToolCall("call-1", tool, arguments), default);
     }
 
-    private static MemoryStream MinimalDocx()
+    /// <summary>A real .docx, not a marker: the plugin's answer has to come from the parts inside the container.</summary>
+    private static MemoryStream Docx()
     {
-        // A real OOXML container, not a marker: the two parts below are what makes a zip a document as far as any
-        // reader is concerned, and building it the same way the plugin's parser will have to read it keeps this test
-        // honest after the parser lands.
-        var zip = new MemoryStream();
-        using (var archive = new ZipArchive(zip, ZipArchiveMode.Create, leaveOpen: true))
+        var stream = new MemoryStream();
+        using (var document = WordprocessingDocument.Create(stream, WordprocessingDocumentType.Document, autoSave: true))
         {
-            using (var writer = new StreamWriter(archive.CreateEntry("[Content_Types].xml").Open(), Encoding.UTF8))
-                writer.Write("""<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>""");
-            using (var writer = new StreamWriter(archive.CreateEntry("word/document.xml").Open(), Encoding.UTF8))
-                writer.Write("""<?xml version="1.0"?><w:document xmlns:w="x"><w:body/></w:document>""");
+            var main = document.AddMainDocumentPart();
+            main.Document = new W.Document(new W.Body(
+                new W.Paragraph(
+                    new W.ParagraphProperties(new W.ParagraphStyleId { Val = "Heading1" }),
+                    new W.Run(new W.Text("季度报告")))));
+            main.Document.Save();
         }
-        zip.Position = 0;
-        return zip;
+        stream.Position = 0;
+        return stream;
     }
 
     [Fact]
@@ -70,20 +72,19 @@ public sealed class DocumentToolsTests : IDisposable
     }
 
     [Fact]
-    public async Task A_docx_is_recognised_as_the_container_it_is()
+    public async Task A_docx_is_reported_as_a_docx_with_what_it_contains()
     {
         var (access, tools) = Open();
-        Assert.True((await access.SaveAsync(FileScopes.Workspace, "reports/q3.docx", MinimalDocx(), default)).Ok);
+        Assert.True((await access.SaveAsync(FileScopes.Workspace, "reports/q3.docx", Docx(), default)).Ok);
 
         var answer = await CallAsync(tools, "doc_info",
             """{"scope":"workspace","path":"reports/q3.docx"}""");
 
-        Assert.True(answer.Ok);
+        Assert.True(answer.Ok, answer.Error?.Message);
         var text = answer.Value!.Content;
-        Assert.Contains("ZIP", text, StringComparison.Ordinal);
         Assert.Contains("workspace/reports/q3.docx", text, StringComparison.Ordinal);
-        // It says out loud that the parsing half is not there yet, instead of implying the content was read.
-        Assert.Contains("解析还没接上", text, StringComparison.Ordinal);
+        Assert.Contains("docx", text, StringComparison.Ordinal);
+        Assert.Contains("段落 1", text, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -96,9 +97,10 @@ public sealed class DocumentToolsTests : IDisposable
 
         var answer = await CallAsync(tools, "doc_info", """{"scope":"workspace","path":"report.docx"}""");
 
-        Assert.True(answer.Ok);
-        Assert.Contains("PDF", answer.Value!.Content, StringComparison.Ordinal);
-        Assert.DoesNotContain("ZIP", answer.Value.Content, StringComparison.Ordinal);
+        // It got as far as "this is a PDF", which is the answer the name would have got wrong. The PDF reader is the
+        // next thing to land; until then the refusal says which half is missing rather than blaming the file.
+        Assert.False(answer.Ok);
+        Assert.Contains("PDF", answer.Error!.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -110,8 +112,8 @@ public sealed class DocumentToolsTests : IDisposable
 
         var answer = await CallAsync(tools, "doc_info", """{"scope":"workspace","path":"blob.bin"}""");
 
-        Assert.True(answer.Ok);
-        Assert.Contains("没认出来", answer.Value!.Content, StringComparison.Ordinal);
+        Assert.False(answer.Ok);
+        Assert.Contains("不是本框架认识的办公文档", answer.Error!.Message, StringComparison.Ordinal);
     }
 
     [Fact]
