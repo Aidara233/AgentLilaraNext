@@ -215,14 +215,16 @@ public sealed class DocumentReaderTests
         Assert.Contains("OLE", parsed.Error!.Message, StringComparison.Ordinal);
     }
 
-    private static MemoryStream Pdf(string? text)
+    private static MemoryStream Pdf(params string[] lines)
     {
         var builder = new PdfDocumentBuilder();
         var page = builder.AddPage(PageSize.A4);
-        if (text is not null)
+        var font = builder.AddStandard14Font(Standard14Font.Helvetica);
+        var y = 700;
+        foreach (var line in lines)
         {
-            var font = builder.AddStandard14Font(Standard14Font.Helvetica);
-            page.AddText(text, 12, new PdfPoint(50, 700), font);
+            page.AddText(line, 12, new PdfPoint(50, y), font);
+            y -= 20;
         }
         return new MemoryStream(builder.Build());
     }
@@ -240,11 +242,26 @@ public sealed class DocumentReaderTests
     }
 
     [Fact]
+    public void A_pdf_keeps_its_lines_apart()
+    {
+        // The library's own page text is one run: a title and an address block welded together read like a sentence
+        // nobody wrote. The lines come back from where the words sit, which is the only thing a PDF knows about a line.
+        using var stream = Pdf("Service Agreement", "Party A: Lilara Labs", "Term: 12 months");
+        var parsed = DocumentReader.Read(stream);
+
+        Assert.True(parsed.Ok, parsed.Error?.Message);
+        var text = parsed.Value!.Sections[0].Text;
+        Assert.Contains("Service Agreement\n", text, StringComparison.Ordinal);
+        Assert.Contains("\nParty A: Lilara Labs", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("AgreementParty", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void A_page_with_no_text_layer_is_not_reported_as_an_empty_document()
     {
         // What a scanner produces: a real page, a real page count, and no text at all. "Empty" would be a lie about a
         // document that is sitting right there, so the answer has to name the missing layer instead.
-        using var stream = Pdf(null);
+        using var stream = Pdf();
         var parsed = DocumentReader.Read(stream);
 
         Assert.False(parsed.Ok);

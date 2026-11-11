@@ -59,7 +59,7 @@ internal static class PdfReader
                 if (page.Number > MaxPages) { truncated = true; break; }
                 if (used >= maxChars) { truncated = true; break; }
 
-                var text = Blocks.NormalizeLines(page.Text);
+                var text = Blocks.NormalizeLines(TextOf(page));
                 if (text.Length == 0) { withoutText.Add(page.Number); continue; }
                 if (used + text.Length > maxChars) { truncated = true; break; }
 
@@ -90,6 +90,40 @@ internal static class PdfReader
 
             return Result<ParsedDocument>.Success(new ParsedDocument(DocumentFormats.Pdf, sections, truncated));
         }
+    }
+
+    /// <summary>
+    /// A page's text with its lines put back.
+    ///
+    /// <b>Words, not <c>Page.Text</c>.</b> The library's own text is the words in content order, which for a page written
+    /// by a layout engine is one long run: a title, an address block and a table row all arrive welded together, and the
+    /// result reads like a sentence nobody wrote. The words do carry where they sit, so the lines can be recovered by
+    /// grouping on the baseline — which is the only thing a PDF actually knows about a line.
+    ///
+    /// The tolerance is a couple of points because a page can have several blocks of text on one visual line, and
+    /// splitting them into separate lines would be just as wrong in the other direction.
+    /// </summary>
+    private static string TextOf(UglyToad.PdfPig.Content.Page page)
+    {
+        var words = page.GetWords().ToList();
+        if (words.Count == 0) return string.Empty;
+
+        var lines = new List<(double Baseline, List<UglyToad.PdfPig.Content.Word> Words)>();
+        foreach (var word in words.OrderByDescending(word => word.BoundingBox.Bottom).ThenBy(word => word.BoundingBox.Left))
+        {
+            if (lines.Count > 0 && Math.Abs(lines[^1].Baseline - word.BoundingBox.Bottom) <= 2.0)
+                lines[^1].Words.Add(word);
+            else
+                lines.Add((word.BoundingBox.Bottom, [word]));
+        }
+
+        var builder = new System.Text.StringBuilder();
+        foreach (var line in lines)
+        {
+            if (builder.Length > 0) builder.Append('\n');
+            builder.AppendJoin(' ', line.Words.OrderBy(word => word.BoundingBox.Left).Select(word => word.Text));
+        }
+        return builder.ToString();
     }
 
     /// <summary>Page numbers as a person would say them: 3, or 3–5, or 3, 7, 9–11.</summary>
