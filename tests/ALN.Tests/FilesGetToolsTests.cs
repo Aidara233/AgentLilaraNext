@@ -103,22 +103,26 @@ public sealed class FilesGetToolsTests : IDisposable
     [Fact]
     public async Task A_handle_puts_the_bytes_exactly_where_the_caller_said()
     {
+        var registry = new FileJobRegistry();
         var catalog = Catalog();
         var files = Files();
-        var answered = await CallAsync(Tools(catalog, files),
+        var answered = await CallAsync(Tools(catalog, files, jobs: registry),
             $$"""{"target":"{{FileHandles.Wrap("0|new")}}","scope":"workspace","path":"downloads/成片.mp4"}""");
 
         Assert.True(answered.Ok, answered.Error?.Message);
         Assert.Contains("workspace/downloads/成片.mp4", answered.Value!.Content, StringComparison.Ordinal);
-        // The size comes from the bytes that actually arrived, not from what the platform claimed about them: the listing
-        // said 2048 and this fake hands over 20, and the number in the answer has to be the true one.
-        Assert.Contains("→ workspace/downloads/成片.mp4（", answered.Value.Content, StringComparison.Ordinal);
+
+        var opened = Assert.Single((await registry.ListAsync("s-1", default)).Value!);
+        var settled = await WaitForJobAsync(registry, opened.Id);
+        Assert.Equal(JobState.Done, settled.State);
 
         var saved = await files.ReadAsync(FileScopes.Workspace, "downloads/成片.mp4", default);
         Assert.True(saved.Ok, saved.Error?.Message);
         Assert.Equal("bytes of 新的成片.mp4", saved.Value!.Text);
         Assert.Equal("downloads/成片.mp4", saved.Value.Path);
-        Assert.Contains($"{saved.Value.Bytes} B", answered.Value.Content, StringComparison.Ordinal);
+        // The size comes from the bytes that actually arrived, not from what the platform claimed about them: the listing
+        // said 2048 and this fake hands over a few dozen, and the number on the row has to be the true one.
+        Assert.Contains($"（{saved.Value.Bytes} B）", settled.Result ?? "", StringComparison.Ordinal);
         Assert.Equal(new[] { FileHandles.Wrap("0|new") }, catalog.Fetched);
     }
 
@@ -130,11 +134,15 @@ public sealed class FilesGetToolsTests : IDisposable
     [Fact]
     public async Task A_platform_file_may_be_larger_than_one_transfer_and_the_tool_says_so()
     {
+        var registry = new FileJobRegistry();
         var catalog = Catalog();
-        var answered = await CallAsync(Tools(catalog, Files()),
+        var answered = await CallAsync(Tools(catalog, Files(), jobs: registry),
             $$"""{"target":"{{FileHandles.Wrap("0|new")}}","scope":"workspace","path":"big.mp4"}""");
 
         Assert.True(answered.Ok, answered.Error?.Message);
+        var opened = Assert.Single((await registry.ListAsync("s-1", default)).Value!);
+        Assert.Equal(JobState.Done, (await WaitForJobAsync(registry, opened.Id)).State);
+        // The ceiling the job carried, not the one a tool moving its own tarball would use.
         Assert.Equal(new[] { FilesGetTools.MaxFetchBytes }, catalog.Ceilings);
         Assert.Equal(4L * 1024 * 1024 * 1024, FilesGetTools.MaxFetchBytes);
         Assert.True(FilesGetTools.MaxFetchBytes > IBinaryFileAccess.MaxTransferBytes);
@@ -144,9 +152,10 @@ public sealed class FilesGetToolsTests : IDisposable
     public async Task The_destination_is_the_byte_ports_decision_and_its_refusal_is_passed_on()
     {
         // Media is the read-only half of the file system: bytes somebody else sent, which the model may look at but not
-        // write. Asking to put a download there is refused by the port, and this tool repeats that answer instead of
-        // keeping its own list of what is allowed (I-37).
-        var answered = await CallAsync(Tools(Catalog(), Files()),
+        // write. "Does this scope take bytes at all" is answered before anything is in flight, because a job aimed at a
+        // scope that never accepts writes is a failed row somebody waits for. A path that escapes its scope is a
+        // different question, and the port answers that one when the write happens (I-37).
+        var answered = await CallAsync(Tools(Catalog(), Files(), jobs: new FileJobRegistry()),
             $$"""{"target":"{{FileHandles.Wrap("0|new")}}","scope":"media","path":"file/x.mp4"}""");
 
         Assert.False(answered.Ok);
@@ -154,17 +163,22 @@ public sealed class FilesGetToolsTests : IDisposable
     }
 
     [Fact]
-    public async Task A_fetch_that_fails_is_not_retried_as_a_search()
+    public async Task A_fetch_that_fails_lands_on_the_ledger_and_is_not_retried_as_a_search()
     {
         // The one mistake that makes three shapes worse than one: "it did not work, so it must have been the other
         // shape". A model asking for bytes would get a listing, and would have no way to tell that nothing arrived.
+        var registry = new FileJobRegistry();
         var catalog = Catalog();
         catalog.Failure = new(ErrorCode.Unavailable, "平台那边没有这个文件。");
-        var answered = await CallAsync(Tools(catalog, Files()),
+        var answered = await CallAsync(Tools(catalog, Files(), jobs: registry),
             $$"""{"target":"{{FileHandles.Wrap("0|gone")}}","scope":"workspace","path":"x.mp4"}""");
 
-        Assert.False(answered.Ok);
-        Assert.Contains("没有这个文件", answered.Error!.Message, StringComparison.Ordinal);
+        // The call is the scheduling step, so it succeeds: what failed is the fetch, and that belongs on the row.
+        Assert.True(answered.Ok, answered.Error?.Message);
+        var opened = Assert.Single((await registry.ListAsync("s-1", default)).Value!);
+        var settled = await WaitForJobAsync(registry, opened.Id);
+        Assert.Equal(JobState.Failed, settled.State);
+        Assert.Contains("没有这个文件", settled.Error ?? "", StringComparison.Ordinal);
         // Not a listing: the search was never run.
         Assert.Empty(catalog.Listed);
     }
@@ -189,13 +203,14 @@ public sealed class FilesGetToolsTests : IDisposable
         Assert.Contains("不提供文件目录", answered.Error!.Message, StringComparison.Ordinal);
     }
 
-    // ---- too big to wait for -----------------------------------------------------------------------
+    // ---- a fetch is never this turn's work ---------------------------------------------------------
 
     [Fact]
-    public async Task A_file_too_big_to_wait_for_becomes_a_job_that_still_lands_where_it_was_aimed()
+    public async Task Every_fetch_becomes_a_job_that_still_lands_where_it_was_aimed()
     {
-        // A turn that blocks for a minute reads as a hang, so a big fetch is written down and done in the background —
-        // with the destination decided *now*, because a job that picked its own path would write a file nobody finds.
+        // A turn that blocks reads as a hang, and "will this one be slow" is a question about a network nobody can answer
+        // before the first byte moves — so every fetch is written down and done in the background, with the destination
+        // decided *now*, because a job that picked its own path would write a file nobody finds.
         var registry = new FileJobRegistry();
         var catalog = new FakeCatalog
         {
@@ -228,22 +243,19 @@ public sealed class FilesGetToolsTests : IDisposable
     }
 
     [Fact]
-    public async Task Without_a_ledger_a_big_file_is_still_fetched_in_the_turn()
+    public async Task Without_a_ledger_a_fetch_is_refused_rather_than_held_open()
     {
-        // The ledger is what makes a background fetch worth doing (it is what tells the Session afterwards). A host
-        // without one keeps working — smaller in what it can wait for, not smaller in what it can do.
-        var catalog = new FakeCatalog
-        {
-            Entries = [new PlatformFile(FileHandles.Wrap("0|big"), "成片.mp4", 12L * 1024 * 1024, null, "小林")]
-        };
-        var files = Files();
+        // Every fetch goes through the ledger now, so a host without one cannot fetch at all — and says so. Falling back
+        // to doing it in the turn would put the wait back exactly where this change took it out of, decided by a
+        // configuration the caller cannot see.
+        var catalog = Catalog();
+        var answered = await CallAsync(Tools(catalog, Files()),
+            $$"""{"target":"{{FileHandles.Wrap("0|new")}}","scope":"workspace","path":"x.mp4"}""");
 
-        var answered = await CallAsync(Tools(catalog, files),
-            $$"""{"target":"{{FileHandles.Wrap("0|big")}}","scope":"workspace","path":"downloads/成片.mp4"}""");
-
-        Assert.True(answered.Ok, answered.Error?.Message);
-        Assert.DoesNotContain("后台", answered.Value!.Content, StringComparison.Ordinal);
-        Assert.True((await files.ReadAsync(FileScopes.Workspace, "downloads/成片.mp4", default)).Ok);
+        Assert.False(answered.Ok);
+        Assert.Contains("账本", answered.Error!.Message, StringComparison.Ordinal);
+        // And nothing was asked of the platform.
+        Assert.Empty(catalog.Fetched);
     }
 
     private static async Task<JobSnapshot> WaitForJobAsync(IJobRegistry registry, string jobId, int seconds = 10)

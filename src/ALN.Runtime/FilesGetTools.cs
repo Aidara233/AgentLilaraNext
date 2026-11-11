@@ -31,13 +31,6 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
     private readonly IJobRegistry? _jobs = jobs;
 
     /// <summary>
-    /// Above this, a fetch becomes a job: a turn that blocks for a minute is a turn the person on the other side reads as
-    /// a hang. Not a limit on what may be fetched — <see cref="IBinaryFileAccess.MaxTransferBytes"/> is that — a limit on
-    /// what one turn waits for.
-    /// </summary>
-    public const long BackgroundThreshold = 8L * 1024 * 1024;
-
-    /// <summary>
     /// The largest file this tool will pull, when what is being handed over is whatever the platform happens to have.
     ///
     /// <b>Not the same question as <see cref="IBinaryFileAccess.MaxTransferBytes"/>.</b> That one answers "how much may
@@ -186,54 +179,23 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
                     $"例如 {{\"scope\":\"workspace\",\"path\":\"downloads/report.zip\"}}。这个宿主收字节的 scope：" +
                     $"{string.Join("、", owner._files.BinaryScopes)}。"));
 
-            // Big enough that waiting for it would look like a hang: written down, fetched in the background, and the
-            // Session is woken when it lands (docs/28 §9.4). The destination has to be decided *now*, because a job that
-            // chose its own path would be a file nobody can find later.
-            if (owner._jobs is not null)
-            {
-                var declared = await owner.DeclaredAsync(adapter, conversation, handle, cancellationToken)
-                    .ConfigureAwait(false);
-                if (declared?.Bytes is { } declaredBytes && declaredBytes > BackgroundThreshold)
-                    return await owner.StartBackgroundAsync(adapter, conversation, sessionId, handle, scope!, path!,
-                        declaredBytes, declared.Name, cancellationToken).ConfigureAwait(false);
-            }
+            // Always the ledger, never this turn. "Will this one be slow" is a question about a network nobody can answer
+            // before the first byte moves, and a turn that blocks long enough for a person to notice reads as a hang. What
+            // the job adds is only *when* the bytes move; the destination is decided here, because a background task that
+            // chose its own path would write a file nobody can find a day later (docs/28 §6.8).
+            if (owner._jobs is null)
+                return Result<SessionToolResult>.Failure(new(ErrorCode.Unavailable,
+                    "这个宿主没有后台任务账本，而取文件一律走后台——没有账本就没人能告诉你会话什么时候拿到文件。"));
 
-            var fetched = await adapter.FetchAsync(conversation, handle, MaxFetchBytes,
+            // The one thing worth answering before anything is in flight: a scope that takes no bytes at all. A path that
+            // escapes its scope stays the port's call at write time, and it costs a failed job instead of a failed call —
+            // that is the price of not holding the turn open.
+            if (!owner._files.BinaryScopes.Contains(scope))
+                return Result<SessionToolResult>.Failure(new(ErrorCode.Invalid,
+                    $"\"{scope}\" 不收字节。这个宿主收字节的 scope：{string.Join("、", owner._files.BinaryScopes)}。"));
+
+            return await owner.StartBackgroundAsync(adapter, conversation, sessionId, handle, scope!, path!,
                 cancellationToken).ConfigureAwait(false);
-            if (!fetched.Ok || fetched.Value is null)
-                return Result<SessionToolResult>.Failure(fetched.Error ??
-                    new(ErrorCode.Unavailable, "这个 handle 取不回字节。"));
-
-            var content = fetched.Value;
-            await using (content.Content)
-            {
-                // The port is the one that decides whether this scope may hold bytes, is writable, and whether the path
-                // is inside it. Asked, never predicted: a check here would be a second answer to the same question.
-                var saved = await owner._files.SaveAsync(scope!, path!, content.Content, MaxFetchBytes,
-                    cancellationToken).ConfigureAwait(false);
-                if (!saved.Ok)
-                    return Result<SessionToolResult>.Failure(saved.Error!);
-            }
-
-            // What landed, not what the platform claimed: a receipt that repeats a declaration can be wrong about the one
-            // number it states, and that number is the one a reader trusts (docs/28 §6.8).
-            var bytes = await SizeAsync(scope!, path!, cancellationToken).ConfigureAwait(false);
-            var said = new StringBuilder();
-            // The name may be empty: an adapter that answered with a link rather than with a named file never learned what
-            // the file is called, and an empty one is "the platform did not say" rather than a hole to guess into.
-            said.Append(string.IsNullOrEmpty(content.Name) ? "已取回 " : $"已取回 {content.Name} ");
-            said.Append("→ ").Append(scope).Append('/').Append(path);
-            if (bytes is { } size) said.Append("（").Append(Size(size)).Append("）");
-            said.Append("。它可以当成一个普通文件用：读、算、发给别人，或者再传出去。");
-            return ToolArguments.Ok(said.ToString());
-        }
-
-        /// <summary>The size after the fact: a stream that came from an adapter may not know how long it was.</summary>
-        private async ValueTask<long?> SizeAsync(string scope, string path, CancellationToken cancellationToken)        {
-            var opened = await owner._files.OpenReadStreamAsync(scope, path, long.MaxValue, cancellationToken).ConfigureAwait(false);
-            if (!opened.Ok || opened.Value is null) return null;
-            await using var stream = opened.Value;
-            return stream.CanSeek ? stream.Length : null;
         }
 
         private static string Line(PlatformFile file)
@@ -250,25 +212,6 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
     }
 
     /// <summary>
-    /// How big the platform says it is, when it says.
-    ///
-    /// Asked before the transfer starts because "does this belong in the background" is a question about size, and after
-    /// the first byte it is too late to answer it: the work is in flight and moving it would download twice. One extra
-    /// call, and it is a listing, not a download.
-    ///
-    /// Unknown is a real answer: a handle that is not in the listing (an attachment in a private chat, a file that
-    /// appeared a second ago) keeps the fetch synchronous. Guessing "probably big" would put small files through the
-    /// ledger for nothing, and a ledger full of trivia is a ledger nobody reads.
-    /// </summary>
-    private async ValueTask<PlatformFile?> DeclaredAsync(IFileCatalogAdapter adapter, string conversation, string handle,
-        CancellationToken cancellationToken)
-    {
-        var listed = await adapter.ListAsync(conversation, SearchDepth, cancellationToken).ConfigureAwait(false);
-        if (!listed.Ok || listed.Value is null) return null;
-        return listed.Value.Files.FirstOrDefault(file => file.Handle == handle);
-    }
-
-    /// <summary>
     /// Starts the fetch as a job and returns at once.
     ///
     /// <b>The destination is fixed here, not when the job runs.</b> A background task that chose its own path would write
@@ -277,10 +220,9 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
     /// (docs/28 §9.4).
     /// </summary>
     private async ValueTask<Result<SessionToolResult>> StartBackgroundAsync(IFileCatalogAdapter adapter, string conversation,
-        string sessionId, string handle, string scope, string path, long bytes, string name,
-        CancellationToken cancellationToken)
+        string sessionId, string handle, string scope, string path, CancellationToken cancellationToken)
     {
-        var opened = await _jobs!.OpenAsync(new(JobKind, $"{name} → {scope}/{path}", sessionId), cancellationToken)
+        var opened = await _jobs!.OpenAsync(new(JobKind, $"{scope}/{path}", sessionId), cancellationToken)
             .ConfigureAwait(false);
         if (!opened.Ok || opened.Value is null)
             return Result<SessionToolResult>.Failure(opened.Error ?? new(ErrorCode.Unavailable, "开不了后台任务。"));
@@ -291,7 +233,7 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
             CancellationToken.None);
 
         return ToolArguments.Ok(
-            $"这个文件 {Size(bytes)}，比一轮值得等的要大，所以放到后台取了：job {opened.Value.Id}，落点 {scope}/{path}。" +
+            $"放到后台取了：job {opened.Value.Id}，落点 {scope}/{path}。" +
             "取完会叫醒这个会话，到时候用 jobs 看结果；不用守着它。");
     }
 
