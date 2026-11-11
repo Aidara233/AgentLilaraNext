@@ -73,7 +73,8 @@ public sealed class DocumentToolsTests : IDisposable
         var (_, tools) = Open();
         var offers = (await tools.ToolsAsync(new RoundContextRequest("s-1", Guid.NewGuid(), 1), default)).Value!;
 
-        Assert.Equal(["doc_info", "doc_tree", "doc_read"], offers.Select(offer => offer.Definition.Name));
+        Assert.Equal(["doc_info", "doc_tree", "doc_read", "doc_create_docx", "doc_create_xlsx"],
+            offers.Select(offer => offer.Definition.Name));
         Assert.All(offers, offer => Assert.False(offer.ActsExternally));
         Assert.All(offers, offer => Assert.False(offer.Tool.EndsTurn));
         Assert.All(offers, offer => Assert.Equal(AccessLevel.Agent, offer.MinLevel));
@@ -203,5 +204,83 @@ public sealed class DocumentToolsTests : IDisposable
 
         Assert.False(answer.Ok);
         Assert.Equal(ErrorCode.Invalid, answer.Error!.Code);
+    }
+
+    [Fact]
+    public async Task A_created_docx_reads_back_as_what_was_asked_for()
+    {
+        var (_, tools) = Open();
+
+        var created = await CallAsync(tools, "doc_create_docx",
+            """
+            {"scope":"workspace","path":"out/summary.docx","blocks":[
+              {"kind":"heading","text":"季度总结","level":2},
+              {"kind":"paragraph","text":"收入上升。"},
+              {"kind":"bullet","text":"成本持平"},
+              {"kind":"table","rows":[["项目","金额"],["苹果","42"]]}]}
+            """);
+        Assert.True(created.Ok, created.Error?.Message);
+
+        // The round trip is the test: what was written is only right if it reads back as the same four pieces.
+        var tree = await CallAsync(tools, "doc_tree", """{"scope":"workspace","path":"out/summary.docx"}""");
+        Assert.True(tree.Ok, tree.Error?.Message);
+        Assert.Contains("共 4 段", tree.Value!.Content, StringComparison.Ordinal);
+        Assert.Contains("[1] 标题 2", tree.Value.Content, StringComparison.Ordinal);
+
+        var read = await CallAsync(tools, "doc_read",
+            """{"scope":"workspace","path":"out/summary.docx","from":1,"to":4}""");
+        Assert.True(read.Ok, read.Error?.Message);
+        var text = read.Value!.Content;
+        Assert.Contains("## 季度总结", text, StringComparison.Ordinal);
+        Assert.Contains("收入上升。", text, StringComparison.Ordinal);
+        Assert.Contains("成本持平", text, StringComparison.Ordinal);
+        Assert.Contains("| 苹果 | 42 |", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_created_sheet_keeps_numbers_as_numbers()
+    {
+        var (_, tools) = Open();
+
+        var created = await CallAsync(tools, "doc_create_xlsx",
+            """
+            {"scope":"workspace","path":"out/stock.xlsx","sheets":[
+              {"name":"库存","rows":[["名称","数量"],["苹果","42"],["编号","007"]]}]}
+            """);
+        Assert.True(created.Ok, created.Error?.Message);
+
+        var read = await CallAsync(tools, "doc_read", """{"scope":"workspace","path":"out/stock.xlsx"}""");
+        Assert.True(read.Ok, read.Error?.Message);
+        var text = read.Value!.Content;
+        Assert.Contains("库存", text, StringComparison.Ordinal);
+        Assert.Contains("| 苹果 | 42 |", text, StringComparison.Ordinal);
+        // Leading zeros are data, not a number to be normalised away.
+        Assert.Contains("007", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Creating_over_an_existing_file_is_refused_rather_than_replacing_it()
+    {
+        var (access, tools) = Open();
+        Assert.True((await access.SaveAsync(FileScopes.Workspace, "taken.docx", Docx(), default)).Ok);
+
+        var answer = await CallAsync(tools, "doc_create_docx",
+            """{"scope":"workspace","path":"taken.docx","blocks":[{"kind":"paragraph","text":"会覆盖吗"}]}""");
+
+        Assert.False(answer.Ok);
+        Assert.Equal(ErrorCode.Conflict, answer.Error!.Code);
+        Assert.Contains("已经存在", answer.Error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_name_that_does_not_match_the_format_is_refused()
+    {
+        var (_, tools) = Open();
+
+        var answer = await CallAsync(tools, "doc_create_docx",
+            """{"scope":"workspace","path":"report.txt","blocks":[{"kind":"paragraph","text":"x"}]}""");
+
+        Assert.False(answer.Ok);
+        Assert.Contains(".docx", answer.Error!.Message, StringComparison.Ordinal);
     }
 }

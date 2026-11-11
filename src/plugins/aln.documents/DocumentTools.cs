@@ -18,7 +18,7 @@ namespace Aln.Documents;
 /// shape offered is: <c>doc_info</c> says what the file is, <c>doc_tree</c> says what is in it, and only then does
 /// <c>doc_read</c> take a range. Each tool says what the next one is for, because a list of names is not a procedure.
 /// </summary>
-public sealed class DocumentTools(IBinaryFileAccess files) : ISessionToolSource
+public sealed partial class DocumentTools(IBinaryFileAccess files) : ISessionToolSource
 {
     public const string SourceId = "aln.documents";
     public const string InfoToolName = "doc_info";
@@ -86,7 +86,11 @@ public sealed class DocumentTools(IBinaryFileAccess files) : ISessionToolSource
             // that to decide whether this round's text was its reply (docs/08 §5.1).
             new SessionToolOffer(new InfoTool(this), InfoDefinition, ActsExternally: false),
             new SessionToolOffer(new TreeTool(this), TreeDefinition, ActsExternally: false),
-            new SessionToolOffer(new ReadTool(this), ReadDefinition, ActsExternally: false)
+            new SessionToolOffer(new ReadTool(this), ReadDefinition, ActsExternally: false),
+            // Writing is the same kind of act as reading — it changes this disk, not anybody's inbox — so these are
+            // not "acts externally" either: a round that only wrote a file has not spoken to anyone (docs/08 §5.1).
+            new SessionToolOffer(new CreateTool(this, DocxToolName), DocxDefinition, ActsExternally: false),
+            new SessionToolOffer(new CreateTool(this, XlsxToolName), XlsxDefinition, ActsExternally: false)
         ];
         return ValueTask.FromResult(Result<IReadOnlyList<SessionToolOffer>>.Success(tools));
     }
@@ -314,5 +318,32 @@ public sealed class DocumentTools(IBinaryFileAccess files) : ISessionToolSource
             value.TryGetDouble(out var number)
                 ? number
                 : null;
+
+        /// <summary>
+        /// A two-dimensional block of cell text. Numbers and booleans are taken as they are written in the JSON rather
+        /// than re-formatted: "1.50" in the request becomes "1.50" in the cell, because a model that wrote two decimals
+        /// meant two decimals.
+        /// </summary>
+        public static IReadOnlyList<IReadOnlyList<string>>? Grid(JsonElement root, string name)
+        {
+            if (!root.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Array) return null;
+            var rows = new List<IReadOnlyList<string>>();
+            foreach (var row in value.EnumerateArray())
+            {
+                if (row.ValueKind != JsonValueKind.Array) continue;
+                var cells = new List<string>();
+                foreach (var cell in row.EnumerateArray())
+                    cells.Add(cell.ValueKind switch
+                    {
+                        JsonValueKind.String => cell.GetString() ?? string.Empty,
+                        JsonValueKind.Number => cell.GetRawText(),
+                        JsonValueKind.True => "TRUE",
+                        JsonValueKind.False => "FALSE",
+                        _ => string.Empty
+                    });
+                rows.Add(cells);
+            }
+            return rows;
+        }
     }
 }
