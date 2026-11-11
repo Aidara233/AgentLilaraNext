@@ -190,7 +190,6 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
                     new(ErrorCode.Unavailable, "这个 handle 取不回字节。"));
 
             var content = fetched.Value;
-            long? bytes = content.Bytes;
             await using (content.Content)
             {
                 // The port is the one that decides whether this scope may hold bytes, is writable, and whether the path
@@ -200,9 +199,14 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
                     return Result<SessionToolResult>.Failure(saved.Error!);
             }
 
-            if (bytes is null) bytes = await SizeAsync(scope!, path!, cancellationToken).ConfigureAwait(false);
+            // What landed, not what the platform claimed: a receipt that repeats a declaration can be wrong about the one
+            // number it states, and that number is the one a reader trusts (docs/28 §6.8).
+            var bytes = await SizeAsync(scope!, path!, cancellationToken).ConfigureAwait(false);
             var said = new StringBuilder();
-            said.Append("已取回 ").Append(content.Name).Append(" → ").Append(scope).Append('/').Append(path);
+            // The name may be empty: an adapter that answered with a link rather than with a named file never learned what
+            // the file is called, and an empty one is "the platform did not say" rather than a hole to guess into.
+            said.Append(string.IsNullOrEmpty(content.Name) ? "已取回 " : $"已取回 {content.Name} ");
+            said.Append("→ ").Append(scope).Append('/').Append(path);
             if (bytes is { } size) said.Append("（").Append(Size(size)).Append("）");
             said.Append("。它可以当成一个普通文件用：读、算、发给别人，或者再传出去。");
             return ToolArguments.Ok(said.ToString());
@@ -289,7 +293,6 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
             }
 
             var content = fetched.Value;
-            long? bytes = content.Bytes;
             await using (content.Content)
             {
                 var saved = await _files.SaveAsync(scope, path, content.Content, CancellationToken.None).ConfigureAwait(false);
@@ -299,9 +302,10 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
                     return;
                 }
             }
-            if (bytes is null) bytes = await SizeAtAsync(scope, path).ConfigureAwait(false);
+            var bytes = await SizeAtAsync(scope, path).ConfigureAwait(false);
             await SettleAsync(sessionId, jobId,
-                $"已取回 {content.Name} → {scope}/{path}" + (bytes is { } known ? $"（{Size(known)}）" : string.Empty), null)
+                (string.IsNullOrEmpty(content.Name) ? "已取回 " : $"已取回 {content.Name} ") + $"→ {scope}/{path}"
+                + (bytes is { } known ? $"（{Size(known)}）" : string.Empty), null)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)

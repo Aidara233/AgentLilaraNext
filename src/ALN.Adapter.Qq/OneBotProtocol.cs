@@ -629,6 +629,35 @@ public static partial class OneBotProtocol
     }
 
     /// <summary>
+    /// <c>get_group_file_url</c>: QQ's own download link for one group file, resolved by the bridge over its packet
+    /// connection. The caller fetches that link itself — which is the whole point, because a link works from any machine
+    /// and a path only from the one the bridge runs on (docs/28 §6.8).
+    ///
+    /// <c>group_id</c> goes as a string because that is what this action declares; the list action next door takes a
+    /// number. Two spellings of one thing in one dialect, which is not something a caller can fix from here.
+    /// </summary>
+    public static string BuildGetGroupFileUrl(string echo, long groupId, string fileId) =>
+        JsonSerializer.Serialize(new
+        {
+            action = "get_group_file_url",
+            @params = new Dictionary<string, object?> { ["group_id"] = Number(groupId), ["file_id"] = fileId },
+            echo
+        }, Json);
+
+    /// <summary>
+    /// <c>get_private_file_url</c>: the same idea for a file in a private conversation. It takes the id alone, and asked
+    /// about a group's file it answers with a link that reads <c>http://undefined:undefined…</c> while still saying
+    /// <c>retcode 0</c> — so the answer is checked for being a link, not for being an answer (docs/28 §6.8).
+    /// </summary>
+    public static string BuildGetPrivateFileUrl(string echo, string fileId) =>
+        JsonSerializer.Serialize(new
+        {
+            action = "get_private_file_url",
+            @params = new Dictionary<string, object?> { ["file_id"] = fileId },
+            echo
+        }, Json);
+
+    /// <summary>
     /// One entry in a group's file area, as the bridge described it. Kept as its own record rather than parsed straight
     /// into a <c>PlatformFile</c> because the handle is the adapter's business: the protocol knows a file id and a busid,
     /// and how those two become a name nobody else parses is decided one layer up.
@@ -678,17 +707,39 @@ public static partial class OneBotProtocol
     }
 
     /// <summary>
-    /// Where <c>get_file</c> says the bytes are: a url, <c>base64://</c>, a data url, or a path on the bridge's own disk.
-    /// Implementations really do answer differently, and NapCat answers with a path (docs/16 §12.5) — so the caller gets
-    /// the raw string and decides, instead of this method guessing that a string with slashes is a path.
+    /// Every place <c>get_file</c> said the bytes are, with the field each one came from.
+    ///
+    /// <b>Every one of them, because "the first non-empty field" answers a different question than "which of these can
+    /// this host reach".</b> Implementations really do answer differently: NapCat hands back a path inside its own
+    /// container <i>and</i> — when <c>enableLocalFile2Url</c> is on — the same bytes as a bare <c>base64</c> string, and
+    /// the path is the field a dictionary-ordered read finds first. Taking it would keep the one answer the caller cannot
+    /// use and throw away the one it can (docs/28 §6.8).
+    ///
+    /// Order is the order the fields were read, and duplicates are dropped: several keys routinely carry one value.
     /// </summary>
-    public static string? ReadFileBody(JsonElement data)
+    public static IReadOnlyList<(string Field, string Value)> ReadFileBodies(JsonElement data)
     {
-        if (data.ValueKind != JsonValueKind.Object) return null;
+        if (data.ValueKind != JsonValueKind.Object) return [];
+        var found = new List<(string Field, string Value)>();
         foreach (var key in new[] { "file", "url", "base64", "file_path", "path" })
-            if (TryString(data, key, out var value) && !string.IsNullOrWhiteSpace(value)) return value;
-        return null;
+        {
+            if (!TryString(data, key, out var value) || string.IsNullOrWhiteSpace(value)) continue;
+            if (found.Exists(entry => string.Equals(entry.Value, value, StringComparison.Ordinal))) continue;
+            found.Add((key, value));
+        }
+        return found;
     }
+
+    /// <summary>
+    /// The link a url-shaped action answered with, when it answered with one.
+    ///
+    /// <b>A link is not a claim to be trusted on the strength of the status.</b> <c>get_private_file_url</c> asked about a
+    /// group's file answers <c>retcode 0</c> with <c>http://undefined:undefined…</c> — a url assembled out of fields the
+    /// bridge did not have — so whoever fetches it has to look at the value (docs/28 §6.8).
+    /// </summary>
+    public static string? ReadFileUrl(JsonElement data) =>
+        data.ValueKind == JsonValueKind.Object && TryString(data, "url", out var url) &&
+        !string.IsNullOrWhiteSpace(url) ? url : null;
 
     /// <summary>The name <c>get_file</c> felt like including, when it did. Often it does not — the caller has a fallback.</summary>
     public static string? ReadFileName(JsonElement data) =>

@@ -564,6 +564,159 @@ public sealed class QqMediaWireTests : IDisposable
         finally { await adapter.StopAsync(default); }
     }
 
+    /// <summary>
+    /// The link before the bytes: on this deployment the bridge answers <c>get_file</c> with a path inside its own
+    /// container, so the link is the only route this host can actually take (docs/28 §6.8).
+    /// </summary>
+    [Fact]
+    public async Task A_group_file_comes_through_the_direct_link_without_asking_get_file()
+    {
+        await using var bridge = await FakeBridge.StartAsync(Png());
+        var sink = new RecordingSink();
+        var adapter = NewAdapter(bridge.WebSocketUri!, sink, files: null);
+        Assert.True((await adapter.StartAsync(default)).Ok);
+        try
+        {
+            Assert.True(await WaitAsync(() => bridge.IsConnected), "the adapter never connected");
+            bridge.DirectLink = bridge.MediaUri("direct.bin").ToString();
+            var catalog = (IFileCatalogAdapter)adapter;
+
+            var fetched = await catalog.FetchAsync("group-123456", "f:0|file-1", 1 << 20, default);
+            Assert.True(fetched.Ok, fetched.Error?.Message);
+            var content = fetched.Value!.Content;
+            await using (content)
+            {
+                using var memory = new MemoryStream();
+                await content.CopyToAsync(memory);
+                Assert.Equal(Png(), memory.ToArray());
+            }
+
+            var asked = Assert.Single(bridge.CallsOf("get_group_file_url"));
+            Assert.Equal("123456", asked.GetProperty("params").GetProperty("group_id").GetString());
+            Assert.Equal("file-1", asked.GetProperty("params").GetProperty("file_id").GetString());
+            // One round trip was enough, so nothing had to move the file through the bridge.
+            Assert.Empty(bridge.CallsOf("get_file"));
+            // A link carries no name: the receipt is told that instead of being handed a file id dressed as one.
+            Assert.Equal(string.Empty, fetched.Value.Name);
+        }
+        finally { await adapter.StopAsync(default); }
+    }
+
+    /// <summary>
+    /// A private attachment's handle is spelled "&lt;busid&gt;|&lt;id&gt;" like a group file's, with a placeholder busid.
+    /// Leaving that on would hand the bridge "0|pm-1" — an id nothing can resolve, and one that fails as "not found"
+    /// rather than as "wrong shape" (docs/28 §6.8).
+    /// </summary>
+    [Fact]
+    public async Task A_private_handle_is_split_before_the_id_reaches_the_bridge()
+    {
+        await using var bridge = await FakeBridge.StartAsync(Png());
+        var sink = new RecordingSink();
+        var adapter = NewAdapter(bridge.WebSocketUri!, sink, files: null);
+        Assert.True((await adapter.StartAsync(default)).Ok);
+        try
+        {
+            Assert.True(await WaitAsync(() => bridge.IsConnected), "the adapter never connected");
+            bridge.DirectLink = bridge.MediaUri("direct.bin").ToString();
+            var catalog = (IFileCatalogAdapter)adapter;
+
+            var fetched = await catalog.FetchAsync("user-1664093638", "f:0|pm-1", 1 << 20, default);
+            Assert.True(fetched.Ok, fetched.Error?.Message);
+            await fetched.Value!.Content.DisposeAsync();
+
+            var asked = Assert.Single(bridge.CallsOf("get_private_file_url"));
+            Assert.Equal("pm-1", asked.GetProperty("params").GetProperty("file_id").GetString());
+            Assert.Empty(bridge.CallsOf("get_group_file_url"));
+        }
+        finally { await adapter.StopAsync(default); }
+    }
+
+    /// <summary>
+    /// A "successful" answer that is not a link: one bridge produces exactly this when asked for a url it cannot make, and
+    /// following it would be a request to a host literally named "undefined" (docs/28 §6.8).
+    /// </summary>
+    [Fact]
+    public async Task A_link_made_of_undefined_is_not_followed_and_get_file_still_answers()
+    {
+        await using var bridge = await FakeBridge.StartAsync(Png());
+        var sink = new RecordingSink();
+        var adapter = NewAdapter(bridge.WebSocketUri!, sink, files: null);
+        Assert.True((await adapter.StartAsync(default)).Ok);
+        try
+        {
+            Assert.True(await WaitAsync(() => bridge.IsConnected), "the adapter never connected");
+            bridge.DirectLink = "http://undefined:undefinedundefined&isthumb=0";
+            var catalog = (IFileCatalogAdapter)adapter;
+
+            var fetched = await catalog.FetchAsync("group-123456", "f:0|file-1", 1 << 20, default);
+            Assert.True(fetched.Ok, fetched.Error?.Message);
+            var content = fetched.Value!.Content;
+            await using (content)
+            {
+                using var memory = new MemoryStream();
+                await content.CopyToAsync(memory);
+                Assert.Equal("zip-bytes", Encoding.UTF8.GetString(memory.ToArray()));
+            }
+            Assert.Single(bridge.CallsOf("get_file"));
+        }
+        finally { await adapter.StopAsync(default); }
+    }
+
+    /// <summary>
+    /// The answer that made this necessary: a path in the bridge's container comes first in the object, and the same bytes
+    /// as a bare base64 string come second. Reading only the first non-empty field finds the one answer this host cannot
+    /// use (docs/28 §6.8).
+    /// </summary>
+    [Fact]
+    public async Task A_bare_base64_field_is_read_even_though_the_bridges_path_comes_first()
+    {
+        await using var bridge = await FakeBridge.StartAsync(Png());
+        var sink = new RecordingSink();
+        var adapter = NewAdapter(bridge.WebSocketUri!, sink, files: null);
+        Assert.True((await adapter.StartAsync(default)).Ok);
+        try
+        {
+            Assert.True(await WaitAsync(() => bridge.IsConnected), "the adapter never connected");
+            var catalog = (IFileCatalogAdapter)adapter;
+
+            var fetched = await catalog.FetchAsync("group-123456", "f:0|bare-b64", 1 << 20, default);
+            Assert.True(fetched.Ok, fetched.Error?.Message);
+            var content = fetched.Value!.Content;
+            await using (content)
+            {
+                using var memory = new MemoryStream();
+                await content.CopyToAsync(memory);
+                Assert.Equal("zip-bytes", Encoding.UTF8.GetString(memory.ToArray()));
+            }
+        }
+        finally { await adapter.StopAsync(default); }
+    }
+
+    /// <summary>
+    /// A bridge's own file url is a hash it resolves internally. Reporting it as "a path on the bridge's disk" sends
+    /// somebody looking for a mount that was never the problem (docs/16 §12.6).
+    /// </summary>
+    [Fact]
+    public async Task A_file_url_is_not_reported_as_a_path_on_the_bridges_disk()
+    {
+        await using var bridge = await FakeBridge.StartAsync(Png());
+        var sink = new RecordingSink();
+        var adapter = NewAdapter(bridge.WebSocketUri!, sink, files: null);
+        Assert.True((await adapter.StartAsync(default)).Ok);
+        try
+        {
+            Assert.True(await WaitAsync(() => bridge.IsConnected), "the adapter never connected");
+            var catalog = (IFileCatalogAdapter)adapter;
+
+            var fetched = await catalog.FetchAsync("group-123456", "f:0|file-url", 1 << 20, default);
+            Assert.False(fetched.Ok);
+            var message = fetched.Error!.Message;
+            Assert.Contains("文件标识", message, StringComparison.Ordinal);
+            Assert.DoesNotContain("磁盘上：file://", message, StringComparison.Ordinal);
+        }
+        finally { await adapter.StopAsync(default); }
+    }
+
     [Fact]
     public async Task A_group_file_upload_reaches_the_channel_as_an_envelope_with_no_message_id()
     {
@@ -771,6 +924,13 @@ public sealed class QqMediaWireTests : IDisposable
         public bool IsConnected => _socket is { State: WebSocketState.Open };
         public Uri MediaUri(string name) => new(BaseUri, "/media/" + name);
 
+        /// <summary>
+        /// What the two url actions answer, when they are asked. Null means this bridge does not implement them, which is
+        /// a different fact from "it answered with nothing usable" — and the adapter falls back in both cases
+        /// (docs/28 §6.8).
+        /// </summary>
+        public string? DirectLink { get; set; }
+
         public static async Task<FakeBridge> StartAsync(byte[] picture, string? resolveImageAs = null)
         {
             var builder = WebApplication.CreateBuilder();
@@ -862,6 +1022,17 @@ public sealed class QqMediaWireTests : IDisposable
                         await WriteAsync(socket, new { status = "ok", retcode = 0, echo,
                             data = new { file_id = "f-1" } });
                         break;
+                    case "get_group_file_url":
+                    case "get_private_file_url":
+                    {
+                        var link = DirectLink;
+                        if (link is null)
+                            await WriteAsync(socket, new { status = "failed", retcode = 1404,
+                                message = "this bridge has no url for it", echo });
+                        else
+                            await WriteAsync(socket, new { status = "ok", retcode = 0, echo, data = new { url = link } });
+                        break;
+                    }
                     case "download_file":
                         // What a bridge answers when it has fetched our url onto its own disk: a path it can open.
                         await WriteAsync(socket, new { status = "ok", retcode = 0, echo,
@@ -898,6 +1069,19 @@ public sealed class QqMediaWireTests : IDisposable
                             case "on-disk":
                                 await WriteAsync(socket, new { status = "ok", retcode = 0, echo,
                                     data = new { file = "/srv/napcat/files/x.zip", file_name = "x.zip" } });
+                                break;
+                            // NapCat with enableLocalFile2Url on: a path inside its own container *and* the same bytes as
+                            // a bare base64 string, no "base64://" in front of it. The path is the field that reads first,
+                            // and it is the one this host cannot use.
+                            case "bare-b64":
+                                await WriteAsync(socket, new { status = "ok", retcode = 0, echo,
+                                    data = new { file = "/app/.config/QQ/NapCat/temp/x.zip", file_name = "x.zip",
+                                        base64 = Convert.ToBase64String(Encoding.UTF8.GetBytes("zip-bytes")) } });
+                                break;
+                            // Its own file url: a hash it resolves internally, not a path on any disk.
+                            case "file-url":
+                                await WriteAsync(socket, new { status = "ok", retcode = 0, echo,
+                                    data = new { file = "file://1234567890", file_name = "x.zip" } });
                                 break;
                             default:
                                 await WriteAsync(socket, new { status = "ok", retcode = 0, echo,

@@ -1059,12 +1059,18 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
     /// <summary>
     /// The bytes behind one handle.
     ///
-    /// Four shapes come back from <c>get_file</c> depending on the bridge, and this is the place that knows all four:
-    /// <c>base64://</c>, a data url, an http(s) url, or a path on the bridge's own disk. The last one is only reachable
-    /// when the two machines share a volume and the operator said so with <c>pathMap</c> — the same mapping inbound
-    /// pictures already use, read the same direction (docs/28 §6.6). Everything is capped at
-    /// <paramref name="maxBytes"/> and refused rather than truncated: a short file that looks complete is how a backup
-    /// turns out not to be one.
+    /// <b>Three places to look, in the order of "can this host reach it".</b> The direct link first: both
+    /// <c>get_group_file_url</c> and <c>get_private_file_url</c> answer with a url on QQ's own download service, and this
+    /// host fetches that url itself — the one shape that does not care where the bridge runs (docs/28 §6.8).
+    ///
+    /// Then <c>get_file</c>, whose answer comes in four shapes depending on the bridge and on its
+    /// <c>enableLocalFile2Url</c>: <c>base64://</c>, a bare <c>base64</c> field, a data url, an http(s) url, or a path on
+    /// the bridge's own disk. <b>All of them are read and ranked, never "the first non-empty field"</b>: NapCat answers
+    /// with a path inside its container and the same bytes as base64, and taking whichever field came first would keep
+    /// the one answer this host cannot use and throw away the one it can.
+    ///
+    /// Everything is capped at <paramref name="maxBytes"/> and refused rather than truncated: a short file that looks
+    /// complete is how a backup turns out not to be one.
     /// </summary>
     public async ValueTask<Result<PlatformFileContent>> FetchAsync(string conversationId, string handle, long maxBytes,
         CancellationToken cancellationToken)
@@ -1073,18 +1079,28 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
             return Result<PlatformFileContent>.Failure(new(ErrorCode.Unavailable, "QQ adapter is not running."));
         if (!OneBotProtocol.TryReadConversation(conversationId, out var target, out var platform))
             return Result<PlatformFileContent>.Failure(new(ErrorCode.Invalid,
-                $"无法识别的会话 id：{conversationId}"));
+                $"无法识别的会话 id（应为 {OneBotProtocol.GroupPrefix}<群号> 或 {OneBotProtocol.PrivatePrefix}<QQ号>）：{conversationId}"));
         if (!FileHandles.TryUnwrap(handle, out var inner))
             return Result<PlatformFileContent>.Failure(new(ErrorCode.Invalid,
                 $"这不是一个文件 handle（应以 {FileHandles.Prefix} 开头）：{handle}"));
 
-        // The handle is this adapter's own shape: "busid|file_id" for a group file, a bare id for a private one. It is
-        // split at the *first* bar so a file id that contains one still survives.
+        // The handle's shape is "<busid>|<file id>", and the bar is split off whatever the conversation is: an inbound
+        // notice spells a private attachment the same way (with a busid of 0), so reading the whole thing as the id would
+        // hand the bridge "0|<id>" — an id it cannot resolve, and one that fails as "not found" instead of as "wrong
+        // shape". Split at the *first* bar so a file id that contains one still survives.
         var bar = inner.IndexOf('|', StringComparison.Ordinal);
         var busid = platform == OneBotProtocol.PrivatePlatform ? string.Empty : bar <= 0 ? "0" : inner[..bar];
-        var fileId = platform == OneBotProtocol.PrivatePlatform ? inner : bar >= 0 ? inner[(bar + 1)..] : inner;
+        var fileId = bar >= 0 ? inner[(bar + 1)..] : inner;
         if (string.IsNullOrWhiteSpace(fileId))
             return Result<PlatformFileContent>.Failure(new(ErrorCode.Invalid, $"handle 里没有 file_id：{handle}"));
+
+        // The link before the bytes: it is the only route that survives a bridge in another container, and asking for it
+        // costs one round trip that does not move the file.
+        var direct = await DirectLinkAsync(platform, target, fileId, maxBytes, cancellationToken).ConfigureAwait(false);
+        if (direct.Content is not null) return Result<PlatformFileContent>.Success(direct.Content);
+        // Too big for this call is not a reason to try the other route: it is capped by the same number, and the other
+        // route moves the whole file through the bridge first.
+        if (direct.Fatal) return Result<PlatformFileContent>.Failure(new(ErrorCode.Invalid, direct.Miss));
 
         var called = await _connection.CallAsync(
             echo => OneBotProtocol.BuildGetFile(echo, busid, fileId), cancellationToken, UploadTimeout)
@@ -1106,71 +1122,164 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
                 $"{platform}:{target}", true));
         }
 
-        var body = OneBotProtocol.ReadFileBody(called.Value.Data);
-        if (string.IsNullOrWhiteSpace(body))
+        var bodies = OneBotProtocol.ReadFileBodies(called.Value.Data);
+        var name = OneBotProtocol.ReadFileName(called.Value.Data);
+        var mediaType = OneBotProtocol.ReadFileMediaType(called.Value.Data);
+        if (bodies.Count == 0)
             return Result<PlatformFileContent>.Failure(new(ErrorCode.Unavailable,
-                "get_file 的回答里没有 file / url / base64，桥接的实现和这个构建的假设不一致。"));
+                "get_file 的回答里没有 file / url / base64，桥接的实现和这个构建的假设不一致。"
+                + $"直链那边：{direct.Miss}"));
 
-        var name = OneBotProtocol.ReadFileName(called.Value.Data) ?? FallbackName(body);
-        if (body.StartsWith("base64://", StringComparison.Ordinal))
-            return Decode(body["base64://".Length..]);
-        if (body.StartsWith("data:", StringComparison.Ordinal) && body.Contains(";base64,", StringComparison.Ordinal))
-            return Decode(body[(body.IndexOf(";base64,", StringComparison.Ordinal) + ";base64,".Length)..]);
-        if (TryHttpUrl(body) is { } url)
+        // Ranked by what this host can do with the value, never by the order the fields arrived in: an http link streams
+        // and works from anywhere, base64 comes with the answer but costs the bridge's memory for the whole file, and a
+        // path only resolves when the two machines share a volume and the operator said so with pathMap.
+        var tried = new List<string>();
+        foreach (var candidate in bodies.OrderBy(Rank))
         {
-            var fetched = await FetchBytesAsync(url, maxBytes, cancellationToken).ConfigureAwait(false);
-            return fetched.Ok && fetched.Value is not null
-                ? Result<PlatformFileContent>.Success(new(new MemoryStream(fetched.Value, writable: false), name,
-                    fetched.Value.Length))
-                : Result<PlatformFileContent>.Failure(fetched.Error ?? new(ErrorCode.Unavailable, "文件取不回来。"));
-        }
-
-        // A path. It is on the bridge's own disk, which is this one only when the two share a volume and the operator
-        // said so with pathMap — and that mapping is the whole safety story: it can only ever reach a scope the host
-        // registered, never an arbitrary path a bridge printed.
-        if (TryMapPath(body, out var scope, out var relative))
-        {
-            if (_files is null)
-                return Result<PlatformFileContent>.Failure(new(ErrorCode.Unavailable,
-                    "桥接给的是一个路径，而这台宿主没有给适配器文件端口，所以读不到。"));
-            var opened = await _files.OpenReadAsync(scope, relative, cancellationToken).ConfigureAwait(false);
-            if (!opened.Ok || opened.Value is null)
-                return Result<PlatformFileContent>.Failure(opened.Error ?? new(ErrorCode.Unavailable,
-                    $"映射到的 {scope}/{relative} 读不出来。"));
-            return Result<PlatformFileContent>.Success(new(opened.Value, name, null));
+            var (content, why) = await ReadShapeAsync(candidate.Field, candidate.Value, name, mediaType, maxBytes,
+                cancellationToken).ConfigureAwait(false);
+            if (content is not null) return Result<PlatformFileContent>.Success(content);
+            tried.Add($"{candidate.Field}：{why}");
         }
 
         return Result<PlatformFileContent>.Failure(new(ErrorCode.Unavailable,
-            $"桥接说文件在它自己的磁盘上：{body}。这台宿主读不到那个路径——" +
-            "要么让桥接和宿主共享卷并配上 pathMap（把那个目录映射到一个 scope），要么让桥接用 base64 回答。"));
+            $"这个文件取不回来。直链：{direct.Miss}。get_file 的回答：{string.Join("；", tried)}。"
+            + "要让取字节在这台机器上成立，得让桥接回一个这台机器到得了的地方："
+            + "宿主与桥接共享卷并配 pathMap（把那个目录映射到一个 scope），或者桥接回 http 直链/base64。"));
 
-        Result<PlatformFileContent> Decode(string payload)
+        static int Rank((string Field, string Value) body)
+        {
+            if (body.Value.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                body.Value.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return 0;
+            if (body.Field == "base64" ||
+                body.Value.StartsWith("base64://", StringComparison.Ordinal) ||
+                body.Value.StartsWith("data:", StringComparison.Ordinal)) return 1;
+            return 2;
+        }
+    }
+
+    /// <summary>
+    /// Asks the bridge for QQ's own download link and fetches it here.
+    ///
+    /// <b>Which action depends on the conversation, not on the file.</b> <c>get_group_file_url</c> takes a group id and
+    /// answers for a group's file area *and* for a file somebody posted in it; <c>get_private_file_url</c> takes the file
+    /// id alone and answers for a private conversation. Handing a group's file to the private action is not something the
+    /// bridge reports as an error — it answers <c>status: ok</c> with <c>http://undefined:undefined…</c>, a url built out
+    /// of fields it did not have — so the link is judged here, and the status is not the judge (docs/28 §6.8).
+    ///
+    /// <b>Nothing about the link is remembered.</b> QQ's download urls carry a key that expires; the next request asks
+    /// again and gets a fresh one. Caching one would be caching a link that stopped working without saying when.
+    ///
+    /// A <c>Fatal</c> miss means "do not bother with the slower route": the file was refused for being larger than this
+    /// call allows, and <c>get_file</c> is capped by the same number.
+    /// </summary>
+    private async ValueTask<(PlatformFileContent? Content, string Miss, bool Fatal)> DirectLinkAsync(string platform,
+        long target, string fileId, long maxBytes, CancellationToken cancellationToken)
+    {
+        var called = await _connection.CallAsync(
+            echo => platform == OneBotProtocol.PrivatePlatform
+                ? OneBotProtocol.BuildGetPrivateFileUrl(echo, fileId)
+                : OneBotProtocol.BuildGetGroupFileUrl(echo, target, fileId),
+            cancellationToken).ConfigureAwait(false);
+        if (!called.Ok)
+            return (null, called.Error?.Message ?? "直链动作没有回答。", false);
+        var answer = called.Value.Response;
+        if (!answer.Ok)
+            return (null, $"直链动作回 retcode {answer.RetCode}：{answer.Message ?? "没说原因"}", false);
+
+        var link = OneBotProtocol.ReadFileUrl(called.Value.Data);
+        if (string.IsNullOrWhiteSpace(link)) return (null, "直链动作没给 url。", false);
+        if (!Uri.TryCreate(link, UriKind.Absolute, out var uri) || string.IsNullOrEmpty(uri.Host) ||
+            string.Equals(uri.Host, "undefined", StringComparison.OrdinalIgnoreCase))
+            return (null, $"直链动作给的 url 用不了：{link}", false);
+        if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+            return (null, $"直链动作给的不是 http(s)：{link}", false);
+
+        var fetched = await FetchBytesAsync(uri, maxBytes, cancellationToken).ConfigureAwait(false);
+        if (!fetched.Ok || fetched.Value is null)
+        {
+            var refused = fetched.Error?.Code == ErrorCode.Invalid;
+            return (null, fetched.Error?.Message ?? "直链取不回来。", refused);
+        }
+
+        // A link carries no name: the actions that make one do not say what the file is called. An empty name is "the
+        // platform did not say", which the receipt repeats — inventing one from the handle would put a file id there.
+        return (new PlatformFileContent(new MemoryStream(fetched.Value, writable: false), string.Empty,
+            fetched.Value.Length), string.Empty, false);
+    }
+
+    /// <summary>
+    /// One shape of a <c>get_file</c> answer, read as far as it goes.
+    ///
+    /// A null with a sentence when this host cannot use it: the sentence is what the caller prints once every shape has
+    /// been tried, because "none of the four worked" with no reason for each is a dead end for whoever reads it.
+    /// </summary>
+    private async ValueTask<(PlatformFileContent? Content, string Why)> ReadShapeAsync(string field, string value,
+        string? name, string? mediaType, long maxBytes, CancellationToken cancellationToken)
+    {
+        // A field called "base64" is base64 whatever it looks like: NapCat answers a bare string there, with no
+        // "base64://" in front of it, and it is the whole file when enableLocalFile2Url is on.
+        if (field == "base64") return Decode(value);
+        if (value.StartsWith("base64://", StringComparison.Ordinal)) return Decode(value["base64://".Length..]);
+        if (value.StartsWith("data:", StringComparison.Ordinal) && value.Contains(";base64,", StringComparison.Ordinal))
+            return Decode(value[(value.IndexOf(";base64,", StringComparison.Ordinal) + ";base64,".Length)..]);
+
+        if (TryHttpUrl(value) is { } url)
+        {
+            var fetched = await FetchBytesAsync(url, maxBytes, cancellationToken).ConfigureAwait(false);
+            return fetched.Ok && fetched.Value is not null
+                ? (new PlatformFileContent(new MemoryStream(fetched.Value, writable: false),
+                    name ?? FallbackName(value), fetched.Value.Length, mediaType), string.Empty)
+                : (null, fetched.Error?.Message ?? "取不回来。");
+        }
+
+        // A path. It is on the bridge's own disk, which is this one only when the two share a volume and the operator said
+        // so with pathMap — and that mapping is the whole safety story: it can only ever reach a scope the host
+        // registered, never an arbitrary path a bridge printed.
+        if (TryMapPath(value, out var scope, out var relative))
+        {
+            if (_files is null) return (null, "这台宿主没有给适配器文件端口，所以映射上了也读不到。");
+            var opened = await _files.OpenReadAsync(scope, relative, cancellationToken).ConfigureAwait(false);
+            return opened.Ok && opened.Value is not null
+                ? (new PlatformFileContent(opened.Value, name ?? FallbackName(value), null, mediaType), string.Empty)
+                : (null, opened.Error?.Message ?? $"映射到的 {scope}/{relative} 读不出来。");
+        }
+
+        // NapCat's own file url: "file://1234567890" is a handle it resolves internally, not a path on any disk. Calling
+        // that "a path on the bridge's disk" would be a wrong sentence in the direction that sends somebody looking for a
+        // mount that was never the problem (docs/16 §12.6).
+        if (value.StartsWith("file://", StringComparison.Ordinal))
+            return (null, $"这是桥接自己的文件标识（{value}），不是磁盘路径，而本构建没有解析它的动作。");
+
+        return (null, $"桥接说文件在它自己的磁盘上：{value}，这台宿主读不到那个路径。");
+
+        (PlatformFileContent? Content, string Why) Decode(string payload)
         {
             try
             {
                 var bytes = Convert.FromBase64String(payload);
                 if (bytes.Length > maxBytes)
-                    return Result<PlatformFileContent>.Failure(new(ErrorCode.Invalid,
-                        $"这个文件解出来是 {bytes.Length} 字节，超过这次取的 {maxBytes} 字节上限。", null, false));
-                return Result<PlatformFileContent>.Success(new(new MemoryStream(bytes, writable: false), name, bytes.Length,
-                    OneBotProtocol.ReadFileMediaType(called.Value.Data)));
+                    return (null, $"解出来是 {bytes.Length} 字节，超过这次取的 {maxBytes} 字节上限。");
+                return (new PlatformFileContent(new MemoryStream(bytes, writable: false), name ?? "file", bytes.Length,
+                    mediaType), string.Empty);
             }
             catch (FormatException ex)
             {
-                return Result<PlatformFileContent>.Failure(new(ErrorCode.Unavailable,
-                    "桥接给的是 base64，但解不开。", ex.Message));
+                return (null, "桥接给的是 base64，但解不开：" + ex.Message);
             }
         }
+    }
 
-        // The bridge's own idea of a name, or the end of whatever it gave us: a model needs something to call this file,
-        // and "the last segment" is at least true.
-        static string FallbackName(string body)
-        {
-            var tail = body.Split('|').Last();
-            var cut = tail.LastIndexOfAny(['/', '\\']);
-            var candidate = cut >= 0 ? tail[(cut + 1)..] : tail;
-            return string.IsNullOrWhiteSpace(candidate) ? "file" : candidate;
-        }
+    /// <summary>
+    /// The bridge's own idea of a name, or the end of whatever it gave us: a model needs something to call this file, and
+    /// "the last segment" is at least true.
+    /// </summary>
+    private static string FallbackName(string body)
+    {
+        var tail = body.Split('|').Last();
+        var cut = tail.LastIndexOfAny(['/', '\\']);
+        var candidate = cut >= 0 ? tail[(cut + 1)..] : tail;
+        return string.IsNullOrWhiteSpace(candidate) ? "file" : candidate;
     }
 
     /// <summary>
