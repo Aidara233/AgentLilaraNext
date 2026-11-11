@@ -50,8 +50,10 @@ public static class DocumentReader
                 + "如果它本该是其中之一，文件可能没下载完或者是别的格式。" + Describe(span), Describe(span)));
 
         if (detected == DocumentFormats.Pdf)
-            return Result<ParsedDocument>.Failure(new(ErrorCode.Unavailable,
-                "PDF 的解析还没接上。"));
+        {
+            stream.Position = 0;
+            return PdfReader.Read(stream, maxChars);
+        }
 
         string? kind;
         try

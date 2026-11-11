@@ -37,6 +37,45 @@ internal static class Blocks
         return builder.ToString().TrimEnd();
     }
 
+    /// <summary>
+    /// The same tidying, except that line breaks survive.
+    ///
+    /// A PDF page is one string in which the line breaks <b>are</b> the layout: a heading, an address block and a table
+    /// row all arrive as lines, and flattening them turns a page into one very long sentence. Three or more breaks
+    /// become one, because a page whose leading is generous should not cost the model a dozen newlines.
+    /// </summary>
+    public static string NormalizeLines(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return string.Empty;
+        var builder = new StringBuilder(text.Length);
+        var breaks = 0;
+        var trailingSpace = true;
+        foreach (var character in text.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n'))
+        {
+            if (character == '\n')
+            {
+                breaks++;
+                trailingSpace = true;
+                continue;
+            }
+            if (character is ' ' or '\t' or '\u00A0')
+            {
+                if (!trailingSpace) builder.Append(' ');
+                trailingSpace = true;
+                continue;
+            }
+            if (breaks > 0)
+            {
+                builder.Append('\n');
+                if (breaks > 1) builder.Append('\n');
+                breaks = 0;
+            }
+            builder.Append(character);
+            trailingSpace = false;
+        }
+        return builder.ToString().Trim();
+    }
+
     public static string RenderTable(Table table)
     {
         var rows = new List<List<string>>();
@@ -52,8 +91,8 @@ internal static class Blocks
     }
 
     /// <summary>
-    /// Rows in, a markdown table out. Shared by the three readers so that a spreadsheet and a Word table look the same
-    /// to whoever reads them — one shape to learn, one shape to test.
+    /// Rows in, a markdown table out. Shared by the readers so that a spreadsheet and a Word table look the same to
+    /// whoever reads them — one shape to learn, one shape to test.
     /// </summary>
     public static string RenderGrid(IReadOnlyList<IReadOnlyList<string>> rows, int maxColumns = MaxColumns)
     {

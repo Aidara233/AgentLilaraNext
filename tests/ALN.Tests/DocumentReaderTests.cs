@@ -3,6 +3,10 @@ using ALN.Contracts;
 using Aln.Documents;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
+using UglyToad.PdfPig.Content;
+using UglyToad.PdfPig.Core;
+using UglyToad.PdfPig.Fonts.Standard14Fonts;
+using UglyToad.PdfPig.Writer;
 using A = DocumentFormat.OpenXml.Drawing;
 using P = DocumentFormat.OpenXml.Presentation;
 using S = DocumentFormat.OpenXml.Spreadsheet;
@@ -209,5 +213,42 @@ public sealed class DocumentReaderTests
 
         Assert.False(parsed.Ok);
         Assert.Contains("OLE", parsed.Error!.Message, StringComparison.Ordinal);
+    }
+
+    private static MemoryStream Pdf(string? text)
+    {
+        var builder = new PdfDocumentBuilder();
+        var page = builder.AddPage(PageSize.A4);
+        if (text is not null)
+        {
+            var font = builder.AddStandard14Font(Standard14Font.Helvetica);
+            page.AddText(text, 12, new PdfPoint(50, 700), font);
+        }
+        return new MemoryStream(builder.Build());
+    }
+
+    [Fact]
+    public void A_pdf_page_arrives_as_its_text()
+    {
+        using var stream = Pdf("Quarterly revenue grew.");
+        var parsed = DocumentReader.Read(stream);
+
+        Assert.True(parsed.Ok, parsed.Error?.Message);
+        var page = Assert.Single(parsed.Value!.Sections);
+        Assert.Equal(SectionKind.Page, page.Kind);
+        Assert.Contains("Quarterly revenue", page.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_page_with_no_text_layer_is_not_reported_as_an_empty_document()
+    {
+        // What a scanner produces: a real page, a real page count, and no text at all. "Empty" would be a lie about a
+        // document that is sitting right there, so the answer has to name the missing layer instead.
+        using var stream = Pdf(null);
+        var parsed = DocumentReader.Read(stream);
+
+        Assert.False(parsed.Ok);
+        Assert.Contains("没有文字层", parsed.Error!.Message, StringComparison.Ordinal);
+        Assert.Contains("OCR", parsed.Error.Message, StringComparison.Ordinal);
     }
 }
