@@ -51,7 +51,16 @@ public sealed class DocumentToolsTests : IDisposable
             main.Document = new W.Document(new W.Body(
                 new W.Paragraph(
                     new W.ParagraphProperties(new W.ParagraphStyleId { Val = "Heading1" }),
-                    new W.Run(new W.Text("季度报告")))));
+                    new W.Run(new W.Text("季度报告"))),
+                new W.Paragraph(new W.Run(new W.Text("第一段：收入比上季度高了。"))),
+                new W.Paragraph(new W.Run(new W.Text("第二段：成本没有变化。"))),
+                new W.Table(
+                    new W.TableRow(
+                        new W.TableCell(new W.Paragraph(new W.Run(new W.Text("项目")))),
+                        new W.TableCell(new W.Paragraph(new W.Run(new W.Text("金额"))))),
+                    new W.TableRow(
+                        new W.TableCell(new W.Paragraph(new W.Run(new W.Text("苹果")))),
+                        new W.TableCell(new W.Paragraph(new W.Run(new W.Text("42"))))))));
             main.Document.Save();
         }
         stream.Position = 0;
@@ -59,16 +68,60 @@ public sealed class DocumentToolsTests : IDisposable
     }
 
     [Fact]
-    public async Task The_tool_is_offered_and_reading_a_file_is_not_speaking_to_anyone()
+    public async Task The_tools_are_offered_and_reading_a_file_is_not_speaking_to_anyone()
     {
         var (_, tools) = Open();
         var offers = (await tools.ToolsAsync(new RoundContextRequest("s-1", Guid.NewGuid(), 1), default)).Value!;
 
-        var offer = Assert.Single(offers);
-        Assert.Equal("doc_info", offer.Definition.Name);
-        Assert.False(offer.ActsExternally);
-        Assert.False(offer.Tool.EndsTurn);
-        Assert.Equal(AccessLevel.Agent, offer.MinLevel);
+        Assert.Equal(["doc_info", "doc_tree", "doc_read"], offers.Select(offer => offer.Definition.Name));
+        Assert.All(offers, offer => Assert.False(offer.ActsExternally));
+        Assert.All(offers, offer => Assert.False(offer.Tool.EndsTurn));
+        Assert.All(offers, offer => Assert.Equal(AccessLevel.Agent, offer.MinLevel));
+    }
+
+    [Fact]
+    public async Task The_outline_numbers_every_piece_so_that_a_range_can_name_one()
+    {
+        var (access, tools) = Open();
+        Assert.True((await access.SaveAsync(FileScopes.Workspace, "q3.docx", Docx(), default)).Ok);
+
+        var answer = await CallAsync(tools, "doc_tree", """{"scope":"workspace","path":"q3.docx"}""");
+
+        Assert.True(answer.Ok, answer.Error?.Message);
+        var text = answer.Value!.Content;
+        Assert.Contains("[1] 标题 1 · # 季度报告", text, StringComparison.Ordinal);
+        Assert.Contains("[2] 段落 · 第一段", text, StringComparison.Ordinal);
+        Assert.Contains("[4] 表格", text, StringComparison.Ordinal);
+        Assert.Contains("共 4 段", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_range_reads_exactly_the_pieces_it_names()
+    {
+        var (access, tools) = Open();
+        Assert.True((await access.SaveAsync(FileScopes.Workspace, "q3.docx", Docx(), default)).Ok);
+
+        var answer = await CallAsync(tools, "doc_read", """{"scope":"workspace","path":"q3.docx","from":2,"to":3}""");
+
+        Assert.True(answer.Ok, answer.Error?.Message);
+        var text = answer.Value!.Content;
+        Assert.Contains("第一段", text, StringComparison.Ordinal);
+        Assert.Contains("第二段", text, StringComparison.Ordinal);
+        // A range means a range: what was outside it must not leak in wearing a heading.
+        Assert.DoesNotContain("季度报告", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("| 项目 |", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_range_past_the_end_says_how_many_pieces_there_are()
+    {
+        var (access, tools) = Open();
+        Assert.True((await access.SaveAsync(FileScopes.Workspace, "q3.docx", Docx(), default)).Ok);
+
+        var answer = await CallAsync(tools, "doc_read", """{"scope":"workspace","path":"q3.docx","from":99}""");
+
+        Assert.False(answer.Ok);
+        Assert.Contains("4", answer.Error!.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -84,7 +137,8 @@ public sealed class DocumentToolsTests : IDisposable
         var text = answer.Value!.Content;
         Assert.Contains("workspace/reports/q3.docx", text, StringComparison.Ordinal);
         Assert.Contains("docx", text, StringComparison.Ordinal);
-        Assert.Contains("段落 1", text, StringComparison.Ordinal);
+        Assert.Contains("段落 3", text, StringComparison.Ordinal);
+        Assert.Contains("表格 1", text, StringComparison.Ordinal);
     }
 
     [Fact]
