@@ -1,0 +1,10 @@
+{
+  "id": "aln.documents",
+  "version": "1.0.0",
+  "contracts": "2",
+  "entryAssembly": "Aln.Documents.dll",
+  "entryType": "Aln.Documents.DocumentsPlugin",
+  "provides": [],
+  "dependencies": [],
+  "reloadPolicy": "replace"
+}

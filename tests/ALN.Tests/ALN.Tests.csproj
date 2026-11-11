@@ -40,5 +40,7 @@
     <ProjectReference Include="..\..\src\ALN.Rice\ALN.Rice.csproj" />
     <!-- The sample plugin is loaded by a test as a real package: the artifact that ships is the artifact tested. -->
     <ProjectReference Include="..\..\samples\plugins\sample.environment\SampleEnvironment.csproj" />
+    <!-- The document plugin ships as a package too, so its tools are tested against the real byte port. -->
+    <ProjectReference Include="..\..\src\plugins\aln.documents\Aln.Documents.csproj" />
   </ItemGroup>
 </Project>

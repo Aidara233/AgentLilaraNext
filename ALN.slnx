@@ -27,6 +27,9 @@
   <Folder Name="/src/dev/">
     <Project Path="src/ALN.Adapter.Qq/dev/FakeOneBot/FakeOneBot.csproj" />
   </Folder>
+  <Folder Name="/src/plugins/">
+    <Project Path="src/plugins/aln.documents/Aln.Documents.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/ALN.Tests/ALN.Tests.csproj" />
   </Folder>
