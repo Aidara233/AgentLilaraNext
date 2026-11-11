@@ -22,6 +22,34 @@ public sealed class FileSystemAccessTests : IDisposable
     private LocalFileSystemAccess Open(params string[] scopes) =>
         new(_root, scopes.Length == 0 ? ["memory", "workspace"] : scopes);
 
+    // ---- the ceiling rule ----------------------------------------------------------------------
+
+    /// <summary>
+    /// A ceiling the caller names is the one that applies, in both directions: one constant cannot be right for a tool
+    /// moving a tarball and for a host receiving whatever a platform hands it, and only the caller knows which it is
+    /// doing (docs/28 §6.6.1).
+    /// </summary>
+    [Fact]
+    public async Task A_write_ceiling_the_caller_names_is_the_one_that_applies()
+    {
+        var access = new LocalFileSystemAccess(_root, [FileScopes.Workspace], binaryScopes: [FileScopes.Workspace]);
+
+        var tooBig = await access.SaveAsync(FileScopes.Workspace, "big.bin", new MemoryStream(new byte[2048]), 1024,
+            default);
+        Assert.False(tooBig.Ok);
+        Assert.Equal(ErrorCode.Invalid, tooBig.Error!.Code);
+        Assert.Contains("1024", tooBig.Error.Message, StringComparison.Ordinal);
+
+        // The same bytes under a ceiling that allows them: the transfer constant was never consulted.
+        var fits = await access.SaveAsync(FileScopes.Workspace, "fits.bin", new MemoryStream(new byte[2048]), 4096,
+            default);
+        Assert.True(fits.Ok, fits.Error?.Message);
+        var opened = await access.OpenReadAsync(FileScopes.Workspace, "fits.bin", default);
+        Assert.True(opened.Ok, opened.Error?.Message);
+        await using var stream = opened.Value!;
+        Assert.Equal(2048, stream.Length);
+    }
+
     // ---- the path rule -------------------------------------------------------------------------
 
     [Theory]

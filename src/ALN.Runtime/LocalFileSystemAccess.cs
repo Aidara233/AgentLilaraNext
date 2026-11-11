@@ -166,19 +166,26 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
     /// caller that dies mid-way leaves the old file untouched.
     /// </summary>
     public ValueTask<Result> SaveAsync(string scope, string path, Stream content, CancellationToken cancellationToken) =>
-        SaveCoreAsync(scope, path, content, asHost: false, cancellationToken);
+        SaveCoreAsync(scope, path, content, asHost: false, IBinaryFileAccess.MaxTransferBytes, cancellationToken);
+
+    /// <inheritdoc />
+    public ValueTask<Result> SaveAsync(string scope, string path, Stream content, long ceiling,
+        CancellationToken cancellationToken) =>
+        SaveCoreAsync(scope, path, content, asHost: false, ceiling, cancellationToken);
 
     /// <summary>
     /// The host's own write path: the one way into a read-only scope.
     ///
     /// <c>internal</c> on purpose — it is on no interface a module can hold, so "the host fills media, a model only
     /// reads it" is a fact about the assembly rather than a rule somebody has to remember to check. Everything else is
-    /// the same code as <see cref="SaveAsync"/>: same scope check, same containment, same rename-into-place.
+    /// the same code as <see cref="SaveAsync(string, string, Stream, CancellationToken)"/>: same scope check, same
+    /// containment, same rename-into-place.
     /// </summary>
-    internal ValueTask<Result> SaveAsHostAsync(string scope, string path, Stream content, CancellationToken cancellationToken) =>
-        SaveCoreAsync(scope, path, content, asHost: true, cancellationToken);
+    internal ValueTask<Result> SaveAsHostAsync(string scope, string path, Stream content,
+        CancellationToken cancellationToken) =>
+        SaveCoreAsync(scope, path, content, asHost: true, IBinaryFileAccess.MaxTransferBytes, cancellationToken);
 
-    private ValueTask<Result> SaveCoreAsync(string scope, string path, Stream content, bool asHost,
+    private ValueTask<Result> SaveCoreAsync(string scope, string path, Stream content, bool asHost, long ceiling,
         CancellationToken cancellationToken) =>
         RunAsync(cancellationToken, async () =>
         {
@@ -214,9 +221,9 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
                     {
                         written += read;
                         // Checked as it goes: refusing after the disk is full is not a refusal, it is a mess.
-                        if (written > IBinaryFileAccess.MaxTransferBytes)
+                        if (written > ceiling)
                             return Result.Failure(new(ErrorCode.Invalid,
-                                $"The content is larger than the {IBinaryFileAccess.MaxTransferBytes} allowed for one transfer."));
+                                $"The content is larger than the {ceiling} bytes this write allows."));
                         await stream.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
                     }
                     // The one deliberate block: .NET offers no asynchronous "flush to disk", and the alternative is a file

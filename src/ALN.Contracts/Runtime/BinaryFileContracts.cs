@@ -56,4 +56,19 @@ public interface IBinaryFileAccess
     /// target and renamed into place, so a reader never sees half a file — the same rule the text writes follow.
     /// </summary>
     ValueTask<Result> SaveAsync(string scope, string path, Stream content, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The same write, with a ceiling the caller names instead of <see cref="MaxTransferBytes"/>.
+    ///
+    /// <b>Same reasoning as <see cref="OpenReadStreamAsync"/>, on the way in.</b> <see cref="MaxTransferBytes"/> answers
+    /// "how much may one transfer move, when the caller is a tool and the file is one it chose" — 64 MiB, small enough
+    /// that a mistyped path cannot start copying a disk image through this process. A caller that is instead receiving
+    /// bytes it did not choose — what a platform is handing over, at whatever size that turns out to be — has a better
+    /// number for the job, and it is not this constant.
+    ///
+    /// The ceiling is a parameter for the same reason it is one on the read side: the right number belongs to whoever is
+    /// moving the bytes, and a second constant here would be one more thing to keep in agreement with the other two.
+    /// </summary>
+    ValueTask<Result> SaveAsync(string scope, string path, Stream content, long ceiling,
+        CancellationToken cancellationToken);
 }

@@ -37,6 +37,21 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
     /// </summary>
     public const long BackgroundThreshold = 8L * 1024 * 1024;
 
+    /// <summary>
+    /// The largest file this tool will pull, when what is being handed over is whatever the platform happens to have.
+    ///
+    /// <b>Not the same question as <see cref="IBinaryFileAccess.MaxTransferBytes"/>.</b> That one answers "how much may
+    /// one transfer move through this process for a caller that picked the file itself" — a tool moving a tarball, an SSH
+    /// pull — and 64 MiB is a good answer there. This one answers "how big a thing may somebody have put on the platform
+    /// and then asked for". A person's group file area is not a place to be cautious about; it is a place where a system
+    /// image happens to live. 4 GiB is where that stops being a file and starts being a way to fill a disk, and it is
+    /// also as far as QQ's own file area goes.
+    ///
+    /// It is a number about the destination disk, not about this host's memory: the adapter streams the bytes, so a file
+    /// of this size costs one buffer on the way in (docs/28 §6.6.1).
+    /// </summary>
+    public const long MaxFetchBytes = 4L * 1024 * 1024 * 1024;
+
     public const string TypeId = "files.control";
     public const string SourceId = "system.files-tools";
     public const string ToolName = "files_get";
@@ -183,7 +198,7 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
                         declaredBytes, declared.Name, cancellationToken).ConfigureAwait(false);
             }
 
-            var fetched = await adapter.FetchAsync(conversation, handle, IBinaryFileAccess.MaxTransferBytes,
+            var fetched = await adapter.FetchAsync(conversation, handle, MaxFetchBytes,
                 cancellationToken).ConfigureAwait(false);
             if (!fetched.Ok || fetched.Value is null)
                 return Result<SessionToolResult>.Failure(fetched.Error ??
@@ -194,7 +209,8 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
             {
                 // The port is the one that decides whether this scope may hold bytes, is writable, and whether the path
                 // is inside it. Asked, never predicted: a check here would be a second answer to the same question.
-                var saved = await owner._files.SaveAsync(scope!, path!, content.Content, cancellationToken).ConfigureAwait(false);
+                var saved = await owner._files.SaveAsync(scope!, path!, content.Content, MaxFetchBytes,
+                    cancellationToken).ConfigureAwait(false);
                 if (!saved.Ok)
                     return Result<SessionToolResult>.Failure(saved.Error!);
             }
@@ -284,7 +300,7 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
     {
         try
         {
-            var fetched = await adapter.FetchAsync(conversation, handle, IBinaryFileAccess.MaxTransferBytes,
+            var fetched = await adapter.FetchAsync(conversation, handle, MaxFetchBytes,
                 CancellationToken.None).ConfigureAwait(false);
             if (!fetched.Ok || fetched.Value is null)
             {
@@ -295,7 +311,8 @@ public sealed class FilesGetTools(IChannelManager channels, IAdapterManager adap
             var content = fetched.Value;
             await using (content.Content)
             {
-                var saved = await _files.SaveAsync(scope, path, content.Content, CancellationToken.None).ConfigureAwait(false);
+                var saved = await _files.SaveAsync(scope, path, content.Content, MaxFetchBytes,
+                    CancellationToken.None).ConfigureAwait(false);
                 if (!saved.Ok)
                 {
                     await SettleAsync(sessionId, jobId, null, saved.Error?.Message ?? "存不下来。").ConfigureAwait(false);

@@ -933,48 +933,147 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
     /// A url a caller asked for by handle, with the caller's own ceiling and a reason when it fails — unlike the picture
     /// path above, where a failure is deliberately quiet and the message travels on without the picture.
     ///
-    /// Buffered, not streamed. That is a real cost and a deliberate one: this is the route a bridge answers with when it
-    /// holds the file on an HTTP side, and buffering it once (≤ what the caller asked for) keeps one code path for
-    /// "bytes to hand over" instead of three. The route that must never buffer — <c>pathMap</c> — streams instead.
+    /// <b>Streamed, not buffered.</b> The caller's ceiling says how much may move; it must not also say how much may sit
+    /// in this process's heap. A file somebody put on the platform is as big as they made it, and the disk it is going to
+    /// has more room than memory does. The declared length is checked before the first byte and the running total after
+    /// it, so a server that under-declares is refused rather than truncated.
     /// </summary>
-    private async ValueTask<Result<byte[]>> FetchBytesAsync(Uri url, long maxBytes, CancellationToken cancellationToken)
+    private async ValueTask<Result<(Stream Content, long? Bytes)>> FetchStreamAsync(Uri url, long maxBytes,
+        CancellationToken cancellationToken)
     {
+        CancellationTokenSource? deadline = null;
+        HttpResponseMessage? response = null;
         try
         {
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(UploadTimeout);
-            using var response = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, timeout.Token)
+            deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(UploadTimeout);
+            response = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, deadline.Token)
                 .ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
-                return Result<byte[]>.Failure(new(ErrorCode.Unavailable,
-                    $"桥接给的地址回答了 {(int)response.StatusCode}。",
-                    url.GetLeftPart(UriPartial.Path), true));
-            if (response.Content.Headers.ContentLength is { } declared && declared > maxBytes)
-                return Result<byte[]>.Failure(new(ErrorCode.Invalid,
-                    $"这个文件是 {declared} 字节，超过这次取的 {maxBytes} 字节上限。"));
-
-            await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
-            var buffer = new MemoryStream();
-            var chunk = new byte[81920];
-            int read;
-            while ((read = await stream.ReadAsync(chunk, timeout.Token).ConfigureAwait(false)) > 0)
             {
-                // Checked as it grows, not only from Content-Length: a chunked response declares nothing, and "it fit in
-                // memory" is not a limit.
-                if (buffer.Length + read > maxBytes)
-                    return Result<byte[]>.Failure(new(ErrorCode.Invalid,
-                        $"这个文件超过这次取的 {maxBytes} 字节上限，取到一半停下了。"));
-                buffer.Write(chunk, 0, read);
+                var status = (int)response.StatusCode;
+                var where = url.GetLeftPart(UriPartial.Path);
+                response.Dispose();
+                response = null;
+                return Result<(Stream, long?)>.Failure(new(ErrorCode.Unavailable,
+                    $"桥接给的地址回答了 {status}。", where, true));
             }
-            return Result<byte[]>.Success(buffer.ToArray());
+
+            var declared = response.Content.Headers.ContentLength;
+            if (declared is { } known && known > maxBytes)
+            {
+                response.Dispose();
+                response = null;
+                return Result<(Stream, long?)>.Failure(new(ErrorCode.Invalid,
+                    $"这个文件是 {known} 字节，超过这次取的 {maxBytes} 字节上限。"));
+            }
+
+            var body = await response.Content.ReadAsStreamAsync(deadline.Token).ConfigureAwait(false);
+            // Handed over open: the response lives inside the stream from here, and closing the stream closes both.
+            var handed = new ResponseStream(response, body, deadline, maxBytes);
+            response = null;
+            deadline = null;
+            return Result<(Stream, long?)>.Success((handed, declared));
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            return Result<byte[]>.Failure(new(ErrorCode.Timeout, "桥接的文件地址超时了。", url.GetLeftPart(UriPartial.Path), true));
+            return Result<(Stream, long?)>.Failure(new(ErrorCode.Timeout, "桥接的文件地址超时了。",
+                url.GetLeftPart(UriPartial.Path), true));
         }
         catch (Exception ex) when (ex is HttpRequestException or IOException)
         {
-            return Result<byte[]>.Failure(new(ErrorCode.Unavailable, "桥接的文件地址取不回来。", ex.Message, true));
+            return Result<(Stream, long?)>.Failure(new(ErrorCode.Unavailable, "桥接的文件地址取不回来。", ex.Message, true));
+        }
+        finally
+        {
+            response?.Dispose();
+            deadline?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// An http response body as a stream: capped as it is read, and closed together with the response it came from.
+    ///
+    /// <b>Why not an array.</b> <c>ReadAsByteArrayAsync</c> turns "how much may move" into "how much may sit in this
+    /// process's heap", and those stop being the same number the moment a platform hands over a 4 GB image: the file would
+    /// have to fit in memory before it could be written to the disk that has room for it. Streaming costs one buffer, and
+    /// the ceiling is still enforced twice — the declared length before the first byte, the running total after it.
+    ///
+    /// The response is owned here because an inner stream's <c>Dispose</c> does not release the
+    /// <see cref="HttpResponseMessage"/> it came out of; one leaked connection per fetched file is a slow way to run out of
+    /// sockets.
+    /// </summary>
+    private sealed class ResponseStream(HttpResponseMessage response, Stream inner, CancellationTokenSource deadline,
+        long ceiling) : Stream
+    {
+        private long _read;
+        private bool _disposed;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => _read;
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => Count(inner.Read(buffer, offset, count));
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            // The transfer's own deadline plus whatever the caller brought: a bridge that stops sending must not hold a
+            // turn open until somebody notices.
+            using var both = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
+            return Count(await inner.ReadAsync(buffer, both.Token).ConfigureAwait(false));
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override void Flush() { }
+
+        private int Count(int read)
+        {
+            if (read <= 0) return read;
+            _read += read;
+            // Checked as it grows, not only from Content-Length: a chunked response declares nothing, and "it fit in
+            // memory" is not a limit.
+            if (_read > ceiling)
+                throw new IOException($"这个文件超过这次取的 {ceiling} 字节上限，取到一半停下了。");
+            return read;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (!_disposed)
+            {
+                _disposed = true;
+                if (disposing)
+                {
+                    inner.Dispose();
+                    response.Dispose();
+                    deadline.Dispose();
+                }
+            }
+            base.Dispose(disposing);
+        }
+
+        public override async ValueTask DisposeAsync()
+        {
+            if (!_disposed)
+            {
+                _disposed = true;
+                await inner.DisposeAsync().ConfigureAwait(false);
+                response.Dispose();
+                deadline.Dispose();
+            }
+            await base.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -1195,8 +1294,8 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
         if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
             return (null, $"直链动作给的不是 http(s)：{link}", false);
 
-        var fetched = await FetchBytesAsync(uri, maxBytes, cancellationToken).ConfigureAwait(false);
-        if (!fetched.Ok || fetched.Value is null)
+        var fetched = await FetchStreamAsync(uri, maxBytes, cancellationToken).ConfigureAwait(false);
+        if (!fetched.Ok || fetched.Value.Content is null)
         {
             var refused = fetched.Error?.Code == ErrorCode.Invalid;
             return (null, fetched.Error?.Message ?? "直链取不回来。", refused);
@@ -1204,8 +1303,7 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
 
         // A link carries no name: the actions that make one do not say what the file is called. An empty name is "the
         // platform did not say", which the receipt repeats — inventing one from the handle would put a file id there.
-        return (new PlatformFileContent(new MemoryStream(fetched.Value, writable: false), string.Empty,
-            fetched.Value.Length), string.Empty, false);
+        return (new PlatformFileContent(fetched.Value.Content, string.Empty, fetched.Value.Bytes), string.Empty, false);
     }
 
     /// <summary>
@@ -1226,10 +1324,10 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
 
         if (TryHttpUrl(value) is { } url)
         {
-            var fetched = await FetchBytesAsync(url, maxBytes, cancellationToken).ConfigureAwait(false);
-            return fetched.Ok && fetched.Value is not null
-                ? (new PlatformFileContent(new MemoryStream(fetched.Value, writable: false),
-                    name ?? FallbackName(value), fetched.Value.Length, mediaType), string.Empty)
+            var fetched = await FetchStreamAsync(url, maxBytes, cancellationToken).ConfigureAwait(false);
+            return fetched.Ok && fetched.Value.Content is not null
+                ? (new PlatformFileContent(fetched.Value.Content, name ?? FallbackName(value), fetched.Value.Bytes,
+                    mediaType), string.Empty)
                 : (null, fetched.Error?.Message ?? "取不回来。");
         }
 
@@ -1255,6 +1353,13 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
 
         (PlatformFileContent? Content, string Why) Decode(string payload)
         {
+            // Before the string is decoded, not after: 4 GiB of base64 is a 5.4 GiB string, and an OutOfMemoryException is
+            // not a refusal — it is the process gone. Three bytes per four characters holds for every well-formed
+            // payload, padding and all.
+            var estimate = payload.Length / 4L * 3L;
+            if (estimate > maxBytes)
+                return (null, $"这个 base64 解出来约 {estimate} 字节，超过这次取的 {maxBytes} 字节上限。");
+
             try
             {
                 var bytes = Convert.FromBase64String(payload);

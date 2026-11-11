@@ -122,6 +122,24 @@ public sealed class FilesGetToolsTests : IDisposable
         Assert.Equal(new[] { FileHandles.Wrap("0|new") }, catalog.Fetched);
     }
 
+    /// <summary>
+    /// A file on a platform is not a transfer the tool chose: it is as big as whoever put it there made it. So the
+    /// ceiling is four gigabytes, not the sixty-four that answer "how much may one tool move through this process"
+    /// (docs/28 §6.8).
+    /// </summary>
+    [Fact]
+    public async Task A_platform_file_may_be_larger_than_one_transfer_and_the_tool_says_so()
+    {
+        var catalog = Catalog();
+        var answered = await CallAsync(Tools(catalog, Files()),
+            $$"""{"target":"{{FileHandles.Wrap("0|new")}}","scope":"workspace","path":"big.mp4"}""");
+
+        Assert.True(answered.Ok, answered.Error?.Message);
+        Assert.Equal(new[] { FilesGetTools.MaxFetchBytes }, catalog.Ceilings);
+        Assert.Equal(4L * 1024 * 1024 * 1024, FilesGetTools.MaxFetchBytes);
+        Assert.True(FilesGetTools.MaxFetchBytes > IBinaryFileAccess.MaxTransferBytes);
+    }
+
     [Fact]
     public async Task The_destination_is_the_byte_ports_decision_and_its_refusal_is_passed_on()
     {
@@ -258,6 +276,9 @@ public sealed class FilesGetToolsTests : IDisposable
         public List<string> Listed { get; } = [];
         public List<string> Fetched { get; } = [];
 
+        /// <summary>What the tool said it would accept, per fetch: the ceiling belongs to the caller, not to the port.</summary>
+        public List<long> Ceilings { get; } = [];
+
         public ValueTask<Result<PlatformFileListing>> ListAsync(string conversationId, int limit,
             CancellationToken cancellationToken)
         {
@@ -271,6 +292,7 @@ public sealed class FilesGetToolsTests : IDisposable
             CancellationToken cancellationToken)
         {
             Fetched.Add(handle);
+            Ceilings.Add(maxBytes);
             if (Failure is { } failure) return ValueTask.FromResult(Result<PlatformFileContent>.Failure(failure));
             var file = Entries.FirstOrDefault(entry => entry.Handle == handle);
             if (file is null)

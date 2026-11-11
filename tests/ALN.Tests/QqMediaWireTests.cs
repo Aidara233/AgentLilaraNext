@@ -717,6 +717,30 @@ public sealed class QqMediaWireTests : IDisposable
         finally { await adapter.StopAsync(default); }
     }
 
+    /// <summary>
+    /// A base64 payload is refused by its length before it is decoded: a ceiling that only applies after the string has
+    /// already become its bytes is not a ceiling, it is a way to run out of memory (docs/28 §6.8).
+    /// </summary>
+    [Fact]
+    public async Task A_base64_too_large_for_the_ceiling_is_refused_before_it_is_decoded()
+    {
+        await using var bridge = await FakeBridge.StartAsync(Png());
+        var sink = new RecordingSink();
+        var adapter = NewAdapter(bridge.WebSocketUri!, sink, files: null);
+        Assert.True((await adapter.StartAsync(default)).Ok);
+        try
+        {
+            Assert.True(await WaitAsync(() => bridge.IsConnected), "the adapter never connected");
+            var catalog = (IFileCatalogAdapter)adapter;
+
+            // Nine bytes of payload under a ceiling of four: the answer is over before Convert would ever run.
+            var fetched = await catalog.FetchAsync("group-123456", "f:0|bare-b64", 4, default);
+            Assert.False(fetched.Ok);
+            Assert.Contains("超过", fetched.Error!.Message, StringComparison.Ordinal);
+        }
+        finally { await adapter.StopAsync(default); }
+    }
+
     [Fact]
     public async Task A_group_file_upload_reaches_the_channel_as_an_envelope_with_no_message_id()
     {
