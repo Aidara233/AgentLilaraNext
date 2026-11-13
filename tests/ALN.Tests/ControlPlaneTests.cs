@@ -191,7 +191,9 @@ public sealed class ControlPlaneTests : IDisposable
     public async Task A_level_is_a_comparison_and_the_refusal_says_which_half_failed()
     {
         var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
-        Assert.True(plane.Register(new("demo.operator", "Needs an operator.", Capabilities.ModelsControl, true),
+        // 2026-11-12：这条例子的载体原来是 models.control，它随整族降到 agent 了，于是换成定级表里唯一还留在
+        // operator 的一格。测试要钉的是"两半分得开"，不是某一个具体能力名。
+        Assert.True(plane.Register(new("demo.operator", "Needs an operator.", Capabilities.IdentityControl, true),
             (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(JsonSerializer.SerializeToElement(new { ok = 1 })))).Ok);
         // One verb may sit deeper than its family: modules.read is an agent's, this one is the kernel's.
         Assert.True(plane.Register(new("demo.kernel", "Needs the kernel.", Capabilities.ModulesRead, true,
@@ -226,7 +228,57 @@ public sealed class ControlPlaneTests : IDisposable
         Assert.Equal(AccessLevel.Full, AccessLevels.Of("nothing.registered.this"));
         Assert.Equal(AccessLevel.Full, AccessLevels.Of(null));
         Assert.Equal(AccessLevel.Agent, AccessLevels.Of(Capabilities.ChannelsRead));
-        Assert.Equal(AccessLevel.Operator, AccessLevels.Of(Capabilities.ModelsControl));
+        Assert.Equal(AccessLevel.Agent, AccessLevels.Of(Capabilities.ModelsControl));
+    }
+
+    [Fact]
+    public async Task The_dangerous_few_stay_deeper_than_the_family_they_belong_to()
+    {
+        // 2026-11-12：整族降到 agent 之后，剩下的安全边界全落在三条描述符的 MinLevel 上，所以它们要有真的注册出来
+        // 的断言，而不是"我在新(new)的时候写了 MinLevel"这种转述——转述会在下一次重构里悄悄变假。
+        var root = Path.Combine(_root, "graph");
+        var types = new ModuleFactoryRegistry();
+        Assert.True(types.Register("test.plain", manifest => Result<IKernelModule>.Success(new NoopModule(manifest.Id))).Ok);
+        var kernel = new Kernel(root, types);
+        Assert.True((await kernel.StartAsync(default)).Ok);
+        var plane = new ControlPlane(new CollectingAudit(_audit), _signals);
+        Assert.True(CoreActions.RegisterAll(plane, new FakeAdapters(), new FakeChannels(), new FakeModels(null), _signals,
+            new FakeGraph(), new FakeParameters(), kernel: kernel).Ok);
+        Assert.True(PackageActions.Register(plane, new FakePackages()).Ok);
+
+        static AccessLevel LevelOf(IControlPlane plane, string id) =>
+            plane.Catalog.Single(action => action.Id == id).RequiredLevel;
+
+        // 换代码：把正在跑的 dll 换成盘上的另一个版本。换坏了不是数据坏，是进程里那半边没了。
+        Assert.Equal(AccessLevel.Operator, LevelOf(plane, PackageActions.Replace));
+        Assert.Equal(AccessLevel.Operator, LevelOf(plane, PackageActions.Use));
+        Assert.Equal(AccessLevel.Operator, LevelOf(plane, PackageActions.Unload));
+        // 图的手术：删一个目录，让别人的边掉下来，而掉下来的边只被报告、不被修。
+        Assert.Equal(AccessLevel.Operator, LevelOf(plane, CoreActions.ModulesLoad));
+        Assert.Equal(AccessLevel.Operator, LevelOf(plane, CoreActions.ModulesUnload));
+        // 它们所属的那一族比它们浅：这个差就是 MinLevel 的全部意义，没有它这五条会跟着族一起降到 agent。
+        Assert.Equal(AccessLevel.Agent, AccessLevels.Of(Capabilities.ModulesControl));
+
+        // 而 agent 真的被挡在门口，且挡它的是等级不是授予——两句话读起来不一样，这是 C-29 之外的另一条。
+        var refused = await plane.InvokeAsync(new Actor("model", ActorKind.Model, [Actor.Any], AccessLevel.Agent),
+            PackageActions.Unload, JsonSerializer.SerializeToElement(new { id = "sample" }), default);
+        Assert.Equal(ErrorCode.Denied, refused.Error!.Code);
+        Assert.Contains("L1 operator", refused.Error.Message);
+    }
+
+    /// <summary>包维护面，什么也不做：这条测试问的是动作表，不是加载器。</summary>
+    private sealed class FakePackages : IModulePackageMaintenance
+    {
+        public IReadOnlyList<LoadedPackageInfo> LoadedPackages => [];
+        public string? PluginsRoot => null;
+
+        public ValueTask<Result<ModuleReloadReport>> ReplaceAsync(string packageId, string version, TimeSpan timeout,
+            bool force, CancellationToken ct) =>
+            ValueTask.FromResult(Result<ModuleReloadReport>.Failure(new(ErrorCode.Unavailable, "not this test")));
+
+        public ValueTask<Result<ModuleUnloadReport>> UnloadAsync(string packageId, TimeSpan timeout, bool force,
+            CancellationToken ct) =>
+            ValueTask.FromResult(Result<ModuleUnloadReport>.Failure(new(ErrorCode.Unavailable, "not this test")));
     }
 
     [Fact]

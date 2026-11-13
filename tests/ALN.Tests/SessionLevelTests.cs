@@ -48,6 +48,89 @@ public sealed class SessionLevelTests : IDisposable
     private static JsonElement Args(string id, string level) => JsonSerializer.SerializeToElement(new { id, level });
 
     [Fact]
+    public async Task A_session_can_be_made_on_purpose_and_an_existing_name_keeps_what_it_is()
+    {
+        // 2026-11-12 新增的动词。之前造一个会话只有一条路：挂一个脚本，让它 ctx.session.open。这条测试钉三件事：
+        // agent 级就能造；造出来的东西真的在盘上、真的能被叫起来；同名再叫一次不重写它——"指到一个东西"不等于
+        // "决定它是什么"。
+        var plane = Plane(_sessions);
+        var asked = JsonSerializer.SerializeToElement(new
+        {
+            id = "s-made",
+            profile = "default",
+            objective = "守着一个话题。",
+            level = "agent"
+        });
+
+        var made = await plane.InvokeAsync(Agent(), SessionActions.Create, asked, default);
+        Assert.True(made.Ok, made.Error?.Message);
+        Assert.Equal("s-made", made.Value.GetProperty("id").GetString());
+        Assert.True(made.Value.GetProperty("created").GetBoolean());
+        Assert.True(File.Exists(Path.Combine(_root, "modules", "s-made", "module.json")));
+
+        // The next turn runs at the level it was made with — the spec is the thing that was written, not a default.
+        Assert.True((await _sessions.TurnAsync("s-made", Spec(), Guid.NewGuid(),
+            new SessionTurnInput([new("m-1", "user", "alice", "hi", DateTimeOffset.UtcNow)]), null, default)).Ok);
+        Assert.Equal(AccessLevel.Agent, Assert.Single(_recorder.Seen));
+
+        // Same name, different objective: the stored one wins, and the answer says so instead of pretending it wrote.
+        var again = await plane.InvokeAsync(Operator(), SessionActions.Create, JsonSerializer.SerializeToElement(new
+        {
+            id = "s-made",
+            profile = "default",
+            objective = "换一个目标（不该生效）。",
+            level = "operator"
+        }), default);
+        Assert.True(again.Ok, again.Error?.Message);
+        Assert.False(again.Value.GetProperty("created").GetBoolean());
+        Assert.Contains("守着一个话题", again.Value.GetProperty("objective").GetString());
+        Assert.Equal("L0 agent", again.Value.GetProperty("level").GetString());
+    }
+
+    [Fact]
+    public async Task Creating_one_that_is_deeper_than_you_are_is_refused_by_the_same_rule_as_raising_one()
+    {
+        // 造一个会话是"授出一份等级"，因为它会留在那份会话上、从此每轮生效。所以它走的是同一个委派不变式，
+        // 而不是一张自己的算法：把 level 交给控制面那一个点去比。
+        var plane = Plane(_sessions);
+        var tooDeep = await plane.InvokeAsync(Agent(), SessionActions.Create,
+            JsonSerializer.SerializeToElement(new { id = "s-deep", level = "full" }), default);
+
+        Assert.Equal(ErrorCode.Denied, tooDeep.Error!.Code);
+        Assert.Contains("cannot hand out", tooDeep.Error.Message);
+        // Refused before anything was written: a name with no Session behind it does not become a directory on the way.
+        Assert.False(Directory.Exists(Path.Combine(_root, "modules", "s-deep")));
+
+        // And the same request from somebody at that depth is exactly what the verb is for.
+        Assert.True((await plane.InvokeAsync(Operator(), SessionActions.Create,
+            JsonSerializer.SerializeToElement(new { id = "s-deep", profile = "default", level = "operator" }), default)).Ok);
+        Assert.True(Directory.Exists(Path.Combine(_root, "modules", "s-deep")));
+    }
+
+    [Fact]
+    public async Task A_session_made_without_a_name_gets_one_and_can_be_woken()
+    {
+        // 默认名字是"类型 + 新后缀"，和别的实例一样（C-01：名字不是描述，不解析）。造完就能递话，wake 真的跑一轮。
+        var plane = Plane(_sessions);
+        var made = await plane.InvokeAsync(Agent(), SessionActions.Create,
+            JsonSerializer.SerializeToElement(new { profile = "default", objective = "没有频道也活着。" }), default);
+        Assert.True(made.Ok, made.Error?.Message);
+
+        var id = made.Value.GetProperty("id").GetString()!;
+        Assert.StartsWith("session.chat#", id, StringComparison.Ordinal);
+        Assert.Null(made.Value.GetProperty("channel").GetString());
+
+        var woken = await plane.InvokeAsync(Agent(), SessionActions.Message, JsonSerializer.SerializeToElement(new
+        {
+            id,
+            text = "你在吗",
+            wake = true
+        }), default);
+        Assert.True(woken.Ok, woken.Error?.Message);
+        Assert.Equal(AccessLevel.Agent, Assert.Single(_recorder.Seen));
+    }
+
+    [Fact]
     public async Task A_level_change_is_on_disk_and_is_carried_by_the_very_next_turn()
     {
         Assert.True((await _sessions.OpenAsync("s-1", Spec(), default)).Ok);
@@ -81,10 +164,15 @@ public sealed class SessionLevelTests : IDisposable
         Assert.True((await _sessions.OpenAsync("s-2", Spec(), default)).Ok);
         var plane = Plane(_sessions);
 
-        // An agent cannot raise a Session at all: the verb itself is an operator's.
+        // 2026-11-12 改：sessions.control 降到 agent，于是"agent 调不动这个动词"不再是这里的断言。挡 agent 的
+        // 换成委派不变式本身——它才是这条测试真正要钉的东西，比原来那句"这是 operator 的动词"更硬：
+        // 等级可以授出，但只许授出不比自己的深的。
         var byAgent = await plane.InvokeAsync(Agent(), SessionActions.SetLevel, Args("s-2", "operator"), default);
         Assert.Equal(ErrorCode.Denied, byAgent.Error!.Code);
-        Assert.Contains("needs L1 operator", byAgent.Error.Message);
+        Assert.Contains("cannot hand out", byAgent.Error.Message);
+
+        // 同一级它授得出去：不变式管的是"不比自己的深"，不是"不许动"。
+        Assert.True((await plane.InvokeAsync(Agent(), SessionActions.SetLevel, Args("s-2", "agent"), default)).Ok);
 
         // An operator cannot hand out the kernel's level — delegating upwards is the one thing the rule forbids.
         var upwards = await plane.InvokeAsync(Operator(), SessionActions.SetLevel, Args("s-2", "full"), default);

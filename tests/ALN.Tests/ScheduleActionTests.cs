@@ -77,18 +77,19 @@ public sealed class ScheduleActionTests
     };
 
     [Fact]
-    public async Task An_agent_can_see_the_schedule_but_not_write_one()
+    public async Task An_agent_can_see_the_schedule_and_write_one()
     {
+        // 2026-11-12 改，原名 An_agent_can_see_the_schedule_but_not_write_one。schedules.control 降到 agent：
+        // 一条规则是可读、可改、可删的数据，它自己干不出危险的事——危险的是被它叫醒的那个动作，而闸门在动作上。
+        // 原来那条"拒绝也留审计"的断言保留着，只是现在它验的是"允许也留审计"。
         var (plane, _, audit) = SetUp();
         var listed = await plane.InvokeAsync(Agent(), ScheduleActions.List, Args(new { }), default);
         Assert.True(listed.Ok, listed.Error?.Message);
 
         var written = await plane.InvokeAsync(Agent(), ScheduleActions.Set, Args(Daily()), default);
-        Assert.False(written.Ok);
-        Assert.Equal(ErrorCode.Denied, written.Error!.Code);
-        Assert.Contains("needs L1 operator", written.Error.Message, StringComparison.Ordinal);
-        // Denied is not recorded as a change: nothing was written, so nothing claims to have been.
-        Assert.DoesNotContain(audit.Records, record => record.Action == ScheduleActions.Set && record.Outcome == "allowed");
+        Assert.True(written.Ok, written.Error?.Message);
+        // Who wrote it is on the row: a rule nobody is named on is a rule nobody can be asked about.
+        Assert.Contains(audit.Records, record => record.Action == ScheduleActions.Set && record.Outcome == "allowed");
     }
 
     [Fact]

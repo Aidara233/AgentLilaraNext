@@ -20,6 +20,32 @@ public sealed record SessionSummary(
     bool WaitRelease = false);
 
 /// <summary>
+/// One Session as <b>a peer</b> sees it: what it was made for, who it serves, how deep it sits, and whether it is
+/// in the middle of a turn right now.
+///
+/// Not the same shape as <see cref="SessionSummary"/>, and the difference is the question. That one exists so a
+/// keep-or-archive decision has what it needs — bytes, last spoken, the declared deadline. This one exists so a
+/// Session can decide <i>who to ask</i>: an objective is the only field that says what somebody is for, a level says
+/// what it may reach, and "busy" is the difference between "hand it a message and wake it" and "the wake will be
+/// skipped, so it will read this later".
+/// </summary>
+/// <param name="Objective">The one line the Session was created with. Empty for a Session whose spec cannot be
+/// read — a fact worth showing rather than guessing a default into.</param>
+/// <param name="ModelProfileId">Which model answers there, as the spec resolved it. Null when the spec could not be
+/// read. Shown because "this conversation runs on a cheaper model" is a reason to ask a different one.</param>
+/// <param name="Busy">Somebody holds this Session's turn gate: a turn is running, so a wake-up would be skipped
+/// rather than queued.</param>
+public sealed record SessionRosterEntry(
+    string Id,
+    string? Channel,
+    string Objective,
+    string? ModelProfileId,
+    AccessLevel Level,
+    int Steps,
+    DateTimeOffset? LastActiveAt,
+    bool Busy);
+
+/// <summary>
 /// What to do with a Session whose declared deadline has passed. Passed in rather than owned because the two
 /// answers belong to different places: archiving needs the archive, and waking needs a way to run a turn that
 /// nothing wrote a message for.

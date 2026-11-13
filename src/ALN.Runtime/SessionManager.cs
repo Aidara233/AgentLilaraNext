@@ -2228,6 +2228,31 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
         { return ValueTask.FromResult(Result<IReadOnlyList<SessionSummary>>.Failure(new(ErrorCode.Unavailable, "Sessions could not be listed.", ex.Message))); }
     }
 
+    public ValueTask<Result<IReadOnlyList<SessionRosterEntry>>> RosterAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var roster = new List<SessionRosterEntry>();
+            foreach (var (id, directory) in EnumerateSessions())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var state = TryReadState(directory);
+                // The spec is read here rather than carried in state: `module.json` is the one place that says what a
+                // Session is, and a second copy in `state.json` would be a second answer to the same question.
+                var spec = TryReadSpec(directory);
+                var lastActive = state?.LastActiveAt ?? LastWritten(directory);
+                // Busy is the turn gate's own answer, not a guess: the same object every turn takes with a zero
+                // timeout, so "busy" here and "skipped rather than queued" there cannot disagree.
+                var busy = _sessionGates.TryGetValue(id, out var gate) && gate.CurrentCount == 0;
+                roster.Add(new(id, state?.Channel, spec?.Objective ?? "", spec?.ModelProfileId,
+                    spec?.Level ?? AccessLevel.Agent, state?.StepNumber ?? 0, lastActive, busy));
+            }
+            return ValueTask.FromResult(Result<IReadOnlyList<SessionRosterEntry>>.Success(roster));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        { return ValueTask.FromResult(Result<IReadOnlyList<SessionRosterEntry>>.Failure(new(ErrorCode.Unavailable, "Sessions could not be listed.", ex.Message))); }
+    }
+
     public async ValueTask<Result<SessionSweepReport>> SweepAsync(DateTimeOffset now, ISessionDeadlineHandler? handler,
         CancellationToken cancellationToken)
     {

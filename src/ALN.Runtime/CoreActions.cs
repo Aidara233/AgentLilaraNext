@@ -197,8 +197,12 @@ public static class CoreActions
             // Loading is reading a module's own file and adding it to the running graph; it is not "scan the disk again".
             // A module that is already there is a conflict, not a reload: replacing one while it works is a different
             // operation with different questions (what happens to what it holds), and it has not been answered yet.
+            //
+            // 2026-11-12：从 full 降到 operator（原来写的是"内核的"）。它不是代码，也不是内核的表，它是图的手术；
+            // 而给它 operator 而不是 agent 的理由在下面 unload 那一段——装载会往图里加边、卸载会删目录并让别人的边
+            // 掉下来。造适配器/频道/会话各有自己的动词，都已经在 agent，用不着借这条。
             (new(ModulesLoad, "Load one module from its own module.json into the running graph: {\"id\"}.", Capabilities.ModulesControl, true,
-                MinLevel: AccessLevel.Full),
+                MinLevel: AccessLevel.Operator),
                 async (arguments, ct) =>
                 {
                     if (kernel is null) return Unavailable("There is no kernel to load anything into.");
@@ -219,8 +223,10 @@ public static class CoreActions
                 }),
             // Unloading takes the instance out and puts the directory in the bin, because that is what "gone" has meant
             // everywhere else here; keeping it is the explicit choice (archive: false), not the default.
+            // 2026-11-12：full → operator，与 modules.load 同一个理由。落后半句仍成立：掉下来的边会出现在答复里，
+            // 而修它不是这条动词的事。
             (new(ModulesUnload, "Take one module out of the graph. archive defaults to true: its directory goes to the bin.", Capabilities.ModulesControl, true,
-                MinLevel: AccessLevel.Full),
+                MinLevel: AccessLevel.Operator),
                 async (arguments, ct) =>
                 {
                     if (kernel is null) return Unavailable("There is no kernel to unload anything from.");

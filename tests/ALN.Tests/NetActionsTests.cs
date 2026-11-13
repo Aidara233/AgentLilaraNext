@@ -141,8 +141,11 @@ public sealed class NetActionsTests : IDisposable
     }
 
     [Fact]
-    public async Task A_model_may_read_the_list_but_not_extend_it()
+    public async Task A_model_may_read_the_list_and_add_a_target()
     {
+        // 2026-11-12 改，原名 A_model_may_read_the_list_but_not_extend_it。net.control 降到 agent，理由是它与
+        // net.request 同深：一张能被一次对话扩写的白名单本来就不是白名单——因为门口本来就没挂白名单，每次请求
+        // 都是"地址由调用方说"。所以这里现在钉的是"它记得住"，不是"它被挡住"。
         var (plane, net, _, _) = Build();
         await plane.InvokeAsync(Operator, NetActions.Set, Json("""
         {"name":"docs","create":true,"base":"https://example.com"}
@@ -155,10 +158,8 @@ public sealed class NetActionsTests : IDisposable
 
         Assert.True(seen.Ok, seen.Error?.Detail);
         Assert.Equal("docs", seen.Value.GetProperty("targets")[0].GetProperty("name").GetString());
-        // An allowlist a conversation can extend is not an allowlist.
-        Assert.False(extended.Ok);
-        Assert.Equal(ErrorCode.Denied, extended.Error!.Code);
-        Assert.Equal(["docs"], net.Targets);
+        Assert.True(extended.Ok, extended.Error?.Detail);
+        Assert.Equal(["anywhere", "docs"], net.Targets.Order(StringComparer.Ordinal).ToArray());
     }
 
     [Fact]
@@ -250,9 +251,10 @@ public sealed class NetActionsTests : IDisposable
             .ToArray();
 
         Assert.Equal(["net.fetch", "net.targets.get", "net.targets.list", "net.targets.remove", "net.targets.set"], ids);
-        // Looking is a model's business; changing where traffic goes is a person's.
+        // 2026-11-12 改：改地址与凭据的那一半从 operator 降到 agent。"现在就 POST 到任意地址"（net.request）一直是
+        // agent 级的裸门，那么"把这次用的地址记下来"不比它更深；留一道 operator 只会让模型每次重问一遍。
         Assert.Equal(AccessLevel.Agent, AccessLevels.Of(Capabilities.NetRead));
-        Assert.Equal(AccessLevel.Operator, AccessLevels.Of(Capabilities.NetControl));
+        Assert.Equal(AccessLevel.Agent, AccessLevels.Of(Capabilities.NetControl));
         // A verb nobody described cannot be called from a schema-driven client.
         Assert.All(plane.Catalog.Where(action => action.Id.StartsWith("net.", StringComparison.Ordinal)),
             action => Assert.False(string.IsNullOrWhiteSpace(action.ParamsJson)));

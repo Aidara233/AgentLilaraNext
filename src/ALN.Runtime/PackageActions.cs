@@ -15,6 +15,14 @@ namespace ALN.Runtime;
 /// The order inside <c>packages.replace</c> is what makes it safe to press: the switch happens, then the pointer that
 /// records which version is in force is written, then the script catalogue is read again. A failure before the pointer
 /// leaves the old version running and recorded, so a restart boots what worked.
+///
+/// 2026-11-12：这三个动词所属的 <see cref="Capabilities.ModulesControl"/> 降到了 agent，所以它们各自钉了
+/// <c>MinLevel: Operator</c>。理由不是"模型不该管包"，而是这一整族里只有它们是**把正在跑的代码换掉**：
+/// 换坏了不是数据坏，是进程里那半边没了，回滚要另一个人再按一次。
+///
+/// 图与模块那一侧留了同样的分寸，只是理由不同：挂载已经放开（改的是路由），而 <c>modules.load</c> /
+/// <c>modules.unload</c> 仍在 operator——它们是图的手术，会删掉一个目录、会让别人的边掉下来，而掉下来的边
+/// 只被报告、不被修。
 /// </summary>
 public static class PackageActions
 {
@@ -39,7 +47,7 @@ public static class PackageActions
             (new(Replace, "Switch a running package to a version that is already on disk. Writes down which version is "
                     + "in force only after the switch succeeded, then reads the script folders again so the behaviour "
                     + "that came with the new version is what runs. Fails back to the version that was running.",
-                Capabilities.ModulesControl, true,
+                Capabilities.ModulesControl, true, MinLevel: AccessLevel.Operator,
                 ParamsJson: """
                 {"type":"object","properties":{
                   "id":{"type":"string","description":"The package id, e.g. sample.environment."},
@@ -52,7 +60,7 @@ public static class PackageActions
             (new(Use, "Switch to a version that is already installed. Same as packages.replace, kept as its own verb "
                     + "because \"use the one I have\" and \"replace it with this\" are different intentions even when "
                     + "they are the same switch. Idempotent: asking for the version that is already running changes nothing.",
-                Capabilities.ModulesControl, true,
+                Capabilities.ModulesControl, true, MinLevel: AccessLevel.Operator,
                 ParamsJson: """
                 {"type":"object","properties":{
                   "id":{"type":"string"},
@@ -62,7 +70,7 @@ public static class PackageActions
 
             (new(Unload, "Take one package out of this process. Refused while a package that depends on it is loaded, "
                     + "and refused by a package that says it still has work in flight. Its directory stays where it is.",
-                Capabilities.ModulesControl, true,
+                Capabilities.ModulesControl, true, MinLevel: AccessLevel.Operator,
                 ParamsJson: """
                 {"type":"object","properties":{
                   "id":{"type":"string"},

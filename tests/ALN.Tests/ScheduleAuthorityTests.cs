@@ -134,13 +134,16 @@ public sealed class ScheduleAuthorityTests : IDisposable
     }
 
     [Fact]
-    public async Task An_agent_cannot_write_a_rule_at_all_so_there_is_nobody_to_impersonate()
+    public async Task An_agent_can_write_a_rule_and_the_row_names_it_as_the_author()
     {
+        // 2026-11-12 改，原名 An_agent_cannot_write_a_rule_at_all_so_there_is_nobody_to_impersonate。
+        // 这条测试原来的前提（agent 根本写不出规则，所以没有"冒名"这回事）随 schedules.control 降级一起消失了；
+        // 剩下的问题反而更值得钉：模型写了规则之后，那行上署的是谁。答案是"模型"——不是它所属的人，也不是空。
         var store = new ScheduleStore(new MemoryState());
         var plane = new ControlPlane(new SilentAudit(), SignalLog.Open(null));
         Assert.True(ScheduleActions.Register(plane, store, new FrozenTime(Now)).Ok);
 
-        var refused = await plane.InvokeAsync(new Actor("model", ActorKind.Model, [Actor.Any], AccessLevel.Agent),
+        var written = await plane.InvokeAsync(new Actor("model", ActorKind.Model, [Actor.Any], AccessLevel.Agent),
             ScheduleActions.Set, System.Text.Json.JsonSerializer.SerializeToElement(new
             {
                 kind = "every",
@@ -150,8 +153,8 @@ public sealed class ScheduleAuthorityTests : IDisposable
                 targetId = "s-1"
             }), default);
 
-        Assert.Equal(ErrorCode.Denied, refused.Error!.Code);
-        Assert.Empty((await store.ListAsync(default)).Value!);
+        Assert.True(written.Ok, written.Error?.Message);
+        Assert.Equal("model", Assert.Single((await store.ListAsync(default)).Value!).CreatedBy);
     }
 
     /// <summary>An agent's tool and an operator's tool, nothing else: what survives the level is the whole assertion.</summary>

@@ -591,6 +591,11 @@ factories.Register(ScheduleTools.TypeId,
 // to the tool that started it, not to the table that remembers it (docs/28 §9.3).
 factories.Register(JobTools.TypeId,
     manifest => JobToolsModule.FromManifest(manifest, jobs, sessionExtensions));
+// The two verbs a Session needs in order to know the others exist: who is here (and what each one is for), and how to
+// hand one of them a message. A module like the other tool modules, so "may this Session see — and write to — the rest
+// of the graph" is answered by the graph rather than by a line in the host's source.
+factories.Register(SessionToolsModule.TypeId,
+    manifest => SessionToolsModule.FromManifest(manifest, sessions, controlPlane, sessionExtensions));
 // Files that are on the platform rather than in this process: listed, searched and fetched through the adapter. Where
 // they land is the model's answer and the byte port's rule, so this module needs both ends and neither policy.
 factories.Register(FilesGetTools.TypeId,
@@ -734,6 +739,19 @@ var jobToolsFile = await new ModuleManifestStore(data.Root).WriteIfMissingAsync(
 if (!jobToolsFile.Ok)
 {
     Console.Error.WriteLine(jobToolsFile.Error?.Message ?? "Job tool module declaration failed.");
+    shutdown.Cancel();
+    queue.Complete();
+    return 1;
+}
+// The session roster and the session message, offered the same way and for the same reason: a file on disk that
+// somebody can delete, so "the model may see the other Sessions" is a fact about this deployment rather than a
+// compile-time default. Both tools read the roster as it is when they are called.
+var sessionToolsFile = await new ModuleManifestStore(data.Root).WriteIfMissingAsync(
+    new ModuleManifest(new ModuleId(SessionToolsModule.TypeId), SessionToolsModule.TypeId, Enabled: true),
+    CancellationToken.None);
+if (!sessionToolsFile.Ok)
+{
+    Console.Error.WriteLine(sessionToolsFile.Error?.Message ?? "Session tool module declaration failed.");
     shutdown.Cancel();
     queue.Complete();
     return 1;

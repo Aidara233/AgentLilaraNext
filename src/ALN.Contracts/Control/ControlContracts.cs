@@ -48,7 +48,10 @@ public static class AccessLevels
         // Handing a Session a message is how work gets asked for, including upwards: a shallow component may ask a
         // deeper one. Recorded, attributed, and carrying no authority — see SessionRelay.
         [Capabilities.SessionsWrite] = AccessLevel.Agent,
-        [Capabilities.SessionsControl] = AccessLevel.Operator,
+        // 2026-11-12 改，原为 operator。这一格管的是"这个会话被信多深"，看起来最该由人说了算；但真正保护这条的
+        // 不是这里的数字，而是控制面那一个点上的委派不变式（只许授出 ≤ 自己的等级，AssignsLevel）。降下来之后，
+        // 一个 agent 会话能给自己造一个同级会话、能调整同级的别人，却依然授不出比它自己更深的任何东西。
+        [Capabilities.SessionsControl] = AccessLevel.Agent,
         [Capabilities.ModelsRead] = AccessLevel.Agent,
         [Capabilities.SignalsRead] = AccessLevel.Agent,
         [Capabilities.ParamsRead] = AccessLevel.Agent,
@@ -59,35 +62,49 @@ public static class AccessLevels
         // Publishing a draft is the model's own work: the folders it can write are the folders a reload can pick up.
         [Capabilities.ScriptsPublish] = AccessLevel.Agent,
         // Reading the schedules is answering "when does this wake up"; writing one decides when the host acts alone.
+        // 2026-11-12 改，写的那一半从 operator 降到 agent：一条定时规则是可读、可删、可改的数据，出事看得见；
+        // 而它要能干出危险的事，得先有别的动词把那些事变得可能——闸门在动作上，不该在日程上再设一道。
         [Capabilities.SchedulesRead] = AccessLevel.Agent,
-        [Capabilities.SchedulesControl] = AccessLevel.Operator,
-        // Where this process may reach: reading the list is answering a question the model is asked; changing it — or
-        // the credential behind one target — is a deployment decision.
+        [Capabilities.SchedulesControl] = AccessLevel.Agent,
+        // Where this process may reach: reading the list is answering a question the model is asked.
+        // 2026-11-12 改，改的那一半也降到 agent：`net.request` 早就是 agent 级的裸门（下面的理由仍然成立），
+        // 那么"把这次要用的地址和凭据记下来"不比"现在就 POST 过去"更深。留一道 operator 只会让模型每次
+        // 重新问一遍，而答案它本来就有。
         [Capabilities.NetRead] = AccessLevel.Agent,
-        [Capabilities.NetControl] = AccessLevel.Operator,
+        [Capabilities.NetControl] = AccessLevel.Agent,
         // The raw door: an address the caller names, no allowlist in front of it. Agent level because reading a page
         // and calling an endpoint are the same act, and the audit line is what stands in for the missing list.
         [Capabilities.NetRequest] = AccessLevel.Agent,
 
-        // Changing the shape of the process: a person's decision, made on purpose, written down in the audit.
-        [Capabilities.AdaptersControl] = AccessLevel.Operator,
+        // Changing the shape of the process.
+        //
+        // 2026-11-12 改，这一整族（适配器、频道、模型、参数、提示词、归档、图、模块）从 operator 降到 agent，
+        // 原条文是"这是人的决定，按下去要写在审计里"。两件事分开看了：改的是**形状**，而形状本身已经是可逆的
+        // ——销毁走回收站（C-25），包能换回旧版本，等级授不出比自己深的（委派不变式），审计一条没少（C-29）。
+        // 于是"谁能改"这个问题不再是安全边界，剩下的只是"改坏了谁修"；对这一层，把一整族关起来换来的安全感
+        // 比它挡掉的能力更贵。真正留住的例外是三条**机制级**的：换代码（packages.*，operator）、内核的图手术
+        // （modules.load / modules.unload，operator）、远端执行（ssh 工具，operator）。例外写在各自的描述符上，
+        // 不写在这里——一处是"这个动词危险"，另一处是"这一族不属于你"，混起来就再也读不出区别了。
+        [Capabilities.AdaptersControl] = AccessLevel.Agent,
         // Reachable at agent level because the *verb's* depth is per-instance data (rawActions); the handler compares the
         // caller against that. Registering it deeper would make "the model may call get_group_list" impossible to say.
         [Capabilities.AdaptersRaw] = AccessLevel.Agent,
-        [Capabilities.ChannelsControl] = AccessLevel.Operator,
-        [Capabilities.ModelsControl] = AccessLevel.Operator,
-        [Capabilities.ParamsWrite] = AccessLevel.Operator,
-        [Capabilities.PromptsWrite] = AccessLevel.Operator,
+        [Capabilities.ChannelsControl] = AccessLevel.Agent,
+        [Capabilities.ModelsControl] = AccessLevel.Agent,
+        [Capabilities.ParamsWrite] = AccessLevel.Agent,
+        [Capabilities.PromptsWrite] = AccessLevel.Agent,
         // Asking who somebody is costs nothing and answers a question the model would otherwise guess at.
         [Capabilities.IdentityRead] = AccessLevel.Agent,
         // Keeping the cards up to date is the model's own bookkeeping, deliberately at the same depth as reading them:
         // what it may not touch is the level, and that lives behind IdentityControl below (docs/31 §7.1).
         [Capabilities.IdentityWrite] = AccessLevel.Agent,
-        // Setting somebody's level, and rescanning the folder: a deployment decision either way.
+        // 唯一没有跟着降的一格，也是唯一一格"不是改进程、而是决定以后谁的话算数"的：给人定级。
+        // 升一个陌生人的等级，等于把指令系统交给他；而这件事没有"问自己人"的机制可以兜底——会话可以提别人，
+        // 那就等于一条群消息能把一个人提拔成 operator。所以它留在人这边。
         [Capabilities.IdentityControl] = AccessLevel.Operator,
-        [Capabilities.ArchiveControl] = AccessLevel.Operator,
-        [Capabilities.ModulesControl] = AccessLevel.Operator,
-        [Capabilities.GraphControl] = AccessLevel.Operator,
+        [Capabilities.ArchiveControl] = AccessLevel.Agent,
+        [Capabilities.ModulesControl] = AccessLevel.Agent,
+        [Capabilities.GraphControl] = AccessLevel.Agent,
 
         // What a mounted script may reach through its ctx. The names are spelled here rather than referenced because
         // ScriptCapabilities lives one assembly up; a test holds the two lists to each other.
@@ -103,10 +120,11 @@ public static class AccessLevels
         ["self.adapter.send"] = AccessLevel.Agent,
         ["self.adapter.poll"] = AccessLevel.Agent,
         ["channel.bound-send"] = AccessLevel.Agent,
-        // Wiring a source into a Channel is not "replying": it decides what this process listens to, which is a
-        // decision about the deployment rather than about the conversation.
-        ["channel.accept"] = AccessLevel.Operator,
-        ["channel.route"] = AccessLevel.Operator
+        // Wire a source into a Channel, and send a bound reply. 2026-11-12 改，前两个降到 agent：
+        // 频道本身现在就是 agent 能造能改的（channels.control），再说"接线是部署的事"就没有对象了——
+        // 造一个频道就等于接一次线，闸门留在这两格上只会让模型在造完频道之后卡在同一个动作的第二半。
+        ["channel.accept"] = AccessLevel.Agent,
+        ["channel.route"] = AccessLevel.Agent
     };
 
     /// <summary>The level an interface sits at. Unregistered is <see cref="AccessLevel.Full"/>, never Agent.</summary>
@@ -198,7 +216,7 @@ public sealed record Actor(string Id, ActorKind Kind, IReadOnlyList<string> Capa
 /// </param>
 /// <param name="MinLevel">
 /// The level this verb needs, when it is not the one its capability sits at. Most verbs are their family's level;
-/// <c>modules.edge.mount</c> is a model's business and <c>modules.load</c> is the kernel's, and both hang off
+/// <c>modules.edge.mount</c> is a model's business and <c>modules.load</c> is a person's, and both hang off
 /// <c>modules.control</c>.
 /// </param>
 public sealed record ActionDescriptor(string Id, string Summary, string Capability, bool Mutating,

@@ -496,6 +496,17 @@ public interface ISessionManager
     ValueTask<Result<IReadOnlyList<SessionSummary>>> ListAsync(CancellationToken cancellationToken);
 
     /// <summary>
+    /// Every Session with the facts <b>a peer</b> needs: what each is for, which Channel it serves, how deep it sits,
+    /// and whether it is mid-turn. Read on demand, like <see cref="ListAsync"/>.
+    ///
+    /// Two answers instead of one because the two questions are different and a shared shape would answer neither
+    /// well: "may I archive this" wants bytes and deadlines, "who should I ask" wants objectives and levels. Doing it
+    /// here rather than in the tool keeps the reading of a Session's own spec where the spec already lives — a caller
+    /// that parsed <c>module.json</c> itself would be a second implementation of what a Session is.
+    /// </summary>
+    ValueTask<Result<IReadOnlyList<SessionRosterEntry>>> RosterAsync(CancellationToken cancellationToken);
+
+    /// <summary>
     /// Acts on the deadlines Sessions declared when they called <c>wait</c>. Called by the host on startup and
     /// then on a timer: it reads state and nothing else, so it cannot drift from what a Session actually asked
     /// for. A Session with no deadline is not this method's business and is left untouched.
@@ -551,6 +562,22 @@ public sealed record SessionTurnNotice(string SessionId, string Reason, int Step
 public static class SessionActions
 {
     public const string List = "sessions.list";
+
+    /// <summary>
+    /// Make a Session on purpose: <c>id</c> (optional), <c>channel</c>, <c>profile</c>, <c>objective</c>,
+    /// <c>prompts</c>, <c>level</c>.
+    ///
+    /// Before this verb existed there was exactly one way to make a Session, and it was a mounted script calling
+    /// <c>ctx.session.open</c>: the Session was a by-product of a Channel message arriving. That made "I want a
+    /// Session for this" mean "write a script, mount it, then let it open one" — three steps, of which only the last
+    /// one was the thing somebody wanted. A concept that can only be brought into existence by another concept is a
+    /// concept with a tax on it.
+    ///
+    /// What it does <b>not</b> loosen: naming a Session that already exists keeps the spec it was created with (stored
+    /// wins — addressing something cannot rewrite what it is), and <c>level</c> is under the same delegation rule as
+    /// <c>sessions.setLevel</c>: at or below the caller's own, never above.
+    /// </summary>
+    public const string Create = "sessions.create";
 
     /// <summary>
     /// Raise or lower what one Session may reach. The only level anyone can change at runtime: an interface's level is

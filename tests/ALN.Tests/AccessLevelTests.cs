@@ -32,15 +32,42 @@ public sealed class AccessLevelTests
     [Fact]
     public void The_verbs_that_could_move_the_boundary_sit_where_the_document_says()
     {
-        // Each of these can change what this process is or what it will say next, so none of them is an agent's.
-        Assert.Equal(AccessLevel.Operator, AccessLevels.Of(Capabilities.ParamsWrite));
-        Assert.Equal(AccessLevel.Operator, AccessLevels.Of(Capabilities.PromptsWrite));
-        Assert.Equal(AccessLevel.Operator, AccessLevels.Of(Capabilities.ModelsControl));
-        Assert.Equal(AccessLevel.Operator, AccessLevels.Of(Capabilities.SessionsControl));
-        Assert.Equal(AccessLevel.Operator, AccessLevels.Of(Capabilities.ModulesControl));
-        // Reading is the agent's half of the job.
+        // 2026-11-12 改。原来是"造东西、改东西的那几格都是 operator，因为它们改的是这个进程的形状"。改的理由与
+        // 其说是信任变了，不如说是把两件事分开了：改形状已经是可逆的（销毁走回收站 C-25、包能换回旧版、
+        // 等级授不出比自己深的），而真正危险的那几条**作为例外**钉在各自的描述符上（下一个测试 + docs/07 §9.1）。
+        // 冻结这张表，是为了让"下次只改一边"这件事红在测试里。
+        foreach (var control in new[]
+                 {
+                     Capabilities.AdaptersControl, Capabilities.ChannelsControl, Capabilities.ModelsControl,
+                     Capabilities.SessionsControl, Capabilities.ModulesControl, Capabilities.GraphControl,
+                     Capabilities.ParamsWrite, Capabilities.PromptsWrite, Capabilities.ArchiveControl,
+                     Capabilities.SchedulesControl, Capabilities.NetControl
+                 })
+            Assert.Equal(AccessLevel.Agent, AccessLevels.Of(control));
+
+        // 唯一没有跟着降的一格：给人定级。它决定的不是这个进程长什么样，而是以后谁的话算数。
+        Assert.Equal(AccessLevel.Operator, AccessLevels.Of(Capabilities.IdentityControl));
+
+        // Reading is the agent's half of the job, and stays where it was.
         Assert.Equal(AccessLevel.Agent, AccessLevels.Of(Capabilities.ModulesRead));
         Assert.Equal(AccessLevel.Agent, AccessLevels.Of(Capabilities.MessagesWrite));
+    }
+
+    [Fact]
+    public void The_sessions_own_verbs_are_an_agents_including_making_one()
+    {
+        // 2026-11-12 新增：造一个会话原来没有动词，只能由挂载脚本 ctx.session.open 顺手造出来。现在
+        // sessions.create 与会话自己的其它动词同级，而它授出去的等级仍然受委派不变式管（AssignsLevel 指向 level），
+        // 所以"能造"不等于"能造一个比自己深的"。
+        Assert.Equal(AccessLevel.Agent, AccessLevels.Of(Capabilities.SessionsControl));
+
+        var creates = new ActionDescriptor(SessionActions.Create, "Make a Session.", Capabilities.SessionsControl, true,
+            AssignsLevel: "level");
+        Assert.Equal("level", creates.AssignsLevel);
+        Assert.Equal(AccessLevel.Agent, creates.RequiredLevel);
+        // Handing a level down is the same one place for both verbs, and it is still the only place.
+        Assert.Equal("level", new ActionDescriptor(SessionActions.SetLevel, "Raise one.", Capabilities.SessionsControl,
+            true, AssignsLevel: "level").AssignsLevel);
     }
 
     [Fact]

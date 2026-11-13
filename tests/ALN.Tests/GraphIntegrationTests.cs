@@ -934,10 +934,12 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         // Two doors, one answer. The reload tool used to call the same helper directly, which meant an agent-level actor
         // reached a verb the table had at operator, and nothing was written down. The level that makes it an agent's
-        // verb is now the descriptor's own (scripts.publish); switching a script off stays deeper, because that changes
-        // what runs rather than applying what is already on disk.
+        // verb is now the descriptor's own (scripts.publish).
+        // 2026-11-12 改：switching a script off（scripts.set）也随 GraphControl 降到了 agent——它会改变"什么在跑"，
+        // 但它改的是一张表，不是代码；和它同一族的其它动词已经一起降了，只留这一格会让"关掉一个脚本"变成
+        // 模型必须回头求人的事，而它正是最先发现某个脚本在乱跑的那一方。
         Assert.Equal(AccessLevel.Agent, AccessLevels.Of(Capabilities.ScriptsPublish));
-        Assert.Equal(AccessLevel.Operator, AccessLevels.Of(Capabilities.GraphControl));
+        Assert.Equal(AccessLevel.Agent, AccessLevels.Of(Capabilities.GraphControl));
 
         Assert.True((await _graph.LoadAsync([], default)).Ok);
         var tools = ScriptToolsWithPlane(new JsonScriptCatalog(Path.Combine(_root, "program"), _root));
@@ -1312,10 +1314,13 @@ public sealed class GraphIntegrationTests : IDisposable
     {
         static ScriptPackage Greedy() => new(
             new("channel.greedy", 1, "channel", MountMode.Manual, [EventNames.ChannelMessageAccepted], "onEvent",
-                [Capabilities.ModelsControl],  TrustDomain.Trusted, MemoryLimitBytes: 256L * 1024 * 1024),
+                [Capabilities.IdentityControl],  TrustDomain.Trusted, MemoryLimitBytes: 256L * 1024 * 1024),
             "async function onEvent(event, ctx) { }",
             Level: AccessLevel.Agent);
 
+        // 2026-11-12：原来这里声明的是 models.control，它随整族降到 agent 之后这条就再也不触发了。换成定级表里
+        // 唯一还留在 operator 的那一格：给人定级。加载期的这条规矩因此仍然是活的——脚本只能声明它所在目录够得着的
+        // 能力，而 draft/live 够不着它。
         Assert.True((await _graph.LoadAsync([Greedy()], default)).Ok);
         // Not catalogued, and the reason says which of the two halves failed — the load itself is an outcome, not a
         // crash, so the rest of the folder still runs.

@@ -225,19 +225,21 @@ public sealed class ScriptToolTests : IDisposable
     [Fact]
     public async Task A_tool_runs_at_the_level_of_whoever_made_it_and_that_level_bounds_what_it_is_made_of()
     {
-        // sessions.setLevel is an operator's verb. A tool built by a person reaches it — the call gets past the gate and
-        // fails on its own arguments ("invalid", not "denied"). A tool built by the model cannot even be built out of
-        // that capability: the loader refuses the file, which is why "the tool's interfaces never exceed its maker's" is
-        // a property of the catalogue rather than a check at call time.
+        // The capability a tool is built out of is bounded by its maker's level. The example used to be
+        // sessions.setLevel, which was an operator's verb; 2026-11-12 它连同 sessions.control 一起降到 agent 了，
+        // 所以这里换成唯一还留在 operator 的那一格：给人定级。A tool built by a person reaches it — the call gets
+        // past the gate and fails on its own arguments ("invalid", not "denied") — while a tool built by the model
+        // cannot even be built out of that capability: the loader refuses the file, which is why "the tool's interfaces
+        // never exceed its maker's" is a property of the catalogue rather than a check at call time.
         const string Ask = """
             async function onEvent(event, ctx) { }
             async function onCall(args, ctx) {
-              return await ctx.actions.call("sessions.setLevel", { id: "s-no-such-session", level: "operator" });
+              return await ctx.actions.call("identity.people.level", { id: "no-such-person", level: "operator" });
             }
             """;
         static ScriptPackage MadeBy(string id, AccessLevel level) => new(
             new(id, 1, "channel", MountMode.Manual, ["channel.message.accepted"], "onEvent",
-                [ScriptCapabilities.ChannelReply, Capabilities.SessionsControl], TrustDomain.Trusted, Call: "onCall",
+                [ScriptCapabilities.ChannelReply, Capabilities.IdentityControl], TrustDomain.Trusted, Call: "onCall",
                 Tool: new("tool." + id, "Ask for a level change.", """{"type":"object"}""")),
             Ask, Level: level);
 

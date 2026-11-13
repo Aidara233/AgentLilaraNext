@@ -109,10 +109,11 @@ public sealed class ActionToolsTests : IDisposable
     public async Task Calling_goes_through_the_control_plane_and_reports_what_happened()
     {
         var plane = PlaneWithChannels(out var channels);
-        // An operator's session: creating a Channel is wiring, and wiring is not the model's to do (see the level test
-        // below, where the same call is refused). What this test is about is the report, not the permission.
+        // An agent's session, calling the create verb as itself: 2026-11-12 之前这里得站在 operator 上，因为
+        // channels.control 是 operator 级的。现在这就是模型自己造一个频道的样子——本测试关心的仍是"答复长什么样"，
+        // 顺带钉住"它真的造得出来"。
         var tools = new ActionTools(plane);
-        var call = await ToolAsync(tools, ActionTools.CallToolName, AccessLevel.Operator);
+        var call = await ToolAsync(tools, ActionTools.CallToolName, AccessLevel.Agent);
 
         var created = Text(await call.ExecuteAsync(new("c1", ActionTools.CallToolName,
             """{"action":"ACTION","args":{"type":"channel.conversation","instance":"probe-a","bindings":[{"adapter":"adapter.file#file-1","conversation":"probe-a"}]}}"""
@@ -165,8 +166,14 @@ public sealed class ActionToolsTests : IDisposable
         Assert.StartsWith("error: nope.nothing", unknown);
         Assert.Contains("code: invalid", unknown);
 
+        // A verb one level deeper than the family it belongs to: the model meets the level, not the grant. (channels.create
+        // used to be this test's example; 2026-11-12 它降到 agent 了，于是换成一个仍然深一级的动作——测试要钉的是
+        // "denied 的话术分得开"，不是某一个具体动词的等级。)
+        Assert.True(plane.Register(new("test.deep", "Guarded.", Capabilities.ChannelsControl, true,
+                MinLevel: AccessLevel.Operator),
+            (_, _) => ValueTask.FromResult(Result<JsonElement>.Success(JsonSerializer.SerializeToElement(new { ok = 1 })))).Ok);
         var byLevel = Text(await agentCall.ExecuteAsync(new("c2", ActionTools.CallToolName,
-            """{"action":"channels.create","args":{"type":"channel.conversation"}}"""), default));
+            """{"action":"test.deep","args":{}}"""), default));
         Assert.Contains("code: denied", byLevel);
         Assert.Contains("needs L1 operator", byLevel);
         Assert.DoesNotContain("lacks capability", byLevel);

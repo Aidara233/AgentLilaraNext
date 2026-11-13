@@ -41,7 +41,12 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         // settlement script may move money and rice exactly when it could already do anything else. They are listed
         // here because a capability a script cannot name is a capability no script can use: the shelf script that
         // buys rice was rejected for declaring rice.control, and the only symptom was an empty shop.
-        "coin.control", "rice.control"
+        "coin.control", "rice.control",
+        // 2026-11-12：定级表里唯一还留在 operator 的一格，所以它也是这个名单上唯一还高于 agent 的名字——于是
+        // 加载期那条"脚本只能声明它所在目录够得着的能力"仍然是活的，不是一条已经没人能触发的死代码。
+        // 一个 agent 目录（draft / live）里的脚本声明它 → 加载期拒绝；只有人写进 scripts/trusted 的脚本能声
+        // 明并使用它。模型写不出 trusted 目录里的文件（docs/25 §2），所以这不是一条给模型的路。
+        Capabilities.IdentityControl
     };
     private readonly ICatalog _catalog;
     private readonly IModuleTypeCatalog _types;
