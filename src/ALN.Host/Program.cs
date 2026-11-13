@@ -512,7 +512,12 @@ var coinCatalogue = ALN.Coin.CoinCatalogueFile.Load(data.Root, coinScripts);
 foreach (var issue in coinCatalogue.Issues) Console.WriteLine($"market: {issue}");
 var coinLedger = new ALN.Coin.CoinLedger(stateStore, storage, signalLog, auditSink);
 var coinMarket = new ALN.Coin.CoinMarket(coinLedger, coinCatalogue, coinScripts);
-var purse = ALN.Coin.CoinService.Install(sessionExtensions, commandRegistry, controlPlane, coinLedger, coinMarket);
+// A coin somebody gives Lilara is a fact about a conversation as well as about the purse, so it is announced into the
+// Session behind whichever Channel that instruction arrived in. Built here because the two ends it needs — a Channel to
+// find the conversation and a Session to put the note in — are host objects, and the coin module holds neither.
+var coinNotice = new ALN.Coin.CoinNotice(new ALN.Coin.SessionConversations(channels, sessions), signalLog);
+var purse = ALN.Coin.CoinService.Install(sessionExtensions, commandRegistry, controlPlane, coinLedger, coinMarket,
+    notice: coinNotice);
 if (!purse.Ok) Console.Error.WriteLine(purse.Error?.Message ?? "The purse did not install.");
 else
     Console.WriteLine($"purse: {coinCatalogue.Goods.Count} goods, {coinCatalogue.Items.Count} items on the shelf");

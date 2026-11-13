@@ -1,5 +1,9 @@
+using ALN.Commands;
 using ALN.Contracts;
+using ALN.Contracts.Models;
+using ALN.Contracts.Sessions;
 using ALN.Coin;
+using ALN.Runtime;
 
 namespace ALN.Tests;
 
@@ -216,6 +220,171 @@ public sealed class CoinTests
         Assert.Equal(AccessLevel.Full, credit.RequiredLevel);
         var debit = Assert.Single(plane.Registered, action => action.Id == CoinActions.Debit);
         Assert.Equal(AccessLevel.Full, debit.RequiredLevel);
+    }
+
+    // ---- a coin from a person (//coin toss) -----------------------------------------------------
+
+    private static readonly Address Chat = new("adapter", "qq", "main");
+    private static readonly Address Channel = new("channel", "conversation", "qq-group-1");
+    private const string Conversation = "qq-group-1";
+
+    private static Person Xiaolin => new("xiaolin", "小林");
+
+    private FixedTime Clock(DateTimeOffset now) => new(now);
+
+    private (CommandRegistry Registry, RecordingPlane Plane) Installed(TimeProvider time, CoinNotice? notice = null)
+    {
+        var registry = new CommandRegistry(new CommandOptions());
+        var plane = new RecordingPlane();
+        var installed = CoinService.Install(new SessionExtensionRegistry(), registry, plane, Ledger(),
+            new CoinMarket(Ledger(), Catalogue, Giving("shop.box", "{}")), time, notice);
+        Assert.True(installed.Ok, installed.Error?.Message);
+        return (registry, plane);
+    }
+
+    private static CommandInvocation From(string text, Person? person) =>
+        new(text, Chat, Conversation, "m-" + Guid.NewGuid().ToString("N"), Guid.NewGuid(), person, "1234567", "群名片");
+
+    private async Task<long> BalanceAsync() => (await Ledger().ReadAsync(default)).Value!.Balance;
+
+    [Fact]
+    public async Task A_person_gives_one_coin_a_day_and_the_table_keeps_only_today()
+    {
+        var clock = Clock(new DateTimeOffset(2026, 6, 5, 10, 0, 0, TimeSpan.Zero));
+        var gifts = new CoinGifts(Ledger(), clock);
+
+        var first = await gifts.GiveAsync(Xiaolin, "command:xiaolin", default);
+        var again = await gifts.GiveAsync(Xiaolin, "command:xiaolin", default);
+
+        Assert.True(first.Ok, first.Error?.Message);
+        Assert.Equal(1, first.Value!.Balance);
+        Assert.Equal(1, first.Value.GiversToday);
+        Assert.False(again.Ok);
+        Assert.Equal(ErrorCode.Conflict, again.Error!.Code);
+        Assert.Contains("今天已经给过了", again.Error.Message);
+
+        // A second person is their own day: the limit is per person, not per purse.
+        var other = await gifts.GiveAsync(new Person("ada", "Ada"), "command:ada", default);
+        Assert.True(other.Ok, other.Error?.Message);
+        Assert.Equal(2, other.Value!.Balance);
+        Assert.Equal(2, other.Value.GiversToday);
+
+        // Tomorrow: yesterday's row no longer blocks him and no longer counts as "today".
+        clock.Now = new DateTimeOffset(2026, 6, 6, 9, 0, 0, TimeSpan.Zero);
+        var tomorrow = await gifts.GiveAsync(Xiaolin, "command:xiaolin", default);
+        Assert.True(tomorrow.Ok, tomorrow.Error?.Message);
+        Assert.Equal(3, tomorrow.Value!.Balance);
+        Assert.Equal(1, tomorrow.Value.GiversToday);
+
+        var state = (await Ledger().ReadAsync(default)).Value!;
+        Assert.Single(state.Gifts!);                    // only today's people survive the write
+        Assert.True(state.GaveOn("xiaolin", "2026-06-06"));
+    }
+
+    [Fact]
+    public async Task A_stranger_cannot_give_and_a_known_person_can()
+    {
+        var (registry, _) = Installed(Clock(new DateTimeOffset(2026, 6, 5, 10, 0, 0, TimeSpan.Zero)));
+
+        // Nobody on the identity table: the refusal is the whole point of "only people we know".
+        var stranger = await registry.InvokeAsync(From("//coin toss", null), default);
+        Assert.False(stranger.Ok);
+        Assert.Equal(ErrorCode.Denied, stranger.Error!.Code);
+        Assert.Equal(0, await BalanceAsync());
+
+        var known = await registry.InvokeAsync(From("//coin toss", Xiaolin), default);
+        Assert.True(known.Ok, known.Error?.Message);
+        Assert.Contains("收下了 1 枚", known.Value!.Reply);
+        Assert.Equal(1, await BalanceAsync());
+
+        // Same person, same day, second instruction: no second coin.
+        var twice = await registry.InvokeAsync(From("//coin toss", Xiaolin), default);
+        Assert.False(twice.Ok);
+        Assert.Equal(ErrorCode.Conflict, twice.Error!.Code);
+        Assert.Equal(1, await BalanceAsync());
+    }
+
+    [Fact]
+    public async Task A_gift_is_announced_to_the_session_behind_the_channel()
+    {
+        var world = new FakeConversations(Channel, session: "s-1");
+        var (registry, _) = Installed(Clock(new DateTimeOffset(2026, 6, 5, 10, 0, 0, TimeSpan.Zero)),
+            new CoinNotice(world));
+
+        var given = await registry.InvokeAsync(From("//coin toss", Xiaolin), default);
+
+        Assert.True(given.Ok, given.Error?.Message);
+        var note = Assert.Single(world.Delivered);
+        Assert.Equal(Channel, world.Asked);                        // the Channel that carried the instruction
+        Assert.Equal("s-1", note.Session);
+        Assert.Contains("小林", note.Text);
+        Assert.Contains("1 枚", note.Text);
+    }
+
+    [Fact]
+    public async Task A_conversation_with_nobody_behind_it_still_gets_the_coin()
+    {
+        // Nothing bound, and then a Channel with no Session yet: both are "there is nobody to tell", never "the gift
+        // failed". The coin is in the purse either way, which is the only part the person was promised.
+        var unbound = new FakeConversations(channel: null, session: null);
+        var (first, _) = Installed(Clock(new DateTimeOffset(2026, 6, 5, 10, 0, 0, TimeSpan.Zero)),
+            new CoinNotice(unbound));
+        var withoutChannel = await first.InvokeAsync(From("//coin toss", Xiaolin), default);
+
+        var empty = new FakeConversations(Channel, session: null);
+        var (second, _) = Installed(Clock(new DateTimeOffset(2026, 6, 5, 10, 0, 0, TimeSpan.Zero)),
+            new CoinNotice(empty));
+        var withoutSession = await second.InvokeAsync(From("//coin toss", new Person("ada", "Ada")), default);
+
+        Assert.True(withoutChannel.Ok, withoutChannel.Error?.Message);
+        Assert.True(withoutSession.Ok, withoutSession.Error?.Message);
+        Assert.Empty(unbound.Delivered);
+        Assert.Empty(empty.Delivered);
+        Assert.Equal(2, await BalanceAsync());
+    }
+
+    /// <summary>A clock that can be moved: "one a day" is a rule about days, and a test that cannot change the day cannot test it.</summary>
+    private sealed class FixedTime(DateTimeOffset now) : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = now;
+
+        public override DateTimeOffset GetUtcNow() => Now;
+
+        public override TimeZoneInfo LocalTimeZone => TimeZoneInfo.Utc;
+    }
+
+
+    /// <summary>
+    /// The three answers a notice asks for, and nothing else: which Channel a conversation is bound to, which Session
+    /// serves it, and where the note went. That the seam is three methods is the point — the Channel and Session managers
+    /// answer thirty questions between them, and a coin needs three of them.
+    /// </summary>
+    private sealed class FakeConversations(Address? channel, string? session) : ICoinConversations
+    {
+        public List<(string Session, string Text)> Delivered { get; } = [];
+
+        /// <summary>The Channel this world claims serves the conversation, so a test can check it was asked at all.</summary>
+        public Address? Asked { get; private set; }
+
+        public ValueTask<Result<Address>> ChannelOfAsync(Address adapter, string conversation,
+            CancellationToken cancellationToken)
+        {
+            Asked = channel;
+            return ValueTask.FromResult(channel is { } address
+                ? Result<Address>.Success(address)
+                : Result<Address>.Failure(new(ErrorCode.Invalid, "nothing is bound here")));
+        }
+
+        public ValueTask<Result<string>> SessionOfAsync(Address channel, CancellationToken cancellationToken) =>
+            ValueTask.FromResult(session is { } id
+                ? Result<string>.Success(id)
+                : Result<string>.Failure(new(ErrorCode.Unavailable, "no Session here yet")));
+
+        public ValueTask<Result> PostAsync(string session, string text, CancellationToken cancellationToken)
+        {
+            Delivered.Add((session, text));
+            return ValueTask.FromResult(Result.Success());
+        }
     }
 
     private sealed class RecordingPlane : IControlPlane

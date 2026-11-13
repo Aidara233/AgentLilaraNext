@@ -11,13 +11,26 @@ public sealed record CoinStack(string Item, int Count);
 /// <c>AtomicallyAsync</c> already serializes writers); it exists so an audit line can name the exact version of the
 /// purse a number was read from.
 /// </summary>
+/// <param name="Gifts">
+/// Who gave Lilara a coin today, and on which local day. <c>personId → yyyy-MM-dd</c>, and only entries for the day being
+/// written are kept, so the table is exactly "who gave today" rather than a history nobody reads.
+///
+/// It lives in the purse rather than in a key of its own because the coin and the day are one write: a balance that went
+/// up while the day did not get recorded is a gift somebody can give twice — and one document is the only way two things
+/// change together here (see the note on this record). A gift that is refused writes nothing, so the table only ever
+/// grows by the people who actually gave.
+///
+/// <b>Keyed by person, not by account:</b> the identity table is what says two platform accounts are one person, and a
+/// person gives once a day however many accounts he has.
+/// </param>
 public sealed record CoinState(
     long Balance,
     long Revision,
     IReadOnlyList<CoinStack> Bag,
     IReadOnlyDictionary<string, int> Sold,
     IReadOnlyDictionary<string, IReadOnlyDictionary<string, int>> Purchased,
-    IReadOnlyList<string>? Settled = null)
+    IReadOnlyList<string>? Settled = null,
+    IReadOnlyDictionary<string, string>? Gifts = null)
 {
     public static CoinState Empty(long balance = 0) => new(
         balance, 0, [],
@@ -31,6 +44,18 @@ public sealed record CoinState(
 
     /// <summary>How many of one thing were sold. Only meaningful for a good with a finite <c>stock</c>.</summary>
     public int SoldOf(string good) => Sold.TryGetValue(good, out var count) ? count : 0;
+
+    /// <summary>
+    /// Whether this person has already given a coin on <paramref name="day"/>. Never written and never given are the same
+    /// answer, so a purse from before this existed behaves exactly like a purse nobody gave to today.
+    /// </summary>
+    public bool GaveOn(string person, string day) =>
+        Gifts is { } gifts && gifts.TryGetValue(person, out var when)
+        && string.Equals(when, day, StringComparison.Ordinal);
+
+    /// <summary>How many people gave on <paramref name="day"/>. Only ever the day being written, by construction.</summary>
+    public int GiversOn(string day) =>
+        Gifts?.Count(entry => string.Equals(entry.Value, day, StringComparison.Ordinal)) ?? 0;
 }
 
 /// <summary>

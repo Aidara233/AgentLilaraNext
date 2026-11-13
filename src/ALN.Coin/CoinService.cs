@@ -44,7 +44,7 @@ public sealed class CoinContextSource(CoinLedger ledger, CoinMarket market) : IF
 public static class CoinService
 {
     public static Result Install(ISessionExtensionRegistry extensions, ICommandRegistry commands, IControlPlane plane,
-        CoinLedger ledger, CoinMarket market)
+        CoinLedger ledger, CoinMarket market, TimeProvider? time = null, CoinNotice? notice = null)
     {
         var verbs = CoinActions.Register(plane, ledger);
         if (!verbs.Ok) return verbs;
@@ -52,6 +52,8 @@ public static class CoinService
         if (!tools.Ok) return tools;
         var context = extensions.Register(new CoinContextSource(ledger, market));
         if (!context.Ok) return context;
+        // One coin a day from a person. Nothing else has a clock, because nothing else here cares what day it is.
+        var gifts = new CoinGifts(ledger, time);
 
         CommandNode[] nodes =
         [
@@ -65,6 +67,11 @@ public static class CoinService
                     var state = read.Value;
                     var bag = new StringBuilder();
                     bag.Append($"余额：{state.Balance} 枚（第 {state.Revision} 版）");
+                    // Who gave today, and only when somebody did: a line that says "今天 0 人" on every check is noise
+                    // where the number that matters should be.
+                    var today = CoinGifts.DayOf((time ?? TimeProvider.System).GetLocalNow());
+                    var givers = state.GiversOn(today);
+                    if (givers > 0) bag.Append($"\n今天有 {givers} 人投过硬币");
                     bag.Append(state.Bag.Count == 0
                         ? "\n背包：空"
                         : "\n背包 " + state.Bag.Sum(stack => stack.Count) + "/" + market.Capacity + "："
@@ -141,6 +148,33 @@ public static class CoinService
                     if (!credited.Ok || credited.Value is null)
                         return Result<string>.Failure(credited.Error ?? new(ErrorCode.Unavailable, "没充上。"));
                     return Result<string>.Success($"存了 {amount} 枚，现在有 {credited.Value.Balance} 枚。");
+                }),
+            // The one way a person adds money: no depth needed beyond being on the identity table, and nothing at all for
+            // somebody who is not. The check is `Person is null`, not a level — a stranger arrives as agent, so a level
+            // cannot tell the two apart and using one here would let every stranger in.
+            new("coin.toss", "给 Lilara 一枚硬币：每人每天一枚，只认登记过的人", AccessLevel.Agent,
+                Body: async (context, cancellationToken) =>
+                {
+                    if (context.Person is not { } person)
+                        return Result<string>.Failure(new(ErrorCode.Denied,
+                            "投币只认人物表里的人：让管这件事的人在 identify/ 里给你写一张卡。"));
+
+                    var given = await gifts.GiveAsync(person, context.Actor.Id, cancellationToken).ConfigureAwait(false);
+                    if (!given.Ok || given.Value is null)
+                        return Result<string>.Failure(given.Error ?? new(ErrorCode.Unavailable, "没投进去。"));
+
+                    // The coin is in the purse from here on, so telling the conversation is best effort: a Channel nobody
+                    // bound or a Session busy with a turn must not turn a taken coin into a failed instruction (the
+                    // notice logs its own reason). It goes before the reply because the reply is sent by the interceptor
+                    // once this body returns, and "she has already noticed" is the shape a person expects.
+                    if (notice is not null)
+                        await notice.SendAsync(context.Adapter, context.PlatformConversationId,
+                            $"{person.Name}（{person.Id}）投了一枚硬币给你：今天第 {given.Value.GiversToday} 枚，"
+                            + $"钱包里现在有 {given.Value.Balance} 枚。", cancellationToken).ConfigureAwait(false);
+
+                    return Result<string>.Success(
+                        $"收下了 {CoinGifts.CoinsPerDay} 枚硬币，Lilara 现在有 {given.Value.Balance} 枚"
+                        + $"（今天是第 {given.Value.GiversToday} 位）。明天再来。");
                 })
         ];
 
