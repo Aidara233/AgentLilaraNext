@@ -6,3 +6,6 @@ TestResults/
 *.user
 *.suo
 *.tmp
+publish/
+*.cmd
+*.ps1
