@@ -59,18 +59,20 @@ async function onEvent(event, ctx) {
               description: "segments: one message per blank-line separated paragraph (default). text: the whole text as one message."
             },
             // A layout for one message: what a chat window shows as one bubble. Blocks are the only way to
-            // mention somebody or send a picture; plain text stays plain text.
+            // mention somebody, send a picture, or hand over a file; plain text stays plain text.
             blocks: {
               type: "array",
-              description: "One message laid out in order: words, mentions, pictures, faces. Use this OR text, not both.",
+              maxItems: 32,
+              description: "One message laid out in order: words, mentions, pictures, faces, files. Use this OR text, not both.",
               items: {
                 type: "object",
                 properties: {
-                  type: { type: "string", enum: ["text", "at", "image", "face"] },
+                  type: { type: "string", enum: ["text", "at", "image", "face", "file"] },
                   text: { type: "string", description: "for text" },
                   who: { type: "string", description: "for at: \"sender\" (the person being answered) or a numeric platform id. \"all\" is refused." },
-                  path: { type: "string", description: "for image: media/<file> or workspace/<file> — a picture that is already stored." },
-                  scope: { type: "string", description: "for image, when given separately from path" },
+                  path: { type: "string", description: "for image / file: media/<file> or workspace/<file> — something already stored." },
+                  scope: { type: "string", description: "for image / file, when the scope is given apart from path" },
+                  name: { type: "string", description: "for file: what the other side should see it called (defaults to the file's own name), at most 120 characters." },
                   id: { type: "string", description: "for face: this platform's own emoji id, e.g. \"1\"" }
                 },
                 required: ["type"],
