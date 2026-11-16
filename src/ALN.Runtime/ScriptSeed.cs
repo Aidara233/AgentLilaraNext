@@ -219,7 +219,7 @@ public sealed class ScriptSeed(string programRoot, string dataRoot)
     | `channel.bound-send` | `ctx.channel.reply(message)` | 往这个频道回一句。回答刚收到的那条消息可以，频道开始/停止工作或一轮说完时说一句也可以（那时平台会话 id 可以省略，就是本频道那一个） |
     | `model.complete` | `ctx.model.complete(profileId, request)` | 一次模型调用，无会话、无工具 |
     | `session.run` | `ctx.session.run(spec, text)` | channel 事件：跑一轮会话并拿回结果 |
-    | `session.activate` | `ctx.session.activate(spec)` | channel 事件：唤醒会话，不等结果 |
+    | `session.activate` | `ctx.session.activate(spec)` | channel 事件：唤醒会话，**不等结果**（立刻返回 `{ok, accepted, session}`；这一轮在宿主时间里跑） |
     | `session.open` | `ctx.session.open({ channel?, spec?, text?, wake? })` | 任何时候：给一个频道取或建会话（幂等），给了 `text` 就连同"交给它"一起做 |
     | `session.message` | `ctx.session.message({ id? \\| channel?, text, wake? })` | 任何时候：把一句话交给一个会话，`wake` 决定要不要它马上看。**不分等级** |
     | `self.adapter.send` | `ctx.self.adapter.send(message)` | adapter 事件 |

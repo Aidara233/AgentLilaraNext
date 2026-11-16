@@ -63,6 +63,11 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
     private readonly HashSet<Address> _drainingTargets = new();
     private readonly Dictionary<Address, int> _activeDispatches = new();
     private readonly Dictionary<Address, TaskCompletionSource> _dispatchDrained = new();
+    /// <summary>
+    /// Turns a script handed over and did not wait for. Held so they are not collected mid-flight and so a shutdown can
+    /// ask where they are: a turn whose outcome nobody awaits has no caller left to complain if it disappears.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, Task> _handedOver = new();
     private readonly IStateStore? _state;
     /// <summary>
     /// The action table, kept from <see cref="RegisterActions"/> so a script can reach it. Held here rather than passed
@@ -119,6 +124,93 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
     private IChannelManager Channels => Require<IChannelManager>(ModuleNames.ChannelManager);
     private IModelManager? Models => Maybe<IModelManager>(ModuleNames.ModelManager, "model");
     private ISessionManager? Sessions => Maybe<ISessionManager>(ModuleNames.SessionManager, "session");
+
+    /// <summary>
+    /// Runs one turn on the host's time and writes down how it ended.
+    ///
+    /// Three things this has to get right, because nobody is left holding the task. It must not run on the caller's
+    /// stack — the caller is a script whose budget is the very thing being taken out of the turn's way. It must keep the
+    /// signal lineage of the edge that asked for it, which the captured execution context already gives it. And it must
+    /// record its own ending: a turn whose outcome nobody awaits has no caller left to complain if it goes missing, so
+    /// the record is the only witness there is.
+    /// </summary>
+    /// <param name="mount">The edge it was handed over from — recorded on the ending, because "which script woke this
+    /// conversation" is the first question anybody asks afterwards.</param>
+    /// <param name="lifetime">
+    /// The host's token, never the caller's. A cancelled caller means "this script overran its budget"; that is a fact
+    /// about the script, and it must not become a fact about the conversation (docs/08 §5.4).
+    /// </param>
+    private void HandOver(string sessionId, Guid eventId, MountedScript mount, CancellationToken lifetime,
+        Func<CancellationToken, ValueTask<Result<SessionTurnResult>>> run)
+    {
+        var ticket = Guid.NewGuid();
+        var task = DetachedAsync(ticket);
+        _handedOver[ticket] = task;
+        return;
+
+        async Task DetachedAsync(Guid key)
+        {
+            // Off the caller's stack before anything else: "it does not wait" has to mean the answer is already written
+            // when this starts, or the script is waiting for a little bit of a turn after all.
+            await Task.Yield();
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            string outcome;
+            string detail;
+            try
+            {
+                var result = await run(lifetime).ConfigureAwait(false);
+                outcome = result.Ok ? "completed" : "failed";
+                detail = result.Ok
+                    ? $"step {result.Value!.StepNumber}"
+                    : result.Error?.Message ?? "the turn failed";
+            }
+            catch (OperationCanceledException)
+            {
+                // The host is going away, not the caller: this turn's token is the lifetime's.
+                outcome = "cancelled";
+                detail = "the host stopped before this turn finished";
+            }
+            catch (Exception ex)
+            {
+                outcome = "failed";
+                detail = ex.Message;
+            }
+            finally { _handedOver.TryRemove(key, out _); }
+
+            await _audit.AppendAsync(new(DateTimeOffset.UtcNow, eventId, mount.Package.Manifest.Id, mount.Target,
+                ScriptCapabilities.SessionActivate, outcome, $"session {sessionId}: {detail}"), CancellationToken.None)
+                .ConfigureAwait(false);
+            _signalLog.Write(new()
+            {
+                Group = "session",
+                Name = "activate",
+                StepId = eventId,
+                From = mount.Target.ToString(),
+                To = sessionId,
+                Mechanism = "session.activate",
+                Outcome = outcome,
+                Level = outcome == "completed" ? SignalLevel.Info : SignalLevel.Warn,
+                DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+                Detail = new Dictionary<string, string>(StringComparer.Ordinal) { ["detail"] = detail }
+            });
+        }
+    }
+
+    /// <summary>
+    /// Waits until every turn a script handed over has finished. For a shutdown that wants to be polite, and for a test
+    /// that has to look at what a turn did; nothing else needs it, because a handed-over turn's outcome lives in the
+    /// record rather than in a return value.
+    /// </summary>
+    public async Task WhenTurnsSettleAsync(CancellationToken cancellationToken = default)
+    {
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var pending = _handedOver.Values.ToArray();
+            if (pending.Length == 0) return;
+            await Task.WhenAll(pending).WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
 
     public IReadOnlyList<MountedScript> Mounted
     { get { _gate.Wait(); try { return _mounted.ToArray(); } finally { _gate.Release(); } } }
@@ -485,9 +577,10 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         Result<string> result;
         using (SignalScope.Enter(invocationId, invocationId))
         {
-            var api = new ScriptApi(Adapters, Channels, _audit, _signalLog, Models, Sessions,
+            var api = new ScriptApi(this, Adapters, Channels, _audit, _signalLog, Models, Sessions,
                 new MountedScript(package, target), new RoutedEvent(ToolCallEvent, target, invocationId, argumentsJson),
-                $"script.tool:{package.Manifest.Id}", _state, _plane, cancellationToken, _media);
+                $"script.tool:{package.Manifest.Id}", _state, _plane, cancellationToken, lifetime: cancellationToken,
+                _media);
             result = await _executor.InvokeAsync(package, target, argumentsJson, api, cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -956,8 +1049,11 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
                 Result result;
                 using (SignalScope.Enter(invocationId, routedEvent.EventId))
                 {
-                    var api = new ScriptApi(Adapters, Channels, _audit, _signalLog, Models, Sessions, mount, routedEvent,
-                        stateScopes[handlerIndex], _state, _plane, deadline.Token, _media);
+                    var api = new ScriptApi(this, Adapters, Channels, _audit, _signalLog, Models, Sessions, mount, routedEvent,
+                        stateScopes[handlerIndex], _state, _plane, deadline.Token,
+                        // The host's token, not this handler's: a turn handed over runs on the lifetime's time, and the
+                        // handler's budget must not be able to reach it (docs/08 §5.4).
+                        lifetime: cancellationToken, _media);
                     result = await _executor.ExecuteAsync(mount.Package, mount.Target, routedEvent, api, deadline.Token).ConfigureAwait(false);
                 }
                 // The record settles after the handler returns, but its id existed during it, so
@@ -1044,9 +1140,10 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
         public Error Error { get; } = error;
     }
 
-    private sealed class ScriptApi(IAdapterManager adapters, IChannelManager channels, IAuditSink audit,
+    private sealed class ScriptApi(GraphManager owner, IAdapterManager adapters, IChannelManager channels, IAuditSink audit,
         ISignalLog signalLog, IModelManager? models, ISessionManager? sessions, MountedScript mount, RoutedEvent current,
-        string? stateScope, IStateStore? state, IControlPlane? plane, CancellationToken ct, IMediaStore? media = null) : IScriptApi
+        string? stateScope, IStateStore? state, IControlPlane? plane, CancellationToken ct, CancellationToken lifetime,
+        IMediaStore? media = null) : IScriptApi
     {
         /// <summary>
         /// The action table, as this script: its own id, the capabilities its manifest declared, and the level its folder
@@ -1167,14 +1264,22 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
             InvokeAsync(ScriptCapabilities.SessionMessage, () => MessageSessionCoreAsync(optionsJson, cancellationToken));
 
         public Task<string> ActivateSessionAsync(string sessionSpecJson, CancellationToken cancellationToken) =>
-            InvokeAsync(ScriptCapabilities.SessionActivate, () => ActivateSessionCoreAsync(sessionSpecJson, cancellationToken));
+            InvokeAsync(ScriptCapabilities.SessionActivate,
+                () => ActivateSessionCoreAsync(sessionSpecJson, cancellationToken, lifetime));
 
         /// <summary>
-        /// The two-phase activation, first half: wake the Session, carry nothing. Whatever the Channel has
-        /// for it is pulled later, when the Session assembles the request (see ChannelDeltaContributor), so
-        /// the model sees everything up to "now" instead of only the message that happened to trigger this.
+        /// Wakes the Session that serves this Channel: <b>the hand-over is the whole act.</b> Whatever the Channel has for
+        /// it is pulled later, when the Session assembles the request (see ChannelDeltaContributor), so the model sees
+        /// everything up to "now" instead of only the message that happened to trigger this.
+        ///
+        /// It used to await the whole turn, which made the script's own budget bound the conversation: a turn doing real
+        /// work (fourteen model rounds and five ssh calls was one measured case) ran past the sixty-second handler
+        /// deadline, the deadline cancelled its token, and the turn was cut mid-round having said nothing. The script had
+        /// no opinion about how long a conversation may take — it only asked for one to happen — so the turn now runs on
+        /// the host's token and this returns as soon as the wake-up is accepted (docs/08 §5.4).
         /// </summary>
-        private async Task<string> ActivateSessionCoreAsync(string sessionSpecJson, CancellationToken cancellationToken)
+        private async Task<string> ActivateSessionCoreAsync(string sessionSpecJson, CancellationToken cancellationToken,
+            CancellationToken lifetime)
         {
             await RequireCapabilityAsync(ScriptCapabilities.SessionActivate, cancellationToken).ConfigureAwait(false);
             if (sessions is null) throw new InvalidOperationException("Session manager is unavailable.");
@@ -1199,24 +1304,28 @@ public sealed partial class GraphManager : IGraphRuntime, IModule
                 mount.Target, ScriptCapabilities.SessionActivate, opened.Ok ? "allowed" : "failed",
                 opened.Ok && opened.Value is not null ? opened.Value.Id.Value : channelMessage.Channel.ToString()),
                 cancellationToken).ConfigureAwait(false);
+            if (!opened.Ok || opened.Value is null)
+                return ErrorJson(opened.Error?.Code ?? ErrorCode.Unavailable,
+                    opened.Error?.Message ?? "Session could not be opened.");
 
+            var session = opened.Value;
             // The trigger message is not handed over here on purpose: it is already in the Channel's history,
             // and the delta pull will include it. Passing it twice is how a conversation gets answered twice.
             var input = new SessionTurnInput([], channelMessage.Channel, channelMessage.Binding);
-            // The spec is what an absent Session becomes: one that already exists keeps the one it was created with.
-            var result = opened.Ok && opened.Value is not null
-                ? await opened.Value.RunTurnAsync(current.EventId, input,
-                    new TurnToolbox(new SpeakTool(this, current, mount, channels, audit)), cancellationToken).ConfigureAwait(false)
-                : Result<SessionTurnResult>.Failure(opened.Error!);
-            if (!result.Ok || result.Value is null)
+            var toolbox = new TurnToolbox(new SpeakTool(this, current, mount, channels, audit));
+            owner.HandOver(session.Id.Value, current.EventId, mount, lifetime,
+                token => session.RunTurnAsync(current.EventId, input, toolbox, token));
+
+            // What comes back is the hand-over, not the answer: waking a Session is the whole act, and what it decides is
+            // the host's business from here (docs/08 §5.4). A script that wanted the decision asked the wrong door —
+            // `ctx.session.run` is the one that returns a turn's result, and the one whose own budget bounds it.
+            return JsonSerializer.Serialize(new
             {
-                await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
-                    mount.Target, ScriptCapabilities.SessionActivate, "failed", result.Error?.Message), cancellationToken).ConfigureAwait(false);
-                return JsonSerializer.Serialize(new { ok = false, error = result.Error }, JsonOptions);
-            }
-            await audit.AppendAsync(new(DateTimeOffset.UtcNow, current.EventId, mount.Package.Manifest.Id,
-                mount.Target, ScriptCapabilities.SessionActivate, "completed", result.Value.SessionId), cancellationToken).ConfigureAwait(false);
-            return JsonSerializer.Serialize(new { ok = true, result = result.Value }, JsonOptions);
+                ok = true,
+                accepted = true,
+                session = session.Id.Value,
+                note = "the turn runs in the host and its outcome does not come back here"
+            }, JsonOptions);
         }
 
         /// <summary>

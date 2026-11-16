@@ -8,9 +8,11 @@ namespace ALN.Tests;
 /// A script package declares <c>memoryLimitBytes</c> in its manifest (16 MiB for <c>adapter.channel-intake</c>), and
 /// the host reads it as "this script may not allocate more than this". What it really measures is <b>the current
 /// thread's allocation since the engine was built</b> — so anything the host allocates while the script is waiting on
-/// it is charged to the script. The host does a lot of that on the one call script packages make:
-/// <c>ctx.session.activate()</c> runs a whole model turn (request, history, JSON) and <c>ctx.channel.accept()</c>
-/// writes a picture to disk and serialises a message.
+/// it is charged to the script. The host does a lot of that on the calls a script package makes: <c>ctx.model.complete()</c>
+/// is a whole model request, <c>ctx.session.run()</c> a whole turn (request, history, JSON), and <c>ctx.channel.accept()</c>
+/// writes a picture to disk and serialises a message. Waking a Session (<c>ctx.session.activate</c>) no longer runs the
+/// turn inside the script at all — it hands it over (docs/08 §5.4) — so it is the one long call that costs the script's
+/// budget nothing.
 ///
 /// Two consequences, both measured below:
 /// <list type="bullet">

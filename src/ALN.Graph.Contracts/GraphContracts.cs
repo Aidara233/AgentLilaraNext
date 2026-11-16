@@ -101,6 +101,16 @@ public interface IGraphRuntime : IInstanceBindings
     IReadOnlyList<MountedScript> Mounted { get; }
 
     /// <summary>
+    /// Waits until every turn a script handed over has finished.
+    ///
+    /// Waking a Session is a hand-over, not a call: the script gets an acknowledgement and the turn runs on the host's
+    /// time (docs/08 §5.4). Nothing holds that turn's return value, so the two moments anybody needs to ask about it are
+    /// "is the host still busy" — a shutdown, so a package is not unloaded out from under a reply — and "did it finish",
+    /// a test. Defaulted to "there is nothing to wait for", which is true of a graph that hands nothing over.
+    /// </summary>
+    Task WhenTurnsSettleAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+    /// <summary>
     /// Every instance the graph can mount onto: the addresses a rule may name. It includes instances nothing is mounted
     /// on, which is the whole point — a mount needs an address before anything has been mounted anywhere.
     /// </summary>

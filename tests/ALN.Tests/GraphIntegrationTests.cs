@@ -340,6 +340,125 @@ public sealed class GraphIntegrationTests : IDisposable
     }
 
     /// <summary>
+    /// Waking a Session is a hand-over, not a request for its opinion: the script gets an acknowledgement and the turn
+    /// runs on the host's time. This is the shape a deployment actually needs, because a turn doing real work takes
+    /// minutes and a script's budget is a minute at most.
+    /// </summary>
+    [Fact]
+    public async Task Waking_a_Session_answers_with_the_hand_over_and_the_turn_runs_after_it()
+    {
+        _model.Enqueue(
+            new ToolCallDelta(0, "call-1", "speak", """{"text":"起了"}"""),
+            new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1)));
+        _model.Enqueue(
+            new ToolCallDelta(0, "call-2", "wait", "{}"),
+            new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1)));
+
+        var wake = new ScriptPackage(
+            new("channel.wake", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",
+                [ScriptCapabilities.SessionActivate, ScriptCapabilities.ChannelReply], TrustDomain.Builtin,
+                MemoryLimitBytes: 256L * 1024 * 1024),
+            """
+            async function onEvent(event, ctx) {
+              // What the answer has to say, and what it must not pretend to say: the turn has not run yet, so there is
+              // no result in it and "accepted" carries no promise about what the conversation will decide.
+              const outcome = JSON.parse(await ctx.session.activate({
+                modelProfileId: "default", objective: "聊两句", formatVersion: "1",
+                tools: [{
+                  name: "speak",
+                  description: "Say something.",
+                  parametersJson: JSON.stringify({
+                    type: "object",
+                    properties: { text: { type: "string" } },
+                    required: ["text"], additionalProperties: false
+                  })
+                }]
+              }));
+              if (!outcome.ok || !outcome.accepted) throw new Error("not handed over: " + JSON.stringify(outcome));
+              if (Object.prototype.hasOwnProperty.call(outcome, "result")) throw new Error("the answer carried a turn result");
+            }
+            """);
+
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), wake], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+
+        await WriteInputAsync("chat-1", "在吗");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+
+        // The turn happened anyway, after the acknowledgement went back.
+        var spoken = Assert.Single(Directory.GetFiles(Path.Combine(_mailbox.Root, "outbox", "chat-1"), "*.json"));
+        Assert.Equal("起了", ReadOutbound(spoken).Text);
+        Assert.Equal(2, _model.Requests);
+    }
+
+    /// <summary>
+    /// The budget a script declares is about the script. A turn it woke used to run inside that budget, so a turn doing
+    /// real work was cut mid-round at the deadline and said nothing — measured in the deployment at exactly sixty
+    /// seconds, twice in one afternoon. Here the script declares a second and a half and the model takes two; the turn
+    /// has to finish anyway, the script's own dispatch has to come back on time, and the record has to say how it ended.
+    /// </summary>
+    [Fact]
+    public async Task A_scripts_budget_does_not_bound_the_turn_it_handed_over()
+    {
+        // Two steps of one second: the turn lives two seconds, longer than the 1.5 s the script is allowed to run.
+        _model.Pause = TimeSpan.FromSeconds(1);
+        _model.Enqueue(
+            new ToolCallDelta(0, "call-1", "speak", """{"text":"慢一点也跑完了"}"""),
+            new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1)));
+        _model.Enqueue(
+            new ToolCallDelta(0, "call-2", "wait", "{}"),
+            new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1)));
+
+        var impatient = new ScriptPackage(
+            new("channel.wake", 1, "channel", MountMode.Default, [EventNames.ChannelMessageAccepted], "onEvent",
+                [ScriptCapabilities.SessionActivate, ScriptCapabilities.ChannelReply], TrustDomain.Builtin,
+                TimeoutMilliseconds: 1500,
+                MemoryLimitBytes: 256L * 1024 * 1024),
+            """
+            async function onEvent(event, ctx) {
+              await ctx.session.activate({
+                modelProfileId: "default", objective: "聊两句", formatVersion: "1",
+                tools: [{
+                  name: "speak",
+                  description: "Say something.",
+                  parametersJson: JSON.stringify({
+                    type: "object",
+                    properties: { text: { type: "string" } },
+                    required: ["text"], additionalProperties: false
+                  })
+                }]
+              });
+            }
+            """);
+
+        Assert.True((await _graph.LoadAsync([AdapterIntake(), impatient], default)).Ok);
+        Assert.True((await _adapters.CreateAsync(new(_adapterAddress, _adapter.Descriptor, "adapter.file"), _ => _adapter, default)).Ok);
+        await AddChannelAsync(new("channel", "conversation", "chat-1"), "chat-1");
+        Assert.True((await _adapters.StartAsync(_adapterAddress, default)).Ok);
+
+        await WriteInputAsync("chat-1", "在吗");
+        Assert.Equal(1, (await PulseAdapterAsync()).Value);
+        await DrainAsync();
+
+        // The script itself finished inside its budget — this is the "脚本只管脚本" half.
+        Assert.Contains(_signals.Snapshot(), record => record.Group == "dispatch"
+            && record.Name.StartsWith("channel.wake@", StringComparison.Ordinal) && record.Outcome == "ok");
+        // Two seconds of model time under a 1.5 s script budget. Before the hand-over this was a cancelled turn and an
+        // empty outbox; now the budget only ever bounded the script, which had already returned.
+        var spoken = Assert.Single(Directory.GetFiles(Path.Combine(_mailbox.Root, "outbox", "chat-1"), "*.json"));
+        Assert.Equal("慢一点也跑完了", ReadOutbound(spoken).Text);
+        Assert.Equal(2, _model.Requests);
+        // Nobody awaits a handed-over turn, so the record is the only witness that it ended — and how.
+        Assert.Contains(_audit.ReadAudit(), entry => entry.Action == ScriptCapabilities.SessionActivate
+            && entry.Outcome == "completed");
+        Assert.Contains(_signals.Snapshot(), record => record.Mechanism == "session.activate"
+            && record.Outcome == "completed");
+    }
+
+    /// <summary>
     /// A script hands a Session a spec, and a spec carries a level. What a script reaches is decided by the folder it
     /// came from, so a Session it opens must not reach further than that: otherwise the shallowest place in the system
     /// (a draft, written by the model itself) is one `level: "full"` away from the deepest.
@@ -456,6 +575,12 @@ public sealed class GraphIntegrationTests : IDisposable
         private readonly Queue<ModelEvent[]> _steps = new();
         public int Requests { get; private set; }
 
+        /// <summary>
+        /// How long each step takes to answer. Zero for every test that is not about time; one test needs the model to
+        /// outlive the caller's budget on purpose, and scripting a delay is the only way to make that deterministic.
+        /// </summary>
+        public TimeSpan Pause { get; set; }
+
         public void Enqueue(params ModelEvent[] events) => _steps.Enqueue(events);
 
         public ValueTask<Result<IAsyncEnumerable<ModelEvent>>> CompleteAsync(string profileId, ModelRequest request,
@@ -468,10 +593,11 @@ public sealed class GraphIntegrationTests : IDisposable
             return ValueTask.FromResult(Result<IAsyncEnumerable<ModelEvent>>.Success(Stream(step)));
         }
 
-        private static async IAsyncEnumerable<ModelEvent> Stream(ModelEvent[] events,
+        private async IAsyncEnumerable<ModelEvent> Stream(ModelEvent[] events,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             await Task.Yield();
+            if (Pause > TimeSpan.Zero) await Task.Delay(Pause, cancellationToken);
             foreach (var item in events) yield return item;
         }
 
@@ -492,11 +618,21 @@ public sealed class GraphIntegrationTests : IDisposable
 
     private async Task DrainAsync()
     {
-        while (_events.TryRead(out var queued))
+        // Drain → settle → drain: a handed-over turn runs outside the queue (docs/08 §5.4), and it announces its own
+        // start and end, which are events of their own. Both have to be quiet before a test may look at the mailbox.
+        for (var pass = 0; pass < 20; pass++)
         {
-            var dispatched = await _graph.DispatchAsync(queued, default);
-            Assert.True(dispatched.Ok, dispatched.Error?.Detail ?? dispatched.Error?.Message);
+            while (_events.TryRead(out var queued))
+            {
+                var dispatched = await _graph.DispatchAsync(queued, default);
+                Assert.True(dispatched.Ok, dispatched.Error?.Detail ?? dispatched.Error?.Message);
+            }
+            await _graph.WhenTurnsSettleAsync();
+            if (!_events.TryRead(out var announced)) return;
+            var rest = await _graph.DispatchAsync(announced, default);
+            Assert.True(rest.Ok, rest.Error?.Detail ?? rest.Error?.Message);
         }
+        throw new InvalidOperationException("the event loop did not go quiet");
     }
 
     [Fact]

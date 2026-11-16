@@ -1014,6 +1014,16 @@ finally
     try { await pumpTask.WaitAsync(TimeSpan.FromSeconds(10)); }
     catch (TimeoutException) { pumpStop.Cancel(); try { await pumpTask; } catch (OperationCanceledException) { } }
     catch (OperationCanceledException) { }
+    // Turns a script handed over are the host's, so the host is what waits for them: nothing else holds their return
+    // value, and unloading a package out from under one is how a conversation ends with half a reply. Ten seconds, then
+    // the lifetime tokens are cancelled and their endings are recorded as cancelled (docs/08 §5.4).
+    try { await graph.WhenTurnsSettleAsync().WaitAsync(TimeSpan.FromSeconds(10)); }
+    catch (TimeoutException)
+    {
+        pumpStop.Cancel();
+        try { await graph.WhenTurnsSettleAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException) { }
+    }
     foreach (var profile in modelManager.ListProfiles()) modelManager.RemoveProfile(profile.Id);
     foreach (var provider in modelManager.List()) await modelManager.DestroyAsync(provider.Address, CancellationToken.None);
     await modulePackages.UnloadAsync(modelPackage.Value!.Id, TimeSpan.FromSeconds(10), force: true, CancellationToken.None);
