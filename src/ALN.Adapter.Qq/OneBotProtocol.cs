@@ -398,6 +398,16 @@ public static partial class OneBotProtocol
         JsonSerializer.Serialize(new { action, @params = parameters, echo }, Json);
 
     /// <summary>
+    /// One action of ours — the ones this package wraps by name — with a payload built from typed values.
+    ///
+    /// <see cref="BuildRaw"/> carries whatever the caller wrote, which is the point of a pass-through door and the reason a
+    /// wrapped verb must not use it: the whole value of wrapping is that <c>group_id</c> is a number here because this code
+    /// said it is, not because a model remembered which of OneBot's verbs take a string (docs/16 §10.1).
+    /// </summary>
+    public static string BuildAction(string echo, string action, object parameters) =>
+        JsonSerializer.Serialize(new { action, @params = parameters, echo }, Json);
+
+    /// <summary>
     /// What a raw call answers: the platform's own verdict, with its <c>retcode</c> intact.
     ///
     /// The one thing to get right is that a reply may carry no <c>data</c> at all — a poke, a set_*, half of OneBot's

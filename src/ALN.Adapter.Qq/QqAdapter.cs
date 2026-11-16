@@ -242,6 +242,21 @@ public sealed class QqAdapter : AdapterBase, IAdapterHealth, IAdapterIdentity, I
         return Result<JsonElement>.Success(OneBotProtocol.BuildRawAnswer(reply.Response, reply.Data));
     }
 
+    /// <summary>
+    /// One action this package wraps by name, sent to the bridge as that bridge's own verb.
+    ///
+    /// It exists so <see cref="QqOperations"/> can build the payload from typed values without holding the connection: the
+    /// "is it running" question and the socket are this class's, and a wrapper that reached past them would be a second
+    /// place where "the adapter is stopped" has to be remembered (docs/16 §10.1).
+    /// </summary>
+    internal async ValueTask<Result<OneBotReply>> CallBridgeAsync(Func<string, string> build,
+        CancellationToken cancellationToken)
+    {
+        if (!IsRunning)
+            return Result<OneBotReply>.Failure(new(ErrorCode.Unavailable, "QQ adapter is not running."));
+        return await _connection.CallAsync(build, cancellationToken).ConfigureAwait(false);
+    }
+
     public override async ValueTask<Result> StopAsync(CancellationToken cancellationToken)
     {
         if (_run is { } run)

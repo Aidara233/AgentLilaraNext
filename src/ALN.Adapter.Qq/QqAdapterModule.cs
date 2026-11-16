@@ -48,6 +48,15 @@ public sealed class QqAdapterModule : IModulePlugin
 
         var registered = _factories.Register(PackageId, new QqAdapterFactory(events, logger, acks, queue, files, urls));
         if (!registered.Ok) return ValueTask.FromResult(registered);
+        // The QQ verbs this package wraps by name (docs/16 §10.1). Registered here rather than by the host: the verbs are
+        // this platform's, the schemas are this platform's dialect, and the package is the one place that can change them
+        // without a host release — which is exactly why adapters.raw exists for the rest (docs/16 §10). The loader takes
+        // them back when the package goes, so an unloaded package leaves no names behind.
+        if (context.HostServices.GetService(typeof(IControlPlane)) is IControlPlane plane)
+        {
+            var actions = QqOperations.Register(plane, _adapters);
+            if (!actions.Ok) return ValueTask.FromResult(actions);
+        }
         _started = true;
         return ValueTask.FromResult(Result.Success());
     }
