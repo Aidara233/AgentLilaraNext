@@ -1276,6 +1276,31 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
     /// </summary>
     private const string PerTurnTool = "speak";
 
+    /// <summary>
+    /// Said to a model that reached for <c>speak</c> in a turn with nothing to answer. It has to do three things: say
+    /// that the call did nothing, say why in terms that are not the model's fault, and name what it may do instead —
+    /// otherwise the model spends a round working out which of its own words was wrong.
+    /// </summary>
+    private const string NoMessageToAnswer =
+        "这一轮不是回某条消息：是转交、定时或者任务结束把你叫醒的，没有可以回复的对象，所以 speak 发不出任何东西。"
+        + "想主动往频道里说话，用你手上的 actions（channels.send 那类）；只是等下一次，就调用 wait。";
+
+    /// <summary>
+    /// A tool this build implements, offered in a turn whose context does not fit it. It answers instead of
+    /// disappearing, because "you cannot speak here" is something a model can route around and a missing tool is not.
+    /// </summary>
+    private sealed class UnavailableTool(string name, string reason) : ISessionTool
+    {
+        public string Name => name;
+
+        /// <summary>Never an exit: a refusal that ended the turn would let "speak where nothing can be said" quietly
+        /// become "this turn is over", and the model would never have read why.</summary>
+        public bool EndsTurn => false;
+
+        public ValueTask<Result<SessionToolResult>> ExecuteAsync(ModelToolCall call, CancellationToken cancellationToken) =>
+            ValueTask.FromResult(Result<SessionToolResult>.Failure(new(ErrorCode.Unavailable, reason)));
+    }
+
     private static Result<ResolvedTools> ResolveTools(SessionSpec spec, ISessionToolbox? toolbox, IReadOnlyList<SessionToolOffer> offered)
     {
         var visible = new List<ModelToolDefinition> { WaitTool.Definition, CompactTool.Definition };
@@ -1309,10 +1334,20 @@ public sealed partial class SessionManager : ISessionManager, ISessionWaker, ISe
             }
             // "speak" is the one tool built per turn rather than registered: it answers a specific Channel message, so
             // it exists only in a turn that has one (GraphManager.TurnToolbox). A Session woken some other way — by a
-            // script, by a schedule — still carries it in its spec, because the spec was written for the Channel.
-            // Failing the whole round over that would make "wake up and do something else" impossible, which is not
-            // an assembly mistake but a different kind of turn. Everything else declared-but-absent is still a bug.
-            if (string.Equals(declared.Name, PerTurnTool, StringComparison.Ordinal)) continue;
+            // script, by a schedule, by a relay — still carries it in its spec, because the spec was written for the
+            // Channel. Everything else declared-but-absent is still a bug.
+            //
+            // It is offered anyway, bound to a refusal, which is docs/08 §5.0 rather than a kindness: "the
+            // implementation exists but this turn's context does not fit" is supposed to come back as a tool error the
+            // model can read. Withholding it turned that into a failed step and a retry — 24 of the 28 "Model called a
+            // tool this round did not offer" records in one deployment's signal log were this — and the sentence the
+            // model got blamed its own writing instead of naming what it could do instead.
+            if (string.Equals(declared.Name, PerTurnTool, StringComparison.Ordinal))
+            {
+                visible.Add(declared);
+                byName[declared.Name] = new UnavailableTool(declared.Name, NoMessageToAnswer);
+                continue;
+            }
             missing.Add(declared.Name);
         }
         if (missing.Count == 0) return Result<ResolvedTools>.Success(new(visible, byName, acting));

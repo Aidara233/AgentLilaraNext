@@ -155,6 +155,42 @@ public sealed class SessionToolTests : IDisposable
     }
 
     [Fact]
+    public async Task Speaking_in_a_turn_with_nothing_to_answer_is_a_tool_error_the_model_can_read()
+    {
+        // A wake with no Channel message — a relay, a deadline, a job ending. The spec declares speak because it was
+        // written for a Channel, and the model reaches for it, as it has in every turn where somebody was talking to it.
+        var model = new ScriptedModel(
+            [new ToolCallDelta(0, "call-1", "speak", """{"text":"谢谢你的硬币。"}"""),
+             new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))],
+            [new ToolCallDelta(0, "call-2", "wait", "{}"), new ModelCompleted(StopReason.ToolUse, new ModelUsage(1, 1))]);
+        var sessions = Manager(model);
+
+        // No toolbox at all: this turn has no message being answered, so the host has nothing to bind speak to.
+        var turn = await sessions.TurnAsync("s-1", Spec(SpeakShape), Guid.NewGuid(),
+            new SessionTurnInput([], null, null), null, default);
+        Assert.True(turn.Ok, turn.Error?.Detail ?? turn.Error?.Message);
+
+        // Two requests, not five: the call was heard and refused, so the step was not failed and retried. A withheld
+        // tool made this a "Model called a tool this round did not offer" — one wasted model call, and a retry note
+        // that blamed the model's own writing for a situation the framework created.
+        Assert.Equal(2, model.Requests.Count);
+        Assert.DoesNotContain(model.Requests[1].Messages,
+            message => message.Content?.Contains("上一次请求没有成功", StringComparison.Ordinal) == true);
+        // What the model was offered is what its spec declared: the contract it was written against.
+        Assert.Contains(model.Requests[0].Tools ?? [], tool => tool.Name == "speak");
+
+        // And the answer it read says what happened, that it was not its mistake, and what it may do instead
+        // (docs/08 §5.0: an implementation that does not fit this turn answers, it does not disappear).
+        var refusal = Assert.Single(model.Requests[1].Messages,
+            message => message.Role == "tool" && message.Content?.Contains("没有可以回复的对象", StringComparison.Ordinal) == true).Content!;
+        Assert.Contains("没有可以回复的对象", refusal, StringComparison.Ordinal);
+        Assert.Contains("wait", refusal, StringComparison.Ordinal);
+        // The call is in the turn's record — it happened, and it did nothing — and the turn ended by wait, not by it.
+        Assert.Contains(turn.Value!.ToolCalls, call => call.Name == "speak");
+        Assert.Equal(StopReason.EndTurn, turn.Value.StopReason);
+    }
+
+    [Fact]
     public async Task A_turn_ends_because_wait_says_so_and_a_silent_model_says_nothing()
     {
         var model = new ScriptedModel(

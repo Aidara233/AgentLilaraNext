@@ -48,9 +48,12 @@ public interface ISessionTool
 /// a tool that needs the Channel message being answered cannot outlive that message, so there is nothing
 /// long-lived here to register and unregister.
 ///
-/// Absent tools are not an error: a name the spec declares but no module implements is simply not offered to
-/// the model (and said out loud in the signal log), because offering a tool nobody can run only buys a wasted
-/// round.
+/// Absent tools are not an error here, but they do not all mean the same thing. A name the spec declares and no
+/// module implements is an assembly mistake, and the turn fails naming it — a tool nobody can run buys a wasted
+/// round at best. A tool this build <i>does</i> implement, in a turn whose context does not fit it (<c>speak</c>
+/// with no message to answer), is still offered and refuses the call with a sentence the model can act on
+/// (docs/08 §5.0): a tool that is merely missing teaches the model nothing, and the retry it costs is spent on a
+/// mistake the model was never told about.
 /// </summary>
 public interface ISessionToolbox
 {

@@ -1,3 +1,4 @@
+using ALN.Contracts;
 using ALN.Contracts.Models;
 using ALN.Contracts.Sessions;
 using ALN.Runtime;
@@ -112,6 +113,28 @@ public sealed class SessionCompactionTests
         Assert.NotNull(plan);
         Assert.Contains("没有放进来", plan!.Prompt, StringComparison.Ordinal);
         Assert.Contains("看看这个", plan.Prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_look_at_a_picture_survives_compaction_as_the_place_it_is_kept()
+    {
+        // The platform's word for a picture is "[图片]" — the bytes are in media and the message only carries a
+        // reference. A brief that keeps the word and drops the reference remembers that something was sent and can
+        // never look at it again, even though the file is still there; and "send it again", "look at it", "what was in
+        // it" all start with knowing where it is (docs/28 §3).
+        var picture = new MediaRef("media", "image/1b/1b2484a1b8760a05.jpg", MediaKind.Image, "image/jpeg",
+            203_852, 864, 1920, "hash");
+        var history = new List<SessionHistoryEntry>
+        {
+            new("a1:user", "a1", 1, "user", null, At,
+                ChannelMessages: [new("m-1", "adapter.qq", "小林", "[图片]", At, Media: [picture])]),
+            User("a2", 2), User("a3", 3), User("a4", 4), User("a5", 5)
+        };
+
+        var plan = SessionCompaction.Plan(history, inputBudgetTokens: 100_000);
+
+        Assert.NotNull(plan);
+        Assert.Contains("[小林] [图片]（media/image/1b/1b2484a1b8760a05.jpg）", plan!.Prompt, StringComparison.Ordinal);
     }
 
     private static List<SessionHistoryEntry> Conversation(int activations)

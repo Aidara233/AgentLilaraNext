@@ -99,7 +99,17 @@ public static class SessionCompaction
         foreach (var entry in segment)
         {
             foreach (var message in entry.ChannelMessages ?? [])
-                lines.Add($"[{message.Sender ?? message.Source}] {Clip(message.Content)}");
+            {
+                // A picture's own text is a placeholder — the platform sends "[图片]" and the picture lives in media — so
+                // the location goes in beside it. A compacted brief that remembers "somebody sent a picture" and can
+                // never look at it again is the one thing a summary must not do to a file that still exists: the
+                // timeline keeps a MediaRef precisely so that it stays reachable (docs/28 §3), and this is the step
+                // where that reference would otherwise be thrown away.
+                var where = message.Media is { Count: > 0 } attached
+                    ? "（" + string.Join("、", attached.Select(file => file.Locator)) + "）"
+                    : "";
+                lines.Add($"[{message.Sender ?? message.Source}] {Clip(message.Content)}{where}");
+            }
             if (entry.ToolCalls is { Count: > 0 } calls)
                 lines.Add($"[它调用了] {string.Join(", ", calls.Select(call => call.Name))}");
             if (entry.Role == "tool")
