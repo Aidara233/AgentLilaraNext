@@ -22,12 +22,13 @@ public sealed class SshModule(ModuleId id, SshTools tools, ISessionExtensionRegi
     public const string TypeId = "ssh.local";
 
     /// <summary>
-    /// What the host writes when no <c>module.json</c> exists yet: two hours of idle before a live key is dropped, a
-    /// thirty-second command ceiling, 64 KiB of output. Nothing here grants anything — the file has no device list,
-    /// because a device is something a user hands over in a conversation, not something a default file invents.
+    /// What the host writes when no <c>module.json</c> exists yet: two hours of idle before a live key is dropped, a ten
+    /// minute command ceiling, 256 KiB of output, and no ceiling on file transfers. Nothing here grants anything — the
+    /// file has no device list, because a device is something a user hands over in a conversation, not something a
+    /// default file invents.
     /// </summary>
     public const string DefaultConfig = """
-        {"idleTimeoutMinutes":120,"commandSeconds":30,"maxOutputBytes":65536,"allowTunnel":false}
+        {"idleTimeoutMinutes":120,"commandSeconds":600,"maxOutputBytes":262144,"maxTransferBytes":0,"allowTunnel":false}
         """;
 
     private bool _registered;
@@ -76,6 +77,15 @@ public sealed class SshModule(ModuleId id, SshTools tools, ISessionExtensionRegi
                         return Result<IKernelModule>.Failure(new(ErrorCode.Invalid,
                             $"{manifest.Id}: \"maxOutputBytes\" must be greater than zero."));
                     options = options with { MaxOutputBytes = bytes };
+                }
+                // Zero (or a number the caller wants to mean "no limit") is spelled 0, not omitted: an absent key keeps
+                // the default, which is already "no ceiling", while 0 says so out loud in the file a person reads.
+                if (root.TryGetProperty("maxTransferBytes", out var transfer) && transfer.ValueKind == JsonValueKind.Number)
+                {
+                    if (!transfer.TryGetInt64(out var transferBytes) || transferBytes < 0)
+                        return Result<IKernelModule>.Failure(new(ErrorCode.Invalid,
+                            $"{manifest.Id}: \"maxTransferBytes\" must be zero (no ceiling) or a positive byte count."));
+                    options = options with { MaxTransferBytes = transferBytes };
                 }
                 if (root.TryGetProperty("allowTunnel", out var tunnel) && tunnel.ValueKind is JsonValueKind.True or JsonValueKind.False)
                     options = options with { AllowTunnel = tunnel.GetBoolean() };

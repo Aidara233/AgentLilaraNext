@@ -159,8 +159,14 @@ public interface ISshConnection : IAsyncDisposable
     ValueTask<Result> UploadAsync(Stream content, string remotePath, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Copies a remote path into a stream, refusing anything larger than <paramref name="maxBytes"/> rather than
-    /// truncating: a silently short file is indistinguishable from a complete one once it is on disk.
+    /// Opens a remote path for reading. The stream <b>is</b> the transfer: reading it is what moves bytes, and the
+    /// caller disposes it whether or not it read to the end.
+    ///
+    /// <paramref name="maxBytes"/> is a ceiling the caller asks for, not one this interface needs: a positive value
+    /// refuses a larger file rather than truncating it (a silently short file is indistinguishable from a complete one
+    /// once it is on disk), and zero or less means no ceiling at all. The number is the caller's because the right one
+    /// belongs to what the bytes are for — an artifact moving to a workspace has none worth naming, while a platform
+    /// handing over an attachment has whatever its own protocol allows.
     /// </summary>
     ValueTask<Result<Stream>> DownloadAsync(string remotePath, long maxBytes, CancellationToken cancellationToken);
 

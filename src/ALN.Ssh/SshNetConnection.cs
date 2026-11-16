@@ -103,28 +103,35 @@ public sealed class SshNetConnection(SshClient client, ConnectionInfo connection
         CancellationToken cancellationToken)
     {
         if (_disposed) return Result<Stream>.Failure(new(ErrorCode.Conflict, "The connection is closed."));
+        // Not disposed on the way out: the stream is the transfer, and it owns the session until it is done.
+        SftpClient? sftp = null;
         try
         {
-            using var sftp = new SftpClient(connection);
+            sftp = new SftpClient(connection);
             await sftp.ConnectAsync(cancellationToken).ConfigureAwait(false);
-            var attributes = sftp.GetAttributes(remotePath);
-            var size = (long)attributes.Size;
-            // Refused rather than truncated: a short file that looks complete is how a "backup" turns out not to be one.
-            if (size > maxBytes)
+            var size = (long)sftp.GetAttributes(remotePath).Size;
+            // Refused rather than truncated — but only when somebody actually asked for a ceiling. "How big may one
+            // file be" used to be answered here because the download landed in memory; now that the bytes go straight
+            // to the caller's disk, the honest answer is "as big as the two file systems allow", and a caller that
+            // wants a limit passes one (docs/27 §7).
+            if (maxBytes > 0 && size > maxBytes)
+            {
+                sftp.Dispose();
                 return Result<Stream>.Failure(new(ErrorCode.Invalid,
                     $"The remote file is {size} bytes, more than the {maxBytes} allowed for one read."));
+            }
 
-            var buffer = new MemoryStream();
-            sftp.DownloadFile(remotePath, buffer);
-            buffer.Position = 0;
-            return Result<Stream>.Success(buffer);
+            var content = sftp.OpenRead(remotePath);
+            return Result<Stream>.Success(new SftpDownloadStream(sftp, content));
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            sftp?.Dispose();
             throw;
         }
         catch (Exception ex)
         {
+            sftp?.Dispose();
             return Result<Stream>.Failure(SshFailures.Map(ex, new SshTarget(client.ConnectionInfo.Host,
                 client.ConnectionInfo.Port, client.ConnectionInfo.Username), HostKey));
         }

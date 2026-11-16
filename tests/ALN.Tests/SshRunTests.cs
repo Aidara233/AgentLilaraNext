@@ -391,6 +391,32 @@ public sealed class SshRunTests : IDisposable
     }
 
     [Fact]
+    public async Task A_download_has_no_ceiling_unless_the_deployment_asks_for_one()
+    {
+        // The 64 MiB number is gone from the path a real transfer takes. It was there for one reason: the download used
+        // to land in a MemoryStream, so "how big may a file be" was a memory decision. The stream now goes from the far
+        // side to the scope through one buffer, so the size stopped being this process's business — and the ceiling that
+        // remains is whatever the module was configured with, not a constant (docs/27 §7).
+        var files = new LocalFileSystemAccess(_root, ["workspace"], ["workspace"]);
+        var tools = await Ready(files: files);
+        Assert.Equal(0, tools.Options.MaxTransferBytes);
+
+        // Larger than the old constant, so a stale one anywhere on this path shows up here rather than in production.
+        _access.DownloadPayload = new byte[IBinaryFileAccess.MaxTransferBytes + 4096];
+        var get = await tools.GetAsync(Session,
+            """{"remotePath":"/srv/app/image.bin","scope":"workspace","path":"image.bin"}""", default);
+        Assert.True(get.Ok, get.Error?.Message);
+        Assert.Equal(IBinaryFileAccess.MaxTransferBytes + 4096,
+            new FileInfo(Path.Combine(_root, "workspace", "image.bin")).Length);
+
+        // And the same file goes back up, from a scope whose own default ceiling is also "none".
+        var put = await tools.PutAsync(Session,
+            """{"scope":"workspace","path":"image.bin","remotePath":"/srv/app/back.bin"}""", default);
+        Assert.True(put.Ok, put.Error?.Message);
+        Assert.Equal(IBinaryFileAccess.MaxTransferBytes + 4096, Assert.Single(_access.Open[0].Uploads).Bytes.Length);
+    }
+
+    [Fact]
     public async Task Every_command_leaves_an_audit_record_with_the_command_but_not_its_output()
     {
         var tools = await Ready();

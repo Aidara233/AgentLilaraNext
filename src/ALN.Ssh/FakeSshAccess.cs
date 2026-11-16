@@ -154,7 +154,8 @@ public sealed class FakeSshAccess : ISshAccess
         {
             if (Disposed) return ValueTask.FromResult(Result<Stream>.Failure(new(ErrorCode.Conflict, "Connection is closed.")));
             var bytes = owner.DownloadPayload ?? Encoding.UTF8.GetBytes($"fake contents of {remotePath}");
-            if (bytes.Length > maxBytes)
+            // A ceiling of zero or less is "no ceiling", the same rule the real connection follows.
+            if (maxBytes > 0 && bytes.Length > maxBytes)
                 return ValueTask.FromResult(Result<Stream>.Failure(new(ErrorCode.Invalid,
                     $"Remote file is larger than {maxBytes} bytes; refusing to truncate it.")));
             return ValueTask.FromResult(Result<Stream>.Success(new MemoryStream(bytes, writable: false)));

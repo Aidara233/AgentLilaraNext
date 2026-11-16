@@ -142,11 +142,15 @@ SSH 模块守的只有三件事：
 | | 契约 | 作用 |
 |---|---|---|
 | 文本面 | `IFileSystemAccess`（不变） | 模型读写它能读回来的东西（7 个 `fs_*` 工具） |
-| 字节面 | `IBinaryFileAccess`（`LocalFileSystemAccess` 一并实现） | `ssh_put` / `ssh_get`：流式、64 MiB 上限、临时文件 + rename 保证原子 |
+| 字节面 | `IBinaryFileAccess`（`LocalFileSystemAccess` 一并实现） | `ssh_put` / `ssh_get`：流式、上限来自模块配置（`maxTransferBytes`，默认 `0` = 无上限）、临时文件 + rename 保证原子 |
 
 三条规则：**只有显式登记为字节区的 scope 才收字节**（宿主默认只给 `workspace`——"删光也不心疼"的房间，
-记忆库与脚本草稿仍然是文本区）；路径规则与文本面完全相同；超过上限**拒绝而不是截断**。
-模型看到的仍然只是"scope + 相对路径"，所以 40 MiB 的文件对上下文是零成本。
+记忆库与脚本草稿仍然是文本区）；路径规则与文本面完全相同；超过（若配置了）上限时**拒绝而不是截断**。
+模型看到的仍然只是"scope + 相对路径"，所以 40 GiB 的文件对上下文是零成本。
+
+下载是**流**而不是先攒成一个 `MemoryStream`：早先那版把整份文件读进内存，"一次能搬多大"因此成了内存问题，
+64 MiB 这个数就是这么来的。现在 `SftpDownloadStream` 把 SFTP 会话的所有权交给调用方拿到的那个流，字节边读边写，
+上限只剩"谁来给"这一件事。
 | `ssh_tunnel` | 本地回环转发 | **operator** | 是 |
 | `ssh_save` / `ssh_load` / `ssh_forget` | live ↔ 存量 | **operator** | 否 |
 

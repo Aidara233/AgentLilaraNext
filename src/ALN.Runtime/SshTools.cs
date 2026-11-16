@@ -780,8 +780,11 @@ public sealed class SshTools(ISshAccess access, ISecretStore liveKeys, IAuditSin
         var current = connected.Value!;
 
         // The local half is a scope plus a relative path — the same two arguments fs_read takes, and a scope that has to
-        // accept bytes. The file itself is streamed: nothing about a 40 MiB tarball ever enters the conversation.
-        var local = await binaryFiles.OpenReadAsync(scope!, path!, cancellationToken).ConfigureAwait(false);
+        // accept bytes. The file itself is streamed: nothing about a 40 GiB tarball ever enters the conversation, and
+        // nothing about it enters this process either, which is why the ceiling is whatever the module was told rather
+        // than a constant somebody picked when every transfer still fitted in memory.
+        var ceiling = Options.MaxTransferBytes;
+        var local = await binaryFiles.OpenReadStreamAsync(scope!, path!, ceiling, cancellationToken).ConfigureAwait(false);
         if (!local.Ok) return Result<SessionToolResult>.Failure(local.Error!);
 
         long bytes;
@@ -823,8 +826,9 @@ public sealed class SshTools(ISshAccess access, ISecretStore liveKeys, IAuditSin
         if (!connected.Ok) return Result<SessionToolResult>.Failure(connected.Error!);
         var current = connected.Value!;
 
-        // Refused when larger than the cap rather than truncated: a short file that looks complete is how a "backup"
-        // turns out not to be one. The bytes go straight into the scope; they are never read as text on the way.
+        // Refused when larger than the configured ceiling rather than truncated: a short file that looks complete is how
+        // a "backup" turns out not to be one. The default ceiling is none — the bytes stream from the far side into the
+        // scope with one buffer in between, so "how large may a file be" is not a question this process has to answer.
         var fetched = await current.Connection!.DownloadAsync(remotePath!, Options.MaxTransferBytes, cancellationToken)
             .ConfigureAwait(false);
         if (!fetched.Ok) return Result<SessionToolResult>.Failure(fetched.Error!);
@@ -833,7 +837,8 @@ public sealed class SshTools(ISshAccess access, ISecretStore liveKeys, IAuditSin
         await using (var stream = fetched.Value!)
         {
             bytes = stream.Length;
-            var saved = await binaryFiles.SaveAsync(scope!, path!, stream, cancellationToken).ConfigureAwait(false);
+            var saved = await binaryFiles.SaveAsync(scope!, path!, stream, Options.MaxTransferBytes, cancellationToken)
+                .ConfigureAwait(false);
             NoteUse(sessionId, saved.Ok ? null : saved.Error?.Message);
             await AuditAsync(sessionId, current, "ssh.get", saved.Ok ? "ok" : "failed",
                 Summarize($"{remotePath} -> {scope}/{path}", $"{bytes} bytes", null),
@@ -1354,17 +1359,20 @@ public sealed record SshOptions
     /// <summary>How long a live configuration keeps its key while nobody uses it.</summary>
     public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromHours(2);
 
-    /// <summary>Output cap for one command, in bytes.</summary>
-    public int MaxOutputBytes { get; init; } = 64 * 1024;
+    /// <summary>Output cap for one command, in bytes. Output lands in the model's context, so this is a budget knob
+    /// rather than a safety one: a megabyte of stdout is a quarter of a window nobody meant to spend.</summary>
+    public int MaxOutputBytes { get; init; } = 256 * 1024;
 
-    /// <summary>Wall clock for one command.</summary>
-    public int CommandSeconds { get; init; } = 30;
+    /// <summary>Wall clock for one command. Long enough for a build, short enough that a hung command is found while
+    /// somebody is still watching; <c>ssh_run {wait:false}</c> is the escape hatch for anything longer.</summary>
+    public int CommandSeconds { get; init; } = 600;
 
     /// <summary>
-    /// Largest file ssh_get will pull in, and the ceiling the local side enforces on the way out. Matches the byte
-    /// surface's own limit so a transfer can never be refused after it has already crossed the network.
+    /// Largest file <c>ssh_put</c> / <c>ssh_get</c> will move, in bytes. Zero or less means <b>no ceiling</b>, and that
+    /// is the default: both directions stream through one fixed buffer, so nothing about a transfer is a function of the
+    /// file's size except how long it takes. A deployment that wants a limit asks for one here (docs/27 §7).
     /// </summary>
-    public long MaxTransferBytes { get; init; } = IBinaryFileAccess.MaxTransferBytes;
+    public long MaxTransferBytes { get; init; }
 
     /// <summary>Background commands one device may have at once. A cap, not a queue: a Session that piles jobs up is
     /// hiding work it has lost track of.</summary>
