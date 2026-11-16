@@ -431,6 +431,32 @@ public sealed class FileSystemAccessTests : IDisposable
     }
 
     [Fact]
+    public async Task Without_a_ceiling_the_file_surface_has_none()
+    {
+        // The three-argument overloads — what the QQ adapter and ssh_put call — used to apply a compiled-in 64 MiB. That
+        // number was a memory decision from when a transfer landed in a buffer; now it streams, so the default is "no
+        // ceiling" and a deployment that wants one says so at construction. A sparse 65 MiB file is enough to tell the
+        // two apart without writing 65 MiB.
+        var access = new LocalFileSystemAccess(_root, [FileScopes.Workspace], binaryScopes: [FileScopes.Workspace]);
+        var path = Path.Combine(_root, FileScopes.Workspace, "image.bin");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        using (var made = new FileStream(path, FileMode.Create, FileAccess.Write))
+            made.SetLength(IBinaryFileAccess.MaxTransferBytes + 1);
+
+        var opened = await access.OpenReadAsync(FileScopes.Workspace, "image.bin", default);
+        Assert.True(opened.Ok, opened.Error?.Message);
+        await using (var stream = opened.Value!)
+            Assert.Equal(IBinaryFileAccess.MaxTransferBytes + 1, stream.Length);
+
+        // And the knob still does what it says, for a deployment that wants the old behaviour back.
+        var capped = new LocalFileSystemAccess(_root, [FileScopes.Workspace], binaryScopes: [FileScopes.Workspace],
+            transferCeiling: 1024);
+        var refused = await capped.OpenReadAsync(FileScopes.Workspace, "image.bin", default);
+        Assert.False(refused.Ok);
+        Assert.Equal(ErrorCode.Invalid, refused.Error!.Code);
+    }
+
+    [Fact]
     public void A_read_only_scope_that_was_never_registered_is_refused_at_construction()
     {
         var bad = Assert.Throws<ArgumentException>(() => new LocalFileSystemAccess(_root, ["workspace"], readOnlyScopes: ["media"]));

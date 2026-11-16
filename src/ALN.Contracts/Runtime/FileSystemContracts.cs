@@ -31,7 +31,9 @@ public sealed record FileText(string Path, string Text, long Bytes, DateTimeOffs
 /// </list>
 ///
 /// Text only, on purpose. This is the surface for "the model may tidy files up", and a byte-level interface on it
-/// would only invite storing things the model cannot read back.
+/// would only invite storing things the model cannot read back. Bytes have their own surface
+/// (<see cref="IBinaryFileAccess"/>) with their own scopes, and that split is what keeps a text library from becoming
+/// a place to park a tarball (docs/24 §7).
 /// </summary>
 public interface IFileSystemAccess
 {

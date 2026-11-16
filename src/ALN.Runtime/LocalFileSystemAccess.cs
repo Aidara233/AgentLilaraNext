@@ -29,6 +29,8 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
     private readonly IReadOnlyList<string> _scopes;
     private readonly IReadOnlyList<string> _binaryScopes;
     private readonly IReadOnlyList<string> _readOnlyScopes;
+    /// <summary>Ceiling for a transfer nobody sized; zero or less means none. Set once, at construction.</summary>
+    private readonly long _transferCeiling;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _appendLocks = new(StringComparer.Ordinal);
 
     /// <param name="dataRoot">Where the host keeps its data; scopes are directories directly under it.</param>
@@ -48,8 +50,15 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
     /// Enforced here rather than in the tools because there is more than one way in (text and bytes), and two entry
     /// points with two rules is how one of them ends up forgetting.
     /// </param>
+    /// <param name="transferCeiling">
+    /// Largest single transfer this instance will move, in bytes; zero or less means no ceiling, which is the default.
+    /// It is a deployment's policy knob and not a memory guard: both directions stream through one fixed buffer, so a
+    /// ceiling here only refuses what somebody asked to have refused. A caller that wants its own number passes it to
+    /// the overload that takes one.
+    /// </param>
     public LocalFileSystemAccess(string dataRoot, IReadOnlyList<string> scopes,
-        IReadOnlyList<string>? binaryScopes = null, IReadOnlyList<string>? readOnlyScopes = null)
+        IReadOnlyList<string>? binaryScopes = null, IReadOnlyList<string>? readOnlyScopes = null,
+        long transferCeiling = 0)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
         ArgumentNullException.ThrowIfNull(scopes);
@@ -99,6 +108,7 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
             readOnly.Add(canonical);
         }
         _readOnlyScopes = readOnly.AsReadOnly();
+        _transferCeiling = transferCeiling;
 
         // Created once, like the mailbox's folders: a caller may ask what is in an empty scope, and "the directory
         // has not been made yet" is not that answer.
@@ -132,11 +142,12 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
 
     /// <summary>
     /// Opens a file as bytes. Same containment as every other operation, plus one more refusal: the scope has to be one
-    /// that accepts binary at all. Reads are streamed, not slurped, so a 64 MiB transfer costs a buffer rather than 64 MiB
-    /// of managed heap per retry.
+    /// that accepts binary at all. Reads are streamed, not slurped, so a large transfer costs a buffer rather than the
+    /// file's size in managed heap — which is why the ceiling is the deployment's, not a constant: with streaming there
+    /// is nothing here for a size to break (docs/24 §5).
     /// </summary>
     public ValueTask<Result<Stream>> OpenReadAsync(string scope, string path, CancellationToken cancellationToken) =>
-        OpenReadStreamAsync(scope, path, IBinaryFileAccess.MaxTransferBytes, cancellationToken);
+        OpenReadStreamAsync(scope, path, _transferCeiling, cancellationToken);
 
     /// <inheritdoc />
     public ValueTask<Result<Stream>> OpenReadStreamAsync(string scope, string path, long ceiling,
@@ -153,7 +164,9 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
             if (!File.Exists(absolute))
                 return Result<Stream>.Failure(new(ErrorCode.Invalid, $"'{Canonical(scope, path)}' does not exist."));
             var length = new FileInfo(absolute).Length;
-            if (length > ceiling)
+            // A ceiling of zero or less is "none": the same spelling the SSH side uses, so a caller that means "no
+            // limit" says so in one way everywhere.
+            if (ceiling > 0 && length > ceiling)
                 return Result<Stream>.Failure(new(ErrorCode.Invalid,
                     $"'{Canonical(scope, path)}' is {length} bytes, more than the {ceiling} allowed."));
             // FileShare.Read: two readers are fine, a writer is not — an upload reading a half-written file would send
@@ -166,7 +179,7 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
     /// caller that dies mid-way leaves the old file untouched.
     /// </summary>
     public ValueTask<Result> SaveAsync(string scope, string path, Stream content, CancellationToken cancellationToken) =>
-        SaveCoreAsync(scope, path, content, asHost: false, IBinaryFileAccess.MaxTransferBytes, cancellationToken);
+        SaveCoreAsync(scope, path, content, asHost: false, _transferCeiling, cancellationToken);
 
     /// <inheritdoc />
     public ValueTask<Result> SaveAsync(string scope, string path, Stream content, long ceiling,
@@ -183,7 +196,7 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
     /// </summary>
     internal ValueTask<Result> SaveAsHostAsync(string scope, string path, Stream content,
         CancellationToken cancellationToken) =>
-        SaveCoreAsync(scope, path, content, asHost: true, IBinaryFileAccess.MaxTransferBytes, cancellationToken);
+        SaveCoreAsync(scope, path, content, asHost: true, _transferCeiling, cancellationToken);
 
     private ValueTask<Result> SaveCoreAsync(string scope, string path, Stream content, bool asHost, long ceiling,
         CancellationToken cancellationToken) =>
@@ -220,8 +233,9 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
                     while ((read = await content.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
                     {
                         written += read;
-                        // Checked as it goes: refusing after the disk is full is not a refusal, it is a mess.
-                        if (written > ceiling)
+                        // Checked as it goes: refusing after the disk is full is not a refusal, it is a mess. Zero or
+                        // less means the deployment asked for no ceiling, and then the disk is the only judge.
+                        if (ceiling > 0 && written > ceiling)
                             return Result.Failure(new(ErrorCode.Invalid,
                                 $"The content is larger than the {ceiling} bytes this write allows."));
                         await stream.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
@@ -239,6 +253,218 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
                 if (File.Exists(temporary)) try { File.Delete(temporary); } catch (IOException) { }
             }
         });
+
+    /// <summary>
+    /// Overwrites bytes at an offset, and grows the file when the write runs past its end. <paramref name="insert"/>
+    /// switches from "replace these bytes" to "put these bytes here and push the rest along", which is the difference
+    /// between fixing a header and adding one.
+    ///
+    /// Same everything else as a whole-file write: a temporary file beside the target and a rename, so a reader sees the
+    /// old file or the new one. The memory this costs is the caller's own bytes — the file may be any size, which is the
+    /// point of editing in place instead of building it again (docs/24 §7.2).
+    /// </summary>
+    public ValueTask<Result<long>> PatchAsync(string scope, string path, long offset, ReadOnlyMemory<byte> bytes,
+        bool insert, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, async () =>
+        {
+            if (offset < 0)
+                return Result<long>.Failure(new(ErrorCode.Invalid, "offset is a byte position; it cannot be negative."));
+            if (bytes.Length == 0)
+                return Result<long>.Failure(new(ErrorCode.Invalid, "There are no bytes to write."));
+            if (!BeginEdit(scope, path, out var absolute, out var temporary, out var refusal))
+                return Result<long>.Failure(refusal!);
+
+            try
+            {
+                long newLength;
+                // Both handles are closed before the rename: on Windows a destination with an open handle cannot be
+                // replaced, and "the patch worked but the file is not there" is not a state to discover at runtime.
+                await using (var source = new FileStream(absolute, FileMode.Open, FileAccess.Read, FileShare.Read,
+                                 81_920, FileOptions.Asynchronous))
+                {
+                    var length = source.Length;
+                    if (offset > length)
+                        return Result<long>.Failure(new(ErrorCode.Invalid,
+                            $"'{Canonical(scope, path)}' is {length} bytes; offset {offset} is past its end. "
+                            + "To append, patch at the length itself."));
+
+                    await using (var target = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write,
+                                     FileShare.None, 81_920, FileOptions.Asynchronous))
+                    {
+                        var buffer = new byte[81_920];
+                        await CopyAsync(source, target, offset, buffer, cancellationToken).ConfigureAwait(false);
+                        await target.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
+                        // Replace: the bytes just written take the place of what was at the offset. Insert: the source
+                        // carries on from where the prefix stopped, so the rest of it moves along.
+                        source.Position = insert ? offset : Math.Min(offset + bytes.Length, length);
+                        await CopyAsync(source, target, long.MaxValue, buffer, cancellationToken).ConfigureAwait(false);
+                        target.Flush(flushToDisk: true);
+                        newLength = target.Length;
+                    }
+                }
+
+                File.Move(temporary, absolute, overwrite: true);
+                return Result<long>.Success(newLength);
+            }
+            finally
+            {
+                if (File.Exists(temporary)) try { File.Delete(temporary); } catch (IOException) { }
+            }
+        });
+
+    /// <summary>
+    /// Cuts a file down to <paramref name="length"/> bytes. Refuses to grow one: extending is a write with content in
+    /// it (<see cref="PatchAsync"/> at the end), while "truncate to a larger number" is almost always an offset that
+    /// was computed from the wrong thing.
+    /// </summary>
+    public ValueTask<Result<long>> TruncateAsync(string scope, string path, long length,
+        CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, async () =>
+        {
+            if (length < 0)
+                return Result<long>.Failure(new(ErrorCode.Invalid, "length is a byte count; it cannot be negative."));
+            if (!BeginEdit(scope, path, out var absolute, out var temporary, out var refusal))
+                return Result<long>.Failure(refusal!);
+
+            try
+            {
+                await using (var source = new FileStream(absolute, FileMode.Open, FileAccess.Read, FileShare.Read,
+                                 81_920, FileOptions.Asynchronous))
+                {
+                    var current = source.Length;
+                    if (length > current)
+                        return Result<long>.Failure(new(ErrorCode.Invalid,
+                            $"'{Canonical(scope, path)}' is {current} bytes; truncating to {length} would grow it. "
+                            + "Truncate only shortens — to extend, patch bytes at the end."));
+                    if (length == current) return Result<long>.Success(current);
+
+                    await using (var target = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write,
+                                     FileShare.None, 81_920, FileOptions.Asynchronous))
+                    {
+                        await CopyAsync(source, target, length, new byte[81_920], cancellationToken).ConfigureAwait(false);
+                        target.Flush(flushToDisk: true);
+                    }
+                }
+
+                File.Move(temporary, absolute, overwrite: true);
+                return Result<long>.Success(length);
+            }
+            finally
+            {
+                if (File.Exists(temporary)) try { File.Delete(temporary); } catch (IOException) { }
+            }
+        });
+
+    /// <summary>
+    /// Appends one file to another, byte for byte, without either of them passing through the caller's memory.
+    ///
+    /// This is the operation that makes "put these two parts back together" answerable without a tool that accepts a
+    /// gigabyte of base64: the bytes go from disk to disk through one buffer, so what may be joined is bounded by the
+    /// disk rather than by a context window. The source may be the target — appending a file to itself doubles it, which
+    /// is well defined and occasionally what somebody meant.
+    /// </summary>
+    public ValueTask<Result<long>> AppendFromFileAsync(string scope, string path, string sourceScope,
+        string sourcePath, CancellationToken cancellationToken) =>
+        RunAsync(cancellationToken, async () =>
+        {
+            if (!BeginEdit(scope, path, out var absolute, out var temporary, out var refusal))
+                return Result<long>.Failure(refusal!);
+            // The source is a read, but it is a read of *bytes*, so it goes through the same scope rule as every other
+            // byte read: a text scope does not hand out its bytes, and the refusal says which scopes do.
+            if (!_binaryScopes.Contains(sourceScope, StringComparer.Ordinal))
+                return Result<long>.Failure(new(ErrorCode.Denied,
+                    $"Scope '{sourceScope}' does not allow binary transfers. Scopes that do: "
+                    + (_binaryScopes.Count == 0 ? "(none)" : string.Join(", ", _binaryScopes)) + "."));
+            if (Resolve(sourceScope, sourcePath, out var source, out var denied) is false)
+                return Result<long>.Failure(denied!);
+            if (!File.Exists(source))
+                return Result<long>.Failure(new(ErrorCode.Invalid,
+                    $"Nothing to append: {Canonical(sourceScope, sourcePath)} does not exist."));
+
+            try
+            {
+                long newLength;
+                await using (var origin = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read,
+                                 81_920, FileOptions.Asynchronous))
+                {
+                    await using (var target = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write,
+                                     FileShare.None, 81_920, FileOptions.Asynchronous))
+                    {
+                        var buffer = new byte[81_920];
+                        await using (var existing = new FileStream(absolute, FileMode.Open, FileAccess.Read,
+                                         FileShare.Read, 81_920, FileOptions.Asynchronous))
+                            await CopyAsync(existing, target, long.MaxValue, buffer, cancellationToken).ConfigureAwait(false);
+                        await CopyAsync(origin, target, long.MaxValue, buffer, cancellationToken).ConfigureAwait(false);
+                        target.Flush(flushToDisk: true);
+                        newLength = target.Length;
+                    }
+                }
+
+                File.Move(temporary, absolute, overwrite: true);
+                return Result<long>.Success(newLength);
+            }
+            finally
+            {
+                if (File.Exists(temporary)) try { File.Delete(temporary); } catch (IOException) { }
+            }
+        });
+
+    /// <summary>
+    /// The checks and the temporary file every in-place byte edit shares: the same scope rules as a write, plus the
+    /// requirement that the file is already there — creating one is <see cref="SaveAsync(string, string, Stream, CancellationToken)"/>'s
+    /// job, and "patched a file that did not exist" would be a silent create.
+    /// </summary>
+    private bool BeginEdit(string scope, string path, out string absolute, out string temporary, out Error? refusal)
+    {
+        absolute = "";
+        temporary = "";
+        refusal = RefuseWrite(scope);
+        if (refusal is not null) return false;
+        if (!_binaryScopes.Contains(scope, StringComparer.Ordinal))
+        {
+            refusal = new(ErrorCode.Denied,
+                $"Scope '{scope}' does not allow binary transfers. Scopes that do: "
+                + (_binaryScopes.Count == 0 ? "(none)" : string.Join(", ", _binaryScopes)) + ".");
+            return false;
+        }
+        if (Resolve(scope, path, out absolute, out var denied) is false)
+        {
+            refusal = denied;
+            return false;
+        }
+        if (Directory.Exists(absolute))
+        {
+            refusal = new(ErrorCode.Invalid, $"'{Canonical(scope, path)}' is a directory.");
+            return false;
+        }
+        if (!File.Exists(absolute))
+        {
+            refusal = new(ErrorCode.Invalid, $"'{Canonical(scope, path)}' does not exist; there is nothing to edit.");
+            return false;
+        }
+
+        var scopeRoot = Path.Combine(_root, scope);
+        SafeFileSystem.VerifyFile(absolute, scopeRoot);
+        temporary = Path.Combine(Path.GetDirectoryName(absolute)!, $".{Path.GetFileName(absolute)}.{Guid.NewGuid():N}.tmp");
+        SafeFileSystem.VerifyNewOrRegularFile(temporary, scopeRoot);
+        return true;
+    }
+
+    /// <summary>Streams up to <paramref name="count"/> bytes across, in one shared buffer.</summary>
+    private static async Task<long> CopyAsync(FileStream from, FileStream to, long count, byte[] buffer,
+        CancellationToken cancellationToken)
+    {
+        long copied = 0;
+        while (copied < count)
+        {
+            var want = (int)Math.Min(buffer.Length, count - copied);
+            var read = await from.ReadAsync(buffer.AsMemory(0, want), cancellationToken).ConfigureAwait(false);
+            if (read == 0) break;
+            await to.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+            copied += read;
+        }
+        return copied;
+    }
 
     public ValueTask<Result<IReadOnlyList<FileEntry>>> ListAsync(string scope, string path, CancellationToken cancellationToken) =>
         Run(cancellationToken, () =>
@@ -555,6 +781,26 @@ public sealed class LocalFileSystemAccess : IFileSystemAccess, IBinaryFileAccess
                                       or System.Security.SecurityException or ArgumentException)
         {
             return Result.Failure(new(ErrorCode.Unavailable, "File operation failed.", ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// The same guard around an operation that answers something — today the byte edits, which report the file's new
+    /// size. Same rule: a file-system exception comes back as a sentence, and cancellation still cancels.
+    /// </summary>
+    private static async ValueTask<Result<T>> RunAsync<T>(CancellationToken cancellationToken,
+        Func<Task<Result<T>>> operation)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        try
+        {
+            return await operation().ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException
+                                      or System.Security.SecurityException or ArgumentException)
+        {
+            return Result<T>.Failure(new(ErrorCode.Unavailable, "File operation failed.", ex.Message));
         }
     }
 }

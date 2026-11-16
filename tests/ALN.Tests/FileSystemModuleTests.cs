@@ -240,6 +240,57 @@ public sealed class FileSystemModuleTests : IDisposable
     }
 
     [Fact]
+    public async Task A_long_file_is_read_in_slices_and_the_answer_says_where_to_continue()
+    {
+        // 32k characters used to be the end of the road: the answer said "已截断" and stopped, so a session that needed
+        // the rest of a log had no move left but to guess. The slice is still there — a context window is a real budget
+        // — but it now comes with the number that continues it, so "too long to read at once" is no longer "unreadable".
+        var body = string.Concat(Enumerable.Repeat("0123456789", 8_000)); // 80 000 characters
+        Directory.CreateDirectory(Path.Combine(_root, "workspace"));
+        await File.WriteAllTextAsync(Path.Combine(_root, "workspace", "run.log"), body);
+        var source = new FileSystemTools(Access(FileScopes.Workspace), [FileScopes.Workspace]);
+
+        var first = await CallAsync(source, "fs_read", """{"scope":"workspace","path":"run.log"}""");
+        Assert.True(first.Ok, first.Error?.Message);
+        // Where it stopped, how much there is, and the argument that reads on.
+        Assert.Contains("字符 0–32000", first.Value!.Content, StringComparison.Ordinal);
+        Assert.Contains("共 80000 个", first.Value.Content, StringComparison.Ordinal);
+        Assert.Contains("offset=32000", first.Value.Content, StringComparison.Ordinal);
+
+        var second = await CallAsync(source, "fs_read",
+            """{"scope":"workspace","path":"run.log","offset":32000,"maxChars":1000}""");
+        Assert.StartsWith("0123456789", second.Value!.Content, StringComparison.Ordinal);
+        Assert.Contains("字符 32000–33000", second.Value.Content, StringComparison.Ordinal);
+
+        // Zero means the rest, the same spelling the transfer ceilings use.
+        var rest = await CallAsync(source, "fs_read",
+            """{"scope":"workspace","path":"run.log","offset":64000,"maxChars":0}""");
+        Assert.Contains("已经读到结尾", rest.Value!.Content, StringComparison.Ordinal);
+        Assert.Contains("字符 64000–80000", rest.Value.Content, StringComparison.Ordinal);
+
+        // A file that fits comes back whole and unadorned, exactly as before: no footer to parse for the common case.
+        await File.WriteAllTextAsync(Path.Combine(_root, "workspace", "short.txt"), "两行\n就够了");
+        var whole = await CallAsync(source, "fs_read", """{"scope":"workspace","path":"short.txt"}""");
+        Assert.Equal("两行\n就够了", whole.Value!.Content);
+    }
+
+    [Fact]
+    public async Task An_offset_past_the_end_says_so_instead_of_returning_an_empty_string()
+    {
+        var source = new FileSystemTools(Access(), [FileScopes.Memory]);
+        Assert.True((await CallAsync(source, "fs_write",
+            """{"scope":"memory","path":"tiny.md","text":"短"}""")).Ok);
+
+        var past = await CallAsync(source, "fs_read", """{"scope":"memory","path":"tiny.md","offset":99}""");
+        Assert.True(past.Ok, past.Error?.Message);
+        Assert.Contains("只有 1 个字符", past.Value!.Content, StringComparison.Ordinal);
+
+        var negative = await CallAsync(source, "fs_read", """{"scope":"memory","path":"tiny.md","offset":-1}""");
+        Assert.False(negative.Ok);
+        Assert.Equal(ErrorCode.Invalid, negative.Error!.Code);
+    }
+
+    [Fact]
     public async Task Reading_a_file_that_is_not_there_says_so_instead_of_returning_nothing()
     {
         var source = new FileSystemTools(Access(), [FileScopes.Memory]);
